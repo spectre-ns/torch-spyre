@@ -711,37 +711,36 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             return [DimensionInfo(wildcard_symbol(0), 1)]
 
     def codegen_kernel(self):
-        """Codegen the body of this kernel by pretty printing its KernelSpec"""
+        """Codegen the body of this kernel by pretty printing its list of KernelSpecs"""
         buf = IndentedBuffer()
-        if len(self.kernel_specs) != 1:
-            raise Unsupported(f"found {len(self.kernel_specs)} KernelSpecs")
-        ks = self.kernel_specs[0]
+        buf.writeline("[")
+        with buf.indent():
+            for ks in self.kernel_specs:
+                if logger.isEnabledFor(logging.DEBUG):
+                    if isinstance(ks, UnimplementedOp):
+                        logger.debug(f"kernel_spec: UnimplementedOp({ks.op})")
+                    else:
+                        logger.debug(
+                            f"kernel_spec: {ks.op}, is_reduction={ks.is_reduction}, "
+                            f"iteration_space={ks.iteration_space}, op_info={ks.op_info}"
+                        )
 
-        if logger.isEnabledFor(logging.DEBUG):
-            if isinstance(ks, UnimplementedOp):
-                logger.debug(f"kernel_spec: UnimplementedOp({ks.op})")
-            else:
-                logger.debug(
-                    f"kernel_spec: {ks.op}, is_reduction={ks.is_reduction}, "
-                    f"iteration_space={ks.iteration_space}, op_info={ks.op_info}"
-                )
-
-        if isinstance(ks, UnimplementedOp):
-            buf.writeline(f"UnimplementedOp(op='{ks.op}')")
-        else:
-            buf.writeline("KernelSpec(")
-            with buf.indent():
-                buf.writeline(f"op='{ks.op}',")
-                buf.writeline(f"is_reduction={ks.is_reduction},")
-                buf.writeline(f"iteration_space={ks.iteration_space!r},")
-                buf.writeline(f"op_info={ks.op_info!r},")
-                buf.writeline("args=[")
-                with buf.indent():
-                    for arg in ks.args:
-                        buf.writeline(f"{arg!r},")
-                buf.writeline("]")
-            buf.writeline(")")
-
+                if isinstance(ks, UnimplementedOp):
+                    buf.writeline(f"UnimplementedOp(op='{ks.op}')")
+                else:
+                    buf.writeline("KernelSpec(")
+                    with buf.indent():
+                        buf.writeline(f"op='{ks.op}',")
+                        buf.writeline(f"is_reduction={ks.is_reduction},")
+                        buf.writeline(f"iteration_space={ks.iteration_space!r},")
+                        buf.writeline(f"op_info={ks.op_info!r},")
+                        buf.writeline("args=[")
+                        with buf.indent():
+                            for arg in ks.args:
+                                buf.writeline(f"{arg!r},")
+                        buf.writeline("]")
+                    buf.writeline("),")
+        buf.writeline("]")
         return buf.getvalue()
 
     def call_kernel(self, name: str, node=None):
