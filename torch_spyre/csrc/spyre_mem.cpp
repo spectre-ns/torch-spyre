@@ -19,7 +19,6 @@
 #include <ATen/EmptyTensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/Resize.h>
-#include <ATen/ops/as_strided_cpu_dispatch.h>
 #include <ATen/ops/set_cpu_dispatch.h>
 #include <c10/core/Allocator.h>
 #include <c10/core/MemoryFormat.h>
@@ -252,18 +251,35 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   auto str_type = torchScalarToString[tensor->scalar_type()];
   const auto [dtype_cpu, dtype_dev] = stringToDTDataFormatPair(str_type);
   std::stringstream s;
-  auto cpu_shape = tensor->sizes().vec();
+
   DataConversionInfo dci{};
   dci.dci_dsName_ = "DCI-Tensor-0";
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? dtype_cpu : dtype_dev;
   dci.dataformat_dst_ = host2device ? dtype_dev : dtype_cpu;
+
+  std::vector<int64_t> cpu_shape;
+  std::vector<int64_t> dev_shape = stl.device_size;
+  c10::IntArrayRef t_sizes;
+  c10::IntArrayRef t_strides;
+  if (host2device) {
+    // Respect cpu shapes
+    cpu_shape = tensor->sizes().vec();
+    t_sizes = tensor->sizes();
+    t_strides = tensor->strides();
+  } else {
+    // Transfer contiguous memory, deal with view on cpu
+    auto spyre_tensor_impl =
+        static_cast<SpyreTensorImpl*>(tensor->unsafeGetTensorImpl());
+    cpu_shape = spyre_tensor_impl->dma_sizes;
+    t_sizes = c10::IntArrayRef(spyre_tensor_impl->dma_sizes);
+    t_strides = c10::IntArrayRef(spyre_tensor_impl->dma_strides);
+  }
   // Reverse PyTorch ordering
-  auto dev_shape = stl.device_size;
   std::reverse(cpu_shape.begin(), cpu_shape.end());
   std::reverse(dev_shape.begin(), dev_shape.end());
-  dci.dcsi_ = get_device_stride_infos(tensor->sizes(), tensor->strides(), stl,
-                                      dev_shape, host2device);
+  dci.dcsi_ =
+      get_device_stride_infos(t_sizes, t_strides, stl, dev_shape, host2device);
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
   dci.output_shape_ = host2device ? dev_shape : cpu_shape;
@@ -401,6 +417,7 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
   }
   return gl;
 }
+
 auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
   std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, true);
   if (!gl) {
@@ -420,6 +437,7 @@ auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
 
   SEN_THROW_NOK(gl->Copy(sendnn::Outputs(), {inp_tensor}, sn_idx));
 }
+
 auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
   std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, false);
   // execute
@@ -533,9 +551,12 @@ at::Tensor spyre_empty(c10::IntArrayRef size,
           /*resizeable=*/true)),
       pu1_dks, c10::scalarTypeToTypeMeta(dtype));
 
-  tensor.unsafeGetTensorImpl()->set_sizes_contiguous(size);
-  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
-      device_layout;
+  auto spyre_tensor_impl =
+      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  spyre_tensor_impl->set_sizes_contiguous(size);
+  spyre_tensor_impl->spyre_layout = device_layout;
+  spyre_tensor_impl->dma_sizes = size.vec();
+  spyre_tensor_impl->dma_strides = tensor.strides().vec();
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
@@ -576,18 +597,22 @@ at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       std::move(spyre_storage), pu1_dks, dtype);
 
-  auto tensorImpl = tensor.unsafeGetTensorImpl();
+  auto spyre_tensor_impl =
+      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
   if (size.size() == 0) {
     std::vector<int64_t> one = {1};
     c10::IntArrayRef tmp_size(one);
     c10::IntArrayRef tmp_stride(one);
-    tensorImpl->set_sizes_and_strides(tmp_size, tmp_stride);
+    spyre_tensor_impl->set_sizes_and_strides(tmp_size, tmp_stride);
 
   } else {
-    tensorImpl->set_sizes_and_strides(size, stride);
+    spyre_tensor_impl->set_sizes_and_strides(size, stride);
   }
 
-  static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
+  spyre_tensor_impl->spyre_layout = device_layout;
+  spyre_tensor_impl->dma_sizes = size.vec();
+  spyre_tensor_impl->dma_strides = stride.vec();
+
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
@@ -611,22 +636,14 @@ at::Tensor spyre_empty_with_layout(c10::IntArrayRef size,
   auto tensor = at::detail::make_tensor_base<SpyreTensorImpl>(
       std::move(spyre_storage), pu1_dks, c10::scalarTypeToTypeMeta(dtype));
 
-  auto tensorImpl = tensor.unsafeGetTensorImpl();
-  tensorImpl->set_sizes_and_strides(size, stride);
-
-  static_cast<SpyreTensorImpl*>(tensorImpl)->spyre_layout = device_layout;
+  auto spyre_tensor_impl =
+      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  spyre_tensor_impl->set_sizes_and_strides(size, stride);
+  spyre_tensor_impl->spyre_layout = device_layout;
+  spyre_tensor_impl->dma_sizes = size.vec();
+  spyre_tensor_impl->dma_strides = stride.vec();
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
-}
-at::Tensor spyre_as_strided(const at::Tensor& self, c10::IntArrayRef size,
-                            c10::IntArrayRef stride,
-                            std::optional<int64_t> storage_offset_) {
-  // TODO(aviros): This as is will lead to many errors for views, fail for now
-  TORCH_CHECK_NOT_IMPLEMENTED(
-      !self.is_privateuseone(),
-      "as_strided not implemented for Spyre tensors, implement the caller "
-      "using as_strided_with_layout with the proper semantics");
-  return at::cpu::as_strided(self, size, stride, storage_offset_);
 }
 
 at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
@@ -726,9 +743,12 @@ at::Tensor empty_with_layout(
           /*resizeable=*/true)),
       pu1_dks, c10::scalarTypeToTypeMeta(dtype));
 
-  tensor.unsafeGetTensorImpl()->set_sizes_contiguous(size);
-  static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())->spyre_layout =
-      device_layout;
+  auto spyre_tensor_impl =
+      static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  spyre_tensor_impl->set_sizes_contiguous(size);
+  spyre_tensor_impl->spyre_layout = device_layout;
+  spyre_tensor_impl->dma_sizes = size.vec();
+  spyre_tensor_impl->dma_strides = tensor.strides().vec();
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
@@ -743,27 +763,9 @@ at::Tensor py_empty_with_layout(
                            pin_memory_opt, memory_format_opt);
 }
 
-at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
-                                  c10::IntArrayRef stride,
-                                  std::optional<int64_t> storage_offset_,
-                                  SpyreTensorLayout device_layout) {
-  // NOTE: This function does not check whether
-  // the as_strided info and stl are compatible.
-  // This is for the caller of this function to check
-  auto storage_offset = storage_offset_.value_or(self.storage_offset());
-  auto result = at::detail::make_tensor<SpyreTensorImpl>(
-      c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(),
-      self.dtype());
-  at::native::setStrided(result, size, stride, storage_offset);
-  static_cast<SpyreTensorImpl*>(result.unsafeGetTensorImpl())->spyre_layout =
-      device_layout;
-  return result;
-}
-
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
-  m.impl("as_strided", TORCH_FN(spyre_as_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
 }
