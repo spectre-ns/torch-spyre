@@ -410,6 +410,9 @@ def _compile_and_run(fn, args, device, backend=None, needs_device=False, compile
     else:
         result = fn(*device_args, **device_kwargs)
 
+    if isinstance(result, (int, float)):
+        return result
+
     return _to_cpu(result, device)
 
 
