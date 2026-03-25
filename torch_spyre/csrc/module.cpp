@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "logging.h"
+#include "spyre_allocator.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_stream.h"
