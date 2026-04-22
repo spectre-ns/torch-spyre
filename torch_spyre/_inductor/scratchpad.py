@@ -214,7 +214,7 @@ def buf_end_of_life_analysis(operations: list[Operation]):
 
 
 def scratchpad_planning(
-    operations: list[Operation],
+    operations: list[Operation]
 ) -> None:
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
