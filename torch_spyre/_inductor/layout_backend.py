@@ -326,7 +326,7 @@ def allocate_sa(
             break
 
         # Check for reheating / melting / restart condition if the gradient is not
-        # decending fast enough relative to the energy in the current
+        # descending fast enough relative to the energy in the current
         # result. Increase temp and revert back to best result for
         # search restart.
         if len(current_list) > 10:
