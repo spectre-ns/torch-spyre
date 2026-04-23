@@ -1,27 +1,25 @@
 from dataclasses import dataclass
 import copy
 from itertools import combinations
-from typing import List, Tuple, Dict, Literal
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
+from typing import List, Tuple, Literal
 import numpy as np
-
-
-@dataclass
-class ReadWrites:
-    reads: list[str]
-    writes: list[str]
 
 
 @dataclass
 class Buffer:
     name: str
     size: int
-    start_time: int | None = None
-    end_time: int | None = None
-    address: float | None = None
-    spilled: bool | None = None
-    density: float | None = None  # effectively normalized size for now
+    start_time: int
+    end_time: int
+    address: int = 0
+    spilled: bool = False
+    density: float = 0  # effectively normalized size for now
+
+
+@dataclass
+class ReadWrites:
+    reads: list[Buffer]
+    writes: list[Buffer]
 
 
 @dataclass
@@ -44,92 +42,97 @@ class Operation:
         return ReadWrites(reads=reads, writes=writes)
 
 
-def plot_layout(capacity: int, buffers: list[Buffer]):
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.axhline(
-        y=capacity,
-        color="red",
-        linestyle="--",
-        linewidth=2,
-        label=f"SPM Ceiling ({capacity})",
-    )
-    ax.axhline(y=0, color="red", linestyle="--", linewidth=2, label="SPM Floor")
+# def plot_layout(capacity: int, buffers: list[Buffer]):
+#     assert np.all([b.start_time is not None for b in buffers]), (
+#         "Start time must be defined"
+#     )
+#     assert np.all([b.end_time is not None for b in buffers]), "End time must be defined"
 
-    max_time = max(b.end_time for b in buffers)
-    ax.set_xlim(0, max_time + 1)
-    ax.set_ylim(-capacity, capacity * 2)
-    ax.set_xlabel("Time (Logical Steps)")
-    ax.set_ylabel("Memory Address (Bytes)")
-    ax.set_title("Calculated Memory Layout")
+#     fig, ax = plt.subplots(figsize=(10, 6))
+#     ax.axhline(
+#         y=capacity,
+#         color="red",
+#         linestyle="--",
+#         linewidth=2,
+#         label=f"SPM Ceiling ({capacity})",
+#     )
+#     ax.axhline(y=0, color="red", linestyle="--", linewidth=2, label="SPM Floor")
 
-    rects = {}
-    texts = {}
+#     max_time = max([b.end_time for b in buffers if b.end_time is not None])
+#     ax.set_xlim(0, max_time + 1)
+#     ax.set_ylim(-capacity, capacity * 2)
+#     ax.set_xlabel("Time (Logical Steps)")
+#     ax.set_ylabel("Memory Address (Bytes)")
+#     ax.set_title("Calculated Memory Layout")
 
-    # Initialize the visual blocks
-    for b in buffers:
-        rect = patches.Rectangle(
-            (b.start_time, 0),
-            b.end_time - b.start_time,
-            b.size,
-            linewidth=1.5,
-            edgecolor="black",
-            facecolor="skyblue",
-            alpha=0.8,
-        )
-        ax.add_patch(rect)
-        rects[b.name] = rect
+#     rects = {}
+#     texts = {}
 
-        txt = ax.text(
-            0,
-            0,
-            f"Buffer {b.name}",
-            ha="center",
-            va="center",
-            fontsize=10,
-            weight="bold",
-        )
-        texts[b.name] = txt
+#     # Initialize the visual blocks
+#     for b in buffers:
+#         rect = patches.Rectangle(
+#             (b.start_time, 0),
+#             b.end_time - b.start_time,
+#             b.size,
+#             linewidth=1.5,
+#             edgecolor="black",
+#             facecolor="skyblue",
+#             alpha=0.8,
+#         )
+#         ax.add_patch(rect)
+#         rects[b.name] = rect
 
-    step_text = ax.text(
-        0.02, 0.90, "", transform=ax.transAxes, fontsize=12, weight="bold"
-    )
-    fig.canvas.draw()
-    fig.canvas.flush_events()
+#         txt = ax.text(
+#             0,
+#             0,
+#             f"Buffer {b.name}",
+#             ha="center",
+#             va="center",
+#             fontsize=10,
+#             weight="bold",
+#         )
+#         texts[b.name] = txt
 
-    msg = "FINISHED! Showing Final Configuration"
-    for b in buffers:
-        if not b.spilled:
-            rects[b.name].set_visible(True)
-            texts[b.name].set_visible(True)
-            rects[b.name].set_y(b.address)
-            texts[b.name].set_position(
-                (
-                    b.start_time + (b.end_time - b.start_time) / 2,
-                    b.address + b.size / 2,
-                )
-            )
-        else:
-            rects[b.name].set_visible(False)
-            texts[b.name].set_visible(False)
+#     step_text = ax.text(
+#         0.02, 0.90, "", transform=ax.transAxes, fontsize=12, weight="bold"
+#     )
+#     fig.canvas.draw()
+#     fig.canvas.flush_events()
 
-    # Add a warning box for spilled buffers
-    spilled_buffers = [b.name + f" : {b.density:.2f}" for b in buffers if b.spilled]
-    if spilled_buffers:
-        msg += f"\nSpilled to DRAM: {', '.join(spilled_buffers)}"
-    else:
-        msg += "\n No evictions required"
+#     msg = "FINISHED! Showing Final Configuration"
+#     for b in buffers:
+#         if not b.spilled:
+#             rects[b.name].set_visible(True)
+#             texts[b.name].set_visible(True)
+#             rects[b.name].set_y(b.address)
+#             texts[b.name].set_position(
+#                 (
+#                     b.start_time + (b.end_time - b.start_time) / 2,
+#                     b.address + b.size / 2,
+#                 )
+#             )
+#         else:
+#             rects[b.name].set_visible(False)
+#             texts[b.name].set_visible(False)
 
-    step_text.set_text(msg)
-    plt.show()
+#     # Add a warning box for spilled buffers
+#     spilled_buffers = [b.name + f" : {b.density:.2f}" for b in buffers if b.spilled]
+#     if spilled_buffers:
+#         msg += f"\nSpilled to DRAM: {', '.join(spilled_buffers)}"
+#     else:
+#         msg += "\n No evictions required"
+
+#     step_text.set_text(msg)
+#     plt.show()
 
 
-def calculate_logical_lifetimes(ops: list[Operation]) -> list[Buffer]:
-    pass
+# def calculate_logical_lifetimes(ops: list[Operation]) -> list[Buffer]:
+#     pass
 
 
-def allocate_greedy(capacity: int, buffers: list[Buffer]) -> list[Buffer]:
-    # TODO: Adapt implementation from IBM as a baseline
-    pass
+# def allocate_greedy(capacity: int, buffers: list[Buffer]) -> list[Buffer]:
+#     # TODO: Adapt implementation from IBM as a baseline
+#     pass
 
 
 def allocate_greedy_global(capacity: int, buffers: list[Buffer]) -> list[Buffer]:
@@ -139,7 +142,7 @@ def allocate_greedy_global(capacity: int, buffers: list[Buffer]) -> list[Buffer]
         key=lambda item: ((item.end_time - item.start_time), item.size), reverse=True
     )
 
-    allocated_buffers = []
+    allocated_buffers: list[Buffer] = []
     for target in buffers:
         _place_buffer(capacity, target, allocated_buffers)
 
@@ -197,7 +200,7 @@ def _find_free_gaps(
     return gaps
 
 
-def normalize_buffer_sizes(buffers: dict[str, Buffer]):
+def normalize_buffer_sizes(buffers: list[Buffer]):
     if not buffers:
         return
 
@@ -218,7 +221,7 @@ def allocate_sa(
     eviction_penalty: float = 1.5,
 ) -> list[Buffer]:
     rng = np.random.default_rng(seed=10)
-    overlapping_time = {}
+    overlapping_time: dict[str, list[tuple[str, int]]] = {}
     for buffer in buffers:
         overlapping_time[buffer.name] = []
         buffer.address = rng.integers(0, capacity - buffer.size)
@@ -240,13 +243,11 @@ def allocate_sa(
         )
         buffer.spilled = bool(eviction_length)
 
-    def evaluate_objective(candidate_buffers: dict[str, Buffer]) -> float:
+    def evaluate_objective(candidate_buffers: list[Buffer]) -> float:
         collision_term = 0.0
         for buffer in candidate_buffers:
             for second, time_overlap in overlapping_time[buffer.name]:
-                second_buffer = next(
-                    (b for b in candidate_buffers if b.name == second), None
-                )
+                second_buffer = next((b for b in candidate_buffers if b.name == second))
                 end = min(
                     buffer.address + buffer.size,
                     second_buffer.address + second_buffer.size,
@@ -275,11 +276,11 @@ def allocate_sa(
     # ==========================================
     current_list = []
 
-    best: Dict[str, Buffer] = buffers
+    best: list[Buffer] = buffers
     best_eval: float = evaluate_objective(best)
 
     current_eval: float = best_eval
-    current: Dict[str, Buffer] = copy.deepcopy(best)
+    current: list[Buffer] = copy.deepcopy(best)
 
     reheating_step = initial_temp
     temp = initial_temp
@@ -311,8 +312,8 @@ def allocate_sa(
 
         overlapping = False
         for buffer in best:
-            for second, time_overlap in overlapping_time[buffer.name]:
-                second_buffer = next((b for b in best if b.name == second), None)
+            for second_buffer_name, time_overlap in overlapping_time[buffer.name]:
+                second_buffer = next((b for b in best if b.name == second_buffer_name))
                 end = min(
                     buffer.address + buffer.size,
                     second_buffer.address + second_buffer.size,
@@ -369,7 +370,7 @@ def allocate_buffers(
     result: None | List[Buffer] = None
     match method:
         case "greedy":
-            result = allocate_greedy(capacity, _buffers)
+            raise NotImplementedError("Greedy implementation is supported yet")
         case "ordered-global":
             result = allocate_greedy_global(capacity, _buffers)
         case "annealing":
@@ -399,4 +400,4 @@ if __name__ == "__main__":
     best_allocation = allocate_buffers(
         SPM_CAPACITY, buffer_list, "ordered-global", allow_fallback=True
     )
-    plot_layout(SPM_CAPACITY, best_allocation)
+    # plot_layout(SPM_CAPACITY, best_allocation)
