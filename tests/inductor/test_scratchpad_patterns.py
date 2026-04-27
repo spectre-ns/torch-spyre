@@ -3,11 +3,17 @@ import copy
 from dataclasses import dataclass
 from typing import Callable, Optional, override
 from unittest import TestCase, expectedFailure
-from enum import Enum
 import os
 from functools import wraps
+from torch_spyre._inductor.layout_backend import (
+    Buffer,
+    Operation,
+    Component,
+    Allocation,
+    AllocationResult,
+    calculate_liveness,
+)
 
-from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._inductor.scratchpad import (
     scratchpad_planning,
@@ -30,101 +36,6 @@ if os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1":
         return wrapper
 else:
     usuallyExpectedFailure = expectedFailure
-
-
-class BufferDeviceLayout:
-    """This class mimics the FixedTiledLayout.device_layout field."""
-
-    def __init__(self, size: int):
-        self.device_size = [(size + 127) // 128, 128]
-
-
-class BufferLayout:
-    """This class mimics the TensorBox.layout field (a FixedTiledLayout)."""
-
-    def __init__(self, size: int):
-        self.device_layout = BufferDeviceLayout(size)
-        self.size = size
-        self.allocation = {}
-
-
-class Buffer:
-    def __init__(self, name: str, size: int):
-        self.name = name
-        self.size = size
-        self.layout = BufferLayout(size)
-        self.data = self  # This helps 'scratchpad'
-
-
-def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
-    return {name: Buffer(name=name, size=size) for (name, size) in names_sizes.items()}
-
-
-@dataclass
-class ReadWrites:
-    reads: OrderedSet[Buffer]
-    writes: OrderedSet[Buffer]
-
-
-@dataclass
-class Operation:
-    name: str
-    inputs: list[str]
-    outputs: list[str]
-    _buffer_registry: dict[str, "Buffer"]
-
-    # To make scratchpad.py work, we add origin_node and target fields that point to the op itself,
-    # a field _opname that is the same as name, and a field op_it_space_splits that is used in core
-    # division. (If the value of op_it_space_splits is different for operations in a sequence, that
-    # blocks LX allocation, so we make sure it is always the same.)
-    op_it_space_splits = None
-    origin_node = None
-    target = None
-    _opname = None
-
-    def __post_init__(self):
-        self.op_it_space_splits = []
-        self.origin_node = self
-        self.target = self
-        self._opname = self.name
-
-    def get_read_writes(self) -> ReadWrites:
-        # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
-        reads = OrderedSet(
-            self._buffer_registry[buffer_name] for buffer_name in self.inputs
-        )
-        writes = OrderedSet(
-            self._buffer_registry[buffer_name] for buffer_name in self.outputs
-        )
-        return ReadWrites(reads=reads, writes=writes)
-
-    def get_read_names(self):
-        return self.inputs
-
-
-class Component(Enum):
-    LX = "LX"
-    HBM = "HBM"
-
-
-@dataclass
-class Allocation:
-    buffer: str
-    component: Component = Component.LX
-    # If the component is LX, then the address must be an integer. If the component is HBM, we don't
-    # care about the address; this is encoded by the address being None. (This is enforced in
-    # TestExamplePattern.verify_pattern.)
-    address: Optional[int] = None
-
-
-# A type alias for the result of an allocation. The ith entry in the list is the state during
-# the ith operation. It maps each allocated buffer to the scratch pad address where it is
-# allocated at that point in time.
-AllocationResult = list[dict[str, Allocation]]
-
-
-def make_allocation_result(lists: list[list[Allocation]]) -> AllocationResult:
-    return [{alloc.buffer: alloc for alloc in lst} for lst in lists]
 
 
 @dataclass
@@ -152,6 +63,14 @@ class Pattern:
 
         outputs = list(bufs_written_to.difference(bufs_read_from))
         return (list(inputs), outputs)
+
+
+def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
+    return {name: Buffer(name=name, size=size) for (name, size) in names_sizes.items()}
+
+
+def make_allocation_result(lists: list[list[Allocation]]) -> AllocationResult:
+    return [{alloc.buffer: alloc for alloc in lst} for lst in lists]
 
 
 class InstrumentedAllocator(ScratchPadAllocator):
@@ -385,16 +304,7 @@ class TestExamplePattern(TestCase):
                 )
 
     def verify_actual_run(self, pattern: Pattern, alloc: InstrumentedAllocator):
-        # Verify that the actual run's allocation is valid. We assume that any allocation is "live"
-        # during the entire liveness of the corresponding buffer.
-        liveness_start = {}
-        liveness_end = {}
-        for i, op in enumerate(pattern.operations):
-            for buffer_name in op.inputs + op.outputs:
-                if buffer_name not in liveness_start:
-                    liveness_start[buffer_name] = i
-                liveness_end[buffer_name] = i
-
+        (liveness_start, liveness_end) = calculate_liveness(pattern)
         # Sanity check -- every buffer should have a start and an end to its liveness.
         self.assertTrue(set(liveness_start.keys()) == set(liveness_end.keys()))
 

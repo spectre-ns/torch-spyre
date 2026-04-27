@@ -1,12 +1,14 @@
 from dataclasses import dataclass
 import copy
 from itertools import combinations
-from typing import List, Tuple, Literal
+from typing import List, Tuple, Literal, Optional
 import numpy as np
+from enum import Enum
+from torch.utils._ordered_set import OrderedSet
 
 
 @dataclass
-class Buffer:
+class LifetimeBoundBuffer:
     name: str
     size: int
     start_time: int
@@ -16,10 +18,34 @@ class Buffer:
     density: float = 0  # effectively normalized size for now
 
 
+class BufferDeviceLayout:
+    """This class mimics the FixedTiledLayout.device_layout field."""
+
+    def __init__(self, size: int):
+        self.device_size = [(size + 127) // 128, 128]
+
+
+class BufferLayout:
+    """This class mimics the TensorBox.layout field (a FixedTiledLayout)."""
+
+    def __init__(self, size: int):
+        self.device_layout = BufferDeviceLayout(size)
+        self.size = size
+        self.allocation = {}
+
+
+class Buffer:
+    def __init__(self, name: str, size: int):
+        self.name = name
+        self.size = size
+        self.layout = BufferLayout(size)
+        self.data = self  # This helps 'scratchpad'
+
+
 @dataclass
 class ReadWrites:
-    reads: list[Buffer]
-    writes: list[Buffer]
+    reads: OrderedSet[Buffer]
+    writes: OrderedSet[Buffer]
 
 
 @dataclass
@@ -27,31 +53,71 @@ class Operation:
     name: str
     inputs: list[str]
     outputs: list[str]
-    _buffer_registry: dict[str, Buffer]
+    _buffer_registry: dict[str, "Buffer"]
 
-    # To make scratchpad.py work, we add an origin_node field that points to the op itself.
+    # To make scratchpad.py work, we add origin_node and target fields that point to the op itself,
+    # a field _opname that is the same as name, and a field op_it_space_splits that is used in core
+    # division. (If the value of op_it_space_splits is different for operations in a sequence, that
+    # blocks LX allocation, so we make sure it is always the same.)
+    op_it_space_splits = None
     origin_node = None
+    target = None
+    _opname = None
 
     def __post_init__(self):
+        self.op_it_space_splits = []
         self.origin_node = self
+        self.target = self
+        self._opname = self.name
 
     def get_read_writes(self) -> ReadWrites:
         # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
-        reads = [self._buffer_registry[buffer_name] for buffer_name in self.inputs]
-        writes = [self._buffer_registry[buffer_name] for buffer_name in self.outputs]
+        reads = OrderedSet(
+            self._buffer_registry[buffer_name] for buffer_name in self.inputs
+        )
+        writes = OrderedSet(
+            self._buffer_registry[buffer_name] for buffer_name in self.outputs
+        )
         return ReadWrites(reads=reads, writes=writes)
 
-
-# def calculate_logical_lifetimes(ops: list[Operation]) -> list[Buffer]:
-#     pass
-
-
-# def allocate_greedy(capacity: int, buffers: list[Buffer]) -> list[Buffer]:
-#     # TODO: Adapt implementation from IBM as a baseline
-#     pass
+    def get_read_names(self):
+        return self.inputs
 
 
-def allocate_greedy_global(capacity: int, buffers: list[Buffer]) -> list[Buffer]:
+class Component(Enum):
+    LX = "LX"
+    HBM = "HBM"
+
+
+@dataclass
+class Allocation:
+    buffer: str
+    component: Component = Component.LX
+    # If the component is LX, then the address must be an integer. If the component is HBM, we don't
+    # care about the address; this is encoded by the address being None. (This is enforced in
+    # TestExamplePattern.verify_pattern.)
+    address: Optional[int] = None
+
+
+# A type alias for the result of an allocation. The ith entry in the list is the state during
+# the ith operation. It maps each allocated buffer to the scratch pad address where it is
+# allocated at that point in time.
+AllocationResult = list[dict[str, Allocation]]
+
+
+def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, int]]:
+    # Verify that the actual run's allocation is valid. We assume that any allocation is "live"
+    # during the entire liveness of the corresponding buffer.
+    liveness_start = {}
+    liveness_end = {}
+    for i, op in enumerate(ops):
+        for buffer_name in op.inputs + op.outputs:
+            if buffer_name not in liveness_start:
+                liveness_start[buffer_name] = i
+            liveness_end[buffer_name] = i
+
+
+def allocate_sorted_global(capacity: int, buffers: list[Buffer]) -> list[TimeBoundBuffer]:
     normalize_buffer_sizes(buffers)
 
     buffers.sort(
@@ -98,6 +164,17 @@ def _place_buffer(capacity: int, target: Buffer, allocated_buffers: list[Buffer]
     allocated_buffers.append(target)
 
 
+@dataclass
+class TimeBoundBuffer:
+    name: str
+    size: int
+    start_time: int
+    end_time: int
+    address: int = 0
+    spilled: bool = False
+    density: float = 0  # effectively normalized size for now
+
+
 def _find_free_gaps(
     capacity: int, occupied: List[Tuple[int, int]]
 ) -> List[Tuple[int, int]]:
@@ -135,7 +212,7 @@ def allocate_sa(
     num_iterations: int = 10000,
     collision_penalty: float = 100,
     eviction_penalty: float = 1.5,
-) -> list[Buffer]:
+) -> list[LifetimeBoundBuffer]:
     rng = np.random.default_rng(seed=10)
     overlapping_time: dict[str, list[tuple[str, int]]] = {}
     for buffer in buffers:
@@ -260,42 +337,41 @@ def allocate_sa(
     return best
 
 
-# TODO: not sure how to handle this one yet
-def calculate_useage():
-    pass
-
-
 def allocate_buffers(
     capacity: int,
-    buffers: List[Buffer],
-    method: Literal["greedy", "ordered-global", "annealing"],
-    allow_fallback: bool = False,
+    ops: List[Operation],
+    buffer_registry: dict[str, Buffer] = {},
+    method: Literal["sorted-global", "annealing"] = "sorted-global",
+    allow_fallback: bool = True,
     **kwargs,
-):
+) -> AllocationResult:
     # Check all buffers have a valid start and end time
-    for b in buffers:
-        assert b.start_time is not None and b.end_time is not None, (
-            "Start and end times must be evaluated prior to scheduling"
-        )
-
-        assert b.start_time < b.end_time, "Buffer must start before end"
+    start_times, end_times = calculate_liveness(ops)
+    buffers = [LifetimeBoundBuffer(
+            name=n, 
+            size=b.size, 
+            start_time=start_times[n], 
+            end_time=end_times[n], 
+            address=0, 
+            spilled=False, 
+            density=0
+        ) for n, b in buffer_registry]
 
     # Don't try to assign buffers which are bigger than capacity
     _buffers = [b for b in buffers if b.size <= capacity]
 
-    result: None | List[Buffer] = None
+    result: None | AllocationResult = None
     match method:
-        case "greedy":
-            raise NotImplementedError("Greedy implementation is supported yet")
-        case "ordered-global":
-            result = allocate_greedy_global(capacity, _buffers)
+        case "sorted-global":
+            result = allocate_sorted_global(capacity, _buffers)
         case "annealing":
             result = allocate_sa(capacity, _buffers, **kwargs)
         case _:
             raise ValueError(f"Allocation method: {method} not not permitted")
 
     if allow_fallback and not np.all([b.spilled for b in result]):
-        fallback_result = allocate_sa(capacity, _buffers, **kwargs)
+        result = allocate_sa(capacity, _buffers, **kwargs)
         # TODO: compare results for optimality if no obvious improvement...
-        return fallback_result
-    return result
+    
+    allocation_result = [Allocation(b.name, Component.HBM if b.spilled else Component.LX, b.address) for b in result]
+    return allocation_result

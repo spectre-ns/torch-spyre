@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import unittest
-import torch
 import torch_spyre._inductor.layout_backend as lb
 from .tools.layout_visualization import plot_layout
+
 
 class TestOps(unittest.TestCase):
     def test_annealing_layout(self):
@@ -35,10 +34,9 @@ class TestOps(unittest.TestCase):
             lb.Buffer(name="J", size=25, start_time=6, end_time=10),
         ]
 
-        best_allocation = lb.allocate_buffers(
-            SPM_CAPACITY, buffer_list, "annealing"
-        )
+        best_allocation = lb.allocate_buffers(SPM_CAPACITY, buffer_list, "annealing")
         plot_layout(SPM_CAPACITY, best_allocation)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,10 @@
 import matplotlib.pyplot as plt
 from matplotlib import patches
+import numpy as np
+from ..torch_spyre._inductor.layout_backend import TimeBoundBuffer
 
-def plot_layout(capacity: int, buffers: list[Buffer]):
+
+def plot_layout(capacity: int, buffers: list[TimeBoundBuffer]):
     assert np.all([b.start_time is not None for b in buffers]), (
         "Start time must be defined"
     )
