@@ -14,7 +14,13 @@
 
 import math
 from typing import Callable, Optional, override
-
+from abc import abstractmethod
+import functools
+from torch_spyre._inductor.layout_backend import (
+    Allocation,
+    AllocationResult,
+    Component
+)
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
@@ -37,171 +43,35 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = [
 ]
 
 logger = get_inductor_logger("LX_PLANNING")
-
-
-class ScratchPadAllocator:
-    """LX manager simplified version"""
-
-    def __init__(self, size: int = -1):
-        # scratch pad is 2MB = 2<<20 bytes in total. preserve total * DXP_LX_FRAC_AVAIL
-        # for backend usage unless specified otherwise
-        if size == -1:
-            size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
-        self.limit = size
-        self.usage: dict = {}  # each record will be tensor_name:{"addr": yy, "size": zz}
-        self.lx_usage_hist: list = []
-
-    def get_lowest_addr_in_use(self):
-        if len(self.usage) > 0:
-            return min([rec["addr"] for rec in self.usage.values()])
-        return None
-
-    def get_highest_addr_in_use(self):
-        if len(self.usage) > 0:
-            return max([rec["addr"] + rec["size"] for rec in self.usage.values()])
-        return None
-
-    def get_available_total(self):
-        total_avail = self.limit
-        for rec in self.usage.values():
-            total_avail -= rec["size"]
-        return total_avail
-
-    def find_free_block(self, size_needed: int):
-        # cannot perform defragmentation yet, will add more cases in the future
-        curr_lo = self.get_lowest_addr_in_use()
-        curr_hi = self.get_highest_addr_in_use()
-        if len(self.usage) == 0 or curr_lo >= size_needed:
-            # completely free or enough room at addr0
-            return 0
-        elif curr_hi + size_needed < self.limit:
-            # enough room at higher addr, return next 128-multiple
-            return math.ceil(curr_hi / 128) * 128
-        elif len(self.usage) > 1:
-            # find a "hole" between lowest and highest (assume a block was dealloc'ed)
-            rec_only = list(self.usage.values())  # simply drop tensor names, not needed
-            sorted_rec = sorted(rec_only, key=lambda rec: rec["addr"])
-            for i in range(len(sorted_rec) - 1):
-                frag_st = sorted_rec[i]["addr"] + sorted_rec[i]["size"]
-                frag_end = sorted_rec[i + 1]["addr"]
-                if frag_end - frag_st >= size_needed:
-                    return frag_st
-            return -1
-        else:
-            # cannot find any free blocks
-            return -1
-
-    def get_output_names(self) -> list[str]:
-        return V.graph.get_output_names()
-
-    def is_graph_input(self, buffer: str) -> bool:
-        return buffer not in V.graph.name_to_buffer
-
-    def try_allocate(self, mem_usage: dict, idx: int, org_op_name: str):
-        """
-        Simple reuse rule:
-        1. for an "input" tensor, found a matched tensor (name and size) on LX
-        2. for an output tensor, if this op is on the "white list" => prep for pinning
-            => alloc a new LX block for the "output" of the op
-        If can_reuse => add lx info to corresponding buffer.layout
-        NOTE: 1. if an op, e.g. max, occurs multiple times on graph, output buffers will
-                 have different names -> end-of-life analysis will take care of dealloc
-              2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
-              3. may be able to generalize this decision in buf end-of-life analysis
-              4. greedy alloc may cause fragments, can further improve
-        """
-        graph_output_buf_name = self.get_output_names()
-        for tensor_name, needed in mem_usage.items():
-            is_graph_input = self.is_graph_input(tensor_name)
-            is_graph_output = tensor_name in graph_output_buf_name
-            core_div_mismatch = (not needed["is_input"]) and needed["core_div_mismatch"]
-            if is_graph_input or is_graph_output or core_div_mismatch:
-                # graph input itself cannot be pinned, but we may be able to clone
-                # graph output has to go back to HBM
-                # if buf users have diff core-splits -> cause cross-core LX read/write
-                continue
-
-            # Decide whether to reuse.
-            addr = -1
-            tensor_on_lx = self.usage.get(tensor_name, {})
-            size_match = tensor_on_lx.get("size", 0) == needed["size"]
-            allowed_output_op = self.op_output_good_for_lx_reuse(org_op_name)
-
-            if needed["is_input"] and tensor_on_lx and size_match:
-                addr = self.usage[tensor_name]["addr"]
-            elif not needed["is_input"] and allowed_output_op:
-                addr = self.find_free_block(needed["size"])
-
-            # add lx info into V.graph.buffers.layout for later codegen use.
-            if addr != -1:
-                self.usage[tensor_name] = {"addr": addr, "size": needed["size"]}
-
-                self.allocate(tensor_name, addr)
-                # Record usage history for debugging
-                self.lx_usage_hist.append(
-                    {
-                        "node_idx": idx,
-                        "op_name": org_op_name,
-                        "tensor_name": tensor_name,
-                        "addr": addr,
-                        "size": needed["size"],
-                    }
-                )
-
-    def allocate(self, tensor_name: str, addr: int):
-        buf = V.graph.get_buffer(tensor_name)
-        layout = buf.get_layout()
-        layout.allocation["lx"] = addr
-        # NOTE assume same addr for same buf, no realloc needed/allowed
-
-    def deallocate(self, bufs: list[str]):
-        """Try to deallocate each of the buffers in a list, if exists."""
-        if isinstance(bufs, str):
-            bufs = [bufs]
-
-        for buf in bufs:
-            if buf in self.usage:
-                del self.usage[buf]
-
-    # TODO add dealloc and defrag mechanism to allocator later
-
-    def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
-        return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
-
-    def mem_usage_by_op(self, op: ComputedBuffer) -> dict[str, dict[str, bool | int]]:
-        """Get a summary of memory usage of the input operation."""
-        rw = op.get_read_writes()
-        mem_usage = {}
-
-        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
-            for dep in deps:
-                buf = V.graph.get_buffer(dep.name)
-                dev_layout = buf.layout.device_layout
-                dev_size = (
-                    math.prod(dev_layout.device_size[:-1]) * 128
-                )  # num_sticks * bytes_per_stick
-                mem_usage[dep.name] = {
-                    "is_input": is_input,
-                    "size": dev_size,
-                }
-
-        return mem_usage
+__LX_CAPACITY__ = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
 
 
 class AllocationStrategy:
+    @abstractmethod
     def plan_allocation(self, operations: list[Operation]):
-        raise NotImplementedError("This is an abstract base class.")
+        pass
+    
+    def push_allocation(self, allocation: AllocationResult):
+        # push the allocation into the code generation
+        for b in allocation:
+            buf = V.graph.get_buffer(b.buffer)
+            layout = buf.get_layout()
+            layout.allocation["lx"] = b.address
 
+class SpyreLxOptimizationPass:
+    @abstractmethod
+    def apply_pass(self, operations: list[Operation]) -> list[Operation]:
+        pass
 
-class GreedyAllocationStrategy(AllocationStrategy):
+# Potential other optimizations... Output cloning, buffer lifetime splitting, rematerialization (advanced)
+class InputBufferOptimization(SpyreLxOptimizationPass):
     def __init__(
         self,
-        alloc: Optional[ScratchPadAllocator] = None,
         graph_lowering: Optional[GraphLowering] = None,
     ):
-        self.alloc = alloc if alloc else ScratchPadAllocator()
         self.graph_lowering = graph_lowering if graph_lowering else V.graph
-
+    
+    
     def should_consider_op(self, op: Operation) -> bool:
         return isinstance(op, ComputedBuffer) and not isinstance(
             op.layout, MutationLayoutSHOULDREMOVE
@@ -433,9 +303,8 @@ class GreedyAllocationStrategy(AllocationStrategy):
             self.insert_op_after(buf, clone_lowering, buf_users, operations)
 
             lx_free_total -= dev_size
-
-    @override
-    def plan_allocation(self, operations: list[Operation]):
+            
+    def apply_pass(self, operations: list[Operation]) -> list[Operation]:
         idx_to_dealloc_bufs, buf_users, core_div_mismatch = self.buf_analysis(
             operations
         )
@@ -444,7 +313,7 @@ class GreedyAllocationStrategy(AllocationStrategy):
             num_ops_before = len(operations)
             self.try_insert_clone_op_for_inputs(
                 operations,
-                self.alloc.get_available_total(),
+                __LX_CAPACITY__,
                 buf_users,
                 core_div_mismatch,
             )
@@ -455,13 +324,214 @@ class GreedyAllocationStrategy(AllocationStrategy):
                     operations
                 )
 
-        for idx, op in enumerate(operations):
-            # release unneeded LX allocations before actual planning
-            self.alloc.deallocate(idx_to_dealloc_bufs.get(idx, []))
+        return operations
 
-            if self.should_consider_op(op):
-                self.consider_for_scratchpad(op, idx)
-        # logger.info(alloc.lx_usage_hist)
+class LayoutSolver:
+    @abstractmethod
+    def plan_layout(self, ops: list[Operation]) -> AllocationResult:
+        pass
+
+class GreedyLayoutSolver(LayoutSolver):
+    def __init__(self, size: int = -1):
+        # scratch pad is 2MB = 2<<20 bytes in total. preserve total * DXP_LX_FRAC_AVAIL
+        # for backend usage unless specified otherwise
+        if size == -1:
+            size = __LX_CAPACITY__
+        self.limit = size
+        self.usage: dict = {}  # each record will be tensor_name:{"addr": yy, "size": zz}
+        self.lx_usage_hist: list = []
+
+    def get_lowest_addr_in_use(self):
+        if len(self.usage) > 0:
+            return min([rec["addr"] for rec in self.usage.values()])
+        return None
+
+    def get_highest_addr_in_use(self):
+        if len(self.usage) > 0:
+            return max([rec["addr"] + rec["size"] for rec in self.usage.values()])
+        return None
+
+    def get_available_total(self):
+        total_avail = self.limit
+        for rec in self.usage.values():
+            total_avail -= rec["size"]
+        return total_avail
+
+    def find_free_block(self, size_needed: int):
+        # cannot perform defragmentation yet, will add more cases in the future
+        curr_lo = self.get_lowest_addr_in_use()
+        curr_hi = self.get_highest_addr_in_use()
+        if len(self.usage) == 0 or curr_lo >= size_needed:
+            # completely free or enough room at addr0
+            return 0
+        elif curr_hi + size_needed < self.limit:
+            # enough room at higher addr, return next 128-multiple
+            return math.ceil(curr_hi / 128) * 128
+        elif len(self.usage) > 1:
+            # find a "hole" between lowest and highest (assume a block was dealloc'ed)
+            rec_only = list(self.usage.values())  # simply drop tensor names, not needed
+            sorted_rec = sorted(rec_only, key=lambda rec: rec["addr"])
+            for i in range(len(sorted_rec) - 1):
+                frag_st = sorted_rec[i]["addr"] + sorted_rec[i]["size"]
+                frag_end = sorted_rec[i + 1]["addr"]
+                if frag_end - frag_st >= size_needed:
+                    return frag_st
+            return -1
+        else:
+            # cannot find any free blocks
+            return -1
+
+    def get_output_names(self) -> list[str]:
+        return V.graph.get_output_names()
+
+    def is_graph_input(self, buffer: str) -> bool:
+        return buffer not in V.graph.name_to_buffer
+
+    def try_allocate(self, mem_usage: dict, idx: int, org_op_name: str) -> AllocationResult:
+        """
+        Simple reuse rule:
+        1. for an "input" tensor, found a matched tensor (name and size) on LX
+        2. for an output tensor, if this op is on the "white list" => prep for pinning
+            => alloc a new LX block for the "output" of the op
+        If can_reuse => add lx info to corresponding buffer.layout
+        NOTE: 1. if an op, e.g. max, occurs multiple times on graph, output buffers will
+                 have different names -> end-of-life analysis will take care of dealloc
+              2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
+              3. may be able to generalize this decision in buf end-of-life analysis
+              4. greedy alloc may cause fragments, can further improve
+        """
+        graph_output_buf_name = self.get_output_names()
+        for tensor_name, needed in mem_usage.items():
+            is_graph_input = self.is_graph_input(tensor_name)
+            is_graph_output = tensor_name in graph_output_buf_name
+            core_div_mismatch = (not needed["is_input"]) # and needed["core_div_mismatch"]
+            if is_graph_input or is_graph_output or core_div_mismatch:
+                # graph input itself cannot be pinned, but we may be able to clone
+                # graph output has to go back to HBM
+                # if buf users have diff core-splits -> cause cross-core LX read/write
+                continue
+
+            # Decide whether to reuse.
+            addr = -1
+            tensor_on_lx = self.usage.get(tensor_name, {})
+            size_match = tensor_on_lx.get("size", 0) == needed["size"]
+            allowed_output_op = self.op_output_good_for_lx_reuse(org_op_name)
+
+            if needed["is_input"] and tensor_on_lx and size_match:
+                addr = self.usage[tensor_name]["addr"]
+            elif not needed["is_input"] and allowed_output_op:
+                addr = self.find_free_block(needed["size"])
+
+            # add lx info into V.graph.buffers.layout for later codegen use.
+            if addr != -1:
+                self.usage[tensor_name] = {"addr": addr, "size": needed["size"]}
+
+                # Record usage history for debugging
+                self.lx_usage_hist.append(
+                    {
+                        "node_idx": idx,
+                        "op_name": org_op_name,
+                        "tensor_name": tensor_name,
+                        "addr": addr,
+                        "size": needed["size"],
+                    }
+                )
+
+    def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
+        return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+
+    def mem_usage_by_op(self, op: ComputedBuffer) -> dict[str, dict[str, bool | int]]:
+        """Get a summary of memory usage of the input operation."""
+        rw = op.get_read_writes()
+        mem_usage = {}
+
+        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
+            for dep in deps:
+                buf = V.graph.get_buffer(dep.name)
+                dev_layout = buf.layout.device_layout
+                dev_size = (
+                    math.prod(dev_layout.device_size[:-1]) * 128
+                )  # num_sticks * bytes_per_stick
+                mem_usage[dep.name] = {
+                    "is_input": is_input,
+                    "size": dev_size,
+                }
+
+        return mem_usage
+
+    def plan_layout(self, ops: list[Operation]) -> AllocationResult:
+        for idx, op in enumerate(ops):
+            mem_usage = self.mem_usage_by_op(op)
+            # add core division check
+            org_op_name = op.origin_node.target._opname
+            self.try_allocate(mem_usage, idx, org_op_name)
+        
+        return [
+                Allocation(tensor_name, Component.LX, item["addr"])
+                for tensor_name, item in self.usage
+            ]
+
+
+class DefaultAllocationStrategy(AllocationStrategy):
+    def __init__(
+            self,
+            optimization_passes: list[SpyreLxOptimizationPass] | None = None,
+            layout_planning: list[LayoutSolver] | None = None
+    ):
+        if optimization_passes:
+            self.optimization_passes = optimization_passes
+        else:
+            self.optimization_passes = [InputBufferOptimization()]
+
+        if layout_planning:
+            self.layout_planning = layout_planning
+        else:
+            layout_planning = [GreedyLayoutSolver()]
+
+    def apply_checks(self, operations: list[Operation]) -> list[str]:
+        # check core division
+        # check buffer size
+        # return buffers which should be excluded on some basis
+        # might need to expand this as well
+        # return buffers which should not be considered for LX planning
+        # check for operations which are not supported on output
+        #           remove those buffers
+        return []
+
+    def plan_allocation(self, operations: list[Operation]):
+
+        # compute the optimized graph with the optimized operation list
+        # ideally not apply changes to the FX graph until the end
+        optimized_ops = functools.reduce(
+            lambda intermediate_ops, optimization_pass: optimization_pass.apply_pass(intermediate_ops),
+            self.optimization_passes,
+            operations
+        )
+
+        # attempt to place the optimized buffers into LX
+        def try_layout_with_fallback(
+                strategies: list[LayoutSolver],
+                operations: list[Operation]) -> AllocationResult | None:
+            final_layout = None
+            for strategy in strategies:
+                current_layout = strategy.plan_layout(operations)
+                
+                # Check if this strategy places all buffers
+                if all([buffer.component == Component.LX
+                        for buffer in current_layout]):
+                    return current_layout  # Exit early if optimal
+                    
+                final_layout = current_layout  # Store the last attempt
+
+            # Return the best found or the last attempt
+            return final_layout
+
+        allocation = try_layout_with_fallback(self.layout_planning, optimized_ops)
+        if allocation:
+            self.push_allocation(allocation)
+            return
+        
+        logger.warning("LX layout planning failed. All buffers will reside in HBM")
 
 
 def scratchpad_planning(
@@ -472,5 +542,8 @@ def scratchpad_planning(
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts).
     if not strategy:
-        strategy = GreedyAllocationStrategy()
+        strategy = DefaultAllocationStrategy()
     strategy.plan_allocation(operations)
+
+
+

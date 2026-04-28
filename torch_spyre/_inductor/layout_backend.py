@@ -96,13 +96,13 @@ class Allocation:
     # If the component is LX, then the address must be an integer. If the component is HBM, we don't
     # care about the address; this is encoded by the address being None. (This is enforced in
     # TestExamplePattern.verify_pattern.)
-    address: Optional[int] = None
+    address: int = 0
 
 
 # A type alias for the result of an allocation. The ith entry in the list is the state during
 # the ith operation. It maps each allocated buffer to the scratch pad address where it is
 # allocated at that point in time.
-AllocationResult = list[dict[str, Allocation]]
+AllocationResult = list[Allocation]
 
 
 def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, int]]:
@@ -117,7 +117,7 @@ def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, 
             liveness_end[buffer_name] = i
 
 
-def allocate_sorted_global(capacity: int, buffers: list[Buffer]) -> list[TimeBoundBuffer]:
+def allocate_sorted_global(capacity: int, buffers: list[Buffer]) -> list[LifetimeBoundBuffer]:
     normalize_buffer_sizes(buffers)
 
     buffers.sort(
@@ -131,7 +131,7 @@ def allocate_sorted_global(capacity: int, buffers: list[Buffer]) -> list[TimeBou
     return allocated_buffers
 
 
-def _place_buffer(capacity: int, target: Buffer, allocated_buffers: list[Buffer]):
+def _place_buffer(capacity: int, target: Buffer, allocated_buffers: list[LifetimeBoundBuffer]):
     # Find all currently allocated buffers that overlap in TIME
     overlapping_in_time = []
     for alloc in allocated_buffers:
@@ -164,17 +164,6 @@ def _place_buffer(capacity: int, target: Buffer, allocated_buffers: list[Buffer]
     allocated_buffers.append(target)
 
 
-@dataclass
-class TimeBoundBuffer:
-    name: str
-    size: int
-    start_time: int
-    end_time: int
-    address: int = 0
-    spilled: bool = False
-    density: float = 0  # effectively normalized size for now
-
-
 def _find_free_gaps(
     capacity: int, occupied: List[Tuple[int, int]]
 ) -> List[Tuple[int, int]]:
@@ -193,7 +182,7 @@ def _find_free_gaps(
     return gaps
 
 
-def normalize_buffer_sizes(buffers: list[Buffer]):
+def normalize_buffer_sizes(buffers: list[LifetimeBoundBuffer]):
     if not buffers:
         return
 
@@ -236,7 +225,7 @@ def allocate_sa(
         )
         buffer.spilled = bool(eviction_length)
 
-    def evaluate_objective(candidate_buffers: list[Buffer]) -> float:
+    def evaluate_objective(candidate_buffers: list[LifetimeBoundBuffer]) -> float:
         collision_term = 0.0
         for buffer in candidate_buffers:
             for second, time_overlap in overlapping_time[buffer.name]:
@@ -269,18 +258,18 @@ def allocate_sa(
     # ==========================================
     current_list = []
 
-    best: list[Buffer] = buffers
+    best: list[LifetimeBoundBuffer] = buffers
     best_eval: float = evaluate_objective(best)
 
     current_eval: float = best_eval
-    current: list[Buffer] = copy.deepcopy(best)
+    current: list[LifetimeBoundBuffer] = copy.deepcopy(best)
 
     reheating_step = initial_temp
     temp = initial_temp
 
     for i in range(num_iterations):
         idx = rng.integers(0, len(buffers))
-        candidate: list[Buffer] = copy.deepcopy(current)
+        candidate: list[LifetimeBoundBuffer] = copy.deepcopy(current)
         buffer = candidate[idx]
         e: np.ndarray = rng.integers(-capacity, capacity) * temp
         buffer.address = buffer.address + e
@@ -360,7 +349,7 @@ def allocate_buffers(
     # Don't try to assign buffers which are bigger than capacity
     _buffers = [b for b in buffers if b.size <= capacity]
 
-    result: None | AllocationResult = None
+    result: None | list[LifetimeBoundBuffer] = None
     match method:
         case "sorted-global":
             result = allocate_sorted_global(capacity, _buffers)
@@ -373,5 +362,18 @@ def allocate_buffers(
         result = allocate_sa(capacity, _buffers, **kwargs)
         # TODO: compare results for optimality if no obvious improvement...
     
-    allocation_result = [Allocation(b.name, Component.HBM if b.spilled else Component.LX, b.address) for b in result]
+    allocation_result = [
+        Allocation(b.name, 
+                   Component.HBM if b.spilled else Component.LX, 
+                   b.address) for b in result]
     return allocation_result
+
+
+class AllocationStrategy:
+    def plan_allocation(self, operations: list[Operation]):
+        raise NotImplementedError("This is an abstract base class.")
+    
+
+class SimulatedAnnealingAllocationStrategy(AllocationStrategy):
+    def plan_allocation(self, operations: List[Operation]):
+        pass
