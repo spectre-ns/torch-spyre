@@ -158,9 +158,9 @@ class MockGraphLowering:
         return self.buffers[buf]
 
 
-class InstrumentedGreedyAllocationStrategy(InputBufferOptimization):
-    def __init__(self, pattern: Pattern, alloc: InstrumentedAllocator):
-        super().__init__(InstrumentedAllocator(pattern), MockGraphLowering(pattern))
+class InstrumentedInputBufferOptimization(InputBufferOptimization):
+    def __init__(self, pattern: Pattern):
+        super().__init__(MockGraphLowering(pattern))
         self.buffers = pattern.buffers
         self.operations = pattern.operations
 
@@ -442,7 +442,7 @@ class TestExamplePattern(TestCase):
         # strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc)
 
         strategy = MockAllocationStrategy(
-            [InputBufferOptimization(MockGraphLowering(pattern_copy))],
+            [InstrumentedInputBufferOptimization(pattern_copy)],
             [InstrumentedAllocator(pattern_copy)]
         )
 
