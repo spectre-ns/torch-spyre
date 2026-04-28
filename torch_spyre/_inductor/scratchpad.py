@@ -46,6 +46,61 @@ logger = get_inductor_logger("LX_PLANNING")
 __LX_CAPACITY__ = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
 
 
+def buf_analysis(operations: list[Operation]):
+    """
+    First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
+    Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
+    Then check core division -> If any of the operations on a given buffer has different
+    core division => should not pin this buffer to LX
+    NOTE Because each core can only write to its own scratchpad. For example, if a
+            buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> each core
+            in next op has to read from 2 different scratchpads...
+    TODO looking for options to broadcast to or all_reduce from multiple scratchpad
+    """
+    last_used: dict = {}
+    buf_read_counts: dict[str, int] = {}
+    buf_write_counts: dict[str, int] = {}
+    buf_users: dict[str, Operation] = {}
+    buf_users_read_and_write: dict[str, list[Operation]] = {}
+    core_div_mismatch: dict[str, bool] = {}
+
+    for idx, op in enumerate(operations):
+        rw = op.get_read_writes()
+        read_names = op.get_read_names()
+        for dep in rw.reads | rw.writes:  # union of the OrderedSets
+            buf = dep.name  # buffer name, i.e. a str
+            last_used[buf] = idx
+            if buf in read_names:
+                buf_read_counts[buf] = buf_read_counts.get(buf, 0) + 1
+                buf_users[buf] = buf_users.get(buf, []) + [op]
+            else:
+                buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
+            buf_users_read_and_write[buf] = buf_users_read_and_write.get(
+                buf, []
+            ) + [op]
+
+    bufs_to_dealloc_at_idx: dict = {}
+    for buf, idx in last_used.items():
+        # if last used at idx => del at idx+1
+        if idx + 1 in bufs_to_dealloc_at_idx:
+            bufs_to_dealloc_at_idx[idx + 1].append(buf)
+        else:
+            bufs_to_dealloc_at_idx[idx + 1] = [buf]
+
+    using_multicore = config.sencores > 1
+    for buf_name, users_rw in buf_users_read_and_write.items():
+        # this dict includes graph input and output
+        same_core_div = True
+        if using_multicore and len(users_rw) > 1:
+            # graph input and output can have only 1 read or 1 write user.
+            u0_split = users_rw[0].op_it_space_splits  # a list like [16, 1]
+            same_core_div = all(
+                u0_split == u.op_it_space_splits for u in users_rw[1:]
+            )
+        core_div_mismatch[buf_name] = not same_core_div
+
+    return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
+
 class AllocationStrategy:
     @abstractmethod
     def plan_allocation(self, operations: list[Operation]):
@@ -71,89 +126,30 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
     ):
         self.graph_lowering = graph_lowering if graph_lowering else V.graph
     
+    def mem_usage_by_op(self, op: ComputedBuffer) -> dict[str, dict[str, bool | int]]:
+        """Get a summary of memory usage of the input operation."""
+        rw = op.get_read_writes()
+        mem_usage = {}
+
+        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
+            for dep in deps:
+                buf = V.graph.get_buffer(dep.name)
+                dev_layout = buf.layout.device_layout
+                dev_size = (
+                    math.prod(dev_layout.device_size[:-1]) * 128
+                )  # num_sticks * bytes_per_stick
+                mem_usage[dep.name] = {
+                    "is_input": is_input,
+                    "size": dev_size,
+                }
+
+        return mem_usage
+
     
     def should_consider_op(self, op: Operation) -> bool:
         return isinstance(op, ComputedBuffer) and not isinstance(
             op.layout, MutationLayoutSHOULDREMOVE
         )
-
-    def consider_for_scratchpad(
-        self,
-        op: ComputedBuffer,
-        idx: int,
-        core_div_mismatch: dict[str, bool] = {},
-    ):
-        """
-        If core_div_mismatch is not provided, we will consider LX pinning without taking
-        core division into account (previous behavior), may result in slices of a LX tensor
-        scattered over different core's scratchpad, which may result in unusable tensor and
-        incorrect results.
-        """
-        # 1. summarize both inputs and output sizes used by this node.
-        mem_usage = self.alloc.mem_usage_by_op(op)
-        for buf in mem_usage:
-            mem_usage[buf]["core_div_mismatch"] = core_div_mismatch.get(buf, False)
-            # if a buf is not in core_div_mismatch => it has no users => graph output
-
-        # 2. if alloc successful, lx info will be added to corresponding FixedTiledLayout,
-        # which will be used in generate_sdsc() later.
-        org_op_name = op.origin_node.target._opname
-        self.alloc.try_allocate(mem_usage, idx, org_op_name)
-
-    def buf_analysis(self, operations: list[Operation]):
-        """
-        First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
-        Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
-        Then check core division -> If any of the operations on a given buffer has different
-        core division => should not pin this buffer to LX
-        NOTE Because each core can only write to its own scratchpad. For example, if a
-              buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> each core
-              in next op has to read from 2 different scratchpads...
-        TODO looking for options to broadcast to or all_reduce from multiple scratchpad
-        """
-        last_used: dict = {}
-        buf_read_counts: dict[str, int] = {}
-        buf_write_counts: dict[str, int] = {}
-        buf_users: dict[str, Operation] = {}
-        buf_users_read_and_write: dict[str, list[Operation]] = {}
-        core_div_mismatch: dict[str, bool] = {}
-
-        for idx, op in enumerate(operations):
-            rw = op.get_read_writes()
-            read_names = op.get_read_names()
-            for dep in rw.reads | rw.writes:  # union of the OrderedSets
-                buf = dep.name  # buffer name, i.e. a str
-                last_used[buf] = idx
-                if buf in read_names:
-                    buf_read_counts[buf] = buf_read_counts.get(buf, 0) + 1
-                    buf_users[buf] = buf_users.get(buf, []) + [op]
-                else:
-                    buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
-                buf_users_read_and_write[buf] = buf_users_read_and_write.get(
-                    buf, []
-                ) + [op]
-
-        bufs_to_dealloc_at_idx: dict = {}
-        for buf, idx in last_used.items():
-            # if last used at idx => del at idx+1
-            if idx + 1 in bufs_to_dealloc_at_idx:
-                bufs_to_dealloc_at_idx[idx + 1].append(buf)
-            else:
-                bufs_to_dealloc_at_idx[idx + 1] = [buf]
-
-        using_multicore = config.sencores > 1
-        for buf_name, users_rw in buf_users_read_and_write.items():
-            # this dict includes graph input and output
-            same_core_div = True
-            if using_multicore and len(users_rw) > 1:
-                # graph input and output can have only 1 read or 1 write user.
-                u0_split = users_rw[0].op_it_space_splits  # a list like [16, 1]
-                same_core_div = all(
-                    u0_split == u.op_it_space_splits for u in users_rw[1:]
-                )
-            core_div_mismatch[buf_name] = not same_core_div
-
-        return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
 
     class NameSwapHandler(WrapperHandler):
         def __init__(self, inner, name_map: dict[str, str]):
@@ -305,7 +301,7 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
             lx_free_total -= dev_size
             
     def apply_pass(self, operations: list[Operation]) -> list[Operation]:
-        idx_to_dealloc_bufs, buf_users, core_div_mismatch = self.buf_analysis(
+        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(
             operations
         )
 
@@ -320,7 +316,7 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
 
             # refresh LUTs -- insertion may not happen, e.g. input tensor is used only once
             if len(operations) > num_ops_before:
-                idx_to_dealloc_bufs, buf_users, core_div_mismatch = self.buf_analysis(
+                idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(
                     operations
                 )
 
@@ -460,12 +456,21 @@ class GreedyLayoutSolver(LayoutSolver):
         return mem_usage
 
     def plan_layout(self, ops: list[Operation]) -> AllocationResult:
+        """
+        If core_div_mismatch is not provided, we will consider LX pinning without taking
+        core division into account (previous behavior), may result in slices of a LX tensor
+        scattered over different core's scratchpad, which may result in unusable tensor and
+        incorrect results.
+        """
+
+        _, _, core_div_mismatch = buf_analysis(ops)
         for idx, op in enumerate(ops):
             mem_usage = self.mem_usage_by_op(op)
 
-            for _, needed in mem_usage.items():
-                needed["core_div_mismatch"] = False #TODO add back core division check
-            # add core division check
+            # core division should be separated out
+            for key, needed in mem_usage.items():
+                needed["core_div_mismatch"] = core_div_mismatch.get(key, False)
+
             org_op_name = op.origin_node.target._opname
             self.try_allocate(mem_usage, idx, org_op_name)
         

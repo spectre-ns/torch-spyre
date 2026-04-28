@@ -442,7 +442,7 @@ class TestExamplePattern(TestCase):
         # strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc)
 
         strategy = MockAllocationStrategy(
-            [IdentityOptimizationPass()],
+            [InputBufferOptimization(MockGraphLowering(pattern_copy))],
             [InstrumentedAllocator(pattern_copy)]
         )
 
