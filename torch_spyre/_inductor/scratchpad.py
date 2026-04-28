@@ -404,7 +404,7 @@ class GreedyLayoutSolver(LayoutSolver):
         for tensor_name, needed in mem_usage.items():
             is_graph_input = self.is_graph_input(tensor_name)
             is_graph_output = tensor_name in graph_output_buf_name
-            core_div_mismatch = (not needed["is_input"]) # and needed["core_div_mismatch"]
+            core_div_mismatch = (not needed["is_input"]) and needed["core_div_mismatch"]
             if is_graph_input or is_graph_output or core_div_mismatch:
                 # graph input itself cannot be pinned, but we may be able to clone
                 # graph output has to go back to HBM
@@ -462,6 +462,9 @@ class GreedyLayoutSolver(LayoutSolver):
     def plan_layout(self, ops: list[Operation]) -> AllocationResult:
         for idx, op in enumerate(ops):
             mem_usage = self.mem_usage_by_op(op)
+
+            for _, needed in mem_usage.items():
+                needed["core_div_mismatch"] = False #TODO add back core division check
             # add core division check
             org_op_name = op.origin_node.target._opname
             self.try_allocate(mem_usage, idx, org_op_name)

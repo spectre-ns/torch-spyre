@@ -438,29 +438,32 @@ class TestExamplePattern(TestCase):
         # The scratchpad_planning operation may modify the pattern (adding operations), and then
         # examining the "good" allocation will run into trouble.
         pattern_copy = copy.deepcopy(pattern)
-        # alloc = InstrumentedAllocator(pattern_copy)
+        alloc = InstrumentedAllocator(pattern_copy)
         # strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc)
 
-        strategy = MockAllocationStrategy([IdentityOptimizationPass()], [InstrumentedAllocator(pattern_copy)])
+        strategy = MockAllocationStrategy(
+            [IdentityOptimizationPass()],
+            [InstrumentedAllocator(pattern_copy)]
+        )
 
         scratchpad_planning(pattern_copy.operations, strategy)
 
         # Verify that the currently implemented allocation is indeed valid
-        #self.verify_actual_run(pattern_copy, alloc)
+        self.verify_actual_run(pattern_copy, alloc)
 
         # Verify that the currently implemented allocation is at least as good as the "good
         # allocation" in terms of HBM usage.
-        # current_hbm_usage = self.hbm_usage_for_actual_run(
-        #     pattern_copy.operations, alloc
-        # )
-        # good_hbm_usage = self.hbm_usage_for_good_allocation(
-        #     pattern.good_allocation, pattern.operations
-        # )
-        # self.assertLessEqual(
-        #     current_hbm_usage,
-        #     good_hbm_usage,
-        #     f"Current allocation uses more HBM ({current_hbm_usage} bytes) than the good allocation ({good_hbm_usage} bytes). ",
-        # )
+        current_hbm_usage = self.hbm_usage_for_actual_run(
+            pattern_copy.operations, alloc
+        )
+        good_hbm_usage = self.hbm_usage_for_good_allocation(
+            pattern.good_allocation, pattern.operations
+        )
+        self.assertLessEqual(
+            current_hbm_usage,
+            good_hbm_usage,
+            f"Current allocation uses more HBM ({current_hbm_usage} bytes) than the good allocation ({good_hbm_usage} bytes). ",
+        )
 
     def make_simple_fragmentation_pattern(self) -> Pattern:
         """Allocate two buffers A and B that are each a third of the available scratchpad size,
@@ -757,7 +760,7 @@ class TestExamplePattern(TestCase):
     def test_verify_simple_eviction_pattern(self):
         self.verify_pattern(self.make_simple_eviction_pattern())
 
-    @usuallyExpectedFailure
+    #@usuallyExpectedFailure
     def test_simple_eviction_pattern(self):
         self.run_pattern(self.make_simple_eviction_pattern())
 
