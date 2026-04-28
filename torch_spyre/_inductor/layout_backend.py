@@ -115,6 +115,7 @@ def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, 
             if buffer_name not in liveness_start:
                 liveness_start[buffer_name] = i
             liveness_end[buffer_name] = i
+    return liveness_start, liveness_end
 
 
 def allocate_sorted_global(capacity: int, buffers: list[Buffer]) -> list[LifetimeBoundBuffer]:

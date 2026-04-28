@@ -471,7 +471,7 @@ class GreedyLayoutSolver(LayoutSolver):
         
         return [
                 Allocation(tensor_name, Component.LX, item["addr"])
-                for tensor_name, item in self.usage
+                for tensor_name, item in self.usage.items()
             ]
 
 

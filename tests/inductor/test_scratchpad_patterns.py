@@ -89,11 +89,11 @@ class MockAllocationStrategy(DefaultAllocationStrategy):
             layout_planning: list[LayoutSolver] | None = None
     ):
         super().__init__(optimization_passes, layout_planning)
-        self.allocations = {}
+        self.allocations = []
 
     @override
     def push_allocation(self, allocation: AllocationResult):
-        pass
+        self.allocations = allocation
 
 class InstrumentedAllocator(GreedyLayoutSolver):
     def __init__(self, pattern: Pattern):
@@ -334,7 +334,7 @@ class TestExamplePattern(TestCase):
         allocate_at = defaultdict(list)
         deallocate_at = defaultdict(list)
         for buffer_name in liveness_start:
-            if buffer_name in alloc.allocations:
+            if buffer_name in [a.buffer for a in alloc.allocations]:
                 allocate_at[liveness_start[buffer_name]].append(buffer_name)
                 deallocate_at[liveness_end[buffer_name] + 1].append(buffer_name)
 
@@ -429,8 +429,8 @@ class TestExamplePattern(TestCase):
                     hbm_usage += op._buffer_registry[buffer_name].size
 
         # All buffers allocated in the scratchpad are counted only once each.
-        for buffer_name in alloc.allocations:
-            hbm_usage += operations[0]._buffer_registry[buffer_name].size
+        for buffer in alloc.allocations:
+            hbm_usage += operations[0]._buffer_registry[buffer.buffer].size
 
         return hbm_usage
 
@@ -438,7 +438,7 @@ class TestExamplePattern(TestCase):
         # The scratchpad_planning operation may modify the pattern (adding operations), and then
         # examining the "good" allocation will run into trouble.
         pattern_copy = copy.deepcopy(pattern)
-        alloc = InstrumentedAllocator(pattern_copy)
+        # alloc = InstrumentedAllocator(pattern_copy)
         # strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc)
 
         strategy = MockAllocationStrategy(
@@ -449,12 +449,12 @@ class TestExamplePattern(TestCase):
         scratchpad_planning(pattern_copy.operations, strategy)
 
         # Verify that the currently implemented allocation is indeed valid
-        self.verify_actual_run(pattern_copy, alloc)
+        self.verify_actual_run(pattern_copy, strategy)
 
         # Verify that the currently implemented allocation is at least as good as the "good
         # allocation" in terms of HBM usage.
         current_hbm_usage = self.hbm_usage_for_actual_run(
-            pattern_copy.operations, alloc
+            pattern_copy.operations, strategy
         )
         good_hbm_usage = self.hbm_usage_for_good_allocation(
             pattern.good_allocation, pattern.operations
