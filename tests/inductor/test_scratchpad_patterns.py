@@ -98,27 +98,11 @@ class MockAllocationStrategy(DefaultAllocationStrategy):
 class InstrumentedAllocator(GreedyLayoutSolver):
     def __init__(self, pattern: Pattern):
         super().__init__()
-        self.allocations = {}
         self.inputs, self.outputs = pattern.determine_inputs_outputs()
 
     @override
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
         return True
-
-    # @override
-    # def allocate(self, tensor_name: str, addr: int):
-    #     if tensor_name in self.allocations:
-    #         # TODO: support this. We need to store allocations differently, and then modify the
-    #         # logic for measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to
-    #         # account for this. Also update TestExamplePattern.verify_actual_run to account for
-    #         # this.
-    #         assert self.allocations[tensor_name] == addr, (
-    #             f"Buffer {tensor_name} was already allocated at address "
-    #             f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
-    #             f" That is probably a good improvement, but it means this test needs to be "
-    #             f"adjusted."
-    #         )
-    #     self.allocations[tensor_name] = addr
 
     @override
     def mem_usage_by_op(self, op: Operation) -> dict[str, dict[str, bool | int]]:
