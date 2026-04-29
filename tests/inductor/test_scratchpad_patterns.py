@@ -10,14 +10,13 @@ from torch_spyre._inductor.layout_backend import (
     Operation,
     Component,
     Allocation,
-    AllocationResult,
-    calculate_liveness,
-    SimulatedAnnealingAllocationStrategy
+    AllocationResult
 )
 
 
 from torch_spyre._inductor.scratchpad import (
     scratchpad_planning,
+    calculate_liveness,
     AllocationStrategy,
     DefaultAllocationStrategy,
     SpyreLxOptimizationPass,
@@ -85,20 +84,13 @@ class IdentityOptimizationPass(SpyreLxOptimizationPass):
 class MockAllocationStrategy(DefaultAllocationStrategy):
     def __init__(
             self,
+            pattern: Pattern,
             optimization_passes: list[SpyreLxOptimizationPass] | None = None,
-            layout_planning: list[LayoutSolver] | None = None
+            layout_planning: list[LayoutSolver] | None = None,
     ):
         super().__init__(optimization_passes, layout_planning)
-        self.allocations = []
-
-    @override
-    def push_allocation(self, allocation: AllocationResult):
-        self.allocations = allocation
-
-class InstrumentedLayoutSolver(GreedyLayoutSolver):
-    def __init__(self, pattern: Pattern):
-        super().__init__()
         self.inputs, self.outputs = pattern.determine_inputs_outputs()
+        self.allocations = []
 
     @override
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
@@ -129,7 +121,10 @@ class InstrumentedLayoutSolver(GreedyLayoutSolver):
     @override
     def is_graph_input(self, buffer: str) -> bool:
         return buffer in self.inputs
-
+    
+    @override
+    def push_allocation(self, allocation: AllocationResult):
+        self.allocations = allocation
 
 class MockGraphLowering:
     """This class impersonates V.graph."""
@@ -423,8 +418,9 @@ class TestExamplePattern(TestCase):
         # strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc)
 
         strategy = MockAllocationStrategy(
+            pattern_copy,
             [InstrumentedInputBufferOptimization(pattern_copy)],
-            [InstrumentedLayoutSolver(pattern_copy)]
+            [GreedyLayoutSolver(AVAILABLE_LX_SIZE)]
         )
 
         scratchpad_planning(pattern_copy.operations, strategy)
