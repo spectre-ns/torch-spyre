@@ -432,6 +432,15 @@ class GreedyLayoutSolver(LayoutSolver):
                         "size": needed["size"],
                     }
                 )
+    
+    def deallocate(self, bufs: list[str]):
+        """Try to deallocate each of the buffers in a list, if exists."""
+        if isinstance(bufs, str):
+            bufs = [bufs]
+
+        for buf in bufs:
+            if buf in self.usage:
+                del self.usage[buf]
 
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
         return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
@@ -463,8 +472,11 @@ class GreedyLayoutSolver(LayoutSolver):
         incorrect results.
         """
 
-        _, _, core_div_mismatch = buf_analysis(ops)
+        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(ops)
         for idx, op in enumerate(ops):
+            # release unneeded LX allocations before actual planning
+            self.deallocate(idx_to_dealloc_bufs.get(idx, []))
+
             mem_usage = self.mem_usage_by_op(op)
 
             # core division should be separated out
@@ -473,10 +485,10 @@ class GreedyLayoutSolver(LayoutSolver):
 
             org_op_name = op.origin_node.target._opname
             self.try_allocate(mem_usage, idx, org_op_name)
-        
+
         return [
-                Allocation(tensor_name, Component.LX, item["addr"])
-                for tensor_name, item in self.usage.items()
+                Allocation(allocation["tensor_name"], Component.LX, allocation["size"])
+                for allocation in self.lx_usage_hist
             ]
 
 
