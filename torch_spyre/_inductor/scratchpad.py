@@ -524,7 +524,8 @@ class DefaultAllocationStrategy(AllocationStrategy):
     def plan_allocation(self, operations: list[Operation]):
 
         # compute the optimized graph with the optimized operation list
-        # ideally not apply changes to the FX graph until the end
+        # ideally not apply changes to the FX graph until the end but
+        # currently FX graph updates are done stepwise.
         optimized_ops = functools.reduce(
             lambda intermediate_ops, optimization_pass: optimization_pass.apply_pass(intermediate_ops),
             self.optimization_passes,
