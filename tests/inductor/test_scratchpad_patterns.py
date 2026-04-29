@@ -419,15 +419,10 @@ class TestExamplePattern(TestCase):
 
         # Count all usage for buffers not allocated in the scratchpad.
         for i, op in enumerate(operations):
-            for buffer_name in op.inputs:
-                if buffer_name not in alloc.allocations:
+            for buffer_name in op.inputs + op.outputs:
+                if buffer_name not in [a.buffer for a in alloc.allocations]:
                     # This buffer is not allocated in the scratch pad before this operation, so it
                     # must be loaded from HBM.
-                    hbm_usage += op._buffer_registry[buffer_name].size
-            for buffer_name in op.outputs:
-                if buffer_name not in alloc.allocations:
-                    # This buffer is not allocated in the scratch pad after this operation, so it
-                    # must be stored to HBM.
                     hbm_usage += op._buffer_registry[buffer_name].size
 
         # All buffers allocated in the scratchpad are counted only once each.
