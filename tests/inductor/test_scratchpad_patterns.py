@@ -95,7 +95,7 @@ class MockAllocationStrategy(DefaultAllocationStrategy):
     def push_allocation(self, allocation: AllocationResult):
         self.allocations = allocation
 
-class InstrumentedAllocator(GreedyLayoutSolver):
+class InstrumentedLayoutSolver(GreedyLayoutSolver):
     def __init__(self, pattern: Pattern):
         super().__init__()
         self.inputs, self.outputs = pattern.determine_inputs_outputs()
@@ -424,7 +424,7 @@ class TestExamplePattern(TestCase):
 
         strategy = MockAllocationStrategy(
             [InstrumentedInputBufferOptimization(pattern_copy)],
-            [InstrumentedAllocator(pattern_copy)]
+            [InstrumentedLayoutSolver(pattern_copy)]
         )
 
         scratchpad_planning(pattern_copy.operations, strategy)
