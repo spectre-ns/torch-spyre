@@ -11,19 +11,17 @@ from torch_spyre._inductor.layout_backend import (
     Component,
     Allocation,
     AllocationResult,
-    GreedyLayoutSolver,
-    SortingSolver
+    SortingSolver,
 )
 
 
 from torch_spyre._inductor.scratchpad import (
     scratchpad_planning,
     calculate_liveness,
-    AllocationStrategy,
     DefaultAllocationStrategy,
     SpyreLxOptimizationPass,
     InputBufferOptimization,
-    LayoutSolver
+    LayoutSolver,
 )
 from torch_spyre._inductor import config
 
@@ -82,12 +80,13 @@ class IdentityOptimizationPass(SpyreLxOptimizationPass):
     def apply_pass(self, operations: list[Operation]) -> list[Operation]:
         return operations
 
+
 class MockAllocationStrategy(DefaultAllocationStrategy):
     def __init__(
-            self,
-            pattern: Pattern,
-            optimization_passes: list[SpyreLxOptimizationPass] | None = None,
-            layout_planning: list[LayoutSolver] | None = None,
+        self,
+        pattern: Pattern,
+        optimization_passes: list[SpyreLxOptimizationPass] | None = None,
+        layout_planning: list[LayoutSolver] | None = None,
     ):
         super().__init__(optimization_passes, layout_planning)
         self.inputs, self.outputs = pattern.determine_inputs_outputs()
@@ -122,10 +121,11 @@ class MockAllocationStrategy(DefaultAllocationStrategy):
     @override
     def is_graph_input(self, buffer: str) -> bool:
         return buffer in self.inputs
-    
+
     @override
     def push_allocation(self, allocation: AllocationResult):
         self.allocations = allocation
+
 
 class MockGraphLowering:
     """This class impersonates V.graph."""
@@ -307,7 +307,7 @@ class TestExamplePattern(TestCase):
 
     def verify_actual_run(self, pattern: Pattern, alloc):
         (liveness_start, liveness_end) = calculate_liveness(pattern.operations)
-        
+
         # Sanity check -- every buffer should have a start and an end to its liveness.
         self.assertTrue(set(liveness_start.keys()) == set(liveness_end.keys()))
 
@@ -327,7 +327,9 @@ class TestExamplePattern(TestCase):
                     continue
 
                 # Verify that buffer_name does not overlap with any allocated buffers at this point.
-                allocation = next(x for x in alloc.allocations if x.buffer == buffer_name)
+                allocation = next(
+                    x for x in alloc.allocations if x.buffer == buffer_name
+                )
                 addr = allocation.address
                 size = op._buffer_registry[buffer_name].size
                 self.assertLessEqual(
@@ -341,7 +343,9 @@ class TestExamplePattern(TestCase):
                         or other_buffer_name not in alloc.allocations
                     ):
                         continue
-                    other_allocation = next(x for x in alloc.allocations if x.buffer == other_buffer_name)
+                    other_allocation = next(
+                        x for x in alloc.allocations if x.buffer == other_buffer_name
+                    )
                     other_addr = other_allocation.address
                     other_size = op._buffer_registry[other_buffer_name].size
                     if addr <= other_addr:
@@ -389,9 +393,7 @@ class TestExamplePattern(TestCase):
                     hbm_usage += registry[buffer_name].size
         return hbm_usage
 
-    def hbm_usage_for_actual_run(
-        self, operations: list[Operation], alloc
-    ) -> int:
+    def hbm_usage_for_actual_run(self, operations: list[Operation], alloc) -> int:
         if not operations:
             return 0
 
@@ -421,7 +423,7 @@ class TestExamplePattern(TestCase):
         strategy = MockAllocationStrategy(
             pattern_copy,
             [IdentityOptimizationPass()],
-            [SortingSolver(AVAILABLE_LX_SIZE)]
+            [SortingSolver(AVAILABLE_LX_SIZE)],
         )
 
         scratchpad_planning(pattern_copy.operations, strategy)
@@ -738,7 +740,7 @@ class TestExamplePattern(TestCase):
     def test_verify_simple_eviction_pattern(self):
         self.verify_pattern(self.make_simple_eviction_pattern())
 
-    #@usuallyExpectedFailure
+    # @usuallyExpectedFailure
     def test_simple_eviction_pattern(self):
         self.run_pattern(self.make_simple_eviction_pattern())
 

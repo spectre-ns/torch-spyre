@@ -1,9 +1,6 @@
 import math
 from dataclasses import dataclass
-import copy
-from itertools import combinations
-from typing import List, Tuple
-import numpy as np
+from typing import List, Tuple, Any
 from enum import Enum
 from torch.utils._ordered_set import OrderedSet
 from abc import abstractmethod
@@ -33,7 +30,7 @@ class BufferLayout:
     def __init__(self, size: int):
         self.device_layout = BufferDeviceLayout(size)
         self.size = size
-        self.allocation = {}
+        self.allocation: Any = {}  # TODO: assign actual type annotation
 
 
 class Buffer:
@@ -106,15 +103,16 @@ class Allocation:
 # allocated at that point in time.
 AllocationResult = list[Allocation]
 
+
 def get_component(spilled: bool) -> Component:
     if spilled:
         return Component.HBM
     return Component.LX
 
+
 class LayoutSolver:
     @abstractmethod
-    def plan_layout(self,
-                    buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
+    def plan_layout(self, buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
         pass
 
 
@@ -131,13 +129,14 @@ class SortingSolver(LayoutSolver):
     def __init__(self, capacity: int):
         self.capacity = capacity
 
-    def allocate_sorted_global(self,
-                               buffers: list[LifetimeBoundBuffer]
-                               ) -> list[LifetimeBoundBuffer]:
+    def allocate_sorted_global(
+        self, buffers: list[LifetimeBoundBuffer]
+    ) -> list[LifetimeBoundBuffer]:
         normalize_buffer_sizes(buffers)
 
         buffers.sort(
-            key=lambda item: ((item.end_time - item.start_time), item.size), reverse=True
+            key=lambda item: ((item.end_time - item.start_time), item.size),
+            reverse=True,
         )
 
         allocated_buffers: list[LifetimeBoundBuffer] = []
@@ -147,9 +146,8 @@ class SortingSolver(LayoutSolver):
         return allocated_buffers
 
     def place_buffer(
-            self,
-            target: LifetimeBoundBuffer,
-            allocated_buffers: list[LifetimeBoundBuffer]):
+        self, target: LifetimeBoundBuffer, allocated_buffers: list[LifetimeBoundBuffer]
+    ):
         # Find all currently allocated buffers that overlap in TIME
         overlapping_in_time = []
         for alloc in allocated_buffers:
@@ -178,12 +176,10 @@ class SortingSolver(LayoutSolver):
         else:
             # No valid gap found, the buffer must be spilled to DRAM
             target.spilled = True
-            target.address = -1 # use the convension from elsewhere
+            target.address = -1  # use the convension from elsewhere
         allocated_buffers.append(target)
 
-    def find_free_gaps(
-        self, occupied: List[Tuple[int, int]]
-    ) -> List[Tuple[int, int]]:
+    def find_free_gaps(self, occupied: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         """Given a sorted list of occupied memory intervals, return the free gaps."""
         gaps = []
         current_addr = 0
@@ -197,16 +193,14 @@ class SortingSolver(LayoutSolver):
             gaps.append((current_addr, self.capacity))
 
         return gaps
-    
-    def plan_layout(self, 
-                    buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
+
+    def plan_layout(self, buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
         allocations = self.allocate_sorted_global(buffers)
         return [
             Allocation(
-                allocation.name,
-                get_component(allocation.spilled),
-                allocation.address
-                ) for allocation in allocations
+                allocation.name, get_component(allocation.spilled), allocation.address
+            )
+            for allocation in allocations
         ]
 
 
@@ -355,7 +349,7 @@ class SortingSolver(LayoutSolver):
 #             temp = temp * alpha
 
 #         return best
-    
+
 #     def plan_layout(self, buffers: dict) -> AllocationResult:
 #         return self.allocate_sa(buffers)
 
@@ -443,7 +437,7 @@ class GreedyLayoutSolver(LayoutSolver):
                     "size": buffer.size,
                 }
             )
-    
+
     def deallocate(self, bufs: list[str] | str):
         """Try to deallocate each of the buffers in a list, if exists."""
         if isinstance(bufs, str):
@@ -453,12 +447,10 @@ class GreedyLayoutSolver(LayoutSolver):
             if buf in self.usage:
                 del self.usage[buf]
 
-    def plan_layout(
-            self,
-            buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
+    def plan_layout(self, buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
         if not buffers:
             return []
-        
+
         max_time = max(b.end_time for b in buffers)
         for idx in range(max_time):
             # attempt to allocate at based on time
@@ -469,11 +461,17 @@ class GreedyLayoutSolver(LayoutSolver):
                 if idx == buffer.end_time:
                     self.deallocate(buffer.name)
 
-        seen = set() 
-        return [
-                Allocation(allocation["tensor_name"], Component.LX, allocation["addr"])
-                for allocation in self.lx_usage_hist
-                if allocation["tensor_name"] not in seen
-                and not seen.add(allocation["tensor_name"])
-            ]
-    
+        def pack_result():
+            seen = set()
+            ret = []
+            for allocation in self.lx_usage_hist:
+                if allocation["tensor_name"] not in seen:
+                    ret.append(
+                        Allocation(
+                            allocation["tensor_name"], Component.LX, allocation["addr"]
+                        )
+                    )
+                    seen.add(allocation["tensor_name"])
+            return ret
+
+        return pack_result()

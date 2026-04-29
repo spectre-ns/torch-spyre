@@ -13,11 +13,10 @@
 # limitations under the License.
 
 import math
-from typing import Callable, Optional, Tuple, override
+from typing import Callable, Optional, Tuple
 from abc import abstractmethod
 import functools
 from torch_spyre._inductor.layout_backend import (
-    Allocation,
     AllocationResult,
     Component,
     LayoutSolver,
@@ -63,6 +62,7 @@ def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, 
             liveness_end[buffer_name] = i
     return liveness_start, liveness_end
 
+
 def buf_analysis(operations: list[Operation]):
     """
     First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
@@ -92,9 +92,7 @@ def buf_analysis(operations: list[Operation]):
                 buf_users[buf] = buf_users.get(buf, []) + [op]
             else:
                 buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
-            buf_users_read_and_write[buf] = buf_users_read_and_write.get(
-                buf, []
-            ) + [op]
+            buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [op]
 
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
@@ -111,9 +109,7 @@ def buf_analysis(operations: list[Operation]):
         if using_multicore and len(users_rw) > 1:
             # graph input and output can have only 1 read or 1 write user.
             u0_split = users_rw[0].op_it_space_splits  # a list like [16, 1]
-            same_core_div = all(
-                u0_split == u.op_it_space_splits for u in users_rw[1:]
-            )
+            same_core_div = all(u0_split == u.op_it_space_splits for u in users_rw[1:])
         core_div_mismatch[buf_name] = not same_core_div
 
     return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
@@ -126,7 +122,7 @@ class AllocationStrategy:
     @abstractmethod
     def plan_allocation(self, operations: list[Operation]):
         pass
-    
+
     def push_allocation(self, allocation: AllocationResult):
         # push the allocation into the code generation
         for b in allocation:
@@ -176,7 +172,7 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
         graph_lowering: Optional[GraphLowering] = None,
     ):
         self.graph_lowering = graph_lowering if graph_lowering else V.graph
-    
+
     def mem_usage_by_op(self, op: ComputedBuffer) -> dict[str, dict[str, bool | int]]:
         """Get a summary of memory usage of the input operation."""
         rw = op.get_read_writes()
@@ -349,11 +345,9 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
             self.insert_op_after(buf, clone_lowering, buf_users, operations)
 
             lx_free_total -= dev_size
-            
+
     def apply_pass(self, operations: list[Operation]) -> list[Operation]:
-        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(
-            operations
-        )
+        idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
 
         if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
             num_ops_before = len(operations)
@@ -381,6 +375,7 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
 # check for operations which are not supported on output
 #           tag those buffers
 
+
 class LxCompatabilityCheck:
     @abstractmethod
     def apply_check(self, mem_usage: dict, ops: list[Operation]) -> dict:
@@ -389,10 +384,10 @@ class LxCompatabilityCheck:
 
 class DefaultAllocationStrategy(AllocationStrategy):
     def __init__(
-            self,
-            optimization_passes: list[SpyreLxOptimizationPass] | None = None,
-            layout_planning: list[LayoutSolver] | None = None,
-            graph: GraphLowering | None = None,
+        self,
+        optimization_passes: list[SpyreLxOptimizationPass] | None = None,
+        layout_planning: list[LayoutSolver] | None = None,
+        graph: GraphLowering | None = None,
     ):
         if graph:
             super().__init__(graph)
@@ -409,20 +404,21 @@ class DefaultAllocationStrategy(AllocationStrategy):
             self.layout_planning = [GreedyLayoutSolver(__LX_CAPACITY__)]
 
     def plan_allocation(self, operations: list[Operation]):
-
         # compute the optimized graph with the optimized operation list
         # ideally not apply changes to the FX graph until the end but
         # currently FX graph updates are done stepwise.
         optimized_ops = functools.reduce(
-            lambda intermediate_ops, optimization_pass: optimization_pass.apply_pass(intermediate_ops),
+            lambda intermediate_ops, optimization_pass: optimization_pass.apply_pass(
+                intermediate_ops
+            ),
             self.optimization_passes,
-            operations
+            operations,
         )
 
         mem_usage = {}
         for op in operations:
             mem_usage[op.name] = self.mem_usage_by_op(op)
-        
+
         start_times, end_times = calculate_liveness(optimized_ops)
 
         # TODO: Get rid of this heinous looping structure
@@ -435,7 +431,9 @@ class DefaultAllocationStrategy(AllocationStrategy):
                     for _, buffer in mem_usage.items():
                         if buffer_name in buffer:
                             org_op_name = op.origin_node.target._opname
-                            allowed_output_op = self.op_output_good_for_lx_reuse(org_op_name)
+                            allowed_output_op = self.op_output_good_for_lx_reuse(
+                                org_op_name
+                            )
                             buffer_list[buffer_name] = {
                                 "lx_compatible": allowed_output_op,
                                 "size": buffer[buffer_name]["size"],
@@ -459,43 +457,37 @@ class DefaultAllocationStrategy(AllocationStrategy):
 
         # attempt to place the optimized buffers into LX
         def try_layout_with_fallback(
-                strategies: list[LayoutSolver],
-                buffers: list[LifetimeBoundBuffer]) -> AllocationResult | None:
+            strategies: list[LayoutSolver], buffers: list[LifetimeBoundBuffer]
+        ) -> AllocationResult | None:
             if not buffers:
                 return []
-            
+
             final_layout = None
             for strategy in strategies:
                 current_layout = strategy.plan_layout(buffers)
-                
+
                 # Check if this strategy places all buffers
-                if all([buffer.component == Component.LX
-                        for buffer in current_layout]):
+                if all([buffer.component == Component.LX for buffer in current_layout]):
                     return current_layout  # Exit early if optimal
-                    
+
                 final_layout = current_layout  # Store the last attempt
 
             # Return the best found or the last attempt
             return final_layout
 
         filtered_buffers = [
-                            LifetimeBoundBuffer(
-                                name,
-                                item["size"],
-                                item["start_time"],
-                                item["end_time"]
-                                ) 
-                            for name, item in buffer_list.items()
-                            if item["lx_compatible"]
-                            ]
-        allocation = try_layout_with_fallback(
-            self.layout_planning,
-            filtered_buffers)
-        
+            LifetimeBoundBuffer(
+                name, item["size"], item["start_time"], item["end_time"]
+            )
+            for name, item in buffer_list.items()
+            if item["lx_compatible"]
+        ]
+        allocation = try_layout_with_fallback(self.layout_planning, filtered_buffers)
+
         if allocation:
             self.push_allocation(allocation)
             return
-       
+
         logger.warning("LX layout planning failed. All buffers will reside in HBM")
 
 
@@ -509,6 +501,3 @@ def scratchpad_planning(
     if not strategy:
         strategy = DefaultAllocationStrategy()
     strategy.plan_allocation(operations)
-
-
-
