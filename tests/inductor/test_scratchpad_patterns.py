@@ -342,12 +342,13 @@ class TestExamplePattern(TestCase):
         for i, op in enumerate(pattern.operations):
             live_buffers.update(allocate_at[i])
             for buffer_name in op.inputs + op.outputs:
-                if buffer_name not in alloc.allocations:
+                if buffer_name not in [a.buffer for a in alloc.allocations]:
                     # This buffer resides in HBM.
                     continue
 
                 # Verify that buffer_name does not overlap with any allocated buffers at this point.
-                addr = alloc.allocations[buffer_name]
+                allocation = next(x for x in alloc.allocations if x.buffer == buffer_name)
+                addr = allocation.address
                 size = op._buffer_registry[buffer_name].size
                 self.assertLessEqual(
                     addr + size,
@@ -360,7 +361,8 @@ class TestExamplePattern(TestCase):
                         or other_buffer_name not in alloc.allocations
                     ):
                         continue
-                    other_addr = alloc.allocations[other_buffer_name]
+                    other_allocation = next(x for x in alloc.allocations if x.buffer == other_buffer_name)
+                    other_addr = other_allocation.address
                     other_size = op._buffer_registry[other_buffer_name].size
                     if addr <= other_addr:
                         self.assertLessEqual(

@@ -488,7 +488,7 @@ class GreedyLayoutSolver(LayoutSolver):
             seen = set()
             
         return [
-                Allocation(allocation["tensor_name"], Component.LX, allocation["size"])
+                Allocation(allocation["tensor_name"], Component.LX, allocation["addr"])
                 for allocation in self.lx_usage_hist
                 if allocation["tensor_name"] not in seen
                 and not seen.add(allocation["tensor_name"])
