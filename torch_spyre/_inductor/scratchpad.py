@@ -21,7 +21,8 @@ from torch_spyre._inductor.layout_backend import (
     AllocationResult,
     Component,
     LayoutSolver,
-    GreedyLayoutSolver
+    GreedyLayoutSolver,
+    LifetimeBoundBuffer,
 )
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -193,7 +194,6 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
 
         return mem_usage
 
-    
     def should_consider_op(self, op: Operation) -> bool:
         return isinstance(op, ComputedBuffer) and not isinstance(
             op.layout, MutationLayoutSHOULDREMOVE
@@ -436,6 +436,7 @@ class DefaultAllocationStrategy(AllocationStrategy):
                                 "end_time": end_times[buffer_name],
                             }
 
+        # TODO: This is also pretty terrible
         _, _, core_div_mismatch = buf_analysis(optimized_ops)
         graph_output_buf_name = self.get_output_names()
         for tensor_name, meta_data in buffer_list.items():
@@ -452,7 +453,7 @@ class DefaultAllocationStrategy(AllocationStrategy):
         # attempt to place the optimized buffers into LX
         def try_layout_with_fallback(
                 strategies: list[LayoutSolver],
-                buffers: dict) -> AllocationResult | None:
+                buffers: list[LifetimeBoundBuffer]) -> AllocationResult | None:
             final_layout = None
             for strategy in strategies:
                 current_layout = strategy.plan_layout(buffers)
@@ -467,12 +468,23 @@ class DefaultAllocationStrategy(AllocationStrategy):
             # Return the best found or the last attempt
             return final_layout
 
-        filtered_buffers = {k: v for k, v in buffer_list.items() if v["lx_compatible"]}
-        allocation = try_layout_with_fallback(self.layout_planning, filtered_buffers)
+        filtered_buffers = [
+                            LifetimeBoundBuffer(
+                                name,
+                                item["size"],
+                                item["start_time"],
+                                item["end_time"]
+                                ) 
+                            for name, item in buffer_list.items()
+                            if item["lx_compatible"]
+                            ]
+        allocation = try_layout_with_fallback(
+            self.layout_planning,
+            filtered_buffers)
         if allocation:
             self.push_allocation(allocation)
             return
-        
+       
         logger.warning("LX layout planning failed. All buffers will reside in HBM")
 
 

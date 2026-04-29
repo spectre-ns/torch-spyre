@@ -106,85 +106,109 @@ class Allocation:
 # allocated at that point in time.
 AllocationResult = list[Allocation]
 
+def get_component(spilled: bool) -> Component:
+    if spilled:
+        return Component.HBM
+    return Component.LX
+
 class LayoutSolver:
     @abstractmethod
-    def plan_layout(self, buffers: dict) -> AllocationResult:
+    def plan_layout(self,
+                    buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
         pass
 
 
-def allocate_sorted_global(capacity: int, buffers: list[Buffer]) -> list[LifetimeBoundBuffer]:
-    normalize_buffer_sizes(buffers)
-
-    buffers.sort(
-        key=lambda item: ((item.end_time - item.start_time), item.size), reverse=True
-    )
-
-    allocated_buffers: list[Buffer] = []
-    for target in buffers:
-        _place_buffer(capacity, target, allocated_buffers)
-
-    return allocated_buffers
-
-
-def _place_buffer(capacity: int, target: Buffer, allocated_buffers: list[LifetimeBoundBuffer]):
-    # Find all currently allocated buffers that overlap in TIME
-    overlapping_in_time = []
-    for alloc in allocated_buffers:
-        if max(target.start_time, alloc.start_time) < min(
-            target.end_time, alloc.end_time
-        ):
-            overlapping_in_time.append(alloc)
-
-    # Extract their memory address ranges and sort them spatially
-    occupied_spaces = sorted(
-        [(b.address, b.address + b.size) for b in overlapping_in_time]
-    )
-
-    # Find all free gaps in memory during this time window
-    free_gaps = _find_free_gaps(capacity, occupied_spaces)
-
-    # Filter gaps to only those large enough to hold the target buffer
-    valid_gaps = [gap for gap in free_gaps if gap[1] - gap[0] >= target.size]
-
-    if valid_gaps:
-        # BEST-FIT LOGIC: Find the interval closest matching the needed space
-        best_gap = min(valid_gaps, key=lambda gap: (gap[1] - gap[0]) - target.size)
-
-        # Assign the address (starting at the bottom of the best-fit gap)
-        target.address = best_gap[0]
-    else:
-        # No valid gap found, the buffer must be spilled to DRAM
-        target.spilled = True
-        target.address = capacity
-    allocated_buffers.append(target)
-
-
-def _find_free_gaps(
-    capacity: int, occupied: List[Tuple[int, int]]
-) -> List[Tuple[int, int]]:
-    """Given a sorted list of occupied memory intervals, return the free gaps."""
-    gaps = []
-    current_addr = 0
-
-    for start, end in occupied:
-        if start > current_addr:
-            gaps.append((current_addr, start))
-        current_addr = max(current_addr, end)
-
-    if current_addr < capacity:
-        gaps.append((current_addr, capacity))
-
-    return gaps
-
-
-def normalize_buffer_sizes(buffers: dict):
+def normalize_buffer_sizes(buffers: list[LifetimeBoundBuffer]):
     if not buffers:
         return
-
-    max_size = max(b["size"] for b in buffers)
+    max_size = max(b.size for b in buffers)
     if max_size > 0:
         for b in buffers:
-            b["density"] = b["size"] / max_size
+            b.density = b.size / max_size
+
+
+class SortingSolver(LayoutSolver):
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+
+    def allocate_sorted_global(self,
+                               buffers: list[LifetimeBoundBuffer]
+                               ) -> list[LifetimeBoundBuffer]:
+        normalize_buffer_sizes(buffers)
+
+        buffers.sort(
+            key=lambda item: ((item.end_time - item.start_time), item.size), reverse=True
+        )
+
+        allocated_buffers: list[LifetimeBoundBuffer] = []
+        for target in buffers:
+            self.place_buffer(target, allocated_buffers)
+
+        return allocated_buffers
+
+    def place_buffer(
+            self,
+            target: LifetimeBoundBuffer,
+            allocated_buffers: list[LifetimeBoundBuffer]):
+        # Find all currently allocated buffers that overlap in TIME
+        overlapping_in_time = []
+        for alloc in allocated_buffers:
+            if max(target.start_time, alloc.start_time) < min(
+                target.end_time, alloc.end_time
+            ):
+                overlapping_in_time.append(alloc)
+
+        # Extract their memory address ranges and sort them spatially
+        occupied_spaces = sorted(
+            [(b.address, b.address + b.size) for b in overlapping_in_time]
+        )
+
+        # Find all free gaps in memory during this time window
+        free_gaps = self.find_free_gaps(occupied_spaces)
+
+        # Filter gaps to only those large enough to hold the target buffer
+        valid_gaps = [gap for gap in free_gaps if gap[1] - gap[0] >= target.size]
+
+        if valid_gaps:
+            # BEST-FIT LOGIC: Find the interval closest matching the needed space
+            best_gap = min(valid_gaps, key=lambda gap: (gap[1] - gap[0]) - target.size)
+
+            # Assign the address (starting at the bottom of the best-fit gap)
+            target.address = best_gap[0]
+        else:
+            # No valid gap found, the buffer must be spilled to DRAM
+            target.spilled = True
+            target.address = -1 # use the convension from elsewhere
+        allocated_buffers.append(target)
+
+    def find_free_gaps(
+        self, occupied: List[Tuple[int, int]]
+    ) -> List[Tuple[int, int]]:
+        """Given a sorted list of occupied memory intervals, return the free gaps."""
+        gaps = []
+        current_addr = 0
+
+        for start, end in occupied:
+            if start > current_addr:
+                gaps.append((current_addr, start))
+            current_addr = max(current_addr, end)
+
+        if current_addr < self.capacity:
+            gaps.append((current_addr, self.capacity))
+
+        return gaps
+    
+    def plan_layout(self, 
+                    buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
+        allocations = self.allocate_sorted_global(buffers)
+        return [
+            Allocation(
+                allocation.name,
+                get_component(allocation.spilled),
+                allocation.address
+                ) for allocation in allocations
+        ]
+
 
 class SimulatedAnnealingSolver(LayoutSolver):
     def __init__(
@@ -207,13 +231,13 @@ class SimulatedAnnealingSolver(LayoutSolver):
 
     def allocate_sa(
         self,
-        buffers: dict
+        buffers: list[LifetimeBoundBuffer]
     ) -> AllocationResult:
         rng = np.random.default_rng(seed=10)
         overlapping_time: dict[str, list[tuple[str, int]]] = {}
         for buffer in buffers:
             overlapping_time[buffer.name] = []
-            buffer.address = rng.integers(0, capacity - buffer.size) if capacity > buffer.size else 0
+            buffer.address = rng.integers(0, self.capacity - buffer.size) if self.capacity > buffer.size else 0
 
         normalize_buffer_sizes(buffers)
 
@@ -384,7 +408,7 @@ class GreedyLayoutSolver(LayoutSolver):
             # cannot find any free blocks
             return -1
 
-    def try_allocate(self, tensor_name: str, meta_data: dict):
+    def try_allocate(self, buffer: LifetimeBoundBuffer):
         """
         Simple reuse rule:
         1. for an "input" tensor, found a matched tensor (name and size) on LX
@@ -399,24 +423,24 @@ class GreedyLayoutSolver(LayoutSolver):
         """
         # Decide whether to reuse.
         addr = -1
-        tensor_on_lx = self.usage.get(tensor_name, {})
-        size_match = tensor_on_lx.get("size", 0) == meta_data["size"]
+        tensor_on_lx = self.usage.get(buffer.name, {})
+        size_match = tensor_on_lx.get("size", 0) == buffer.size
 
         if tensor_on_lx and size_match:
-            addr = self.usage[tensor_name]["addr"]
+            addr = self.usage[buffer.name]["addr"]
         else:
-            addr = self.find_free_block(meta_data["size"])
+            addr = self.find_free_block(buffer.size)
 
         # add lx info into V.graph.buffers.layout for later codegen use.
         if addr != -1:
-            self.usage[tensor_name] = {"addr": addr, "size": meta_data["size"]}
+            self.usage[buffer.name] = {"addr": addr, "size": buffer.size}
 
             # Record usage history for debugging
             self.lx_usage_hist.append(
                 {
-                    "tensor_name": tensor_name,
+                    "tensor_name": buffer.name,
                     "addr": addr,
-                    "size": meta_data["size"],
+                    "size": buffer.size,
                 }
             )
     
@@ -429,16 +453,18 @@ class GreedyLayoutSolver(LayoutSolver):
             if buf in self.usage:
                 del self.usage[buf]
 
-    def plan_layout(self, buffers: dict) -> AllocationResult:
-        max_time = max(b["end_time"] for b in buffers.values())
+    def plan_layout(
+            self,
+            buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
+        max_time = max(b.end_time for b in buffers)
         for idx in range(max_time):
             # attempt to allocate at based on time
-            for tensor_name, mem_usage in buffers.items():
-                if idx == mem_usage["start_time"]:
-                    self.try_allocate(tensor_name, mem_usage)
+            for buffer in buffers:
+                if idx == buffer.start_time:
+                    self.try_allocate(buffer)
 
-                if idx == mem_usage["end_time"]:
-                    self.deallocate(tensor_name)
+                if idx == buffer.end_time:
+                    self.deallocate(buffer.name)
 
         seen = set() 
         return [
@@ -447,3 +473,4 @@ class GreedyLayoutSolver(LayoutSolver):
                 if allocation["tensor_name"] not in seen
                 and not seen.add(allocation["tensor_name"])
             ]
+    

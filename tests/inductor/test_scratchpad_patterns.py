@@ -10,7 +10,9 @@ from torch_spyre._inductor.layout_backend import (
     Operation,
     Component,
     Allocation,
-    AllocationResult
+    AllocationResult,
+    GreedyLayoutSolver,
+    SortingSolver
 )
 
 
@@ -20,7 +22,6 @@ from torch_spyre._inductor.scratchpad import (
     AllocationStrategy,
     DefaultAllocationStrategy,
     SpyreLxOptimizationPass,
-    GreedyLayoutSolver,
     InputBufferOptimization,
     LayoutSolver
 )
@@ -420,7 +421,7 @@ class TestExamplePattern(TestCase):
         strategy = MockAllocationStrategy(
             pattern_copy,
             [InstrumentedInputBufferOptimization(pattern_copy)],
-            [GreedyLayoutSolver(AVAILABLE_LX_SIZE)]
+            [SortingSolver(AVAILABLE_LX_SIZE)]
         )
 
         scratchpad_planning(pattern_copy.operations, strategy)
