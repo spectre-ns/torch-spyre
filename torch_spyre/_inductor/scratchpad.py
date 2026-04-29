@@ -485,10 +485,13 @@ class GreedyLayoutSolver(LayoutSolver):
 
             org_op_name = op.origin_node.target._opname
             self.try_allocate(mem_usage, idx, org_op_name)
-
+            seen = set()
+            
         return [
                 Allocation(allocation["tensor_name"], Component.LX, allocation["size"])
                 for allocation in self.lx_usage_hist
+                if allocation["tensor_name"] not in seen
+                and not seen.add(allocation["tensor_name"])
             ]
 
 
