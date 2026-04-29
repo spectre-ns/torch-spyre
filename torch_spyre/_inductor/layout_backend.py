@@ -456,6 +456,9 @@ class GreedyLayoutSolver(LayoutSolver):
     def plan_layout(
             self,
             buffers: list[LifetimeBoundBuffer]) -> AllocationResult:
+        if not buffers:
+            return []
+        
         max_time = max(b.end_time for b in buffers)
         for idx in range(max_time):
             # attempt to allocate at based on time

@@ -420,7 +420,7 @@ class TestExamplePattern(TestCase):
 
         strategy = MockAllocationStrategy(
             pattern_copy,
-            [InstrumentedInputBufferOptimization(pattern_copy)],
+            [IdentityOptimizationPass()],
             [SortingSolver(AVAILABLE_LX_SIZE)]
         )
 
@@ -650,17 +650,17 @@ class TestExamplePattern(TestCase):
             # between A{i} and B{i} = B{N+1-(N+1-i)} is (N+1-i)*(N+2-i)/2*k, which is big enough
             # for A{i+1} of size (N-i)*k.
             alloc0 = [
-                Allocation(buffer=f"B{N - j}", address=(j * (j + 1) // 2 + 2) * k)
+                Allocation(buffer=f"B{N - j}", component=Component.HBM)
                 for j in range(N - i, N)
             ]
-            alloc0.append(Allocation(buffer="Z", address=0))
-            alloc0.append(Allocation(buffer=f"A{i}", address=k))
+            alloc0.append(Allocation(buffer="Z", component=Component.HBM))
+            alloc0.append(Allocation(buffer=f"A{i}", component=Component.HBM))
             alloc1 = alloc0 + [Allocation(buffer=f"C{i}", component=Component.HBM)]
             return (alloc0, alloc1)
 
         good_allocations = [
             [
-                Allocation(buffer="Z", address=0),
+                Allocation(buffer="Z", component=Component.HBM),
                 Allocation(buffer="C0", component=Component.HBM),
             ]
         ]

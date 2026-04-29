@@ -55,7 +55,9 @@ def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, 
     liveness_start = {}
     liveness_end = {}
     for i, op in enumerate(ops):
-        for buffer_name in op.inputs + op.outputs:
+        rw = op.get_read_writes()
+        for mem_dep in rw.reads | rw.writes:
+            buffer_name = mem_dep.name
             if buffer_name not in liveness_start:
                 liveness_start[buffer_name] = i
             liveness_end[buffer_name] = i
@@ -390,9 +392,12 @@ class DefaultAllocationStrategy(AllocationStrategy):
             self,
             optimization_passes: list[SpyreLxOptimizationPass] | None = None,
             layout_planning: list[LayoutSolver] | None = None,
-            graph: GraphLowering = V.graph,
+            graph: GraphLowering | None = None,
     ):
-        super().__init__(graph)
+        if graph:
+            super().__init__(graph)
+        else:
+            super().__init__(V.graph)
         if optimization_passes:
             self.optimization_passes = optimization_passes
         else:
@@ -401,7 +406,7 @@ class DefaultAllocationStrategy(AllocationStrategy):
         if layout_planning:
             self.layout_planning = layout_planning
         else:
-            layout_planning = [GreedyLayoutSolver(__LX_CAPACITY__)]
+            self.layout_planning = [GreedyLayoutSolver(__LX_CAPACITY__)]
 
     def plan_allocation(self, operations: list[Operation]):
 
@@ -423,7 +428,9 @@ class DefaultAllocationStrategy(AllocationStrategy):
         # TODO: Get rid of this heinous looping structure
         buffer_list = {}
         for op in optimized_ops:
-            for buffer_name in op.inputs + op.outputs:
+            rw = op.get_read_writes()
+            for mem_dep in rw.reads | rw.writes:
+                buffer_name = mem_dep.name
                 if buffer_name not in buffer_list:
                     for _, buffer in mem_usage.items():
                         if buffer_name in buffer:
@@ -454,6 +461,9 @@ class DefaultAllocationStrategy(AllocationStrategy):
         def try_layout_with_fallback(
                 strategies: list[LayoutSolver],
                 buffers: list[LifetimeBoundBuffer]) -> AllocationResult | None:
+            if not buffers:
+                return []
+            
             final_layout = None
             for strategy in strategies:
                 current_layout = strategy.plan_layout(buffers)
@@ -481,6 +491,7 @@ class DefaultAllocationStrategy(AllocationStrategy):
         allocation = try_layout_with_fallback(
             self.layout_planning,
             filtered_buffers)
+        
         if allocation:
             self.push_allocation(allocation)
             return
