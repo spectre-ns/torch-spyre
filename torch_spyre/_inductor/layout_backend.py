@@ -210,154 +210,154 @@ class SortingSolver(LayoutSolver):
         ]
 
 
-class SimulatedAnnealingSolver(LayoutSolver):
-    def __init__(
-        self,
-        capacity: int,
-        initial_temp: float = 2,
-        alpha: float = 0.9,
-        convergence_criteria: float = 0.0001,
-        num_iterations: int = 10000,
-        collision_penalty: float = 100,
-        eviction_penalty: float = 1.5
-    ):
-        self.capacity = capacity
-        self.initial_temp = initial_temp
-        self.alpha = alpha
-        self.convergence_criteria = convergence_criteria
-        self.num_iterations = num_iterations
-        self.collision_penalty = collision_penalty
-        self.eviction_penalty = eviction_penalty
+# class SimulatedAnnealingSolver(LayoutSolver):
+#     def __init__(
+#         self,
+#         capacity: int,
+#         initial_temp: float = 2,
+#         alpha: float = 0.9,
+#         convergence_criteria: float = 0.0001,
+#         num_iterations: int = 10000,
+#         collision_penalty: float = 100,
+#         eviction_penalty: float = 1.5
+#     ):
+#         self.capacity = capacity
+#         self.initial_temp = initial_temp
+#         self.alpha = alpha
+#         self.convergence_criteria = convergence_criteria
+#         self.num_iterations = num_iterations
+#         self.collision_penalty = collision_penalty
+#         self.eviction_penalty = eviction_penalty
 
-    def allocate_sa(
-        self,
-        buffers: list[LifetimeBoundBuffer]
-    ) -> AllocationResult:
-        rng = np.random.default_rng(seed=10)
-        overlapping_time: dict[str, list[tuple[str, int]]] = {}
-        for buffer in buffers:
-            overlapping_time[buffer.name] = []
-            buffer.address = rng.integers(0, self.capacity - buffer.size) if self.capacity > buffer.size else 0
+#     def allocate_sa(
+#         self,
+#         buffers: list[LifetimeBoundBuffer]
+#     ) -> AllocationResult:
+#         rng = np.random.default_rng(seed=10)
+#         overlapping_time: dict[str, list[tuple[str, int]]] = {}
+#         for buffer in buffers:
+#             overlapping_time[buffer.name] = []
+#             buffer.address = rng.integers(0, self.capacity - buffer.size) if self.capacity > buffer.size else 0
 
-        normalize_buffer_sizes(buffers)
+#         normalize_buffer_sizes(buffers)
 
-        for first, second in combinations(buffers, 2):
-            time_overlap = min(second.end_time, first.end_time) - max(
-                second.start_time, first.start_time
-            )
-            if time_overlap > 0:
-                overlapping_time[first.name].append((second.name, time_overlap))
+#         for first, second in combinations(buffers, 2):
+#             time_overlap = min(second.end_time, first.end_time) - max(
+#                 second.start_time, first.start_time
+#             )
+#             if time_overlap > 0:
+#                 overlapping_time[first.name].append((second.name, time_overlap))
 
-        for buffer in buffers:
-            eviction_length = (
-                -buffer.address
-                if buffer.address < 0
-                else np.clip(buffer.address + buffer.size - capacity, 0, buffer.size)
-            )
-            buffer.spilled = bool(eviction_length)
+#         for buffer in buffers:
+#             eviction_length = (
+#                 -buffer.address
+#                 if buffer.address < 0
+#                 else np.clip(buffer.address + buffer.size - capacity, 0, buffer.size)
+#             )
+#             buffer.spilled = bool(eviction_length)
 
-        def evaluate_objective(candidate_buffers: list[LifetimeBoundBuffer]) -> float:
-            collision_term = 0.0
-            for buffer in candidate_buffers:
-                for second, time_overlap in overlapping_time[buffer.name]:
-                    second_buffer = next((b for b in candidate_buffers if b.name == second))
-                    end = min(
-                        buffer.address + buffer.size,
-                        second_buffer.address + second_buffer.size,
-                    )
-                    start = max(
-                        buffer.address,
-                        second_buffer.address,
-                    )
-                    if start < end:
-                        area_overlap = (end - start) * time_overlap
-                        collision_term += collision_penalty * area_overlap
+#         def evaluate_objective(candidate_buffers: list[LifetimeBoundBuffer]) -> float:
+#             collision_term = 0.0
+#             for buffer in candidate_buffers:
+#                 for second, time_overlap in overlapping_time[buffer.name]:
+#                     second_buffer = next((b for b in candidate_buffers if b.name == second))
+#                     end = min(
+#                         buffer.address + buffer.size,
+#                         second_buffer.address + second_buffer.size,
+#                     )
+#                     start = max(
+#                         buffer.address,
+#                         second_buffer.address,
+#                     )
+#                     if start < end:
+#                         area_overlap = (end - start) * time_overlap
+#                         collision_term += collision_penalty * area_overlap
 
-            eviction_term = 0.0
-            for alloc in candidate_buffers:
-                if alloc.spilled:
-                    eviction_term += eviction_penalty * (
-                        np.abs(-alloc.address)
-                        if alloc.address < 0
-                        else np.clip(alloc.address + alloc.size - capacity, 0, np.inf)
-                    )
+#             eviction_term = 0.0
+#             for alloc in candidate_buffers:
+#                 if alloc.spilled:
+#                     eviction_term += eviction_penalty * (
+#                         np.abs(-alloc.address)
+#                         if alloc.address < 0
+#                         else np.clip(alloc.address + alloc.size - capacity, 0, np.inf)
+#                     )
 
-            return collision_term + eviction_term
+#             return collision_term + eviction_term
 
-        # ==========================================
-        # ANNEALING LOOP
-        # ==========================================
-        current_list = []
+#         # ==========================================
+#         # ANNEALING LOOP
+#         # ==========================================
+#         current_list = []
 
-        best: list[LifetimeBoundBuffer] = buffers
-        best_eval: float = evaluate_objective(best)
+#         best: list[LifetimeBoundBuffer] = buffers
+#         best_eval: float = evaluate_objective(best)
 
-        current_eval: float = best_eval
-        current: list[LifetimeBoundBuffer] = copy.deepcopy(best)
+#         current_eval: float = best_eval
+#         current: list[LifetimeBoundBuffer] = copy.deepcopy(best)
 
-        reheating_step = initial_temp
-        temp = initial_temp
+#         reheating_step = initial_temp
+#         temp = initial_temp
 
-        for i in range(num_iterations):
-            idx = rng.integers(0, len(buffers))
-            candidate: list[LifetimeBoundBuffer] = copy.deepcopy(current)
-            buffer = candidate[idx]
-            e: np.ndarray = rng.integers(-capacity, capacity) * temp
-            buffer.address = buffer.address + e
-            eviction_length = (
-                -buffer.address
-                if buffer.address < 0
-                else np.clip(buffer.address + buffer.size - capacity, 0, buffer.size)
-            )
-            buffer.spilled = bool(eviction_length)
+#         for i in range(num_iterations):
+#             idx = rng.integers(0, len(buffers))
+#             candidate: list[LifetimeBoundBuffer] = copy.deepcopy(current)
+#             buffer = candidate[idx]
+#             e: np.ndarray = rng.integers(-capacity, capacity) * temp
+#             buffer.address = buffer.address + e
+#             eviction_length = (
+#                 -buffer.address
+#                 if buffer.address < 0
+#                 else np.clip(buffer.address + buffer.size - capacity, 0, buffer.size)
+#             )
+#             buffer.spilled = bool(eviction_length)
 
-            candidate_eval: float = evaluate_objective(candidate)
+#             candidate_eval: float = evaluate_objective(candidate)
 
-            if candidate_eval < best_eval:
-                best, best_eval = copy.deepcopy(candidate), candidate_eval
+#             if candidate_eval < best_eval:
+#                 best, best_eval = copy.deepcopy(candidate), candidate_eval
 
-            diff: float = candidate_eval - current_eval
-            metropolis: float = np.exp(-diff / temp) if temp > 0 else 0
+#             diff: float = candidate_eval - current_eval
+#             metropolis: float = np.exp(-diff / temp) if temp > 0 else 0
 
-            if diff < 0 or rng.random() < metropolis:
-                current, current_eval = candidate, candidate_eval
-                current_list.append(current_eval)
+#             if diff < 0 or rng.random() < metropolis:
+#                 current, current_eval = candidate, candidate_eval
+#                 current_list.append(current_eval)
 
-            overlapping = False
-            for buffer in best:
-                for second_buffer_name, time_overlap in overlapping_time[buffer.name]:
-                    second_buffer = next((b for b in best if b.name == second_buffer_name))
-                    end = min(
-                        buffer.address + buffer.size,
-                        second_buffer.address + second_buffer.size,
-                    )
-                    start = max(buffer.address, second_buffer.address)
-                    if start < end:
-                        overlapping = True
-                        break
+#             overlapping = False
+#             for buffer in best:
+#                 for second_buffer_name, time_overlap in overlapping_time[buffer.name]:
+#                     second_buffer = next((b for b in best if b.name == second_buffer_name))
+#                     end = min(
+#                         buffer.address + buffer.size,
+#                         second_buffer.address + second_buffer.size,
+#                     )
+#                     start = max(buffer.address, second_buffer.address)
+#                     if start < end:
+#                         overlapping = True
+#                         break
 
-            if np.all([not b.spilled for b in best]) and not overlapping:
-                break
+#             if np.all([not b.spilled for b in best]) and not overlapping:
+#                 break
 
-            # Check for reheating / melting / restart condition if the gradient is not
-            # descending fast enough relative to the energy in the current
-            # result. Increase temp and revert back to best result for
-            # search restart.
-            if len(current_list) > 10:
-                if (
-                    np.abs(np.mean(np.gradient(current_list, 1)[-10:])) / current_list[-1]
-                    < convergence_criteria
-                ):
-                    temp = temp + reheating_step
-                    current = best
-                    current_list = []
+#             # Check for reheating / melting / restart condition if the gradient is not
+#             # descending fast enough relative to the energy in the current
+#             # result. Increase temp and revert back to best result for
+#             # search restart.
+#             if len(current_list) > 10:
+#                 if (
+#                     np.abs(np.mean(np.gradient(current_list, 1)[-10:])) / current_list[-1]
+#                     < convergence_criteria
+#                 ):
+#                     temp = temp + reheating_step
+#                     current = best
+#                     current_list = []
 
-            temp = temp * alpha
+#             temp = temp * alpha
 
-        return best
+#         return best
     
-    def plan_layout(self, buffers: dict) -> AllocationResult:
-        return self.allocate_sa(buffers)
+#     def plan_layout(self, buffers: dict) -> AllocationResult:
+#         return self.allocate_sa(buffers)
 
 
 class GreedyLayoutSolver(LayoutSolver):
