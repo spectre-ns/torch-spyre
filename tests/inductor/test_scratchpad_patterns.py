@@ -20,7 +20,7 @@ from torch_spyre._inductor.layout_backend import (
 from torch_spyre._inductor.scratchpad import (
     scratchpad_planning,
     calculate_liveness,
-    DefaultAllocationStrategy,
+    DefaultAllocator,
     SpyreLxOptimizationPass,
     InputBufferOptimization,
     LayoutSolver,
@@ -83,7 +83,7 @@ class IdentityOptimizationPass(SpyreLxOptimizationPass):
         return operations
 
 
-class MockAllocationStrategy(DefaultAllocationStrategy):
+class MockAllocationStrategy(DefaultAllocator):
     def __init__(
         self,
         pattern: Pattern,

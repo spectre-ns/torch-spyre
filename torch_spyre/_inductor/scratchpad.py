@@ -15,6 +15,7 @@
 import math
 from typing import Callable, Optional, Tuple
 from abc import abstractmethod
+from collections.abc import Sequence
 import functools
 from torch_spyre._inductor.layout_backend import (
     AllocationResult,
@@ -62,7 +63,7 @@ def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, 
             liveness_end[buffer_name] = i
     return liveness_start, liveness_end
 
-
+# TODO: Update this to either be obsolete or broken up into distinct checks
 def buf_analysis(operations: list[Operation]):
     """
     First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
@@ -115,7 +116,7 @@ def buf_analysis(operations: list[Operation]):
     return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
 
 
-class AllocationStrategy:
+class AbstractAllocator:
     def __init__(self, graph):
         self.graph = graph
 
@@ -159,13 +160,13 @@ class AllocationStrategy:
         return mem_usage
 
 
+# Potential other optimizations... Output cloning, buffer lifetime splitting, rematerialization (advanced)
 class SpyreLxOptimizationPass:
     @abstractmethod
     def apply_pass(self, operations: list[Operation]) -> list[Operation]:
         pass
 
 
-# Potential other optimizations... Output cloning, buffer lifetime splitting, rematerialization (advanced)
 class InputBufferOptimization(SpyreLxOptimizationPass):
     def __init__(
         self,
@@ -367,22 +368,7 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
         return operations
 
 
-# check core division
-# check buffer size
-# return buffers which should be excluded on some basis
-# might need to expand this as well
-# return buffers which should not be considered for LX planning
-# check for operations which are not supported on output
-#           tag those buffers
-
-
-class LxCompatabilityCheck:
-    @abstractmethod
-    def apply_check(self, mem_usage: dict, ops: list[Operation]) -> dict:
-        pass
-
-
-class DefaultAllocationStrategy(AllocationStrategy):
+class DefaultAllocator(AbstractAllocator):
     def __init__(
         self,
         optimization_passes: list[SpyreLxOptimizationPass] | None = None,
@@ -393,8 +379,13 @@ class DefaultAllocationStrategy(AllocationStrategy):
             super().__init__(graph)
         else:
             super().__init__(V.graph)
+        
+        # allow no optimizations passes and guard where needed
         self.optimization_passes = optimization_passes
 
+        # ensure a layout solver is always available. The greedy
+        # solver is likely not optimal moving forward but it is the
+        # default for now until others are verified.
         if layout_planning:
             self.layout_planning = layout_planning
         else:
@@ -457,7 +448,8 @@ class DefaultAllocationStrategy(AllocationStrategy):
 
         # attempt to place the optimized buffers into LX
         def try_layout_with_fallback(
-            strategies: list[LayoutSolver], buffers: list[LifetimeBoundBuffer]
+            strategies: Sequence[LayoutSolver],
+            buffers: Sequence[LifetimeBoundBuffer]
         ) -> AllocationResult | None:
             if not buffers:
                 return []
@@ -482,7 +474,9 @@ class DefaultAllocationStrategy(AllocationStrategy):
             for name, item in buffer_list.items()
             if item["lx_compatible"]
         ]
-        allocation = try_layout_with_fallback(self.layout_planning, filtered_buffers)
+        allocation = try_layout_with_fallback(
+            self.layout_planning,
+            filtered_buffers)
 
         if allocation:
             self.push_allocation(allocation)
@@ -493,11 +487,11 @@ class DefaultAllocationStrategy(AllocationStrategy):
 
 def scratchpad_planning(
     operations: list[Operation],
-    strategy: Optional[AllocationStrategy] = None,
+    strategy: Optional[AbstractAllocator] = None,
 ) -> None:
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts).
     if not strategy:
-        strategy = DefaultAllocationStrategy()
+        strategy = DefaultAllocator()
     strategy.plan_allocation(operations)
