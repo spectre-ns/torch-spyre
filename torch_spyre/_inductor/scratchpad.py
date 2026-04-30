@@ -468,7 +468,8 @@ class DefaultAllocator(AbstractAllocator):
                 # Check if this strategy places all buffers
                 if all([buffer.component == Component.LX for buffer in current_layout]):
                     return current_layout  # Exit early if optimal
-
+                
+                # TODO: Add heuristic to pick best of the incomplete layouts 
                 final_layout = current_layout  # Store the last attempt
 
             # Return the best found or the last attempt
