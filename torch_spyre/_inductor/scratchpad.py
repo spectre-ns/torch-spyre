@@ -393,10 +393,7 @@ class DefaultAllocationStrategy(AllocationStrategy):
             super().__init__(graph)
         else:
             super().__init__(V.graph)
-        if optimization_passes:
-            self.optimization_passes = optimization_passes
-        else:
-            self.optimization_passes = [InputBufferOptimization()]
+        self.optimization_passes = optimization_passes
 
         if layout_planning:
             self.layout_planning = layout_planning
@@ -407,13 +404,16 @@ class DefaultAllocationStrategy(AllocationStrategy):
         # compute the optimized graph with the optimized operation list
         # ideally not apply changes to the FX graph until the end but
         # currently FX graph updates are done stepwise.
-        optimized_ops = functools.reduce(
-            lambda intermediate_ops, optimization_pass: optimization_pass.apply_pass(
-                intermediate_ops
-            ),
-            self.optimization_passes,
-            operations,
-        )
+        if self.optimization_passes:
+            optimized_ops = functools.reduce(
+                lambda intermediate_ops, optimization_pass: optimization_pass.apply_pass(
+                    intermediate_ops
+                ),
+                self.optimization_passes,
+                operations,
+            )
+        else:
+            optimized_ops = operations
 
         mem_usage = {}
         for op in operations:

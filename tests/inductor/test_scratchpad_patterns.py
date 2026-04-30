@@ -11,7 +11,9 @@ from torch_spyre._inductor.layout_backend import (
     Component,
     Allocation,
     AllocationResult,
+    GreedyLayoutSolver,
     SortingSolver,
+    SimulatedAnnealingSolver
 )
 
 
@@ -407,10 +409,6 @@ class TestExamplePattern(TestCase):
                     # must be loaded from HBM.
                     hbm_usage += op._buffer_registry[buffer_name].size
 
-        # All buffers allocated in the scratchpad are counted only once each.
-        for buffer in alloc.allocations:
-            hbm_usage += operations[0]._buffer_registry[buffer.buffer].size
-
         return hbm_usage
 
     def run_pattern(self, pattern: Pattern):
@@ -422,7 +420,7 @@ class TestExamplePattern(TestCase):
 
         strategy = MockAllocationStrategy(
             pattern_copy,
-            [IdentityOptimizationPass()],
+            [],
             [SortingSolver(AVAILABLE_LX_SIZE)],
         )
 
@@ -433,6 +431,7 @@ class TestExamplePattern(TestCase):
 
         # Verify that the currently implemented allocation is at least as good as the "good
         # allocation" in terms of HBM usage.
+
         current_hbm_usage = self.hbm_usage_for_actual_run(
             pattern_copy.operations, strategy
         )
@@ -584,7 +583,8 @@ class TestExamplePattern(TestCase):
         self.run_pattern(self.make_staircase_pattern())
 
     def make_downward_staircase_pattern(self) -> Pattern:
-        """Allocate 1+N*2 buffers of sizes k, N*k, N*k, (N-1)*k, (N-1)*k, ..., 2*k, 2*k, k, k.
+        """
+        Allocate 1+N*2 buffers of sizes k, N*k, N*k, (N-1)*k, (N-1)*k, ..., 2*k, 2*k, k, k.
         After an odd-numbered buffer (>1) is allocated, free the previous even-numbered buffer.
         This creates an easier "staircase" pattern of allocations than in
         `make_staircase_pattern`. Still, the greedy allocator will prefer to allocate
@@ -595,7 +595,8 @@ class TestExamplePattern(TestCase):
 
         The greedy allocator will always allocate the next buffer just after all other buffers,
         up until the point where it reaches the top of available memory and starts looking for gaps.
-        The total usage is less clear to analyze."""
+        The total usage is less clear to analyze.
+        """
         N = 5
         k = (2 * AVAILABLE_LX_SIZE) // (4 + N * (N + 1))
         k = (k // 128) * 128  # round down to a multiple of the stick size
@@ -606,12 +607,20 @@ class TestExamplePattern(TestCase):
                 for i in range(1, N + 1)
                 for letter in ["A", "B"]
             }
+            | {f"A{i}_HBM": (N + 1 - i) * k for i in range(1, N + 1)}
             | {"Z": k}
+            | {"Z_HBM": k}
             | {f"C{i}": k for i in range(N + 2)}
         )
 
-        def op_pair(i: int) -> tuple[Operation, Operation]:
+        def op_tuple(i: int) -> tuple[Operation, Operation, Operation]:
             return (
+                Operation(
+                    f"op{i}_load",
+                    inputs=[f"A{i}_HBM"],
+                    outputs=[f"A{i}"],
+                    _buffer_registry=buffers,
+                ),
                 Operation(
                     f"op{i}_0",
                     inputs=[f"A{i}"],
@@ -629,13 +638,19 @@ class TestExamplePattern(TestCase):
         ops = (
             [
                 Operation(
+                    "op_start_load",
+                    inputs=["Z_HBM"],
+                    outputs=["Z"],
+                    _buffer_registry=buffers,
+                ),
+                Operation(
                     "op_start",
                     inputs=["Z"],
                     outputs=["C0"],
                     _buffer_registry=buffers,
-                )
+                ),
             ]
-            + [op for i in range(1, N + 1) for op in op_pair(i)]
+            + [op for i in range(1, N + 1) for op in op_tuple(i)]
             + [
                 Operation(
                     "op_final",
@@ -646,32 +661,48 @@ class TestExamplePattern(TestCase):
             ]
         )
 
-        def good_allocation_pair(i: int) -> tuple[list[Allocation], list[Allocation]]:
+        def good_allocation_tuple(
+            i: int,
+        ) -> tuple[list[Allocation], list[Allocation], list[Allocation]]:
             # Allocate Z at 0, A{i} at k, and B{j} for j <= i as follows: B{N} at 2*k, B{N-1} at
             # 3*k, B{N-2} at 5*k, B{N-3} at 8*k, ..., B{N-j} at (j*(j+1)/2 + 2)*k. The gap
             # between A{i} and B{i} = B{N+1-(N+1-i)} is (N+1-i)*(N+2-i)/2*k, which is big enough
             # for A{i+1} of size (N-i)*k.
-            alloc0 = [
-                Allocation(buffer=f"B{N - j}", component=Component.HBM)
-                for j in range(N - i, N)
+            allocload = [
+                Allocation(buffer=f"B{N - j}", address=(j * (j + 1) // 2 + 2) * k)
+                for j in range(N - i + 1, N)
+            ] + [
+                Allocation(buffer="Z", address=0),
+                Allocation(buffer=f"A{i}_HBM", component=Component.HBM),
+                Allocation(buffer=f"A{i}", address=k),
             ]
-            alloc0.append(Allocation(buffer="Z", component=Component.HBM))
-            alloc0.append(Allocation(buffer=f"A{i}", component=Component.HBM))
+            alloc0 = allocload + [
+                Allocation(buffer=f"B{i}", address=((N - i) * (N - i + 1) // 2 + 2) * k)
+            ]
             alloc1 = alloc0 + [Allocation(buffer=f"C{i}", component=Component.HBM)]
-            return (alloc0, alloc1)
+            return (allocload, alloc0, alloc1)
 
         good_allocations = [
             [
-                Allocation(buffer="Z", component=Component.HBM),
+                Allocation(buffer="Z_HBM", component=Component.HBM),
+                Allocation(buffer="Z", address=0),
+            ],
+            [
+                Allocation(buffer="Z", address=0),
                 Allocation(buffer="C0", component=Component.HBM),
-            ]
+            ],
         ]
+
         good_allocations.extend(
-            [alloc for i in range(1, N + 1) for alloc in good_allocation_pair(i)]
+            [alloc for i in range(1, N + 1) for alloc in good_allocation_tuple(i)]
         )
-        last_allocation = good_allocation_pair(N)[1]
+
+        last_allocation = good_allocation_tuple(N)[1]
         last_allocation = [
-            alloc for alloc in last_allocation if alloc.buffer != f"A{N}"
+            alloc for alloc in last_allocation if not alloc.buffer.startswith("A")
+        ] + [
+            Allocation(buffer="Z", address=0),
+            Allocation(buffer=f"C{N + 1}", component=Component.HBM),
         ]
         good_allocations.append(last_allocation)
 
@@ -679,6 +710,7 @@ class TestExamplePattern(TestCase):
             buffers, ops, good_allocation=make_allocation_result(good_allocations)
         )
         return pattern
+
 
     def test_verify_downward_staircase_pattern(self):
         self.verify_pattern(self.make_downward_staircase_pattern())
