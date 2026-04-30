@@ -74,6 +74,8 @@ def buf_analysis(operations: list[Operation]):
             buffer is sliced 8 ways (stored on 8 LX) but next Op is 4-cores -> each core
             in next op has to read from 2 different scratchpads...
     TODO looking for options to broadcast to or all_reduce from multiple scratchpad
+    -- NOTE: This should be implemented as an optimization pass the buffers should be 
+             downstream of any graph changes or decisions based on work division. 
     """
     last_used: dict = {}
     buf_read_counts: dict[str, int] = {}
@@ -82,6 +84,8 @@ def buf_analysis(operations: list[Operation]):
     buf_users_read_and_write: dict[str, list[Operation]] = {}
     core_div_mismatch: dict[str, bool] = {}
 
+    # TODO: buf_users should likely be extracted and brought closer 
+    # to where it is used.
     for idx, op in enumerate(operations):
         rw = op.get_read_writes()
         read_names = op.get_read_names()
@@ -95,6 +99,7 @@ def buf_analysis(operations: list[Operation]):
                 buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
             buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [op]
 
+    # TODO: Liveness analysis gives us this plus the allocation time. Remove.
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
         # if last used at idx => del at idx+1
@@ -103,6 +108,8 @@ def buf_analysis(operations: list[Operation]):
         else:
             bufs_to_dealloc_at_idx[idx + 1] = [buf]
 
+    # TODO: Think about how this impacts downstream and how to 
+    # solidify this check. Might require more IQ points.
     using_multicore = config.sencores > 1
     for buf_name, users_rw in buf_users_read_and_write.items():
         # this dict includes graph input and output
