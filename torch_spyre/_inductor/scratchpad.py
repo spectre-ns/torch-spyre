@@ -50,8 +50,25 @@ __LX_CAPACITY__ = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
 
 
 def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, int]]:
-    # Verify that the actual run's allocation is valid. We assume that any allocation is "live"
-    # during the entire liveness of the corresponding buffer.
+    """
+    Calculates the lifetimes of the buffers referenced in the operation list provided.
+    Buffers are considered to be alive from the first time they are referenced
+    in the list until the last time there are referenced.
+
+    NOTE: It is legal for input and output buffers to have end_time - start_time = 0
+        when the buffer is not shared and represents a graph input or output. 
+
+    Args:
+        ops (list[Operation]): List of operations with buffer references to be
+            considered for their lifetimes based on the `tensor_name` referenced
+            at the input and output of each operation.
+
+    Returns:
+        Tuple[dict[str, int], dict[str, int]]: A tuple with the start and end
+            of the buffer lifetime with `tensor_name` as the key for both.
+            Time is defined in logical steps where each operation is
+            considered a logical step in time.
+    """
     liveness_start = {}
     liveness_end = {}
     for i, op in enumerate(ops):
@@ -65,6 +82,15 @@ def calculate_liveness(ops: list[Operation]) -> Tuple[dict[str, int], dict[str, 
 
 # TODO: Update this to either be obsolete or broken up into distinct checks
 def buf_analysis(operations: list[Operation]):
+    """
+    TODO
+
+    Args:
+        operations (list[Operation]): _description_
+
+    Returns:
+        _type_: _description_
+    """    
     """
     First, find out the last time each buffer was used. {buf1: idx_last_used, ...}
     Turn it into {idx_last_used+1:[buf1, ], ...}, ie. buffers to be deleted at given idx
@@ -123,15 +149,31 @@ def buf_analysis(operations: list[Operation]):
     return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
 
 
-class AbstractAllocator:
+class AbstractLxAllocator:
     def __init__(self, graph):
         self.graph = graph
 
     @abstractmethod
     def plan_allocation(self, operations: list[Operation]):
+        """
+        Interface method meant as a placeholder for the interface of LX
+        allocator classes.
+
+        Args:
+            operations (list[Operation]): List of operations to be considered
+                for LX planning.
+        """        
         pass
 
     def push_allocation(self, allocation: AllocationResult):
+        """
+        Applies allocation to the global FX graph to forward the LX planning information
+        into code generation based on the provided allocation pattern.
+        TODO: 
+        Args:
+            allocation (AllocationResult): A list of allocations for particular tensors
+                at specified addresses.
+        """        
         # push the allocation into the code generation
         for b in allocation:
             buf = self.graph.get_buffer(b.buffer)
@@ -139,16 +181,49 @@ class AbstractAllocator:
             layout.allocation["lx"] = b.address
 
     def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
+        """
+        Accepts an operation name and check whether that operation is supported
+        withing 
+
+        Args:
+            org_op_name (str): _description_
+
+        Returns:
+            bool: _description_
+        """        
         return any(op in org_op_name for op in OP_OUTPUT_GOOD_FOR_LX_REUSE)
 
     def get_output_names(self) -> list[str]:
+        """
+        _summary_
+
+        Returns:
+            list[str]: _description_
+        """        
         return self.graph.get_output_names()
 
     def is_graph_input(self, buffer: str) -> bool:
+        """
+        _summary_
+
+        Args:
+            buffer (str): _description_
+
+        Returns:
+            bool: _description_
+        """        
         return buffer not in self.graph.name_to_buffer
 
     def mem_usage_by_op(self, op: ComputedBuffer) -> dict[str, dict[str, bool | int]]:
-        """Get a summary of memory usage of the input operation."""
+        """
+        Get a summary of memory usage of the input operation.
+
+        Args:
+            op (ComputedBuffer): _description_
+
+        Returns:
+            dict[str, dict[str, bool | int]]: _description_
+        """        
         rw = op.get_read_writes()
         mem_usage = {}
 
@@ -171,6 +246,15 @@ class AbstractAllocator:
 class SpyreLxOptimizationPass:
     @abstractmethod
     def apply_pass(self, operations: list[Operation]) -> list[Operation]:
+        """
+        _summary_
+
+        Args:
+            operations (list[Operation]): _description_
+
+        Returns:
+            list[Operation]: _description_
+        """        
         pass
 
 
@@ -179,28 +263,24 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
         self,
         graph_lowering: Optional[GraphLowering] = None,
     ):
+        """
+        _summary_
+
+        Args:
+            graph_lowering (Optional[GraphLowering], optional): _description_. Defaults to None.
+        """        
         self.graph_lowering = graph_lowering if graph_lowering else V.graph
 
-    def mem_usage_by_op(self, op: ComputedBuffer) -> dict[str, dict[str, bool | int]]:
-        """Get a summary of memory usage of the input operation."""
-        rw = op.get_read_writes()
-        mem_usage = {}
-
-        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
-            for dep in deps:
-                buf = V.graph.get_buffer(dep.name)
-                dev_layout = buf.layout.device_layout
-                dev_size = (
-                    math.prod(dev_layout.device_size[:-1]) * 128
-                )  # num_sticks * bytes_per_stick
-                mem_usage[dep.name] = {
-                    "is_input": is_input,
-                    "size": dev_size,
-                }
-
-        return mem_usage
-
     def should_consider_op(self, op: Operation) -> bool:
+        """
+        _summary_
+
+        Args:
+            op (Operation): _description_
+
+        Returns:
+            bool: _description_
+        """        
         return isinstance(op, ComputedBuffer) and not isinstance(
             op.layout, MutationLayoutSHOULDREMOVE
         )
@@ -214,8 +294,16 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
             return super().load(self._name_map.get(name, name), index)
 
     def create_Loop_hack_inner_fn(self, old_Loop, name_map):
-        """Use ops_handler to swap the name of buffers"""
+        """
+        Use ops_handler to swap the name of buffers
 
+        Args:
+            old_Loop (_type_): _description_
+            name_map (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """        
         def new_inner_fn(*args):
             # Pointwise has 1 pos arg index while Reduction has 2, i.e. (index, rindex)
             with V.set_ops_handler(self.NameSwapHandler(V.ops, name_map)):
@@ -242,6 +330,15 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
         buf_users: dict,
         operations: list[Operation],
     ) -> None:
+        """
+        _summary_
+
+        Args:
+            buf (TensorBox): _description_
+            lowering_func (Callable): _description_
+            buf_users (dict): _description_
+            operations (list[Operation]): _description_
+        """        
         """
         Insert an operation using the provided lowering function (e.g. clone_lowering) in
         GraphLowering.operations list after the given op (buf, a TensorBox representing a
@@ -333,6 +430,15 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
         core_div_mismatch: dict[str, bool],
     ) -> None:
         """
+        _summary_
+
+        Args:
+            operations (list[Operation]): _description_
+            lx_free_total (int): _description_
+            buf_users (dict[str, Operation]): _description_
+            core_div_mismatch (dict[str, bool]): _description_
+        """        
+        """
         Check if any input tensors can fit onto scratchpad and needed more than once =>
         Add corresponding "clone operation" to copy it to scratchpad and reduce HBM read.
         """
@@ -355,6 +461,15 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
             lx_free_total -= dev_size
 
     def apply_pass(self, operations: list[Operation]) -> list[Operation]:
+        """
+        _summary_
+
+        Args:
+            operations (list[Operation]): _description_
+
+        Returns:
+            list[Operation]: _description_
+        """        
         idx_to_dealloc_bufs, buf_users, core_div_mismatch = buf_analysis(operations)
 
         if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
@@ -375,13 +490,21 @@ class InputBufferOptimization(SpyreLxOptimizationPass):
         return operations
 
 
-class DefaultAllocator(AbstractAllocator):
+class DefaultAllocator(AbstractLxAllocator):
     def __init__(
         self,
         optimization_passes: list[SpyreLxOptimizationPass] | None = None,
         layout_planning: list[LayoutSolver] | None = None,
         graph: GraphLowering | None = None,
     ):
+        """
+        _summary_
+
+        Args:
+            optimization_passes (list[SpyreLxOptimizationPass] | None, optional): _description_. Defaults to None.
+            layout_planning (list[LayoutSolver] | None, optional): _description_. Defaults to None.
+            graph (GraphLowering | None, optional): _description_. Defaults to None.
+        """        
         if graph:
             super().__init__(graph)
         else:
@@ -399,6 +522,15 @@ class DefaultAllocator(AbstractAllocator):
             self.layout_planning = [GreedyLayoutSolver(__LX_CAPACITY__)]
 
     def plan_allocation(self, operations: list[Operation]):
+        """
+        _summary_
+
+        Args:
+            operations (list[Operation]): _description_
+
+        Returns:
+            _type_: _description_
+        """        
         # compute the optimized graph with the optimized operation list
         # ideally not apply changes to the FX graph until the end but
         # currently FX graph updates are done stepwise.
@@ -458,6 +590,16 @@ class DefaultAllocator(AbstractAllocator):
             strategies: Sequence[LayoutSolver],
             buffers: Sequence[LifetimeBoundBuffer]
         ) -> AllocationResult | None:
+            """
+            _summary_
+
+            Args:
+                strategies (Sequence[LayoutSolver]): _description_
+                buffers (Sequence[LifetimeBoundBuffer]): _description_
+
+            Returns:
+                AllocationResult | None: _description_
+            """            
             if not buffers:
                 return []
 
@@ -495,8 +637,15 @@ class DefaultAllocator(AbstractAllocator):
 
 def scratchpad_planning(
     operations: list[Operation],
-    strategy: Optional[AbstractAllocator] = None,
+    strategy: Optional[AbstractLxAllocator] = None,
 ) -> None:
+    """
+    _summary_
+
+    Args:
+        operations (list[Operation]): _description_
+        strategy (Optional[AbstractAllocator], optional): _description_. Defaults to None.
+    """    
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts).
