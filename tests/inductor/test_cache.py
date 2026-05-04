@@ -16,6 +16,7 @@ import unittest
 import torch
 from torch._inductor.utils import fresh_cache
 from torch._dynamo.utils import counters
+from torch_spyre.execution.compile_cache import get_spyre_cache
 
 
 class TestCache(unittest.TestCase):
@@ -44,3 +45,23 @@ class TestCache(unittest.TestCase):
             self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
 
         self.assertFalse(torch.compiler._cache.CacheArtifactManager.need_serialize())
+
+    def test_sdsc_cache_hit(self):
+        with fresh_cache():
+            torch._dynamo.reset()
+            a = torch.randn((5, 5), device="spyre")
+            fn = torch.compile(torch.abs)
+            fn(a)
+            self.assertEqual(get_spyre_cache().cache_hits(), 0)
+
+            torch._dynamo.reset()
+            a = torch.randn((5, 5), device="spyre")
+            fn = torch.compile(torch.abs)
+            fn(a)
+            self.assertEqual(get_spyre_cache().cache_hits(), 1)
+        with fresh_cache():
+            torch._dynamo.reset()
+            a = torch.randn((5, 5), device="spyre")
+            fn = torch.compile(torch.abs)
+            fn(a)
+            self.assertEqual(get_spyre_cache().cache_hits(), 0)

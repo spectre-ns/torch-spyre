@@ -12,26 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tempfile
-from typing import Any
-import os
-import subprocess
 
-from torch._inductor.runtime.runtime_utils import cache_dir
+import subprocess
+from typing import Any
+
 from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
 from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre.execution.compile_cache import get_spyre_cache, cache_context
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
-
-
-def get_output_dir(kernel_name: str):
-    spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
-    os.makedirs(spyre_dir, exist_ok=True)
-    kernel_output_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{kernel_name}_")
-    return kernel_output_dir
 
 
 class SpyreAsyncCompile:
@@ -39,23 +31,29 @@ class SpyreAsyncCompile:
         pass
 
     def sdsc(self, kernel_name: str, specs: list[OpSpec | UnimplementedOp]):
+        cache = get_spyre_cache()
         unimp = [s for s in specs if isinstance(s, UnimplementedOp)]
         if len(unimp) != 0:
             logger.warning(
                 f"WARNING: Compiling unimplemented {unimp[0].op} to runtime exception"
             )
             return SpyreUnimplementedRunner(kernel_name, unimp[0].op)
-
-        # Generate SDSC Bundle from OpSpecs
-        output_dir = get_output_dir(kernel_name)
         op_specs = [s for s in specs if isinstance(s, OpSpec)]
-        generate_bundle(kernel_name, output_dir, op_specs)
 
-        # Invoke backend compiler of SDSC Bundle
-        subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)
-        convert_artifacts(output_dir)
+        def get_output_directory():
+            output_dir, specs_hash = cache.try_load(op_specs)
+            if not output_dir:
+                # Generate SDSC Bundle from OpSpecs
+                with cache_context(op_specs, specs_hash) as output_dir:
+                    generate_bundle(kernel_name, output_dir, op_specs)
+                    # Invoke backend compiler of SDSC Bundle
+                    subprocess.run(
+                        ["dxp_standalone", "--bundle", "-d", output_dir], check=True
+                    )
+                    convert_artifacts(output_dir)
+            return output_dir
 
-        return SpyreSDSCKernelRunner(kernel_name, output_dir)
+        return SpyreSDSCKernelRunner(kernel_name, get_output_directory())
 
     def wait(self, scope: dict[str, Any]) -> None:
         pass
