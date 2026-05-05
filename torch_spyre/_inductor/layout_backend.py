@@ -37,8 +37,8 @@ class LifetimeBoundBuffer:
 class LayoutSolver:
     """
     An abstract class for defining algorithms which solve
-    the memory layout patterns based on provided sizes, lifetimes,
-    and optional heuristics based on the implementation inputs.
+    memory layout patterns based on provided sizes, lifetimes,
+    and optional heuristics based on the implementation details.
     """
 
     @abstractmethod
@@ -47,13 +47,13 @@ class LayoutSolver:
     ) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
-        whether buffers should be placed in a memory layout based
+        if and where buffers should be placed in lx memory based
         on their attributes.
 
         Args:
-            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for the memory layout
+            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
 
         Returns:
-            list[LifetimeBoundBuffer]: The set of buffer with their placements defined.
+            list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
         """
         pass
