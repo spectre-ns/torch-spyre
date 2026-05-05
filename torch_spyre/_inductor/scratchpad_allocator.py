@@ -30,5 +30,5 @@ class LxAllocator:
         Args:
             operations (List[Operation]): List of operations to be considered
                 for LX planning.
-        """        
+        """
         pass

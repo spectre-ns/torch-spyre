@@ -15,6 +15,7 @@
 from abc import abstractmethod
 from torch_spyre._inductor.operation import Operation
 
+
 class SpyreLxOptimizationPass:
     @abstractmethod
     def apply_pass(self, operations: list[Operation]) -> list[Operation]:
@@ -26,5 +27,5 @@ class SpyreLxOptimizationPass:
 
         Returns:
             list[Operation]: _description_
-        """        
+        """
         pass
