@@ -480,6 +480,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_topk", "test_topk_cpu"): {
+            "param_sets": {
+                "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
+                "2d_k4_dim_minusone": (
+                    unique_randn_along_dim((64, 256), dim=-1),
+                    4,
+                    -1,
+                ),
+                # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
+                # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
+            },
+        },
         ("test_sum_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {
                 "sum": torch.sum,
@@ -1989,6 +2001,973 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_sum_keepdim1", "test_sum_eager"): {
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": {
+                "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
+                "fp16_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((3, 5, 256), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 71, 256), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_3d_dim_2": (
+                    2,
+                    True,
+                    cached_randn((67, 71, 256), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_4d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_4d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_4d_dim_3": (
+                    3,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_3d_dim_neg1": (
+                    -1,
+                    True,
+                    cached_randn((3, 7, 9), dtype=torch.float16, scale=0.1),
+                ),
+                "fp16_3d_dim_neg2": (
+                    -2,
+                    True,
+                    cached_randn((3, 7, 9), dtype=torch.float16, scale=0.1),
+                ),
+                "fp32_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float32)),
+                "fp32_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+                "fp32_3d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((3, 5, 256), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 71, 256), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_3d_dim_2": (
+                    2,
+                    True,
+                    cached_randn((67, 71, 256), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_4d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_4d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_4d_dim_2": (
+                    2,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_4d_dim_3": (
+                    3,
+                    True,
+                    cached_randn((6, 7, 12, 256), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    True,
+                    cached_randn((3, 7, 9), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_3d_dim_neg2": (
+                    -2,
+                    True,
+                    cached_randn((3, 7, 9), dtype=torch.float32, scale=0.1),
+                ),
+            },
+            "expect_fail": [
+                "fp32_1d_dim_0",
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_0",
+                "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_4d_dim_0",
+                "fp32_4d_dim_1",
+                "fp32_4d_dim_2",
+                "fp32_4d_dim_3",
+                "fp32_3d_dim_neg1",
+                "fp32_3d_dim_neg2",
+            ],
+        },
+        ("test_sum_keepdim0", "test_sum_eager"): {
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": {
+                "fp16_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 71, 256), dtype=torch.float16, scale=0.01),
+                ),
+                "fp16_3d_dim_2": (
+                    2,
+                    False,
+                    cached_randn((67, 71, 256), dtype=torch.float16, scale=0.01),
+                ),
+                "fp16_4d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16, scale=0.01),
+                ),
+                "fp16_4d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16, scale=0.01),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16, scale=0.01),
+                ),
+                "fp16_4d_dim_3": (
+                    3,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float16, scale=0.01),
+                ),
+                "fp32_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 71, 256), dtype=torch.float32, scale=0.01),
+                ),
+                "fp32_3d_dim_2": (
+                    2,
+                    False,
+                    cached_randn((67, 71, 256), dtype=torch.float32, scale=0.01),
+                ),
+                "fp32_4d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float32, scale=0.01),
+                ),
+                "fp32_4d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float32, scale=0.01),
+                ),
+                "fp32_4d_dim_2": (
+                    2,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float32, scale=0.01),
+                ),
+                "fp32_4d_dim_3": (
+                    3,
+                    False,
+                    cached_randn((6, 7, 12, 64), dtype=torch.float32, scale=0.01),
+                ),
+            },
+            "expect_fail": [
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_4d_dim_0",
+                "fp32_4d_dim_1",
+                "fp32_4d_dim_2",
+                "fp32_4d_dim_3",
+            ],
+        },
+        ("test_mean_keepdim1", "test_mean_eager"): {
+            "ops_dict": {"mean": torch.mean},
+            "param_sets": {
+                "fp16_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_3d_dim_0": (
+                    0,
+                    True,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    True,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "fp16_3d_dim_2": (
+                    2,
+                    True,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "fp16_3d_dim_neg1": (
+                    -1,
+                    True,
+                    cached_randn((3, 7, 9), dtype=torch.float16),
+                ),
+                "fp32_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+                "fp32_3d_dim_0": (
+                    0,
+                    True,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    True,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                ),
+                "fp32_3d_dim_2": (
+                    2,
+                    True,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    True,
+                    cached_randn((3, 7, 9), dtype=torch.float32),
+                ),
+            },
+            "expect_fail": [
+                "fp16_3d_dim_2",
+                "fp16_3d_dim_neg1",
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_0",
+                "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_3d_dim_neg1",
+            ],
+        },
+        ("test_mean_keepdim0", "test_mean_eager"): {
+            "ops_dict": {"mean": torch.mean},
+            "param_sets": {
+                "fp16_3d_dim_0": (
+                    0,
+                    False,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    False,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float16,
+                    ),
+                ),
+                "fp16_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float16),
+                ),
+                "fp32_3d_dim_0": (
+                    0,
+                    False,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    False,
+                    torch.tensor(
+                        [
+                            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                ),
+                "fp32_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 256), dtype=torch.float32),
+                ),
+            },
+            "expect_fail": [
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_0",
+                "fp32_3d_dim_1",
+            ],
+        },
+        ("test_max_keepdim1", "test_max_eager"): {
+            "ops_dict": {"max": torch.max},
+            "param_sets": {
+                "fp16_2d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_3": (
+                    3,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=3, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_3": (
+                    3,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+            },
+            "expect_fail": [
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_0",
+                "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_4d_dim_0",
+                "fp32_4d_dim_1",
+                "fp32_4d_dim_2",
+                "fp32_4d_dim_3",
+            ],
+        },
+        ("test_max_keepdim0", "test_max_eager"): {
+            "ops_dict": {"max": torch.max},
+            "param_sets": {
+                "fp16_2d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_3": (
+                    3,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=3, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_3": (
+                    3,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+            },
+            "expect_fail": [
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_4d_dim_0",
+                "fp32_4d_dim_1",
+                "fp32_4d_dim_2",
+                "fp32_4d_dim_3",
+            ],
+        },
+        ("test_min_keepdim1", "test_min_eager"): {
+            "ops_dict": {"min": torch.min},
+            "param_sets": {
+                "fp16_2d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_3": (
+                    3,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=3, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_2": (
+                    2,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_3": (
+                    3,
+                    True,
+                    unique_randn_along_dim(
+                        (6, 7, 12, 256), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+            },
+            "expect_fail": [
+                "fp16_2d_dim_0",
+                "fp16_2d_dim_1",
+                "fp16_3d_dim_0",
+                "fp16_3d_dim_1",
+                "fp16_3d_dim_2",
+                "fp16_4d_dim_0",
+                "fp16_4d_dim_1",
+                "fp16_4d_dim_2",
+                "fp16_4d_dim_3",
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_0",
+                "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_4d_dim_0",
+                "fp32_4d_dim_1",
+                "fp32_4d_dim_2",
+                "fp32_4d_dim_3",
+            ],
+        },
+        ("test_min_keepdim0", "test_min_eager"): {
+            "ops_dict": {"min": torch.min},
+            "param_sets": {
+                "fp16_2d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_2d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_3d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=0, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=1, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=2, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp16_4d_dim_3": (
+                    3,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=3, dtype=torch.float16, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_2d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 71, 256), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_2": (
+                    2,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=2, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_4d_dim_3": (
+                    3,
+                    False,
+                    unique_randn_along_dim(
+                        (6, 17, 7, 64), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+            },
+            "expect_fail": [
+                "fp16_2d_dim_0",
+                "fp16_2d_dim_1",
+                "fp16_3d_dim_1",
+                "fp16_3d_dim_2",
+                "fp16_4d_dim_0",
+                "fp16_4d_dim_1",
+                "fp16_4d_dim_2",
+                "fp16_4d_dim_3",
+                "fp32_2d_dim_0",
+                "fp32_2d_dim_1",
+                "fp32_3d_dim_1",
+                "fp32_3d_dim_2",
+                "fp32_4d_dim_0",
+                "fp32_4d_dim_1",
+                "fp32_4d_dim_2",
+                "fp32_4d_dim_3",
+            ],
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -2125,6 +3104,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
         else:
             compare_with_cpu(lambda x: op(x, dim=dim, keepdim=True), x, run_eager=False)
+
+    def test_topk_cpu(self, x, k: int, dim: int):
+        # torch.topk returns (values, indices); only compare values since
+        # index tie-breaking can differ between backends.
+        # aten::topk is not registered for Spyre eager dispatch.
+        compare_with_cpu(lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False)
 
     def test_max_sub_broadcast(self, dim: int, x):
         def fn(x):
@@ -2634,6 +3619,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return q_out
 
         compare_with_cpu(fn, q, freqs, cpu_compile=False)
+
+    def test_sum_eager(self, op, dim: int, keepdim: bool, x):
+        compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
+
+    def test_mean_eager(self, op, dim: int, keepdim: bool, x):
+        compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim), x)
+
+    def test_max_eager(self, op, dim: int, keepdim: bool, x):
+        compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim)[0], x)
+
+    def test_min_eager(self, op, dim: int, keepdim: bool, x):
+        compare_with_cpu(lambda x: op(x, dim=dim, keepdim=keepdim)[0], x)
 
     def test_attn_qkv_paths(self, q, k, v):
         # This tests the dataflows between rope/qkv projection and SDPA for q, k, and v
