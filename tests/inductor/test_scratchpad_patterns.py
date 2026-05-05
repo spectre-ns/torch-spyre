@@ -33,7 +33,6 @@ from torch_spyre._inductor.scratchpad.allocator import (
 from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
 from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
 from torch_spyre._inductor import config
-from torch_spyre._inductor.operation import Component
 
 # From scratchpad.py
 AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
@@ -132,6 +131,10 @@ def make_operations(
         assert isinstance(out, str)
         result.append(Operation(name, ins, out, buffers))
     return result
+
+class Component(Enum):
+    LX = "LX"
+    HBM = "HBM"
 
 @dataclass
 class Allocation:
