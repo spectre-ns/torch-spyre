@@ -16,7 +16,6 @@ from torch_spyre._inductor.scratchpad import (
     GreedyAllocationStrategy,
 )
 from torch_spyre._inductor import config
-from torch_spyre._inductor.operation import Component
 
 # From scratchpad.py
 AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
@@ -116,6 +115,10 @@ def make_operations(
             outs = [outs]
         result.append(Operation(name, ins, outs, buffers))
     return result
+
+class Component(Enum):
+    LX = "LX"
+    HBM = "HBM"
 
 @dataclass
 class Allocation:

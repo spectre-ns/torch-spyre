@@ -61,7 +61,4 @@ class Operation(Protocol):
 
     def get_read_names(self) -> List[str]:
         ...
-
-class Component(Enum):
-    LX = "LX"
-    HBM = "HBM"
+        
