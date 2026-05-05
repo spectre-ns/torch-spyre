@@ -33,6 +33,11 @@ from torch_spyre._inductor.scratchpad.allocator import (
 from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
 from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
 from torch_spyre._inductor import config
+from torch_spyre._inductor.scratchpad_allocator import (
+    Buffer,
+    Operation,
+    Component
+)
 
 # From scratchpad.py
 AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
@@ -48,30 +53,6 @@ if os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1":
         return wrapper
 else:
     usuallyExpectedFailure = expectedFailure
-
-
-class BufferDeviceLayout:
-    """This class mimics the FixedTiledLayout.device_layout field."""
-
-    def __init__(self, size: int):
-        self.device_size = [(size + 127) // 128, 128]
-
-
-class BufferLayout:
-    """This class mimics the TensorBox.layout field (a FixedTiledLayout)."""
-
-    def __init__(self, size: int):
-        self.device_layout = BufferDeviceLayout(size)
-        self.size = size
-        self.allocation = {}
-
-
-class Buffer:
-    def __init__(self, name: str, size: int):
-        self.name = name
-        self.size = size
-        self.layout = BufferLayout(size)
-        self.data = self  # This helps 'scratchpad'
 
 
 def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
@@ -135,11 +116,6 @@ def make_operations(
         assert isinstance(out, str)
         result.append(Operation(name, ins, out, buffers))
     return result
-
-
-class Component(Enum):
-    LX = "LX"
-    HBM = "HBM"
 
 
 @dataclass
