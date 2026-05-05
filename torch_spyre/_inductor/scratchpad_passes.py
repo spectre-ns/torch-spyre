@@ -19,7 +19,7 @@ from torch._inductor.graph import GraphLowering
 class SpyreLxOptimizationPass:
     """
     Abstract class for optimization passes which are implemented to improve
-    a graph's overall LX memory utilization and memory latency.
+    a graph's overall LX memory utilization and/or memory latency.
     """
 
     @abstractmethod
@@ -30,6 +30,6 @@ class SpyreLxOptimizationPass:
         number of nodes in the graph may change as a result of an optimization pass.
 
         Args:
-            graph (GraphLowering): The graph to be optimized to LX memory allocation
+            graph (GraphLowering): The graph to be optimized for LX memory allocation
         """
         pass
