@@ -17,9 +17,6 @@ from torch._inductor.graph import GraphLowering
 
 
 class LxAllocator:
-    def __init__(self, graph):
-        self.graph = graph
-
     @abstractmethod
     def plan_allocation(self, graph: GraphLowering):
         """
