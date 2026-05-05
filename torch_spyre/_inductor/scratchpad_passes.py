@@ -17,8 +17,12 @@ from torch._inductor.graph import GraphLowering
 
 
 class SpyreLxOptimizationPass:
+    """
+    Abstract class for optimization passes which are implemented to improve
+    a graph's overall LX memory utilization and memory latency.
+    """
     @abstractmethod
-    def apply_pass(self, graph: GraphLowering) -> None:
+    def apply_pass(self, graph: GraphLowering):
         """
         Accepts a candidate graph to be optimized and evaluated for lx memory allocation.
         `graph` will be mutated according in an implementation defined way. The order and
