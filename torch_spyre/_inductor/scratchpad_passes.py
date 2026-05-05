@@ -21,6 +21,7 @@ class SpyreLxOptimizationPass:
     Abstract class for optimization passes which are implemented to improve
     a graph's overall LX memory utilization and memory latency.
     """
+
     @abstractmethod
     def apply_pass(self, graph: GraphLowering):
         """
