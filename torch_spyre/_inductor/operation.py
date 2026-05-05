@@ -14,7 +14,6 @@
 
 from typing import List, Dict, Protocol, Self
 from torch.utils._ordered_set import OrderedSet
-from dataclasses import dataclass
 
 
 class BufferDeviceLayout(Protocol):
@@ -38,13 +37,11 @@ class Buffer(Protocol):
     data: Self  # This helps 'scratchpad'
 
 
-@dataclass
 class ReadWrites(Protocol):
     reads: OrderedSet[Buffer]
     writes: OrderedSet[Buffer]
 
 
-@dataclass
 class Operation(Protocol):
     name: str
     inputs: List[str]
