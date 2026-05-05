@@ -32,6 +32,7 @@ class BufferLayout(Protocol):
 
 class Buffer(Protocol):
     """Minimal protocol for a buffer type in the context of an operation"""
+
     name: str
     size: int
     layout: BufferLayout
@@ -40,6 +41,7 @@ class Buffer(Protocol):
 
 class ReadWrites(Protocol):
     """Captures the buffers which read and/or write from the owning operation"""
+
     reads: OrderedSet[Buffer]
     writes: OrderedSet[Buffer]
 
@@ -47,35 +49,31 @@ class ReadWrites(Protocol):
 class Operation(Protocol):
     """
     Defines an named operation with `len(inputs)` input buffers and
-    `len(outputs)` output buffers. 
+    `len(outputs)` output buffers.
     """
+
     name: str
     inputs: List[str]
     outputs: List[str]
     op_it_space_splits: List
     origin_node: Self
     target: Self
-    
-    def __post_init__(self) -> None: 
+    _opname: str
+
+    def get_read_writes(self) -> ReadWrites:
         """
-        _summary_
+        Returns the buffers referenced by the operation as either inputs or outputs
+
+        Returns:
+            ReadWrites: An dataclass of all reads and writes for the operation
         """
         ...
 
-    def get_read_writes(self) -> ReadWrites: 
+    def get_read_names(self) -> List[str]:
         """
-        _summary_
+        Reports the names of all inputs buffers to the operation
 
         Returns:
-            ReadWrites: _description_
-        """
-        ...
-
-    def get_read_names(self) -> List[str]: 
-        """
-        _summary_
-
-        Returns:
-            List[str]: _description_
+            List[str]: List of input buffer names
         """
         ...
