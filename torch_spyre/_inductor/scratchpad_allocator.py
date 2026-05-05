@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
 from abc import abstractmethod
-from operation import Operation
+from torch._inductor.graph import GraphLowering
 
 
 class LxAllocator:
@@ -22,13 +21,12 @@ class LxAllocator:
         self.graph = graph
 
     @abstractmethod
-    def plan_allocation(self, operations: List[Operation]):
+    def plan_allocation(self, graph: GraphLowering):
         """
-        Interface method meant as a placeholder for the interface of LX
-        allocator classes.
+        Accepts a graph to be considerd for LX memory according
+        to its composition and the specific implementation used.
 
         Args:
-            operations (List[Operation]): List of operations to be considered
-                for LX planning.
+            graph (GraphLowering): Graph to be considered for LX planning
         """
         pass
