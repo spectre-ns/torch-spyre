@@ -132,9 +132,11 @@ def make_operations(
         result.append(Operation(name, ins, out, buffers))
     return result
 
+
 class Component(Enum):
     LX = "LX"
     HBM = "HBM"
+
 
 @dataclass
 class Allocation:

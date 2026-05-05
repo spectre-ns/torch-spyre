@@ -31,6 +31,7 @@ class LifetimeBoundBuffer:
 
 class LayoutSolver:
     @abstractmethod
-    def plan_layout(self, buffers: list[LifetimeBoundBuffer]) -> list[LifetimeBoundBuffer]:
+    def plan_layout(
+        self, buffers: list[LifetimeBoundBuffer]
+    ) -> list[LifetimeBoundBuffer]:
         pass
-
