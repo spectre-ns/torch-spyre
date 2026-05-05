@@ -16,6 +16,11 @@ from torch_spyre._inductor.scratchpad import (
     GreedyAllocationStrategy,
 )
 from torch_spyre._inductor import config
+from torch_spyre._inductor.scratchpad_allocator import (
+    Buffer,
+    Operation,
+    Component
+)
 
 # From scratchpad.py
 AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
@@ -33,74 +38,8 @@ else:
     usuallyExpectedFailure = expectedFailure
 
 
-class BufferDeviceLayout:
-    """This class mimics the FixedTiledLayout.device_layout field."""
-
-    def __init__(self, size: int):
-        self.device_size = [(size + 127) // 128, 128]
-
-
-class BufferLayout:
-    """This class mimics the TensorBox.layout field (a FixedTiledLayout)."""
-
-    def __init__(self, size: int):
-        self.device_layout = BufferDeviceLayout(size)
-        self.size = size
-        self.allocation = {}
-
-
-class Buffer:
-    def __init__(self, name: str, size: int):
-        self.name = name
-        self.size = size
-        self.layout = BufferLayout(size)
-        self.data = self  # This helps 'scratchpad'
-
-
 def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
     return {name: Buffer(name=name, size=size) for (name, size) in names_sizes.items()}
-
-
-@dataclass
-class ReadWrites:
-    reads: OrderedSet[Buffer]
-    writes: OrderedSet[Buffer]
-
-
-@dataclass
-class Operation:
-    name: str
-    inputs: list[str]
-    outputs: list[str]
-    _buffer_registry: dict[str, "Buffer"]
-
-    # To make scratchpad.py work, we add origin_node and target fields that point to the op itself,
-    # a field _opname that is the same as name, and a field op_it_space_splits that is used in core
-    # division. (If the value of op_it_space_splits is different for operations in a sequence, that
-    # blocks LX allocation, so we make sure it is always the same.)
-    op_it_space_splits = None
-    origin_node = None
-    target = None
-    _opname = None
-
-    def __post_init__(self):
-        self.op_it_space_splits = []
-        self.origin_node = self
-        self.target = self
-        self._opname = self.name
-
-    def get_read_writes(self) -> ReadWrites:
-        # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
-        reads = OrderedSet(
-            self._buffer_registry[buffer_name] for buffer_name in self.inputs
-        )
-        writes = OrderedSet(
-            self._buffer_registry[buffer_name] for buffer_name in self.outputs
-        )
-        return ReadWrites(reads=reads, writes=writes)
-
-    def get_read_names(self):
-        return self.inputs
 
 
 def make_operations(
@@ -115,11 +54,6 @@ def make_operations(
             outs = [outs]
         result.append(Operation(name, ins, outs, buffers))
     return result
-
-
-class Component(Enum):
-    LX = "LX"
-    HBM = "HBM"
 
 
 @dataclass
