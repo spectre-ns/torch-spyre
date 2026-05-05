@@ -17,13 +17,13 @@ from torch.utils._ordered_set import OrderedSet
 
 
 class BufferDeviceLayout(Protocol):
-    """This class mimics the FixedTiledLayout.device_layout field."""
+    """Mimics the FixedTiledLayout.device_layout field."""
 
     device_size: int
 
 
 class BufferLayout(Protocol):
-    """This class mimics the TensorBox.layout field (a FixedTiledLayout)."""
+    """Mimics the TensorBox.layout field (a FixedTiledLayout)."""
 
     device_layout: BufferDeviceLayout
     size: int
@@ -31,6 +31,7 @@ class BufferLayout(Protocol):
 
 
 class Buffer(Protocol):
+    """Minimal protocol for a buffer type in the context of an operation"""
     name: str
     size: int
     layout: BufferLayout
@@ -38,22 +39,43 @@ class Buffer(Protocol):
 
 
 class ReadWrites(Protocol):
+    """Captures the buffers which read and/or write from the owning operation"""
     reads: OrderedSet[Buffer]
     writes: OrderedSet[Buffer]
 
 
 class Operation(Protocol):
+    """
+    Defines an named operation with `len(inputs)` input buffers and
+    `len(outputs)` output buffers. 
+    """
     name: str
     inputs: List[str]
     outputs: List[str]
-    _buffer_registry: Dict[str, Buffer]
     op_it_space_splits: List
     origin_node: Self
     target: Self
-    _opname: str
+    
+    def __post_init__(self) -> None: 
+        """
+        _summary_
+        """
+        ...
 
-    def __post_init__(self) -> None: ...
+    def get_read_writes(self) -> ReadWrites: 
+        """
+        _summary_
 
-    def get_read_writes(self) -> ReadWrites: ...
+        Returns:
+            ReadWrites: _description_
+        """
+        ...
 
-    def get_read_names(self) -> List[str]: ...
+    def get_read_names(self) -> List[str]: 
+        """
+        _summary_
+
+        Returns:
+            List[str]: _description_
+        """
+        ...
