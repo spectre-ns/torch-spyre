@@ -16,8 +16,6 @@
 import subprocess
 from typing import Any
 
-from torch_spyre._C import convert_artifacts
-from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec, UnimplementedOp
 from torch_spyre._inductor.codegen.bundle import generate_bundle
@@ -51,7 +49,6 @@ class SpyreAsyncCompile:
                     subprocess.run(
                         ["dxp_standalone", "--bundle", "-d", output_dir], check=True
                     )
-                    convert_artifacts(output_dir)
             return output_dir
 
         return SpyreSDSCKernelRunner(kernel_name, get_output_directory())
