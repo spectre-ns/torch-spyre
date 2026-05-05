@@ -33,11 +33,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
 from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
 from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
 from torch_spyre._inductor import config
-from torch_spyre._inductor.scratchpad_allocator import (
-    Buffer,
-    Operation,
-    Component
-)
+from torch_spyre._inductor.operation import Component
 
 # From scratchpad.py
 AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
@@ -55,6 +51,30 @@ else:
     usuallyExpectedFailure = expectedFailure
 
 
+class BufferDeviceLayout:
+    """This class mimics the FixedTiledLayout.device_layout field."""
+
+    def __init__(self, size: int):
+        self.device_size = [(size + 127) // 128, 128]
+
+
+class BufferLayout:
+    """This class mimics the TensorBox.layout field (a FixedTiledLayout)."""
+
+    def __init__(self, size: int):
+        self.device_layout = BufferDeviceLayout(size)
+        self.size = size
+        self.allocation = {}
+
+
+class Buffer:
+    def __init__(self, name: str, size: int):
+        self.name = name
+        self.size = size
+        self.layout = BufferLayout(size)
+        self.data = self  # This helps 'scratchpad'
+
+
 def make_buffer_registry(names_sizes: dict[str, int]) -> dict[str, Buffer]:
     return {name: Buffer(name=name, size=size) for (name, size) in names_sizes.items()}
 
@@ -67,9 +87,9 @@ class ReadWrites:
 
 @dataclass
 class Operation:
-    _opname: str
+    name: str
     inputs: list[str]
-    output: str
+    outputs: list[str]
     _buffer_registry: dict[str, "Buffer"]
 
     # To make scratchpad.py work, we add origin_node and target fields that point to the op itself,
@@ -79,17 +99,13 @@ class Operation:
     op_it_space_splits = None
     origin_node = None
     target = None
-    name = None
+    _opname = None
 
     def __post_init__(self):
         self.op_it_space_splits = []
         self.origin_node = self
         self.target = self
-        self.name = self.output
-
-    @property
-    def outputs(self):
-        return [self.output]
+        self._opname = self.name
 
     def get_read_writes(self) -> ReadWrites:
         # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
@@ -116,7 +132,6 @@ def make_operations(
         assert isinstance(out, str)
         result.append(Operation(name, ins, out, buffers))
     return result
-
 
 @dataclass
 class Allocation:
