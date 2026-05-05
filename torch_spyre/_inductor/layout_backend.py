@@ -20,18 +20,40 @@ from abc import abstractmethod
 
 @dataclass
 class LifetimeBoundBuffer:
+    """
+    Defines the data fields required for a layout solver.
+    The required heuristics are implementation defined.
+    """
+
     name: str
     size: int
     start_time: int
     end_time: int
+    heuristic: dict[str, float] = {}
     address: Optional[int] = None
     spilled: Optional[bool] = None
-    heuristic: dict[str, float] = {}
 
 
 class LayoutSolver:
+    """
+    An abstract class for defining algorithms which solve
+    the memory layout patterns based on provided sizes, lifetimes,
+    and optional heuristics based on the implementation inputs.
+    """
+
     @abstractmethod
     def plan_layout(
         self, buffers: list[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
+        """
+        Utilizes an implementation defined algorithm to determine
+        whether buffers should be placed in a memory layout based
+        on their attributes.
+
+        Args:
+            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for the memory layout
+
+        Returns:
+            list[LifetimeBoundBuffer]: The set of buffer with their placements defined.
+        """
         pass
