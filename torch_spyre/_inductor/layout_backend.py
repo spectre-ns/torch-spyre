@@ -141,8 +141,14 @@ class GreedyLayoutSolver(LayoutSolver):
         if not buffers:
             return []
 
-        max_time = max(b.end_time for b in buffers)
-        for idx in range(max_time):
+        # walk through all the transition points once in 
+        # chronological order
+        times = [b.start_time for b in buffers]
+        times.extend([b.end_time for b in buffers])
+        times = list(set(times))
+        times.sort()
+
+        for idx in times:
             # attempt to allocate at based on time
             for buffer in buffers:
                 if idx == buffer.end_time:
