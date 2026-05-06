@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from torch._inductor.graph import GraphLowering
 
 
-class SpyreLxOptimizationPass:
+class SpyreLxOptimizationPass(ABC):
     """
     Abstract class for optimization passes which are implemented to improve
     a graph's overall LX memory utilization and/or memory latency.

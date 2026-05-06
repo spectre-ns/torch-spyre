@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from torch._inductor.graph import GraphLowering
 
 
-class LxAllocator:
+class LxAllocator(ABC):
     """
     Abstract class for all implementations of LxAllocators
     """
