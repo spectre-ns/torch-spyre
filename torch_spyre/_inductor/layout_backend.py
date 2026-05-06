@@ -63,9 +63,7 @@ class GreedyLayoutSolver(LayoutSolver):
     def __init__(self, size: int, alignment: int = 128):
         self.limit = size
         self.alignment = alignment
-        self.usage: list[
-            LifetimeBoundBuffer
-        ] = []
+        self.usage: list[LifetimeBoundBuffer] = []
 
     def get_lowest_addr_in_use(self):
         if self.usage:
@@ -84,29 +82,27 @@ class GreedyLayoutSolver(LayoutSolver):
         return total_avail
 
     def find_free_block(self, size_needed: int) -> Optional[int]:
-        # cannot perform defragmentation yet, will add more cases in the future
+        assert all(x.address is not None for x in self.usage)
         curr_lo = self.get_lowest_addr_in_use()
         curr_hi = self.get_highest_addr_in_use()
         if not self.usage or curr_lo >= size_needed:
-            # completely free or enough room at addr0
             return 0
         elif curr_hi + size_needed - 1 < self.limit:
             address = math.ceil(curr_hi / self.alignment) * self.alignment
             if address < self.limit:
                 return address
         elif self.usage:
-            # find a "hole" between lowest and highest (assume a block was dealloc'ed)
-            rec_only = self.usage  # simply drop tensor names, not needed
-            sorted_rec = sorted(rec_only, key=lambda rec: rec.address)
-            for i in range(len(sorted_rec) - 1):
-                frag_st = sorted_rec[i].address + sorted_rec[i].size
-                frag_end = sorted_rec[i + 1].address
-                if frag_end - frag_st >= size_needed:
+            self.usage.sort(key=lambda x: (x.address is None, x.address))
+            for i in range(len(self.usage) - 1):
+                assert (current_address := self.usage[i].address) is not None
+                assert (next_address := self.usage[i + 1].address) is not None
+                frag_st = current_address + self.usage[i].size
+                if next_address - frag_st >= size_needed:
                     return frag_st
             return None
-        else:
-            # cannot find any free blocks
-            return None
+
+        # cannot find any free blocks
+        return None
 
     def try_allocate(self, buffer: LifetimeBoundBuffer):
         """
@@ -129,7 +125,6 @@ class GreedyLayoutSolver(LayoutSolver):
             self.usage.append(buffer)
         else:
             buffer.address = None
-  
 
     def deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
         """Try to deallocate each of the buffers in a list, if exists."""
