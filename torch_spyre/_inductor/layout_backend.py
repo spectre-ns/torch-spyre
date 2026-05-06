@@ -13,8 +13,8 @@
 # limitations under the License.
 
 
-from dataclasses import dataclass
-from typing import list, Optional, dict, str, float
+from dataclasses import dataclass, field
+from typing import Optional
 from abc import ABC, abstractmethod
 import math
 
@@ -30,9 +30,8 @@ class LifetimeBoundBuffer:
     size: int
     start_time: int
     end_time: int
-    heuristic: dict[str, float] = {}
+    heuristic: dict[str, float] = field(default_factory=dict)
     address: Optional[int] = None
-    spilled: Optional[bool] = None
 
 
 class LayoutSolver(ABC):
@@ -61,47 +60,47 @@ class LayoutSolver(ABC):
 
 
 class GreedyLayoutSolver(LayoutSolver):
-    def __init__(self, size: int):
-        # scratch pad is 2MB = 2<<20 bytes in total. preserve total * DXP_LX_FRAC_AVAIL
-        # for backend usage unless specified otherwise
+    def __init__(self, size: int, alignment: int = 128):
         self.limit = size
+        self.alignment = alignment
         self.usage: list[
             LifetimeBoundBuffer
-        ] = []  # each record will be tensor_name:{"addr": yy, "size": zz}
+        ] = []
 
     def get_lowest_addr_in_use(self):
-        if len(self.usage) > 0:
-            return min([rec["addr"] for rec in self.usage.values()])
-        return None
+        if self.usage:
+            return min([rec.address for rec in self.usage])
+        return 0
 
     def get_highest_addr_in_use(self):
-        if len(self.usage) > 0:
-            return max([rec["addr"] + rec["size"] for rec in self.usage.values()])
-        return None
+        if self.usage:
+            return max([rec.address + rec.size for rec in self.usage])
+        return 0
 
     def get_available_total(self):
         total_avail = self.limit
-        for rec in self.usage.values():
-            total_avail -= rec["size"]
+        for rec in self.usage:
+            total_avail -= rec.size
         return total_avail
 
     def find_free_block(self, size_needed: int) -> Optional[int]:
         # cannot perform defragmentation yet, will add more cases in the future
         curr_lo = self.get_lowest_addr_in_use()
         curr_hi = self.get_highest_addr_in_use()
-        if len(self.usage) == 0 or curr_lo >= size_needed:
+        if not self.usage or curr_lo >= size_needed:
             # completely free or enough room at addr0
             return 0
-        elif curr_hi + size_needed < self.limit:
-            # enough room at higher addr, return next 128-multiple
-            return math.ceil(curr_hi / 128) * 128
-        elif len(self.usage) > 1:
+        elif curr_hi + size_needed - 1 < self.limit:
+            address = math.ceil(curr_hi / self.alignment) * self.alignment
+            if address < self.limit:
+                return address
+        elif self.usage:
             # find a "hole" between lowest and highest (assume a block was dealloc'ed)
-            rec_only = list(self.usage.values())  # simply drop tensor names, not needed
-            sorted_rec = sorted(rec_only, key=lambda rec: rec["addr"])
+            rec_only = self.usage  # simply drop tensor names, not needed
+            sorted_rec = sorted(rec_only, key=lambda rec: rec.address)
             for i in range(len(sorted_rec) - 1):
-                frag_st = sorted_rec[i]["addr"] + sorted_rec[i]["size"]
-                frag_end = sorted_rec[i + 1]["addr"]
+                frag_st = sorted_rec[i].address + sorted_rec[i].size
+                frag_end = sorted_rec[i + 1].address
                 if frag_end - frag_st >= size_needed:
                     return frag_st
             return None
@@ -125,19 +124,21 @@ class GreedyLayoutSolver(LayoutSolver):
         # Decide whether to reuse.
         addr = self.find_free_block(buffer.size)
 
-        if addr:
-            self.usage.append(buffer)
+        if addr is not None:
             buffer.address = addr
-            buffer.spilled = False
+            self.usage.append(buffer)
+        else:
+            buffer.address = None
+  
 
-    def deallocate(self, bufs: list[str] | str):
+    def deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
         """Try to deallocate each of the buffers in a list, if exists."""
-        if isinstance(bufs, str):
+        if isinstance(bufs, LifetimeBoundBuffer):
             bufs = [bufs]
 
         for buf in bufs:
             if buf in self.usage:
-                del self.usage[buf]
+                del self.usage[self.usage.index(buf)]
 
     def plan_layout(
         self, buffers: list[LifetimeBoundBuffer]
@@ -149,10 +150,10 @@ class GreedyLayoutSolver(LayoutSolver):
         for idx in range(max_time):
             # attempt to allocate at based on time
             for buffer in buffers:
+                if idx == buffer.end_time:
+                    self.deallocate(buffer)
+
                 if idx == buffer.start_time:
                     self.try_allocate(buffer)
-
-                if idx == buffer.end_time:
-                    self.deallocate(buffer.name)
 
         return buffers
