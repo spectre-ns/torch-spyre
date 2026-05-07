@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
 
@@ -29,9 +29,8 @@ class LifetimeBoundBuffer:
     size: int
     start_time: int
     end_time: int
-    heuristic: dict[str, float] = {}
+    heuristic: dict[str, float] = field(default_factory=dict)
     address: Optional[int] = None
-    spilled: Optional[bool] = None
 
 
 class MemoryPlanSolver(ABC):
