@@ -14,7 +14,7 @@
 
 
 from dataclasses import dataclass
-from typing import list, Optional, dict, str, float
+from typing import Optional
 from abc import ABC, abstractmethod
 
 
@@ -34,7 +34,7 @@ class LifetimeBoundBuffer:
     spilled: Optional[bool] = None
 
 
-class LayoutSolver(ABC):
+class MemoryPlanSolver(ABC):
     """
     An abstract class for defining algorithms which solve
     memory layout patterns based on provided sizes, lifetimes,
