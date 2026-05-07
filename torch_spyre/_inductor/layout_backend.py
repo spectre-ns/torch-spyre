@@ -123,12 +123,6 @@ class GreedyLayoutSolver(LayoutSolver):
             buffer.address = None
 
     def _try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
-        """
-        _summary_
-
-        Args:
-            bufs (list[LifetimeBoundBuffer] | LifetimeBoundBuffer): _description_
-        """
         if isinstance(bufs, LifetimeBoundBuffer):
             bufs = [bufs]
 
@@ -139,14 +133,31 @@ class GreedyLayoutSolver(LayoutSolver):
     def plan_layout(
         self, buffers: list[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
-        """
-        _summary_
+        """Allocates addresses to the provided buffer list
+
+        Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
+        allocated addresses with 0 -> `size` where the maximum starting address of
+        buffers are at most `self.size` -  `LifetimeBoundBuffer.size` - 1. The algorithm
+        increments through logical time where time increments 1 unit for each 
+        step in a computation graph. At each step the lifetimes of all buffers are
+        evaluted for allocation and deallocation based on its lifetime relative
+        to the time being evaluated. As an optimization, times where no buffers
+        enter or exit scope are not evaluated.
+
+        When a buffer enters scope, the current useage is evaluated to in the following
+        manner:
+            1. Is there enough space from address 0 -> first useage.
+            2. Is the enough space for the current buffer from the max address
+                to the maximum memory address. Allocate as current_max + 1 + alignment
+            3. Is there space between allocations. Check for gaps between current
+                allocations and find where gaps exceed current size. Allocate if
+                current gap is larger than current size + allignment
 
         Args:
-            buffers (list[LifetimeBoundBuffer]): _description_
+            buffers (list[LifetimeBoundBuffer]): The set of buffers to be planned.
 
         Returns:
-            list[LifetimeBoundBuffer]: _description_
+            list[LifetimeBoundBuffer]: The supplied buffers with addresses assigned.
         """
         if not buffers:
             return []
