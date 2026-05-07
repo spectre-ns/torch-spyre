@@ -65,26 +65,26 @@ class GreedyLayoutSolver(LayoutSolver):
         self.alignment = alignment
         self.usage: list[LifetimeBoundBuffer] = []
 
-    def get_lowest_addr_in_use(self):
+    def _get_lowest_addr_in_use(self):
         if self.usage:
             return min([rec.address for rec in self.usage])
         return 0
 
-    def get_highest_addr_in_use(self):
+    def _get_highest_addr_in_use(self):
         if self.usage:
             return max([rec.address + rec.size for rec in self.usage]) - 1
         return 0
 
-    def get_available_total(self):
+    def _get_available_total(self):
         total_avail = self.limit
         for rec in self.usage:
             total_avail -= rec.size
         return total_avail
 
-    def find_free_block(self, size_needed: int) -> Optional[int]:
+    def _find_free_block(self, size_needed: int) -> Optional[int]:
         assert all(x.address is not None for x in self.usage)
-        curr_lo = self.get_lowest_addr_in_use()
-        curr_hi = self.get_highest_addr_in_use()
+        curr_lo = self._get_lowest_addr_in_use()
+        curr_hi = self._get_highest_addr_in_use()
         if not self.usage or curr_lo >= size_needed:
             return 0
         elif curr_hi + size_needed < self.limit:
@@ -106,7 +106,7 @@ class GreedyLayoutSolver(LayoutSolver):
         # cannot find any free blocks
         return None
 
-    def try_allocate(self, buffer: LifetimeBoundBuffer):
+    def _try_allocate(self, buffer: LifetimeBoundBuffer):
         """
         _summary_
 
@@ -114,7 +114,7 @@ class GreedyLayoutSolver(LayoutSolver):
             buffer (LifetimeBoundBuffer): _description_
         """
         # Decide whether to reuse.
-        addr = self.find_free_block(buffer.size)
+        addr = self._find_free_block(buffer.size)
 
         if addr is not None:
             buffer.address = addr
@@ -122,7 +122,7 @@ class GreedyLayoutSolver(LayoutSolver):
         else:
             buffer.address = None
 
-    def try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
+    def _try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
         """
         _summary_
 
@@ -162,9 +162,9 @@ class GreedyLayoutSolver(LayoutSolver):
             # attempt to allocate at based on time
             for buffer in buffers:
                 if idx == buffer.end_time:
-                    self.try_deallocate(buffer)
+                    self._try_deallocate(buffer)
 
                 if idx == buffer.start_time:
-                    self.try_allocate(buffer)
+                    self._try_allocate(buffer)
 
         return buffers
