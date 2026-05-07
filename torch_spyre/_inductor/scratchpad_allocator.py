@@ -18,16 +18,16 @@ from torch._inductor.graph import GraphLowering
 
 class ScratchpadAllocator(ABC):
     """
-    Abstract class for all implementations of LxAllocators
+    Abstract class for all implementations of ScratchpadAllocator
     """
 
     @abstractmethod
     def plan_allocation(self, graph: GraphLowering):
         """
-        Accepts a graph to be considerd for LX memory according
+        Accepts a graph to be considerd for scratchpad memory according
         to its composition and the specific implementation used.
 
         Args:
-            graph (GraphLowering): Graph to be considered for LX planning
+            graph (GraphLowering): Graph to be considered for scratchpad planning
         """
         pass

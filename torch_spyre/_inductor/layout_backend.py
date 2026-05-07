@@ -47,7 +47,7 @@ class MemoryPlanSolver(ABC):
     ) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
-        if and where buffers should be placed in lx memory based
+        if and where buffers should be placed in scratchpad memory based
         on their attributes.
 
         Args:
