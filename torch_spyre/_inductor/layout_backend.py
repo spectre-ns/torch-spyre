@@ -92,7 +92,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             if address < self.limit:
                 return address
         elif self.usage:
-            #force allignment here. It might be best to inflate the buffers to the alignment
+            # force allignment here. It might be best to inflate the buffers to the alignment
             self.usage.sort(key=lambda x: (x.address is None, x.address))
             for i in range(len(self.usage) - 1):
                 assert (current_address := self.usage[i].address) is not None
@@ -138,7 +138,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
         allocated addresses with 0 -> `size` where the maximum starting address of
         buffers are at most `self.size` -  `LifetimeBoundBuffer.size` - 1. The algorithm
-        increments through logical time where time increments 1 unit for each 
+        increments through logical time where time increments 1 unit for each
         step in a computation graph. At each step the lifetimes of all buffers are
         evaluted for allocation and deallocation based on its lifetime relative
         to the time being evaluated. As an optimization, times where no buffers
@@ -162,7 +162,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         if not buffers:
             return []
 
-        # walk through all the transition points once in 
+        # walk through all the transition points once in
         # chronological order
         times = [b.start_time for b in buffers]
         times.extend([b.end_time for b in buffers])

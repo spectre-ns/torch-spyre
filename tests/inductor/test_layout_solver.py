@@ -21,6 +21,7 @@ __LARGE_SIZE__ = 512
 __SMALL_SIZE__ = 10
 __ALIGNMENT__ = 128
 
+
 class TestGreedySolver(TestCase):
     def verify_layout(
         self,
@@ -116,7 +117,7 @@ class TestGreedySolver(TestCase):
             solvers.LifetimeBoundBuffer("buffer3", 3, 3, 4, {}, 3),
         ]
         self.verify_layout(input, expectation)
-    
+
     def test_realloc_between_with_allocation(self):
         input = [
             solvers.LifetimeBoundBuffer("buffer0", 200, 0, 4, {}),
