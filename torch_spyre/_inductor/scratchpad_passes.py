@@ -19,17 +19,17 @@ from torch._inductor.graph import GraphLowering
 class ScratchpadOptimizationPass(ABC):
     """
     Abstract class for optimization passes which are implemented to improve
-    a graph's overall LX memory utilization and/or memory latency.
+    a graph's overall scratchpad memory utilization and/or memory latency.
     """
 
     @abstractmethod
     def apply_pass(self, graph: GraphLowering):
         """
-        Accepts a candidate graph to be optimized and evaluated for lx memory allocation.
+        Accepts a candidate graph to be optimized and evaluated for scratchpad memory allocation.
         `graph` will be mutated according in an implementation defined way. The order and
         number of nodes in the graph may change as a result of an optimization pass.
 
         Args:
-            graph (GraphLowering): The graph to be optimized for LX memory allocation
+            graph (GraphLowering): The graph to be optimized for scratchpad memory allocation
         """
         pass
