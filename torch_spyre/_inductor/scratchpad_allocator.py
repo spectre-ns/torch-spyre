@@ -31,3 +31,8 @@ class ScratchpadAllocator(ABC):
             graph (GraphLowering): Graph to be considered for scratchpad planning
         """
         pass
+
+
+class DefaultScratchPadAllocator(ScratchpadAllocator):
+    def plan_allocation(self, graph: GraphLowering):
+        pass
