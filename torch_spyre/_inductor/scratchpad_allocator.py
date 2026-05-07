@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from torch._inductor.graph import GraphLowering
 
 
-class LxAllocator(ABC):
+class ScratchpadAllocator(ABC):
     """
     Abstract class for all implementations of LxAllocators
     """
