@@ -72,7 +72,7 @@ class GreedyLayoutSolver(LayoutSolver):
 
     def get_highest_addr_in_use(self):
         if self.usage:
-            return max([rec.address + rec.size for rec in self.usage])
+            return max([rec.address + rec.size for rec in self.usage]) - 1
         return 0
 
     def get_available_total(self):
@@ -87,11 +87,12 @@ class GreedyLayoutSolver(LayoutSolver):
         curr_hi = self.get_highest_addr_in_use()
         if not self.usage or curr_lo >= size_needed:
             return 0
-        elif curr_hi + size_needed - 1 < self.limit:
-            address = math.ceil(curr_hi / self.alignment) * self.alignment
+        elif curr_hi + size_needed < self.limit:
+            address = math.ceil((curr_hi + 1) / self.alignment) * self.alignment
             if address < self.limit:
                 return address
         elif self.usage:
+            #force allignment here. It might be best to inflate the buffers to the alignment
             self.usage.sort(key=lambda x: (x.address is None, x.address))
             for i in range(len(self.usage) - 1):
                 assert (current_address := self.usage[i].address) is not None
@@ -106,16 +107,10 @@ class GreedyLayoutSolver(LayoutSolver):
 
     def try_allocate(self, buffer: LifetimeBoundBuffer):
         """
-        Simple reuse rule:
-        1. for an "input" tensor, found a matched tensor (name and size) on LX
-        2. for an output tensor, if this op is on the "white list" => prep for pinning
-            => alloc a new LX block for the "output" of the op
-        If can_reuse => add lx info to corresponding buffer.layout
-        NOTE: 1. if an op, e.g. max, occurs multiple times on graph, output buffers will
-                 have different names -> end-of-life analysis will take care of dealloc
-              2. prev Op's sdsc.out.out.out.json may have useful info, not needed yet
-              3. may be able to generalize this decision in buf end-of-life analysis
-              4. greedy alloc may cause fragments, can further improve
+        _summary_
+
+        Args:
+            buffer (LifetimeBoundBuffer): _description_
         """
         # Decide whether to reuse.
         addr = self.find_free_block(buffer.size)
@@ -126,8 +121,13 @@ class GreedyLayoutSolver(LayoutSolver):
         else:
             buffer.address = None
 
-    def deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
-        """Try to deallocate each of the buffers in a list, if exists."""
+    def try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
+        """
+        _summary_
+
+        Args:
+            bufs (list[LifetimeBoundBuffer] | LifetimeBoundBuffer): _description_
+        """
         if isinstance(bufs, LifetimeBoundBuffer):
             bufs = [bufs]
 
@@ -138,6 +138,15 @@ class GreedyLayoutSolver(LayoutSolver):
     def plan_layout(
         self, buffers: list[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
+        """
+        _summary_
+
+        Args:
+            buffers (list[LifetimeBoundBuffer]): _description_
+
+        Returns:
+            list[LifetimeBoundBuffer]: _description_
+        """
         if not buffers:
             return []
 
@@ -152,7 +161,7 @@ class GreedyLayoutSolver(LayoutSolver):
             # attempt to allocate at based on time
             for buffer in buffers:
                 if idx == buffer.end_time:
-                    self.deallocate(buffer)
+                    self.try_deallocate(buffer)
 
                 if idx == buffer.start_time:
                     self.try_allocate(buffer)
