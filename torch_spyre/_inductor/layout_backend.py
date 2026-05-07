@@ -34,7 +34,7 @@ class LifetimeBoundBuffer:
     address: Optional[int] = None
 
 
-class LayoutSolver(ABC):
+class MemoryPlanSolver(ABC):
     """
     An abstract class for defining algorithms which solve
     memory layout patterns based on provided sizes, lifetimes,
