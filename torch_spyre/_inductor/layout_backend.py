@@ -98,6 +98,7 @@ class GreedyLayoutSolver(LayoutSolver):
                 assert (current_address := self.usage[i].address) is not None
                 assert (next_address := self.usage[i + 1].address) is not None
                 frag_st = current_address + self.usage[i].size
+                frag_st = math.ceil((frag_st) / self.alignment) * self.alignment
                 if next_address - frag_st >= size_needed:
                     return frag_st
             return None
