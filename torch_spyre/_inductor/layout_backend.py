@@ -59,7 +59,7 @@ class MemoryPlanSolver(ABC):
         pass
 
 
-class GreedyLayoutSolver(LayoutSolver):
+class GreedyLayoutSolver(MemoryPlanSolver):
     def __init__(self, size: int, alignment: int = 128):
         self.limit = size
         self.alignment = alignment
