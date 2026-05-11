@@ -173,7 +173,7 @@ class GreedyLayoutSolver(LayoutSolver):
 
 class SortedLayoutSolver(LayoutSolver):
     def __init__(self, capacity: int, sorting_attribute="size"):
-        assert hasattr(LifetimeBoundBuffer, sorting_attribute), (
+        assert sorting_attribute in LifetimeBoundBuffer.__dataclass_fields__, (
             "sorting_attribute must be a valid attribute of LifetimeBoundBuffer"
         )
         self.capacity = capacity
