@@ -16,6 +16,7 @@
 from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
+from operator import attrgetter
 import math
 
 
@@ -92,7 +93,7 @@ class GreedyLayoutSolver(LayoutSolver):
             if address < self.limit:
                 return address
         elif self.usage:
-            #force allignment here. It might be best to inflate the buffers to the alignment
+            # force allignment here. It might be best to inflate the buffers to the alignment
             self.usage.sort(key=lambda x: (x.address is None, x.address))
             for i in range(len(self.usage) - 1):
                 assert (current_address := self.usage[i].address) is not None
@@ -151,7 +152,7 @@ class GreedyLayoutSolver(LayoutSolver):
         if not buffers:
             return []
 
-        # walk through all the transition points once in 
+        # walk through all the transition points once in
         # chronological order
         times = [b.start_time for b in buffers]
         times.extend([b.end_time for b in buffers])
@@ -168,3 +169,84 @@ class GreedyLayoutSolver(LayoutSolver):
                     self.try_allocate(buffer)
 
         return buffers
+
+
+class SortedLayoutSolver(LayoutSolver):
+    def __init__(self, capacity: int, sorting_attribute="size"):
+        assert hasattr(LifetimeBoundBuffer, sorting_attribute), (
+            "sorting_attribute must be a valid attribute of LifetimeBoundBuffer"
+        )
+        self.capacity = capacity
+        self.sorting_attribute = sorting_attribute
+
+    def allocate_sorted_global(
+        self, buffers: list[LifetimeBoundBuffer]
+    ) -> list[LifetimeBoundBuffer]:
+        buffers.sort(
+            key=attrgetter(self.sorting_attribute),
+            reverse=True,
+        )
+
+        allocated_buffers: list[LifetimeBoundBuffer] = []
+        for target in buffers:
+            self.place_buffer(target, allocated_buffers)
+
+        return allocated_buffers
+
+    def place_buffer(
+        self, target: LifetimeBoundBuffer, allocated_buffers: list[LifetimeBoundBuffer]
+    ):
+        # Find all currently allocated buffers that overlap in TIME
+        overlapping_in_time = []
+        for alloc in allocated_buffers:
+            if max(target.start_time, alloc.start_time) < min(
+                target.end_time, alloc.end_time
+            ):
+                overlapping_in_time.append(alloc)
+
+        # Extract their memory address ranges and sort them spatially
+        occupied_spaces = sorted(
+            [
+                (b.address, b.address + b.size)
+                for b in overlapping_in_time
+                if b.address is not None
+            ]
+        )
+
+        # Find all free gaps in memory during this time window
+        free_gaps = self.find_free_gaps(occupied_spaces)
+
+        # Filter gaps to only those large enough to hold the target buffer
+        valid_gaps = [gap for gap in free_gaps if gap[1] - gap[0] >= target.size]
+
+        if valid_gaps:
+            # BEST-FIT LOGIC: Find the interval closest matching the needed space
+            best_gap = min(valid_gaps, key=lambda gap: (gap[1] - gap[0]) - target.size)
+
+            # Assign the address (starting at the bottom of the best-fit gap)
+            target.address = best_gap[0]
+        else:
+            # No valid gap found, the buffer must be spilled to DRAM
+            target.spilled = True
+            target.address = None
+        allocated_buffers.append(target)
+
+    def find_free_gaps(self, occupied: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Given a sorted list of occupied memory intervals, return the free gaps."""
+        gaps = []
+        current_addr = 0
+
+        for start, end in occupied:
+            if start > current_addr:
+                gaps.append((current_addr, start))
+            current_addr = max(current_addr, end)
+
+        if current_addr < self.capacity:
+            gaps.append((current_addr, self.capacity))
+
+        return gaps
+
+    def plan_layout(
+        self, buffers: list[LifetimeBoundBuffer]
+    ) -> list[LifetimeBoundBuffer]:
+        return self.allocate_sorted_global(buffers)
