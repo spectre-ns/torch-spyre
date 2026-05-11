@@ -29,7 +29,7 @@ class LifetimeBoundBuffer:
     size: int
     start_time: int
     end_time: int
-    heuristic: dict[str, float] = field(default_factory=dict)
+    heuristic: Optional[float] = None
     address: Optional[int] = None
 
 
