@@ -13,7 +13,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._inductor.scratchpad.scratchpad import (
     scratchpad_planning,
-    ScratchPadAllocator,
+    GreedyAllocator,
     GreedyAllocationStrategy,
 )
 from torch_spyre._inductor import config
@@ -206,7 +206,7 @@ class Pattern:
         return (list(inputs), outputs)
 
 
-class InstrumentedAllocator(ScratchPadAllocator):
+class InstrumentedAllocator(GreedyAllocator):
     def __init__(self, pattern: Pattern, lowering: "MockGraphLowering"):
         super().__init__()
         self.allocations: dict[str, int] = {}
