@@ -25,7 +25,7 @@ from torch._inductor.virtualized import V
 from torch._inductor import config as t_inductor_config
 from torch._inductor.ir import Operation
 
-from torch_spyre._inductor.scratchpad import ScratchPadAllocator
+from torch_spyre._inductor.scratchpad.scratchpad import ScratchPadAllocator
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config

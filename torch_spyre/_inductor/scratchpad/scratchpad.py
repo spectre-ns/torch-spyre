@@ -24,9 +24,9 @@ from torch._inductor.lowering import lowerings, clone as clone_lowering
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch._inductor.graph import GraphLowering
-from .logging_utils import get_inductor_logger
-from .ir import FixedTiledLayout, TensorBox
-from . import config
+from ..logging_utils import get_inductor_logger
+from ..ir import FixedTiledLayout, TensorBox
+from .. import config
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
