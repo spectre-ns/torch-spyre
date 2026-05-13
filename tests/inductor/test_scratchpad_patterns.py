@@ -10,7 +10,7 @@ from functools import wraps
 
 from torch.utils._ordered_set import OrderedSet
 
-from torch_spyre._inductor.scratchpad import (
+from torch_spyre._inductor.scratchpad.scratchpad import (
     scratchpad_planning,
     ScratchPadAllocator,
     GreedyAllocationStrategy,

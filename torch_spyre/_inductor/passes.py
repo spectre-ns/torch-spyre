@@ -44,7 +44,7 @@ from .optimize_restickify import optimize_restickify_locations
 from .insert_restickify import insert_restickify, finalize_layouts
 from .work_division import span_reduction, work_distribution
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
-from .scratchpad import scratchpad_planning
+from .scratchpad.scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
