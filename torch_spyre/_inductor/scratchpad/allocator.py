@@ -22,7 +22,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 from torch_spyre._inductor.scratchpad.passes import ScratchpadOptimizationPass
 from torch_spyre._inductor.scratchpad.utility import (
     is_permissible_op,
-    determine_core_division,
+    is_core_division_equal,
+    is_graph_edge,
     calculate_liveness,
     push_allocation,
     mem_usage_by_buffer,
@@ -32,8 +33,13 @@ from torch_spyre._inductor.scratchpad.utility import (
 class GraphBufferConverstion:
     def __init__(
         self,
-        permitted_ops: list[str] = ["max", "sum"],
-        in_place_ops: list[str] = ["add", "div"],
+        permitted_ops: list[str] = [
+            "max",
+            "sum",
+            "exp",
+            "sub",
+        ],
+        in_place_ops: list[str] = ["exp", "sub"],
     ):
         self.permitted_ops = permitted_ops
         self.in_place_ops = in_place_ops
@@ -42,10 +48,14 @@ class GraphBufferConverstion:
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
         permissible_ops = is_permissible_op(graph, self.permitted_ops)
-        core_division_match = determine_core_division(graph)
-        drop_list = [
-            key for key, permissible in permissible_ops.items() if not permissible
-        ] + [key for key, permissible in core_division_match.items() if not permissible]
+        core_division_match = is_core_division_equal(graph)
+        input_output = is_graph_edge(graph)
+
+        drop_list = (
+            [key for key, permissible in permissible_ops.items() if not permissible] + 
+            [key for key, permissible in core_division_match.items() if not permissible] +
+            [key for key, edge in input_output.items() if edge]
+        )
 
         return [b for b in buffers if b.name not in drop_list]
 
