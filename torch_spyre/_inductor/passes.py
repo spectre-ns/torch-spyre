@@ -24,6 +24,7 @@ from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
 )
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
@@ -213,7 +214,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
     Operations are in topological order (guaranteed by GraphLowering).
     """
 
-    def __call__(self, operations: list[Operation]) -> None:
+    def __call__(self, graph: GraphLowering) -> None:
+        operations = graph.operations
         has_spyre_device = any(
             op.get_device() is not None and op.get_device().type == DEVICE_NAME
             for op in operations
@@ -237,7 +239,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         )
         work_distribution(operations, k_fast_ops)
         if config.lx_planning:
-            scratchpad_planning(operations)
+            scratchpad_planning(graph)
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", _format_operations(operations))

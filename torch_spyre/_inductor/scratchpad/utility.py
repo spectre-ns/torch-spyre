@@ -19,7 +19,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 
 def op_output_good_for_lx_reuse(org_op_name: str, op_list: list[str]) -> bool:
-    return any(op in org_op_name for op in op_list)
+    return org_op_name in op_list
 
 
 def is_permissible_op(graph: GraphLowering, op_list: list[str]) -> dict[str, bool]:
@@ -47,21 +47,31 @@ def get_buffer_users(graph: GraphLowering) -> dict[str, list[str]]:
             ]
     return buf_users_read_and_write
 
+def is_graph_edge(graph: GraphLowering) -> dict[str, bool]:
+    output_names = set(graph.get_output_names())
+    result = {}
+    for op in graph.operations:
+        rw = op.get_read_writes()
+        for dep in rw.reads | rw.writes:
+            name = dep.name
+            result[name] = name in graph.graph_inputs or name in output_names
+    return result
 
-def determine_core_division(graph: GraphLowering) -> dict[str, bool]:
-    core_div_mismatch: dict[str, bool] = {}
+
+def is_core_division_equal(graph: GraphLowering) -> dict[str, bool]:
+    core_div_matches: dict[str, bool] = {}
     users = get_buffer_users(graph)
     for buf_name, users_rw in users.items():
         # this dict includes graph input and output
-        core_div_mismatch[buf_name] = True
+        core_div_matches[buf_name] = True
         user_ops = [op for op in graph.operations if op.name in users_rw]
         if all([hasattr(op, "op_it_space_splits") for op in user_ops]):
             # graph input and output can have only 1 read or 1 write user.
             u0_split = user_ops[0].op_it_space_splits  # a list like [16, 1]
-            core_div_mismatch[buf_name] = all(
+            core_div_matches[buf_name] = all(
                 u0_split == u.op_it_space_splits for u in user_ops[1:]
             )
-    return core_div_mismatch
+    return core_div_matches
 
 
 def calculate_buffer_statistics(graph: GraphLowering) -> dict[str, dict[str, int]]:
@@ -91,16 +101,17 @@ def calculate_buffer_statistics(graph: GraphLowering) -> dict[str, dict[str, int
 
 def mem_usage_by_buffer(graph: GraphLowering) -> dict[str, int]:
     mem_usage = {}
-    rw_list = [op.get_read_writes for op in graph.operations]
+    rw_list = [op.get_read_writes() for op in graph.operations]
     deps = [rw.reads | rw.writes for rw in rw_list]
-    bufs = [graph.get_buffer(dep.name) for dep in deps]
+    dep_names = set([dep.name for dep_list in deps for dep in dep_list])
+    bufs = {n: graph.get_buffer(n) for n in dep_names}
 
     def get_device_size(buf):
         dev_layout = buf.layout.device_layout
         dev_size = math.prod(dev_layout.device_size[:-1]) * 128
         return dev_size
 
-    mem_usage = {buf: get_device_size(buf) for buf in bufs}
+    mem_usage = {n: get_device_size(buf) for n, buf in bufs.items()}
 
     return mem_usage
 

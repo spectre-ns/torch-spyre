@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from typing import Callable, Any, Optional, override
+from typing import Callable, Any, Optional
 
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -27,6 +27,12 @@ from torch._inductor.graph import GraphLowering
 from ..logging_utils import get_inductor_logger
 from ..ir import FixedTiledLayout, TensorBox
 from .. import config
+
+from torch_spyre._inductor.scratchpad.allocator import (
+    ScratchpadAllocator,
+    DefaultAllocator,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
@@ -45,7 +51,7 @@ OP_GOOD_FOR_LX_INPLACE = [
 logger = get_inductor_logger("LX_PLANNING")
 
 
-class ScratchPadAllocator:
+class GreedyAllocator:
     """LX manager simplified version"""
 
     def __init__(self, size: int = -1):
@@ -269,18 +275,13 @@ class ScratchPadAllocator:
         return mem_usage
 
 
-class AllocationStrategy:
-    def plan_allocation(self, operations: list[Operation]):
-        raise NotImplementedError("This is an abstract base class.")
-
-
-class GreedyAllocationStrategy(AllocationStrategy):
+class GreedyAllocationStrategy(ScratchpadAllocator):
     def __init__(
         self,
-        alloc: Optional[ScratchPadAllocator] = None,
+        alloc: Optional[GreedyAllocator] = None,
         graph_lowering: Optional[GraphLowering] = None,
     ):
-        self.alloc = alloc if alloc else ScratchPadAllocator()
+        self.alloc = alloc if alloc else GreedyAllocator()
         self.graph_lowering = graph_lowering if graph_lowering else V.graph
 
     def should_consider_op(self, op: Operation) -> bool:
@@ -524,8 +525,8 @@ class GreedyAllocationStrategy(AllocationStrategy):
 
             lx_free_total -= dev_size
 
-    @override
-    def plan_allocation(self, operations: list[Operation]):
+    def plan_allocation(self, graph: GraphLowering):
+        operations = graph.operations
         idx_to_dealloc_bufs, buf_users, core_div_mismatch = self.buf_analysis(
             operations
         )
@@ -557,12 +558,14 @@ class GreedyAllocationStrategy(AllocationStrategy):
 
 
 def scratchpad_planning(
-    operations: list[Operation],
-    strategy: Optional[AllocationStrategy] = None,
+    graph: GraphLowering,
+    strategy: Optional[ScratchpadAllocator] = None,
 ) -> None:
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts).
     if not strategy:
-        strategy = GreedyAllocationStrategy()
-    strategy.plan_allocation(operations)
+        strategy = DefaultAllocator(
+            GreedyLayoutSolver(int((2 << 20) * (1.0 - config.dxp_lx_frac_avail)))
+        )
+    strategy.plan_allocation(graph)
