@@ -22,7 +22,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     DefaultAllocator,
     GraphBufferConverstion,
 )
-from torch_spyre._inductor.scratchpad.utility import (
+from torch_spyre._inductor.scratchpad.utils import (
     is_permissible_op,
     get_buffer_users,
     determine_core_division,
