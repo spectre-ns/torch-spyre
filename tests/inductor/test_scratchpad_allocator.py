@@ -23,7 +23,6 @@ from torch_spyre._inductor.scratchpad.allocator import (
     GraphBufferConverstion,
 )
 from torch_spyre._inductor.scratchpad.utility import (
-    op_output_good_for_lx_reuse,
     is_permissible_op,
     get_buffer_users,
     determine_core_division,
@@ -62,11 +61,6 @@ def _make_op(
 
 
 class TestAllocationUtilities(TestCase):
-    def test_op_lx_reuse(self):
-        allowed_ops = ["add", "sub"]
-        self.assertTrue(op_output_good_for_lx_reuse("add", allowed_ops))
-        self.assertFalse(op_output_good_for_lx_reuse("mul", allowed_ops))
-
     def test_permissible_op(self):
         allowed_ops = ["add", "sub"]
 

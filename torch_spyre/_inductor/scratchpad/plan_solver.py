@@ -17,20 +17,19 @@ from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
 import math
+from torch_spyre._inductor import config
 
 
 @dataclass
 class LifetimeBoundBuffer:
     """
     Defines the data fields required for a plan solver.
-    The required heuristics are implementation defined.
     """
 
     name: str
     size: int
     start_time: int
     end_time: int
-    heuristic: Optional[float] = None
     address: Optional[int] = None
     in_place: list[str] = field(default_factory=list)
 
@@ -38,9 +37,24 @@ class LifetimeBoundBuffer:
 class MemoryPlanSolver(ABC):
     """
     An abstract class for defining algorithms which solve
-    memory layout patterns based on provided sizes, lifetimes,
-    and optional heuristics based on the implementation details.
+    memory layout patterns based on provided sizes, lifetimes.
     """
+
+    def __init__(self, size: int = -1, alignment: int = 128):
+        """Initialize the solver with a fixed scratchpad capacity and alignment.
+
+        Args:
+            size (int): Total scratchpad size in bytes. Buffers whose aligned
+                placement would exceed this limit are evicted (address=None).
+            alignment (int): Byte alignment boundary. Every buffer is placed at
+                the next address that is a multiple of this value. Defaults to 128
+                (one Spyre stick).
+        """
+        if size == -1:
+            size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
+        self.limit = size
+        self.alignment = alignment
+        self.usage: list[LifetimeBoundBuffer] = []
 
     @abstractmethod
     def plan_layout(
@@ -61,20 +75,6 @@ class MemoryPlanSolver(ABC):
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
-    def __init__(self, size: int, alignment: int = 128):
-        """Initialize the solver with a fixed scratchpad capacity and alignment.
-
-        Args:
-            size (int): Total scratchpad size in bytes. Buffers whose aligned
-                placement would exceed this limit are evicted (address=None).
-            alignment (int): Byte alignment boundary. Every buffer is placed at
-                the next address that is a multiple of this value. Defaults to 128
-                (one Spyre stick).
-        """
-        self.limit = size
-        self.alignment = alignment
-        self.usage: list[LifetimeBoundBuffer] = []
-
     def _get_lowest_addr_in_use(self):
         if self.usage:
             return min([rec.address for rec in self.usage if rec.address is not None])
