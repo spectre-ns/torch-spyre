@@ -235,13 +235,13 @@ class InstrumentedAllocator(DefaultAllocator):
         self.buffers = pattern.buffers
         self.operations = pattern.operations
 
-    def op_output_good_for_lx_reuse(self, op: Operation) -> bool:
+    def _op_output_good_for_lx_reuse(self, op: Operation) -> bool:
         return True
 
-    def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
+    def _op_good_for_lx_inplace(self, org_op_name: str) -> bool:
         return True
 
-    def push_allocation(
+    def _push_allocation(
         self, graph: MockGraphLowering, buffers: list[LifetimeBoundBuffer]
     ):
         # push the allocation into the code generation
