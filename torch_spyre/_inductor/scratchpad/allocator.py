@@ -28,12 +28,14 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
 )
-from torch_spyre._inductor.scratchpad.passes import ScratchpadOptimizationPass
-from torch_spyre._inductor.scratchpad.utils import (
-    get_ncores_for_buffers,
-    get_buffer_users
+from torch_spyre._inductor.scratchpad.passes import (
+    CloneInputNodesPass,
+    ScratchpadOptimizationPass,
 )
-from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
+from torch_spyre._inductor.scratchpad.utils import (
+    get_buffer_users,
+    get_ncores_for_buffers,
+)
 
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
