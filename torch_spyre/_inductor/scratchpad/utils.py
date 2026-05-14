@@ -37,7 +37,7 @@ def get_ncores_for_buffers(graph: GraphLowering) -> dict[str, int]:
     If there is a core division mismatch return -1 instead of the
     number of cores.
     """
-    result: dict[str, bool] = {}
+    result: dict[str, int] = {}
     using_multicore = config.sencores > 1
     buf_users_read_and_write = get_buffer_users(graph)
     for buf_name, users_rw in buf_users_read_and_write.items():
@@ -54,7 +54,7 @@ def get_ncores_for_buffers(graph: GraphLowering) -> dict[str, int]:
         else:
             num_cores = 1
         result[buf_name] = num_cores
-    return num_cores
+    return result
 
 
 def calculate_buffer_statistics(graph: GraphLowering) -> dict[str, dict[str, int]]:
