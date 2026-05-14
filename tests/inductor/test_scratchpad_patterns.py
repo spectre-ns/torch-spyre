@@ -15,6 +15,8 @@ from torch_spyre._inductor.scratchpad.allocator import (
     DefaultAllocator,
     LifetimeBoundBuffer,
 )
+from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
+from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
 from torch_spyre._inductor import config
 
 # From scratchpad.py
@@ -222,7 +224,10 @@ class MockGraphLowering:
 
 class InstrumentedAllocator(DefaultAllocator):
     def __init__(self, pattern: Pattern, lowering: MockGraphLowering):
-        super().__init__()
+        layout_planning = GreedyLayoutSolver()
+        super().__init__(
+            pre_optimization_passes=[TestCloneInputNodesPass(layout_planning.limit)]
+        )
         self.allocations: dict[str, int] = {}
         # This overwrites the value set in the superclass constructor:
         self.graph_lowering = lowering
@@ -282,6 +287,8 @@ class InstrumentedAllocator(DefaultAllocator):
             i += 1
         return candidate
 
+
+class TestCloneInputNodesPass(CloneInputNodesPass):
     @override
     def insert_op_after(
         self,
