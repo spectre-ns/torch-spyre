@@ -1,7 +1,6 @@
 from collections import defaultdict
 import copy
 from dataclasses import dataclass
-import itertools
 from typing import Callable, Optional, Iterable, override
 from unittest import TestCase, expectedFailure
 from enum import Enum
@@ -11,10 +10,10 @@ from functools import wraps
 import torch
 from torch.utils._ordered_set import OrderedSet
 
-from torch_spyre._inductor.scratchpad.scratchpad import (
+from torch_spyre._inductor.scratchpad.allocator import (
     scratchpad_planning,
-    GreedyAllocator,
-    GreedyAllocationStrategy,
+    DefaultAllocator,
+    LifetimeBoundBuffer,
 )
 from torch_spyre._inductor import config
 
@@ -206,101 +205,74 @@ class Pattern:
         return (list(inputs), outputs)
 
 
-class InstrumentedAllocator(GreedyAllocator):
-    def __init__(self, pattern: Pattern, lowering: "MockGraphLowering"):
-        super().__init__()
-        self.allocations: dict[str, int] = {}
-        # This overwrites the value set in the superclass constructor:
-        self.graph_lowering = lowering
-        self.inputs, self.outputs = pattern.determine_inputs_outputs()
-
-    @override
-    def op_output_good_for_lx_reuse(self, org_op_name: str) -> bool:
-        return True
-
-    @override
-    def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
-        return True
-
-    @override
-    def allocate(self, tensor_name: str, addr: int):
-        if tensor_name in self.allocations:
-            # TODO: At this point we don't know where we are in terms of time / operations, so we
-            # can't record at what point in time the allocation happens. This is okay as long as we
-            # every buffer name can be uniquely allocated with a single address. In order to change
-            # this, we need to store allocations differently, and then modify the logic for
-            # measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to account for
-            # this. Also update TestExamplePattern.verify_actual_run to account for this.
-            assert self.allocations[tensor_name] == addr, (
-                f"Buffer {tensor_name} was already allocated at address "
-                f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
-                f" That is probably a good improvement, but it means this test needs to be "
-                f"adjusted."
-            )
-        self.allocations[tensor_name] = addr
-
-    @override
-    def mem_usage_by_op(
-        self,
-        op: Operation,
-        core_div_mismatch: dict[str, bool] = {},
-        release_next: list = [],
-    ) -> dict[str, dict[str, bool | int | str] | list[str]]:
-        # Returns a dict mapping each buffer name to a dict with keys "is_input" and "size".
-        # is_input is True if the buffer is an input to the op, and False otherwise. size is the
-        # size of the buffer.
-        result = {}
-        for tensor_name, is_input in itertools.chain(
-            ((tensor_name, True) for tensor_name in op.inputs),
-            ((tensor_name, False) for tensor_name in op.outputs),
-        ):
-            result[tensor_name] = {
-                "is_input": is_input,
-                "size": op._buffer_registry[tensor_name].size,
-                "core_div_mismatch": False,
-                "last_usage": tensor_name in release_next,
-            }
-
-        result["all_inputs"] = op.inputs
-        result["all_outputs"] = op.outputs
-        result["all_buf_used"] = op.inputs + op.outputs
-
-        return result
-
-    @override
-    def get_output_names(self) -> list[str]:
-        return self.outputs
-
-    @override
-    def is_graph_input(self, buffer: str) -> bool:
-        return buffer in self.inputs
-
-
 class MockGraphLowering:
     """This class impersonates V.graph."""
 
     def __init__(self, pattern: Pattern):
-        self.graph_input_names = pattern.determine_inputs_outputs()[0]
+        self.graph_input_names, self._output_names = pattern.determine_inputs_outputs()
         self.buffers = pattern.buffers
+        self.operations = pattern.operations
+
+    def get_output_names(self):
+        return self._output_names
 
     def get_buffer(self, buf: str) -> Buffer:
         return self.buffers[buf]
 
 
-class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
-    def __init__(
-        self,
-        pattern: Pattern,
-        alloc: InstrumentedAllocator,
-        lowering: MockGraphLowering,
-    ):
-        super().__init__(alloc, lowering)
+class InstrumentedAllocator(DefaultAllocator):
+    def __init__(self, pattern: Pattern, lowering: MockGraphLowering):
+        super().__init__()
+        self.allocations: dict[str, int] = {}
+        # This overwrites the value set in the superclass constructor:
+        self.graph_lowering = lowering
+        self.inputs, self.outputs = pattern.determine_inputs_outputs()
         self.buffers = pattern.buffers
         self.operations = pattern.operations
 
-    @override
-    def should_consider_op(self, op: Operation) -> bool:
+    def op_output_good_for_lx_reuse(self, op: Operation) -> bool:
         return True
+
+    def op_good_for_lx_inplace(self, org_op_name: str) -> bool:
+        return True
+
+    def push_allocation(
+        self, graph: MockGraphLowering, buffers: list[LifetimeBoundBuffer]
+    ):
+        # push the allocation into the code generation
+        for b in buffers:
+            tensor_name = b.name
+            addr = b.address
+            if b.address is None:
+                continue
+            if tensor_name in self.allocations:
+                # TODO: At this point we don't know where we are in terms of time / operations, so we
+                # can't record at what point in time the allocation happens. This is okay as long as we
+                # every buffer name can be uniquely allocated with a single address. In order to change
+                # this, we need to store allocations differently, and then modify the logic for
+                # measuring HBM usage in TestExamplePattern.hbm_usage_for_actual_run to account for
+                # this. Also update TestExamplePattern.verify_actual_run to account for this.
+                assert self.allocations[tensor_name] == addr, (
+                    f"Buffer {tensor_name} was already allocated at address "
+                    f"{self.allocations[tensor_name]}, but is being allocated again at address {addr}."
+                    f" That is probably a good improvement, but it means this test needs to be "
+                    f"adjusted."
+                )
+            self.allocations[tensor_name] = addr
+
+    @override
+    def _mem_usage_by_buffer(
+        self, graph: MockGraphLowering
+    ) -> dict[str, dict[str, bool | int]]:
+        mem_usage = {}
+        for buf_name, buf in self.buffers.items():
+            mem_usage[buf_name] = {
+                "size": buf.size,
+                "size_per_core": buf.size,
+                "core_div_mismatch": False,
+            }
+        self._calculate_liveness(graph, mem_usage)
+        return mem_usage
 
     def new_name(self, prefix: str, current_names: set[str]) -> str:
         candidate = prefix
@@ -316,8 +288,9 @@ class InstrumentedGreedyAllocationStrategy(GreedyAllocationStrategy):
         buf: Buffer,
         lowering_func: Callable,
         buf_users: dict,
-        operations: list[Operation],
+        graph: MockGraphLowering,
     ) -> None:
+        operations = graph.operations
         buf_index = [i for i, op in enumerate(operations) if buf.name in op.inputs]
         if not buf_index:
             raise ValueError(
@@ -561,9 +534,8 @@ class TestExamplePattern(TestCase):
         pattern_copy = copy.deepcopy(pattern)
         lowering = MockGraphLowering(pattern_copy)
         alloc = InstrumentedAllocator(pattern_copy, lowering)
-        strategy = InstrumentedGreedyAllocationStrategy(pattern_copy, alloc, lowering)
 
-        scratchpad_planning(pattern_copy.operations, strategy)
+        scratchpad_planning(lowering, alloc)
 
         # Verify that the currently implemented allocation is indeed valid
         self.verify_actual_run(pattern_copy, alloc)
