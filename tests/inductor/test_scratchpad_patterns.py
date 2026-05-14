@@ -224,16 +224,16 @@ class MockGraphLowering:
 
 class InstrumentedAllocator(DefaultAllocator):
     def __init__(self, pattern: Pattern, lowering: MockGraphLowering):
-        layout_planning = GreedyLayoutSolver()
-        super().__init__(
-            pre_optimization_passes=[TestCloneInputNodesPass(layout_planning.limit)]
-        )
-        self.allocations: dict[str, int] = {}
-        # This overwrites the value set in the superclass constructor:
-        self.graph_lowering = lowering
-        self.inputs, self.outputs = pattern.determine_inputs_outputs()
         self.buffers = pattern.buffers
         self.operations = pattern.operations
+        layout_planning = GreedyLayoutSolver()
+        super().__init__(
+            layout_planning,
+            pre_optimization_passes=[TestCloneInputNodesPass(layout_planning.limit, self)],
+        )
+        self.allocations: dict[str, int] = {}
+        self.graph_lowering = lowering
+        self.inputs, self.outputs = pattern.determine_inputs_outputs()
 
     def _op_output_good_for_lx_reuse(self, op: Operation) -> bool:
         return True
@@ -289,6 +289,10 @@ class InstrumentedAllocator(DefaultAllocator):
 
 
 class TestCloneInputNodesPass(CloneInputNodesPass):
+    def __init__(self, limit: int, allocator: "InstrumentedAllocator"):
+        super().__init__(limit)
+        self._allocator = allocator
+
     @override
     def insert_op_after(
         self,
@@ -304,20 +308,21 @@ class TestCloneInputNodesPass(CloneInputNodesPass):
                 f"Was asked to insert after {buf.name}, but couldn't find it"
             )
 
-        buffer_name = self.new_name("copy_buf", {buf for buf in self.buffers})
-        self.buffers[buffer_name] = Buffer(buffer_name, buf.size)
+        buffers = self._allocator.buffers
+        buffer_name = self._allocator.new_name("copy_buf", set(buffers))
+        buffers[buffer_name] = Buffer(buffer_name, buf.size)
 
-        op_name = self.new_name("copy_op", {op.name for op in self.operations})
+        op_name = self._allocator.new_name("copy_op", {op.name for op in self._allocator.operations})
         new_op = Operation(
             op_name,
             inputs=[buf.name],
             outputs=[buffer_name],
-            _buffer_registry=self.buffers,
+            _buffer_registry=buffers,
         )
 
         # The expected order in the list of operations is actually *before* the first operation
         # that uses buf.
-        self.operations.insert(buf_index[0], new_op)
+        self._allocator.operations.insert(buf_index[0], new_op)
 
         for op in self.operations[buf_index[0] + 1 :]:
             op.inputs = [
