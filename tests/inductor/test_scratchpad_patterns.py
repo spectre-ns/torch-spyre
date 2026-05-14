@@ -229,7 +229,9 @@ class InstrumentedAllocator(DefaultAllocator):
         layout_planning = GreedyLayoutSolver()
         super().__init__(
             layout_planning,
-            pre_optimization_passes=[TestCloneInputNodesPass(layout_planning.limit, self)],
+            pre_optimization_passes=[
+                TestCloneInputNodesPass(layout_planning.limit, self)
+            ],
         )
         self.allocations: dict[str, int] = {}
         self.graph_lowering = lowering
@@ -312,7 +314,9 @@ class TestCloneInputNodesPass(CloneInputNodesPass):
         buffer_name = self._allocator.new_name("copy_buf", set(buffers))
         buffers[buffer_name] = Buffer(buffer_name, buf.size)
 
-        op_name = self._allocator.new_name("copy_op", {op.name for op in self._allocator.operations})
+        op_name = self._allocator.new_name(
+            "copy_op", {op.name for op in self._allocator.operations}
+        )
         new_op = Operation(
             op_name,
             inputs=[buf.name],

@@ -16,18 +16,16 @@ import math
 from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
-from typing import Any, Callable, TypeVarTuple, Unpack, Optional, override
+from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
 from unittest.mock import patch
 import torch
 
-from torch._inductor.virtualized import V
 from torch._inductor import config as t_inductor_config
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 
-from torch_spyre._inductor.scratchpad.allocator import DefaultAllocator
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
@@ -112,6 +110,7 @@ class TestScratchpadUsage(unittest.TestCase):
         self, f: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
     ) -> tuple[torch.Tensor, dict[str, str]]:
         mem_usages = {}
+
         def visitor(graph: GraphLowering) -> None:
             nonlocal mem_usages
             operations = graph.operations
@@ -122,8 +121,8 @@ class TestScratchpadUsage(unittest.TestCase):
                 device_layout = layout.device_layout
                 allocation = getattr(layout, "allocation", {})
                 mem_usages[buf_name] = {
-                    "location" :  "LX" if "lx" in allocation else "HBM",
-                    "size" : math.prod(device_layout.device_size[:-1]) * 128
+                    "location": "LX" if "lx" in allocation else "HBM",
+                    "size": math.prod(device_layout.device_size[:-1]) * 128,
                 }
 
         with self.pre_scheduling_iterating_pass(visitor):
@@ -146,9 +145,7 @@ class TestScratchpadUsage(unittest.TestCase):
             device_result, mem_usages = self.compile_and_collect_mem_usage(model, args)
 
         self.assertTrue(
-            any(
-                mem_usage["location"] == "LX" for mem_usage in mem_usages.values()
-            ),
+            any(mem_usage["location"] == "LX" for mem_usage in mem_usages.values()),
             "Expected at least one buffer to be allocated in LX, but none were",
         )
 
@@ -184,7 +181,11 @@ class TestMeasureHBMUsageScratchPad(TestScratchpadUsage):
         has an entry in its allocations that starts with "lx" is free and that any other node's HBM
         transfers are accurately returned by `mem_usage_by_node`."""
         result, mem_usages = self.compile_and_collect_mem_usage(model, args)
-        hbm_transfers = sum(mem_usage["size"] for mem_usage in mem_usages.values() if mem_usage["location"] == "HBM")
+        hbm_transfers = sum(
+            mem_usage["size"]
+            for mem_usage in mem_usages.values()
+            if mem_usage["location"] == "HBM"
+        )
         return (result, hbm_transfers)
 
     @override
