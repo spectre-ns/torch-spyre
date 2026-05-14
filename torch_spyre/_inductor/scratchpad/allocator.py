@@ -33,7 +33,6 @@ from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
 from torch_spyre._inductor.scratchpad.utils import (
-    get_buffer_users,
     get_ncores_for_buffers,
 )
 
@@ -68,7 +67,6 @@ class ScratchpadAllocator(ABC):
             graph (GraphLowering): Graph to be considered for scratchpad planning
         """
         pass
-    
 
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
         return (
@@ -76,16 +74,14 @@ class ScratchpadAllocator(ABC):
             and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
             and (
                 config.allow_all_ops_in_lx_planning
-                or 
-                op.origin_node.target._opname in OP_OUTPUT_GOOD_FOR_LX_REUSE
+                or op.origin_node.target._opname in OP_OUTPUT_GOOD_FOR_LX_REUSE
             )
         )
 
     def _op_good_for_lx_inplace(self, org_op_name: str) -> bool:
         # Determine if this is the desired functionality. This will check for substrings in the
-        # allowed OPS rather than 
+        # allowed OPS rather than
         return any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
-
 
     def _filter_buffers(
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
@@ -107,9 +103,7 @@ class ScratchpadAllocator(ABC):
 
         return [b for b in buffers if b.name not in drop_list]
 
-    def _mem_usage_by_buffer(
-        self, graph: GraphLowering
-    ) -> dict[str, dict[str, Any]]:
+    def _mem_usage_by_buffer(self, graph: GraphLowering) -> dict[str, dict[str, Any]]:
         """
         Get a summary of memory usage for all operations
         Detailed info of individual buf, e.g. mem_usage[<buf_name>], which has
@@ -123,9 +117,19 @@ class ScratchpadAllocator(ABC):
             dev_size = (
                 math.prod(dev_layout.device_size[:-1]) * 128
             )  # num_sticks * bytes_per_stick
-            
+
             mem_usage[buf_name] = {
-                "inputs": [dep.name for dep in next((op.get_read_writes().reads for op in graph.operations if op.name == buf_name), [])],
+                "inputs": [
+                    dep.name
+                    for dep in next(
+                        (
+                            op.get_read_writes().reads
+                            for op in graph.operations
+                            if op.name == buf_name
+                        ),
+                        [],
+                    )
+                ],
                 "size": dev_size,
                 "size_per_core": dev_size // num_cores,
                 "core_div_mismatch": num_cores == -1,
@@ -164,7 +168,6 @@ class ScratchpadAllocator(ABC):
             if not info["core_div_mismatch"]
         ]
 
-        
     def _determine_in_place(
         self,
         graph: GraphLowering,
@@ -177,7 +180,10 @@ class ScratchpadAllocator(ABC):
             ten_start = mem_usage[tensor_name]["liveness_start"]
             for inp_i in mem_usage[tensor_name]["inputs"]:
                 inp_i_dev_lay = graph.get_buffer(inp_i).layout.device_layout
-                inp_i_size_match = mem_usage[tensor_name]["size_per_core"] == mem_usage[inp_i]["size_per_core"]
+                inp_i_size_match = (
+                    mem_usage[tensor_name]["size_per_core"]
+                    == mem_usage[inp_i]["size_per_core"]
+                )
                 inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
                 # Reuse input buffer if the incoming buffer is going out of scope
                 # on the next time step after the current op completes indicating
@@ -193,14 +199,16 @@ class ScratchpadAllocator(ABC):
                 if inp_i_size_match and inp_i_lay_match and inp_i_eol:
                     allow_inplace[tensor_name].append(inp_i)
         return allow_inplace
-    
+
     def _generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
         in_place = self._determine_in_place(graph)
         buffers = self._build_bound_buffers(graph, in_place)
         filtered_buffers = self._filter_buffers(graph, buffers)
         return filtered_buffers
 
-    def _push_allocation(self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]):
+    def _push_allocation(
+        self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
+    ):
         # push the allocation into the code generation
         for b in buffers:
             if b.address is not None:

@@ -16,11 +16,8 @@
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.scratchpad.allocator import (
-    DefaultAllocator
-)
+from torch_spyre._inductor.scratchpad.allocator import DefaultAllocator
 from torch_spyre._inductor.scratchpad.utils import (
     get_buffer_users,
     calculate_buffer_statistics,
