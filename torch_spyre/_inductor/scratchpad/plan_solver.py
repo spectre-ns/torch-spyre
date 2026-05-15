@@ -97,7 +97,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         curr_hi = self._get_highest_addr_in_use()
         if self.limit < size_needed:
             return None
-        
+
         if not self.usage or curr_lo >= size_needed:
             return 0
 
