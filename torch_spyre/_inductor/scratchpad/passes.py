@@ -19,6 +19,7 @@ from typing import Callable
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
+    Operation
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 from torch._inductor.ops_handler import WrapperHandler
@@ -28,8 +29,17 @@ from ..ir import FixedTiledLayout, TensorBox
 
 from torch_spyre._inductor.scratchpad.utils import (
     get_buffer_users,
-    get_ncores_for_buffers,
+    buf_analysis,
 )
+
+OP_OUTPUT_GOOD_FOR_LX_REUSE = [
+    "max",
+    "sum",
+    # "clone",
+    "exp",
+    "sub",
+    # "mul",
+]
 
 
 class ScratchpadOptimizationPass(ABC):
@@ -63,7 +73,7 @@ class _NameSwapHandler(WrapperHandler):
 class CloneInputNodesPass(ScratchpadOptimizationPass):
     def __init__(self, limit: int):
         self.limit = limit
-
+    
     def _create_loop_hack_inner_fn(self, old_Loop, name_map):
         """Use ops_handler to swap the name of buffers"""
 
@@ -85,39 +95,14 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         # LoopBody will be created later when we call CompBuf.recompute()
 
         return new_Loop
-
-    def apply_pass(
-        self,
-        graph: GraphLowering,
-    ) -> None:
-        """
-        Check if any input tensors can fit onto scratchpad and needed more than once =>
-        Add corresponding "clone operation" to copy it to scratchpad and reduce HBM read.
-        """
-        lx_free_total = self.limit
-        buf_users = get_buffer_users(graph)
-        ncores = get_ncores_for_buffers(graph)
-        for inp_name in graph.graph_input_names:
-            if inp_name not in buf_users:
-                continue
-            buf = graph.get_buffer(inp_name)  # this is a TensorBox
-            dev_layout = buf.layout.device_layout
-            # TODO: Is this pessimistic? Can we use per-core size here?
-            dev_size = math.prod(dev_layout.device_size[:-1]) * 128
-            used_only_once = len(buf_users[inp_name]) == 1
-            core_div_mismatch = ncores[inp_name] == -1
-            if used_only_once or dev_size > lx_free_total or core_div_mismatch:
-                continue
-
-            self.insert_op_after(buf, clone_lowering, buf_users, graph)
-            lx_free_total -= dev_size
-
+    
     def insert_op_after(
         self,
+        graph,
         buf: TensorBox,
         lowering_func: Callable,
         buf_users: dict,
-        graph: GraphLowering,
+        operations: list[Operation],
     ) -> None:
         """
         Insert an operation using the provided lowering function (e.g. clone_lowering) in
@@ -135,7 +120,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
           fully consistent and we will try to maintain it that way.
         - To update existing users of the old buffer -> hack the inner_fn then refresh LoopIR
         """
-        fx_graph = graph.graph
+        fx_graph = graph
 
         # Step 1: Add a new FX node for clone and update dependencies
         buf_name = buf.data.data.name  # buf is a TensorBox
@@ -149,8 +134,8 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         user_aten_op = LUTlower_func_to_op[lowering_func]
         # TODO this is a large dict, move it to upper scope so we only need to do it once
         # aten_op is the overloaded version, e.g. ops.aten.clone.*out* instead of .default
-        fx_graph.inserting_after(buf_fx)
-        new_fx_node = fx_graph.create_node("call_function", user_aten_op, (buf_fx,))
+        graph.inserting_after(buf_fx)
+        new_fx_node = graph.create_node("call_function", user_aten_op, (buf_fx,))
         for user in old_users:
             user.args = tuple(new_fx_node if ar is buf_fx else ar for ar in user.args)
         graph.orig_gm.recompile()
@@ -194,7 +179,6 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
             )
             old_com_buf.data = new_Loop
 
-        operations = graph.operations
         # NOTE: operations is a reference to graph_lowering.operations, which is already
         # updated when we call graph_lowering.register_operation() earlier. But the new Op
         # was appended at the end of the list, need to insert at the correct position.
@@ -202,3 +186,56 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         idx_to_first_user = operations.index(first_user)
         operations.remove(new_com_buf)
         operations.insert(idx_to_first_user, new_com_buf)
+
+    
+    def try_insert_clone_op_for_inputs(
+        self,
+        graph,
+        operations: list[Operation],
+        lx_free_total: int,
+        buf_users: dict[str, Operation],
+        core_div_mismatch: dict[str, bool],
+    ) -> None:
+        """
+        Check if any input tensors can fit onto scratchpad and needed more than once =>
+        Add corresponding "clone operation" to copy it to scratchpad and reduce HBM read.
+        """
+        for inp_name in graph.graph_input_names:
+            buf = graph.get_buffer(inp_name)  # this is a TensorBox
+            dev_layout = buf.layout.device_layout
+            dev_size = math.prod(dev_layout.device_size[:-1]) * 128
+            is_on_lx = buf.layout.allocation != {}
+            used_only_once = len(buf_users[inp_name]) == 1
+            if (
+                used_only_once
+                or dev_size > lx_free_total
+                or is_on_lx
+                or core_div_mismatch[inp_name]
+            ):
+                continue
+
+            self.insert_op_after(graph, buf, clone_lowering, buf_users, operations)
+
+            lx_free_total -= dev_size
+
+    def apply_pass(
+        self,
+        graph: GraphLowering,
+    ) -> None:
+        """
+        Check if any input tensors can fit onto scratchpad and needed more than once =>
+        Add corresponding "clone operation" to copy it to scratchpad and reduce HBM read.
+        """
+        buf_users = get_buffer_users(graph)
+
+        operations = graph.operations
+        _,_,core_div_mismatch = buf_analysis(graph.operations)
+        if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
+            num_ops_before = len(operations)
+            self.try_insert_clone_op_for_inputs(
+                graph,
+                operations,
+                self.limit,
+                buf_users,
+                core_div_mismatch,
+            )
