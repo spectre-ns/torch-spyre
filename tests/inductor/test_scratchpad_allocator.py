@@ -169,6 +169,11 @@ class TestDefaultAllocator(TestCase):
         solver.plan_layout.side_effect = _solve
 
         graph = MagicMock(spec=GraphLowering)
+        # Satisfy the ComputedBuffer / MutationLayout guards in plan_allocation.
+        from torch._inductor.ir import ComputedBuffer, FixedLayout
+        op = MagicMock(spec=ComputedBuffer)
+        op.layout = MagicMock(spec=FixedLayout)
+        graph.operations = [op]
         pass1, pass2 = MagicMock(), MagicMock()
         pass1.apply_pass.side_effect = lambda g: call_order.append("pre")
         pass2.apply_pass.side_effect = lambda g: call_order.append("post")
