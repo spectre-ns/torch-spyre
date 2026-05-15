@@ -238,7 +238,7 @@ class DefaultAllocator(ScratchpadAllocator):
         if layout_planning is None:
             layout_planning = GreedyLayoutSolver(size)
         if pre_optimization_passes is None:
-            pre_optimization_passes = [CloneInputNodesPass(size)]
+            pre_optimization_passes = [CloneInputNodesPass(size)] if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE else []
         if post_optimization_passes is None:
             post_optimization_passes = []
 
