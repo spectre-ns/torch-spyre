@@ -95,6 +95,9 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         assert all(x.address is not None for x in self.usage)
         curr_lo = self._get_lowest_addr_in_use()
         curr_hi = self._get_highest_addr_in_use()
+        if self.limit < size_needed:
+            return None
+        
         if not self.usage or curr_lo >= size_needed:
             return 0
 
