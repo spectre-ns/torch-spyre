@@ -17,11 +17,11 @@ import math
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation, ComputedBuffer
 from torch_spyre._inductor import config
-from typing import Any
+
 
 def calculate_liveness(
     mem_usage: dict[str, dict[str, bool | int]], ops: Operation
-):
+) -> dict:
     for i, op in enumerate(ops):
         rw = op.get_read_writes()
         for mem_dep in rw.reads | rw.writes:
@@ -33,11 +33,12 @@ def calculate_liveness(
             mem_usage[buf_name]["liveness_end"] = i + 1
     return mem_usage
 
+
 def mem_usage_by_op(
     graph: GraphLowering,
     ops: list[ComputedBuffer],
     core_div_mismatch: dict[str, bool] = {},
-) -> dict:
+) -> tuple[dict, dict]:
     """
     Get a summary of memory usage of the given operation. Two types of info can be found
     1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
@@ -47,7 +48,7 @@ def mem_usage_by_op(
     if a buf is not in core_div_mismatch => it has no users => graph output
     if a buf is on release_next => it's the last time it'll be used => allow inplace
     """
-    mem_usage = {}
+    mem_usage: dict = {}
     for op in ops:
         rw = op.get_read_writes()
         mem_usage[op.name] = {
@@ -76,7 +77,9 @@ def mem_usage_by_op(
                     mem_usage[op.name]["all_inputs"].append(dep.name)
                 else:
                     mem_usage[op.name]["all_outputs"].append(dep.name)
-        mem_usage[op.name]["all_buf_used"] = mem_usage[op.name]["all_inputs"] + mem_usage[op.name]["all_outputs"]
+        mem_usage[op.name]["all_buf_used"] = (
+            mem_usage[op.name]["all_inputs"] + mem_usage[op.name]["all_outputs"]
+        )
     return mem_usage, calculate_liveness({}, ops)
 
 
@@ -109,9 +112,7 @@ def buf_analysis(operations: list[Operation]):
                 buf_users[buf] = buf_users.get(buf, []) + [op]
             else:
                 buf_write_counts[buf] = buf_write_counts.get(buf, 0) + 1
-            buf_users_read_and_write[buf] = buf_users_read_and_write.get(
-                buf, []
-            ) + [op]
+            buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [op]
 
     bufs_to_dealloc_at_idx: dict = {}
     for buf, idx in last_used.items():
@@ -128,9 +129,7 @@ def buf_analysis(operations: list[Operation]):
         if using_multicore and len(users_rw) > 1:
             # graph input and output can have only 1 read or 1 write user.
             u0_split = users_rw[0].op_it_space_splits  # a list like [16, 1]
-            same_core_div = all(
-                u0_split == u.op_it_space_splits for u in users_rw[1:]
-            )
+            same_core_div = all(u0_split == u.op_it_space_splits for u in users_rw[1:])
         core_div_mismatch[buf_name] = not same_core_div
 
     return bufs_to_dealloc_at_idx, buf_users, core_div_mismatch
