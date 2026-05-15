@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ class TestGreedySolver(TestCase):
         alignment=1,
     ):
         result = GreedyLayoutSolver(size, alignment).plan_layout(buffers)
-        for planned, expected_addr in zip(result, expected_addresses):
+        for planned, expected_addr in zip(result, expected_addresses, strict=True):
             self.assertEqual(planned.address, expected_addr)
 
     def test_simple_layout(self):
@@ -116,6 +116,17 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer1", __LARGE_SIZE__, 3, 4),
         ]
         self.verify_layout(buffers, [0, None], __LARGE_SIZE__, __ALIGNMENT__)
+
+    def test_multiple_evictions_do_not_corrupt_allocation(self):
+        # buffer0 fills the entire scratchpad; buffer1 and buffer2 are evicted.
+        # buffer3 starts after buffer0 ends and should reclaim address 0.
+        buffers = [
+            LifetimeBoundBuffer("buffer0", __SMALL_SIZE__, 0, 2),
+            LifetimeBoundBuffer("buffer1", __SMALL_SIZE__, 0, 2),
+            LifetimeBoundBuffer("buffer2", __SMALL_SIZE__, 0, 2),
+            LifetimeBoundBuffer("buffer3", __SMALL_SIZE__, 2, 3),
+        ]
+        self.verify_layout(buffers, [0, None, None, 0])
 
 
 if __name__ == "__main__":
