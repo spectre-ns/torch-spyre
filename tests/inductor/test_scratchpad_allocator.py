@@ -171,6 +171,7 @@ class TestDefaultAllocator(TestCase):
         graph = MagicMock(spec=GraphLowering)
         # Satisfy the ComputedBuffer / MutationLayout guards in plan_allocation.
         from torch._inductor.ir import ComputedBuffer, FixedLayout
+
         op = MagicMock(spec=ComputedBuffer)
         op.layout = MagicMock(spec=FixedLayout)
         graph.operations = [op]
