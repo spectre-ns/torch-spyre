@@ -98,6 +98,8 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         buf_users = get_buffer_users(graph)
         ncores = get_ncores_for_buffers(graph)
         for inp_name in graph.graph_input_names:
+            if inp_name not in buf_users:
+                continue
             buf = graph.get_buffer(inp_name)  # this is a TensorBox
             dev_layout = buf.layout.device_layout
             # TODO: Is this pessimistic? Can we use per-core size here?
