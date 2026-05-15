@@ -238,7 +238,11 @@ class DefaultAllocator(ScratchpadAllocator):
         if layout_planning is None:
             layout_planning = GreedyLayoutSolver(size)
         if pre_optimization_passes is None:
-            pre_optimization_passes = [CloneInputNodesPass(size)] if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE else []
+            pre_optimization_passes = (
+                [CloneInputNodesPass(size)]
+                if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
+                else []
+            )
         if post_optimization_passes is None:
             post_optimization_passes = []
 
@@ -248,9 +252,11 @@ class DefaultAllocator(ScratchpadAllocator):
 
     def plan_allocation(self, graph: GraphLowering):
         if any(not isinstance(op, ComputedBuffer) for op in graph.operations):
-            return 
-        if any(isinstance(op.layout, MutationLayoutSHOULDREMOVE) for op in graph.operations):
-            return 
+            return
+        if any(
+            isinstance(op.layout, MutationLayoutSHOULDREMOVE) for op in graph.operations
+        ):
+            return
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
         buffers = self._generate_buffers(graph)
