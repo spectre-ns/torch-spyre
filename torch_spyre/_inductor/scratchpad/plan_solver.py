@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
 import math
-from torch_spyre._inductor import config
 
 
 @dataclass
@@ -40,7 +39,7 @@ class MemoryPlanSolver(ABC):
     memory layout patterns based on provided sizes, lifetimes.
     """
 
-    def __init__(self, size: int = -1, alignment: int = 128):
+    def __init__(self, size: int, alignment: int = 128):
         """Initialize the solver with a fixed scratchpad capacity and alignment.
 
         Args:
@@ -50,8 +49,6 @@ class MemoryPlanSolver(ABC):
                 the next address that is a multiple of this value. Defaults to 128
                 (one Spyre stick).
         """
-        if size == -1:
-            size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
         self.limit = size
         self.alignment = alignment
         self.usage: list[LifetimeBoundBuffer] = []
@@ -179,6 +176,9 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         """
         if not buffers:
             return []
+        assert all(buf.address is None for buf in buffers), (
+            "Buffers cannot be previously or partially planned"
+        )
 
         self.usage = []
 

@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import ABC, abstractmethod
-from torch._inductor.graph import GraphLowering
-from torch._inductor.ops_handler import WrapperHandler
-from torch._inductor.virtualized import V
-from torch._inductor.lowering import lowerings, clone as clone_lowering
-
 import math
+from abc import ABC, abstractmethod
 from typing import Callable
 
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
 )
+from torch._inductor.lowering import clone as clone_lowering, lowerings
+from torch._inductor.ops_handler import WrapperHandler
+from torch._inductor.virtualized import V
+
 from ..ir import FixedTiledLayout, TensorBox
 
 from torch_spyre._inductor.scratchpad.utils import (
@@ -64,7 +64,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
     def __init__(self, limit: int):
         self.limit = limit
 
-    def create_Loop_hack_inner_fn(self, old_Loop, name_map):
+    def _create_loop_hack_inner_fn(self, old_Loop, name_map):
         """Use ops_handler to swap the name of buffers"""
 
         def new_inner_fn(*args):
@@ -100,16 +100,11 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         for inp_name in graph.graph_input_names:
             buf = graph.get_buffer(inp_name)  # this is a TensorBox
             dev_layout = buf.layout.device_layout
+            # TODO: Is this pessimistic? Can we use per-core size here?
             dev_size = math.prod(dev_layout.device_size[:-1]) * 128
-            is_on_lx = buf.layout.allocation != {}
             used_only_once = len(buf_users[inp_name]) == 1
             core_div_mismatch = ncores[inp_name] == -1
-            if (
-                used_only_once
-                or dev_size > lx_free_total
-                or is_on_lx
-                or core_div_mismatch
-            ):
+            if used_only_once or dev_size > lx_free_total or core_div_mismatch:
                 continue
 
             self.insert_op_after(buf, clone_lowering, buf_users, graph)
@@ -192,7 +187,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         # Step 4: Hack user nodes' inner_fn
         for old_com_buf in buf_users[buf_name]:
             # hack inner_fn with a nameSwapper ops handler and make a new LoopIR
-            new_Loop = self.create_Loop_hack_inner_fn(
+            new_Loop = self._create_loop_hack_inner_fn(
                 old_com_buf.data, name_map={buf_name: new_buf_name}
             )
             old_com_buf.data = new_Loop
