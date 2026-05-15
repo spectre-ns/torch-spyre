@@ -13,14 +13,9 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-import math
 from typing import Any, Optional
 
-from torch._inductor.ir import (
-    ComputedBuffer,
-    MutationLayoutSHOULDREMOVE,
-    Operation
-)
+from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE, Operation
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -32,11 +27,7 @@ from torch_spyre._inductor.scratchpad.passes import (
     CloneInputNodesPass,
     ScratchpadOptimizationPass,
 )
-from torch_spyre._inductor.scratchpad.utils import (
-    get_ncores_for_buffers,
-    mem_usage_by_op,
-    buf_analysis
-)
+from torch_spyre._inductor.scratchpad.utils import mem_usage_by_op
 
 from torch_spyre._inductor import config
 
@@ -112,27 +103,30 @@ class ScratchpadAllocator(ABC):
         self,
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
-        ops: Operation
+        ops: Operation,
     ) -> list[LifetimeBoundBuffer]:
         mem_usage, lifetimes = mem_usage_by_op(graph, ops)
         in_place = {} if in_place is None else in_place
         buffers = []
         for _, op in mem_usage.items():
             for buffer_name in op["all_inputs"] + op["all_outputs"]:
-                 buffers.append(LifetimeBoundBuffer(
+                buffers.append(
+                    LifetimeBoundBuffer(
                         buffer_name,
                         op[buffer_name]["size_per_core"],
                         lifetimes[buffer_name]["liveness_start"],
                         lifetimes[buffer_name]["liveness_end"],
-                        in_place=in_place[buffer_name] if buffer_name in in_place else []))
-                 
+                        in_place=in_place[buffer_name]
+                        if buffer_name in in_place
+                        else [],
+                    )
+                )
+
         buffers = list({obj.name: obj for obj in buffers}.values())
         return buffers
 
     def _determine_in_place(
-        self,
-        graph: GraphLowering,
-        ops: Operation
+        self, graph: GraphLowering, ops: Operation
     ) -> dict[str, list[str]]:
         allow_inplace: dict[str, list[str]] = {}
         mem_usage, lifetimes = mem_usage_by_op(graph, ops)
@@ -164,7 +158,9 @@ class ScratchpadAllocator(ABC):
         return allow_inplace
 
     def _generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
-        operations = [op for op in graph.operations if self._op_output_good_for_lx_reuse(op)]
+        operations = [
+            op for op in graph.operations if self._op_output_good_for_lx_reuse(op)
+        ]
         in_place = self._determine_in_place(graph, operations)
         buffers = self._build_bound_buffers(graph, in_place, operations)
         filtered_buffers = self._filter_buffers(graph, buffers, operations)

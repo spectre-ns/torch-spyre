@@ -17,10 +17,7 @@ from abc import ABC, abstractmethod
 from typing import Callable
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import (
-    ComputedBuffer,
-    Operation
-)
+from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
@@ -73,7 +70,7 @@ class _NameSwapHandler(WrapperHandler):
 class CloneInputNodesPass(ScratchpadOptimizationPass):
     def __init__(self, limit: int):
         self.limit = limit
-    
+
     def _create_loop_hack_inner_fn(self, old_Loop, name_map):
         """Use ops_handler to swap the name of buffers"""
 
@@ -95,7 +92,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         # LoopBody will be created later when we call CompBuf.recompute()
 
         return new_Loop
-    
+
     def insert_op_after(
         self,
         graph,
@@ -120,7 +117,6 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
           fully consistent and we will try to maintain it that way.
         - To update existing users of the old buffer -> hack the inner_fn then refresh LoopIR
         """
-        fx_graph = graph
 
         # Step 1: Add a new FX node for clone and update dependencies
         buf_name = buf.data.data.name  # buf is a TensorBox
@@ -187,7 +183,6 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         operations.remove(new_com_buf)
         operations.insert(idx_to_first_user, new_com_buf)
 
-    
     def try_insert_clone_op_for_inputs(
         self,
         graph,
@@ -229,9 +224,8 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         buf_users = get_buffer_users(graph)
 
         operations = graph.operations
-        _,_,core_div_mismatch = buf_analysis(graph.operations)
+        _, _, core_div_mismatch = buf_analysis(graph.operations)
         if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
-            num_ops_before = len(operations)
             self.try_insert_clone_op_for_inputs(
                 graph,
                 operations,
