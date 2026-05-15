@@ -16,7 +16,6 @@
 import math
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor import config
 
 
@@ -58,13 +57,12 @@ def get_ncores_for_buffers(graph: GraphLowering) -> dict[str, int]:
 
 
 def calculate_buffer_statistics(graph: GraphLowering) -> dict[str, dict[str, int]]:
-    # this can be compressed more with some comprehensions.
     buf_read_counts: dict[str, int] = {}
     buf_write_counts: dict[str, int] = {}
 
     for op in graph.operations:
         rw = op.get_read_writes()
-        read_names = op.get_read_names()  # <- Comprehension here
+        read_names = op.get_read_names()
         for dep in rw.reads | rw.writes:
             buf = dep.name
             if buf in read_names:
@@ -80,12 +78,3 @@ def calculate_buffer_statistics(graph: GraphLowering) -> dict[str, dict[str, int
         }
         for buf in all_bufs
     }
-
-
-def push_allocation(graph: GraphLowering, buffers: list[LifetimeBoundBuffer]):
-    # push the allocation into the code generation
-    for b in buffers:
-        if b.address is not None:
-            buf = graph.get_buffer(b.name)
-            layout = buf.get_layout()
-            layout.allocation["lx"] = b.address

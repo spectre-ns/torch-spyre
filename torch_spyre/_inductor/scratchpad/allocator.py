@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@ from torch._inductor.ir import (
     MutationLayoutSHOULDREMOVE,
 )
 from torch._inductor.graph import GraphLowering
-from .. import config
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     GreedyLayoutSolver,
@@ -35,6 +34,8 @@ from torch_spyre._inductor.scratchpad.passes import (
 from torch_spyre._inductor.scratchpad.utils import (
     get_ncores_for_buffers,
 )
+
+from torch_spyre._inductor import config
 
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
@@ -60,7 +61,7 @@ class ScratchpadAllocator(ABC):
     @abstractmethod
     def plan_allocation(self, graph: GraphLowering):
         """
-        Accepts a graph to be considerd for scratchpad memory according
+        Accepts a graph to be considered for scratchpad memory according
         to its composition and the specific implementation used.
 
         Args:
@@ -74,14 +75,15 @@ class ScratchpadAllocator(ABC):
             and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
             and (
                 config.allow_all_ops_in_lx_planning
-                or op.origin_node.target._opname in OP_OUTPUT_GOOD_FOR_LX_REUSE
+                or (
+                    op.origin_node is not None
+                    and op.origin_node.target._opname in OP_OUTPUT_GOOD_FOR_LX_REUSE
+                )
             )
         )
 
     def _op_good_for_lx_inplace(self, org_op_name: str) -> bool:
-        # Determine if this is the desired functionality. This will check for substrings in the
-        # allowed OPS rather than
-        return any(op in org_op_name for op in OP_GOOD_FOR_LX_INPLACE)
+        return org_op_name in OP_GOOD_FOR_LX_INPLACE
 
     def _filter_buffers(
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
@@ -104,12 +106,6 @@ class ScratchpadAllocator(ABC):
         return [b for b in buffers if b.name not in drop_list]
 
     def _mem_usage_by_buffer(self, graph: GraphLowering) -> dict[str, dict[str, Any]]:
-        """
-        Get a summary of memory usage for all operations
-        Detailed info of individual buf, e.g. mem_usage[<buf_name>], which has
-            "size", "core_div_mismatch", "size_per_core", "liveness_start",
-            "liveness_end" fields
-        """
         mem_usage = {}
         for buf_name, num_cores in get_ncores_for_buffers(graph).items():
             buf = graph.get_buffer(buf_name)
@@ -133,6 +129,15 @@ class ScratchpadAllocator(ABC):
                 "size": dev_size,
                 "size_per_core": dev_size // num_cores,
                 "core_div_mismatch": num_cores == -1,
+                "opname": next(
+                    (
+                        op.origin_node.target._opname
+                        for op in graph.operations
+                        if op.name == buf_name
+                        if op.origin_node is not None
+                    ),
+                    "NOP",
+                ),
             }
 
         self._calculate_liveness(graph, mem_usage)
@@ -152,9 +157,10 @@ class ScratchpadAllocator(ABC):
     def _build_bound_buffers(
         self,
         graph: GraphLowering,
-        in_place: dict[str, list[str]] = {},
+        in_place: Optional[dict[str, list[str]]] = None,
     ) -> list[LifetimeBoundBuffer]:
         mem_usage = self._mem_usage_by_buffer(graph)
+        in_place = {} if in_place is None else in_place
 
         return [
             LifetimeBoundBuffer(
@@ -178,26 +184,30 @@ class ScratchpadAllocator(ABC):
             allow_inplace[tensor_name] = []
             ten_dev_lay = graph.get_buffer(tensor_name).layout.device_layout
             ten_start = mem_usage[tensor_name]["liveness_start"]
-            for inp_i in mem_usage[tensor_name]["inputs"]:
-                inp_i_dev_lay = graph.get_buffer(inp_i).layout.device_layout
-                inp_i_size_match = (
-                    mem_usage[tensor_name]["size_per_core"]
-                    == mem_usage[inp_i]["size_per_core"]
-                )
-                inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
-                # Reuse input buffer if the incoming buffer is going out of scope
-                # on the next time step after the current op completes indicating
-                # that is not needed downstream.
-                inp_i_eol = mem_usage[inp_i]["liveness_end"] == ten_start + 1
-                # There could optionally be a check here for if a buffer is used as an
-                # input or output to HBM where the buffer won't land in HBM. We can rely
-                # on downstream checks to ensure those buffers don't land in scratchpad
-                # and can therefore not be used in-place. Any optimizations that seek to
-                # move buffers into scratchpad from HBM enabling in-place operations
-                # should maintain consistency downstream. If the scheduler algorithm allows
-                # placement of a buffer in scratchpad it's valid to use it for inlining.
-                if inp_i_size_match and inp_i_lay_match and inp_i_eol:
-                    allow_inplace[tensor_name].append(inp_i)
+            lx_inplace_op = self._op_good_for_lx_inplace(
+                mem_usage[tensor_name]["opname"]
+            )
+            if lx_inplace_op:
+                for inp_i in mem_usage[tensor_name]["inputs"]:
+                    inp_i_dev_lay = graph.get_buffer(inp_i).layout.device_layout
+                    inp_i_size_match = (
+                        mem_usage[tensor_name]["size_per_core"]
+                        == mem_usage[inp_i]["size_per_core"]
+                    )
+                    inp_i_lay_match = ten_dev_lay == inp_i_dev_lay
+                    # Reuse input buffer if the incoming buffer is going out of scope
+                    # on the next time step after the current op completes indicating
+                    # that is not needed downstream.
+                    inp_i_eol = mem_usage[inp_i]["liveness_end"] == ten_start + 1
+                    # There could optionally be a check here for if a buffer is used as an
+                    # input or output to HBM where the buffer won't land in HBM. We can rely
+                    # on downstream checks to ensure those buffers don't land in scratchpad
+                    # and can therefore not be used in-place. Any optimizations that seek to
+                    # move buffers into scratchpad from HBM enabling in-place operations
+                    # should maintain consistency downstream. If the scheduler algorithm allows
+                    # placement of a buffer in scratchpad it's valid to use it for inlining.
+                    if inp_i_size_match and inp_i_lay_match and inp_i_eol:
+                        allow_inplace[tensor_name].append(inp_i)
         return allow_inplace
 
     def _generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
@@ -224,10 +234,11 @@ class DefaultAllocator(ScratchpadAllocator):
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
     ):
+        size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
         if layout_planning is None:
-            layout_planning = GreedyLayoutSolver()
+            layout_planning = GreedyLayoutSolver(size)
         if pre_optimization_passes is None:
-            pre_optimization_passes = [CloneInputNodesPass(layout_planning.limit)]
+            pre_optimization_passes = [CloneInputNodesPass(size)]
         if post_optimization_passes is None:
             post_optimization_passes = []
 
@@ -252,6 +263,6 @@ def scratchpad_planning(
     # Operations are in topological order (guaranteed by GraphLowering).
     # Core division has already been done.
     # Stickification has already been done (therefore all ComputedBuffers have FixedTiledLayouts).
-    if not allocator:
+    if allocator is None:
         allocator = DefaultAllocator()
     allocator.plan_allocation(graph)
