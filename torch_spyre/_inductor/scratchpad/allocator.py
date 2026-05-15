@@ -247,6 +247,8 @@ class DefaultAllocator(ScratchpadAllocator):
         self.layout_planning = layout_planning
 
     def plan_allocation(self, graph: GraphLowering):
+        if any(isinstance(op.layout, MutationLayoutSHOULDREMOVE) for op in graph.operations):
+            return 
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
         buffers = self._generate_buffers(graph)
