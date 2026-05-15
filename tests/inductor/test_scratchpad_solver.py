@@ -128,6 +128,15 @@ class TestGreedySolver(TestCase):
         ]
         self.verify_layout(buffers, [0, None, None, 0])
 
+    def test_first_buffer_exceeds_limit_is_evicted(self):
+        # A buffer whose size exceeds the scratchpad limit must be evicted even
+        # when no other allocation is live (usage is empty, so address 0 would
+        # otherwise be returned without the limit guard).
+        buffers = [
+            LifetimeBoundBuffer("buffer0", __SMALL_SIZE__ + 1, 0, 2),
+        ]
+        self.verify_layout(buffers, [None], size=__SMALL_SIZE__)
+
 
 if __name__ == "__main__":
     import unittest
