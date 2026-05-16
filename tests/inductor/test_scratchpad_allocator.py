@@ -315,6 +315,7 @@ class TestScratchpadAllocatorBase(TestCase):
         self, m_ip, m_build, m_filter
     ):
         graph = MagicMock(spec=GraphLowering)
+        graph.operations = []
         in_place = {"b0": ["b1"]}
         raw = [LifetimeBoundBuffer("b0", 100, 0, 1)]
         filtered = [LifetimeBoundBuffer("b0", 100, 0, 1)]
@@ -516,6 +517,7 @@ class TestCloneInputNodesPass(TestCase):
     def _make_graph(self, inp_names, buf_per_name=None):
         graph = MagicMock(spec=GraphLowering)
         graph.graph_input_names = inp_names
+        graph.operations = []
         if buf_per_name is None:
             graph.get_buffer.return_value = _make_buf(4)
         else:
