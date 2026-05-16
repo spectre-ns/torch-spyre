@@ -26,8 +26,10 @@ from torch_spyre._inductor.scratchpad.passes import CloneInputNodesPass
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.scratchpad.utils import (
     calculate_buffer_statistics,
+    calculate_liveness,
     get_buffer_users,
     get_ncores_for_buffers,
+    mem_usage_by_op,
 )
 
 
@@ -43,28 +45,6 @@ def _make_dep(name: str) -> MagicMock:
     dep = MagicMock()
     dep.name = name
     return dep
-
-
-def _make_op_with_origin(
-    name: str,
-    read_deps: list,
-    write_deps: list,
-    opname: str | None = None,
-) -> MagicMock:
-    """Like _make_op but exposes origin_node (needed for _mem_usage_by_buffer)."""
-    op = MagicMock()
-    op.name = name
-    rw = MagicMock()
-    rw.reads = set(read_deps)
-    rw.writes = set(write_deps)
-    op.get_read_writes.return_value = rw
-    op.get_read_names.return_value = [d.name for d in read_deps]
-    if opname is not None:
-        op.origin_node = MagicMock()
-        op.origin_node.target._opname = opname
-    else:
-        op.origin_node = None
-    return op
 
 
 def _make_op(
@@ -239,7 +219,7 @@ class TestScratchpadAllocatorBase(TestCase):
         )
         mock_graph.get_buffer.assert_not_called()
 
-    # --- _calculate_liveness ---
+    # --- calculate_liveness ---
 
     def test_calculate_liveness_sets_start_and_end(self):
         dep_a, dep_b, dep_c = _make_dep("a"), _make_dep("b"), _make_dep("c")
@@ -249,7 +229,7 @@ class TestScratchpadAllocatorBase(TestCase):
         graph.operations = [op0, op1]
         mem_usage: dict = {"a": {}, "b": {}, "c": {}}
 
-        self.allocator._calculate_liveness(graph, mem_usage)
+        calculate_liveness(mem_usage, graph.operations)
 
         self.assertEqual(mem_usage["a"]["liveness_start"], 0)
         self.assertEqual(mem_usage["a"]["liveness_end"], 1)
@@ -265,7 +245,7 @@ class TestScratchpadAllocatorBase(TestCase):
         graph.operations = [op0]
         mem_usage: dict = {"a": {}, "b": {}}
 
-        self.allocator._calculate_liveness(graph, mem_usage)
+        calculate_liveness(mem_usage, graph.operations)
 
         self.assertEqual(mem_usage["a"]["liveness_start"], 0)
         self.assertEqual(mem_usage["a"]["liveness_end"], 1)
@@ -286,7 +266,7 @@ class TestScratchpadAllocatorBase(TestCase):
         graph.graph_input_names = []
         bufs = [LifetimeBoundBuffer("bad", 100, 0, 1)]
 
-        result = self.allocator._filter_buffers(graph, bufs)
+        result = self.allocator._filter_buffers(graph, bufs, None)
 
         self.assertEqual(result, [])
 
@@ -296,7 +276,7 @@ class TestScratchpadAllocatorBase(TestCase):
         graph.get_output_names.return_value = ["out"]
         graph.graph_input_names = []
         result = self.allocator._filter_buffers(
-            graph, [LifetimeBoundBuffer("out", 100, 0, 1)]
+            graph, [LifetimeBoundBuffer("out", 100, 0, 1)], None
         )
         self.assertEqual(result, [])
 
@@ -306,7 +286,7 @@ class TestScratchpadAllocatorBase(TestCase):
         graph.get_output_names.return_value = []
         graph.graph_input_names = ["inp"]
         result = self.allocator._filter_buffers(
-            graph, [LifetimeBoundBuffer("inp", 100, 0, 1)]
+            graph, [LifetimeBoundBuffer("inp", 100, 0, 1)], None
         )
         self.assertEqual(result, [])
 
@@ -322,7 +302,7 @@ class TestScratchpadAllocatorBase(TestCase):
         graph.graph_input_names = []
         bufs = [LifetimeBoundBuffer("ok", 100, 0, 1)]
 
-        result = self.allocator._filter_buffers(graph, bufs)
+        result = self.allocator._filter_buffers(graph, bufs, None)
 
         self.assertEqual(result, bufs)
 
@@ -344,9 +324,9 @@ class TestScratchpadAllocatorBase(TestCase):
 
         result = self.allocator._generate_buffers(graph)
 
-        m_ip.assert_called_once_with(graph)
-        m_build.assert_called_once_with(graph, in_place)
-        m_filter.assert_called_once_with(graph, raw)
+        m_ip.assert_called_once_with(graph, [])
+        m_build.assert_called_once_with(graph, in_place, [])
+        m_filter.assert_called_once_with(graph, raw, [])
         self.assertEqual(result, filtered)
 
 
@@ -391,94 +371,92 @@ class TestGetNcoresForBuffers(TestCase):
         self.assertEqual(result["buf_a"], -1)
 
 
-class TestMemUsageByBuffer(TestCase):
-    def setUp(self):
-        self.allocator = _ConcreteAllocator()
+class TestMemUsageByOp(TestCase):
+    # --- size and size_per_core ---
 
-    def _make_graph(self, buf_name, num_sticks, opname=None):
-        dep = _make_dep(buf_name)
-        op = _make_op_with_origin(buf_name, [], [dep], opname=opname)
-        graph = MagicMock(spec=GraphLowering)
-        graph.operations = [op]
-        graph.get_buffer.return_value = _make_buf(num_sticks)
-        return graph
-
-    @patch("torch_spyre._inductor.scratchpad.allocator.get_ncores_for_buffers")
-    def test_opname_extracted_from_origin_node(self, mock_ncores):
-        mock_ncores.return_value = {"buf0": 1}
-        graph = self._make_graph("buf0", 4, opname="exp")
-
-        result = self.allocator._mem_usage_by_buffer(graph)
-
-        self.assertEqual(result["buf0"]["opname"], "exp")
-
-    @patch("torch_spyre._inductor.scratchpad.allocator.get_ncores_for_buffers")
-    def test_opname_falls_back_to_nop_when_origin_node_is_none(self, mock_ncores):
-        mock_ncores.return_value = {"buf0": 1}
-        graph = self._make_graph("buf0", 4, opname=None)
-
-        result = self.allocator._mem_usage_by_buffer(graph)
-
-        self.assertEqual(result["buf0"]["opname"], "NOP")
-
-    @patch("torch_spyre._inductor.scratchpad.allocator.get_ncores_for_buffers")
-    def test_size_computed_from_stick_count(self, mock_ncores):
-        CORES = 2
-        mock_ncores.return_value = {"buf0": CORES}
-        graph = self._make_graph("buf0", 8, opname="sum")  # 8 sticks * 128 = 1024
-
-        result = self.allocator._mem_usage_by_buffer(graph)
-
-        self.assertEqual(result["buf0"]["size"], 8 * 128)
-        self.assertEqual(result["buf0"]["size_per_core"], 8 * 128 // CORES)
-
-    @patch("torch_spyre._inductor.scratchpad.allocator.get_ncores_for_buffers")
-    def test_core_div_mismatch_flagged(self, mock_ncores):
-        mock_ncores.return_value = {"buf0": -1}
-        graph = self._make_graph("buf0", 4, opname="exp")
-
-        result = self.allocator._mem_usage_by_buffer(graph)
-
-        self.assertTrue(result["buf0"]["core_div_mismatch"])
-
-    @patch("torch_spyre._inductor.scratchpad.allocator.get_ncores_for_buffers")
-    def test_liveness_populated_across_two_ops(self, mock_ncores):
-        # buf0 written at op0 (i=0), read at op1 (i=1) → start=0, end=2
-        mock_ncores.return_value = {"buf0": 1}
+    def test_size_computed_from_stick_count(self):
         dep = _make_dep("buf0")
-        op0 = _make_op_with_origin("op0", [], [dep], opname="exp")
-        op1 = _make_op_with_origin("op1", [dep], [])
+        op = _make_op("op0", [], [dep])
         graph = MagicMock(spec=GraphLowering)
-        graph.operations = [op0, op1]
+        graph.get_buffer.return_value = _make_buf(4)  # 4 sticks * 128 = 512
+
+        result, _ = mem_usage_by_op(graph, [op])
+
+        self.assertEqual(result["op0"]["buf0"]["size"], 4 * 128)
+        self.assertEqual(result["op0"]["buf0"]["size_per_core"], 4 * 128)  # num_cores=1
+
+    def test_size_per_core_divides_by_num_cores(self):
+        dep = _make_dep("buf0")
+        op = _make_op("op0", [], [dep], splits=[{16: 4}])  # 4 cores
+        graph = MagicMock(spec=GraphLowering)
+        graph.get_buffer.return_value = _make_buf(8)  # 8 sticks * 128 = 1024
+
+        result, _ = mem_usage_by_op(graph, [op])
+
+        self.assertEqual(result["op0"]["buf0"]["size"], 8 * 128)
+        self.assertEqual(result["op0"]["buf0"]["size_per_core"], 8 * 128 // 4)
+
+    # --- core_div_mismatch ---
+
+    def test_core_div_mismatch_propagated_from_argument(self):
+        dep = _make_dep("buf0")
+        op = _make_op("op0", [], [dep])
+        graph = MagicMock(spec=GraphLowering)
+        graph.get_buffer.return_value = _make_buf(4)
+
+        result, _ = mem_usage_by_op(graph, [op], core_div_mismatch={"buf0": True})
+
+        self.assertTrue(result["op0"]["buf0"]["core_div_mismatch"])
+
+    # --- buffer lists ---
+
+    def test_all_buf_used_aggregates_inputs_and_outputs(self):
+        dep_in = _make_dep("inp")
+        dep_out = _make_dep("out")
+        op = _make_op("op0", [dep_in], [dep_out])
+        graph = MagicMock(spec=GraphLowering)
+        graph.get_buffer.return_value = _make_buf(4)
+
+        result, _ = mem_usage_by_op(graph, [op])
+
+        self.assertEqual(result["op0"]["all_inputs"], ["inp"])
+        self.assertEqual(result["op0"]["all_outputs"], ["out"])
+        self.assertEqual(sorted(result["op0"]["all_buf_used"]), ["inp", "out"])
+
+    # --- liveness ---
+
+    def test_liveness_populated_across_two_ops(self):
+        # buf0 written at op0 (i=0), read at op1 (i=1) → start=0, end=2
+        dep = _make_dep("buf0")
+        op0 = _make_op("op0", [], [dep])
+        op1 = _make_op("op1", [dep], [])
+        graph = MagicMock(spec=GraphLowering)
         graph.get_buffer.return_value = _make_buf(2)
 
-        result = self.allocator._mem_usage_by_buffer(graph)
+        _, lifetimes = mem_usage_by_op(graph, [op0, op1])
 
-        self.assertEqual(result["buf0"]["liveness_start"], 0)
-        self.assertEqual(result["buf0"]["liveness_end"], 2)
+        self.assertEqual(lifetimes["buf0"]["liveness_start"], 0)
+        self.assertEqual(lifetimes["buf0"]["liveness_end"], 2)
 
 
 class TestDetermineInPlace(TestCase):
     def setUp(self):
         self.allocator = _ConcreteAllocator()
 
-    def _make_mem_usage(self, out_size, inp_size, out_start, inp_end, opname="exp"):
-        return {
-            "out": {
-                "opname": opname,
-                "inputs": ["inp"],
-                "size_per_core": out_size,
-                "liveness_start": out_start,
-                "liveness_end": out_start + 2,
-            },
-            "inp": {
-                "opname": "NOP",
-                "inputs": [],
-                "size_per_core": inp_size,
-                "liveness_start": 0,
-                "liveness_end": inp_end,
-            },
+    def _make_mem_usage(self, out_size, inp_size, out_start, inp_end):
+        mem_usage = {
+            "some_op": {
+                "all_inputs": ["inp"],
+                "all_outputs": ["out"],
+                "inp": {"size_per_core": inp_size},
+                "out": {"size_per_core": out_size},
+            }
         }
+        lifetimes = {
+            "inp": {"liveness_start": 0, "liveness_end": inp_end},
+            "out": {"liveness_start": out_start, "liveness_end": out_start + 2},
+        }
+        return mem_usage, lifetimes
 
     def _make_graph(self, shared_layout=True):
         graph = MagicMock(spec=GraphLowering)
@@ -495,50 +473,41 @@ class TestDetermineInPlace(TestCase):
             )
         return graph
 
-    @patch.object(ScratchpadAllocator, "_mem_usage_by_buffer")
+    @patch("torch_spyre._inductor.scratchpad.allocator.mem_usage_by_op")
     def test_inplace_allowed_when_all_conditions_met(self, mock_mem):
         mock_mem.return_value = self._make_mem_usage(512, 512, 2, 3)
         graph = self._make_graph(shared_layout=True)
 
-        result = self.allocator._determine_in_place(graph)
+        result = self.allocator._determine_in_place(graph, [])
 
         self.assertIn("inp", result["out"])
 
-    @patch.object(ScratchpadAllocator, "_mem_usage_by_buffer")
+    @patch("torch_spyre._inductor.scratchpad.allocator.mem_usage_by_op")
     def test_inplace_skipped_size_mismatch(self, mock_mem):
         mock_mem.return_value = self._make_mem_usage(512, 256, 2, 3)
         graph = self._make_graph(shared_layout=True)
 
-        result = self.allocator._determine_in_place(graph)
+        result = self.allocator._determine_in_place(graph, [])
 
         self.assertNotIn("inp", result["out"])
 
-    @patch.object(ScratchpadAllocator, "_mem_usage_by_buffer")
+    @patch("torch_spyre._inductor.scratchpad.allocator.mem_usage_by_op")
     def test_inplace_skipped_layout_mismatch(self, mock_mem):
         mock_mem.return_value = self._make_mem_usage(512, 512, 2, 3)
         graph = self._make_graph(shared_layout=False)
 
-        result = self.allocator._determine_in_place(graph)
+        result = self.allocator._determine_in_place(graph, [])
 
         self.assertNotIn("inp", result["out"])
 
-    @patch.object(ScratchpadAllocator, "_mem_usage_by_buffer")
+    @patch("torch_spyre._inductor.scratchpad.allocator.mem_usage_by_op")
     def test_inplace_skipped_when_input_not_end_of_life(self, mock_mem):
         mock_mem.return_value = self._make_mem_usage(512, 512, 2, 4)
         graph = self._make_graph(shared_layout=True)
 
-        result = self.allocator._determine_in_place(graph)
+        result = self.allocator._determine_in_place(graph, [])
 
         self.assertNotIn("inp", result["out"])
-
-    @patch.object(ScratchpadAllocator, "_mem_usage_by_buffer")
-    def test_inplace_skipped_for_non_inplace_op(self, mock_mem):
-        mock_mem.return_value = self._make_mem_usage(512, 512, 2, 3, opname="bad_op")
-        graph = self._make_graph(shared_layout=True)
-
-        result = self.allocator._determine_in_place(graph)
-
-        self.assertEqual(result["out"], [])
 
 
 class TestCloneInputNodesPass(TestCase):
@@ -553,62 +522,88 @@ class TestCloneInputNodesPass(TestCase):
             graph.get_buffer.side_effect = lambda name: buf_per_name[name]
         return graph
 
-    @patch("torch_spyre._inductor.scratchpad.passes.get_ncores_for_buffers")
+    @patch(
+        "torch_spyre._inductor.scratchpad.passes.OP_OUTPUT_GOOD_FOR_LX_REUSE",
+        new=["clone"],
+    )
+    @patch("torch_spyre._inductor.scratchpad.passes.buf_analysis")
     @patch("torch_spyre._inductor.scratchpad.passes.get_buffer_users")
     @patch.object(CloneInputNodesPass, "insert_op_after")
-    def test_eligible_input_triggers_insert(self, mock_insert, mock_users, mock_ncores):
+    def test_eligible_input_triggers_insert(
+        self, mock_insert, mock_users, mock_buf_analysis
+    ):
         graph = self._make_graph(["inp0"])
         mock_users.return_value = {"inp0": [MagicMock(), MagicMock()]}
-        mock_ncores.return_value = {"inp0": 1}
+        mock_buf_analysis.return_value = ({}, {}, {"inp0": False})
 
         CloneInputNodesPass(self.LIMIT).apply_pass(graph)
 
         mock_insert.assert_called_once()
 
-    @patch("torch_spyre._inductor.scratchpad.passes.get_ncores_for_buffers")
+    @patch(
+        "torch_spyre._inductor.scratchpad.passes.OP_OUTPUT_GOOD_FOR_LX_REUSE",
+        new=["clone"],
+    )
+    @patch("torch_spyre._inductor.scratchpad.passes.buf_analysis")
     @patch("torch_spyre._inductor.scratchpad.passes.get_buffer_users")
     @patch.object(CloneInputNodesPass, "insert_op_after")
-    def test_skips_input_used_only_once(self, mock_insert, mock_users, mock_ncores):
+    def test_skips_input_used_only_once(
+        self, mock_insert, mock_users, mock_buf_analysis
+    ):
         graph = self._make_graph(["inp0"])
         mock_users.return_value = {"inp0": [MagicMock()]}  # single user
-        mock_ncores.return_value = {"inp0": 1}
+        mock_buf_analysis.return_value = ({}, {}, {"inp0": False})
 
         CloneInputNodesPass(self.LIMIT).apply_pass(graph)
 
         mock_insert.assert_not_called()
 
-    @patch("torch_spyre._inductor.scratchpad.passes.get_ncores_for_buffers")
+    @patch(
+        "torch_spyre._inductor.scratchpad.passes.OP_OUTPUT_GOOD_FOR_LX_REUSE",
+        new=["clone"],
+    )
+    @patch("torch_spyre._inductor.scratchpad.passes.buf_analysis")
     @patch("torch_spyre._inductor.scratchpad.passes.get_buffer_users")
     @patch.object(CloneInputNodesPass, "insert_op_after")
-    def test_skips_input_too_large_for_lx(self, mock_insert, mock_users, mock_ncores):
+    def test_skips_input_too_large_for_lx(
+        self, mock_insert, mock_users, mock_buf_analysis
+    ):
         # 20 sticks * 128 = 2560 > LIMIT=1280
         graph = self._make_graph(["inp0"], buf_per_name={"inp0": _make_buf(20)})
         mock_users.return_value = {"inp0": [MagicMock(), MagicMock()]}
-        mock_ncores.return_value = {"inp0": 1}
+        mock_buf_analysis.return_value = ({}, {}, {"inp0": False})
 
         CloneInputNodesPass(self.LIMIT).apply_pass(graph)
 
         mock_insert.assert_not_called()
 
-    @patch("torch_spyre._inductor.scratchpad.passes.get_ncores_for_buffers")
+    @patch(
+        "torch_spyre._inductor.scratchpad.passes.OP_OUTPUT_GOOD_FOR_LX_REUSE",
+        new=["clone"],
+    )
+    @patch("torch_spyre._inductor.scratchpad.passes.buf_analysis")
     @patch("torch_spyre._inductor.scratchpad.passes.get_buffer_users")
     @patch.object(CloneInputNodesPass, "insert_op_after")
     def test_skips_input_with_core_div_mismatch(
-        self, mock_insert, mock_users, mock_ncores
+        self, mock_insert, mock_users, mock_buf_analysis
     ):
         graph = self._make_graph(["inp0"])
         mock_users.return_value = {"inp0": [MagicMock(), MagicMock()]}
-        mock_ncores.return_value = {"inp0": -1}
+        mock_buf_analysis.return_value = ({}, {}, {"inp0": True})
 
         CloneInputNodesPass(self.LIMIT).apply_pass(graph)
 
         mock_insert.assert_not_called()
 
-    @patch("torch_spyre._inductor.scratchpad.passes.get_ncores_for_buffers")
+    @patch(
+        "torch_spyre._inductor.scratchpad.passes.OP_OUTPUT_GOOD_FOR_LX_REUSE",
+        new=["clone"],
+    )
+    @patch("torch_spyre._inductor.scratchpad.passes.buf_analysis")
     @patch("torch_spyre._inductor.scratchpad.passes.get_buffer_users")
     @patch.object(CloneInputNodesPass, "insert_op_after")
     def test_budget_decremented_between_inputs(
-        self, mock_insert, mock_users, mock_ncores
+        self, mock_insert, mock_users, mock_buf_analysis
     ):
         # inp0: 8 sticks = 1024 bytes (fits LIMIT=1280, consumes it)
         # inp1: 4 sticks = 512 bytes (remaining budget=256, 512>256 → skipped)
@@ -621,12 +616,12 @@ class TestCloneInputNodesPass(TestCase):
             "inp0": [MagicMock(), MagicMock()],
             "inp1": [MagicMock(), MagicMock()],
         }
-        mock_ncores.return_value = {"inp0": 1, "inp1": 1}
+        mock_buf_analysis.return_value = ({}, {}, {"inp0": False, "inp1": False})
 
         CloneInputNodesPass(self.LIMIT).apply_pass(graph)
 
         self.assertEqual(mock_insert.call_count, 1)
-        self.assertIs(mock_insert.call_args[0][0], buf0)
+        self.assertIs(mock_insert.call_args[0][1], buf0)
 
 
 if __name__ == "__main__":
