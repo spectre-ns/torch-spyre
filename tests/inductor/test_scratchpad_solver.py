@@ -105,7 +105,9 @@ class TestGreedySolver(TestCase):
         # Test that adding inplace options allows for more efficient peak usage
         buffers = [
             LifetimeBoundBuffer("buffer0", LARGE_SIZE, 0, 4),
-            LifetimeBoundBuffer("buffer1", LARGE_SIZE, 3, 4, in_place_parents=["buffer0"]),
+            LifetimeBoundBuffer(
+                "buffer1", LARGE_SIZE, 3, 4, in_place_parents=["buffer0"]
+            ),
         ]
         self.verify_layout(buffers, [0, 0], LARGE_SIZE, ALIGNMENT)
 

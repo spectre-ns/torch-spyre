@@ -112,7 +112,9 @@ class ScratchpadAllocator(ABC):
         filtered_buffers = [b for b in buffers if b.name not in drop_list]
         valid_buffers = [buf.name for buf in filtered_buffers]
         for buf in filtered_buffers:
-            buf.in_place_parents = [name for name in buf.in_place_parents if name in valid_buffers]
+            buf.in_place_parents = [
+                name for name in buf.in_place_parents if name in valid_buffers
+            ]
 
         return filtered_buffers
 
