@@ -20,9 +20,9 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
 )
 
-__LARGE_SIZE__ = 512
-__SMALL_SIZE__ = 10
-__ALIGNMENT__ = 128
+LARGE_SIZE = 512
+SMALL_SIZE = 10
+ALIGNMENT = 128
 
 
 class TestGreedySolver(TestCase):
@@ -30,7 +30,7 @@ class TestGreedySolver(TestCase):
         self,
         buffers: list[LifetimeBoundBuffer],
         expected_addresses: list[int | None],
-        size=__SMALL_SIZE__,
+        size=SMALL_SIZE,
         alignment=1,
     ):
         result = GreedyLayoutSolver(size, alignment).plan_layout(buffers)
@@ -53,7 +53,7 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer1", 3, 0, 2),
             LifetimeBoundBuffer("buffer2", 4, 0, 2),
         ]
-        self.verify_layout(buffers, [0, None, None], alignment=__ALIGNMENT__)
+        self.verify_layout(buffers, [0, None, None], alignment=ALIGNMENT)
 
     def test_alignment_enforced(self):
         # Each buffer is placed at the next alignment boundary.
@@ -62,7 +62,7 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer1", 3, 0, 2),
             LifetimeBoundBuffer("buffer2", 4, 0, 2),
         ]
-        self.verify_layout(buffers, [0, 128, 256], __LARGE_SIZE__, __ALIGNMENT__)
+        self.verify_layout(buffers, [0, 128, 256], LARGE_SIZE, ALIGNMENT)
 
     def test_simple_eviction_layout(self):
         # buffer1 is evicted because it won't fit; buffer2 reuses buffer0's space.
@@ -99,32 +99,32 @@ class TestGreedySolver(TestCase):
             LifetimeBoundBuffer("buffer2", 100, 2, 4),
             LifetimeBoundBuffer("buffer3", 100, 3, 4),
         ]
-        self.verify_layout(buffers, [0, 256, 384, 256], __LARGE_SIZE__, __ALIGNMENT__)
+        self.verify_layout(buffers, [0, 256, 384, 256], LARGE_SIZE, ALIGNMENT)
 
     def test_inplace_allocation(self):
         # Test that adding inplace options allows for more efficient peak usage
         buffers = [
-            LifetimeBoundBuffer("buffer0", __LARGE_SIZE__, 0, 4),
-            LifetimeBoundBuffer("buffer1", __LARGE_SIZE__, 3, 4, in_place=["buffer0"]),
+            LifetimeBoundBuffer("buffer0", LARGE_SIZE, 0, 4),
+            LifetimeBoundBuffer("buffer1", LARGE_SIZE, 3, 4, in_place=["buffer0"]),
         ]
-        self.verify_layout(buffers, [0, 0], __LARGE_SIZE__, __ALIGNMENT__)
+        self.verify_layout(buffers, [0, 0], LARGE_SIZE, ALIGNMENT)
 
     def test_without_inplace_allocation(self):
         # Test that buffer gets evicted without in_place
         buffers = [
-            LifetimeBoundBuffer("buffer0", __LARGE_SIZE__, 0, 4),
-            LifetimeBoundBuffer("buffer1", __LARGE_SIZE__, 3, 4),
+            LifetimeBoundBuffer("buffer0", LARGE_SIZE, 0, 4),
+            LifetimeBoundBuffer("buffer1", LARGE_SIZE, 3, 4),
         ]
-        self.verify_layout(buffers, [0, None], __LARGE_SIZE__, __ALIGNMENT__)
+        self.verify_layout(buffers, [0, None], LARGE_SIZE, ALIGNMENT)
 
     def test_multiple_evictions_do_not_corrupt_allocation(self):
         # buffer0 fills the entire scratchpad; buffer1 and buffer2 are evicted.
         # buffer3 starts after buffer0 ends and should reclaim address 0.
         buffers = [
-            LifetimeBoundBuffer("buffer0", __SMALL_SIZE__, 0, 2),
-            LifetimeBoundBuffer("buffer1", __SMALL_SIZE__, 0, 2),
-            LifetimeBoundBuffer("buffer2", __SMALL_SIZE__, 0, 2),
-            LifetimeBoundBuffer("buffer3", __SMALL_SIZE__, 2, 3),
+            LifetimeBoundBuffer("buffer0", SMALL_SIZE, 0, 2),
+            LifetimeBoundBuffer("buffer1", SMALL_SIZE, 0, 2),
+            LifetimeBoundBuffer("buffer2", SMALL_SIZE, 0, 2),
+            LifetimeBoundBuffer("buffer3", SMALL_SIZE, 2, 3),
         ]
         self.verify_layout(buffers, [0, None, None, 0])
 
@@ -133,9 +133,9 @@ class TestGreedySolver(TestCase):
         # when no other allocation is live (usage is empty, so address 0 would
         # otherwise be returned without the limit guard).
         buffers = [
-            LifetimeBoundBuffer("buffer0", __SMALL_SIZE__ + 1, 0, 2),
+            LifetimeBoundBuffer("buffer0", SMALL_SIZE + 1, 0, 2),
         ]
-        self.verify_layout(buffers, [None], size=__SMALL_SIZE__)
+        self.verify_layout(buffers, [None], size=SMALL_SIZE)
 
 
 if __name__ == "__main__":
