@@ -89,7 +89,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
                 )
                 - 1
             )
-        return 0
+        return -1
 
     def _find_free_block(self, size_needed: int) -> Optional[int]:
         assert all(x.address is not None for x in self.usage)
@@ -101,9 +101,9 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         if not self.usage or curr_lo >= size_needed:
             return 0
 
-        end_address = math.ceil((curr_hi + 1) / self.alignment) * self.alignment
-        if end_address + size_needed <= self.limit:
-            return end_address
+        address = math.ceil((curr_hi + 1) / self.alignment) * self.alignment
+        if address + size_needed <= self.limit:
+            return address
 
         # Search for a gap between existing allocations
         self.usage.sort(key=lambda x: (x.address is None, x.address))
