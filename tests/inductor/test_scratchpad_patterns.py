@@ -241,11 +241,11 @@ class InstrumentedAllocator(DefaultAllocator):
     def __init__(self, pattern: Pattern, lowering: MockGraphLowering):
         self.buffers = pattern.buffers
         self.operations = pattern.operations
-        layout_planning = GreedyLayoutSolver()
+        layout_planning = GreedyLayoutSolver(AVAILABLE_LX_SIZE)
         super().__init__(
             layout_planning,
             pre_optimization_passes=[
-                TestCloneInputNodesPass(layout_planning.limit, self)
+                MockCloneInputNodesPass(layout_planning.limit, self)
             ],
         )
         self.allocations: dict[str, int] = {}
@@ -282,20 +282,6 @@ class InstrumentedAllocator(DefaultAllocator):
                 )
             self.allocations[tensor_name] = addr
 
-    @override
-    def _mem_usage_by_buffer(
-        self, graph: MockGraphLowering
-    ) -> dict[str, dict[str, bool | int]]:
-        mem_usage = {}
-        for buf_name, buf in self.buffers.items():
-            mem_usage[buf_name] = {
-                "size": buf.size,
-                "size_per_core": buf.size,
-                "core_div_mismatch": False,
-            }
-        self._calculate_liveness(graph, mem_usage)
-        return mem_usage
-
     def new_name(self, prefix: str, current_names: set[str]) -> str:
         candidate = prefix
         i = 0
@@ -305,20 +291,20 @@ class InstrumentedAllocator(DefaultAllocator):
         return candidate
 
 
-class TestCloneInputNodesPass(CloneInputNodesPass):
+class MockCloneInputNodesPass(CloneInputNodesPass):
     def __init__(self, limit: int, allocator: "InstrumentedAllocator"):
         super().__init__(limit)
         self._allocator = allocator
 
     @override
-    def insert_op_after(
+    def _insert_op_after(
         self,
+        graph: MockGraphLowering,
         buf: Buffer,
         lowering_func: Callable,
         buf_users: dict,
-        graph: MockGraphLowering,
+        operations: list,
     ) -> None:
-        operations = graph.operations
         buf_index = [i for i, op in enumerate(operations) if buf.name in op.inputs]
         if not buf_index:
             raise ValueError(
@@ -1207,7 +1193,6 @@ class TestExamplePattern(TestCase):
     def test_verify_moe_mlp_pattern(self):
         self.verify_pattern(self.make_moe_mlp_pattern(), inplace=True)
 
-    @usuallyExpectedFailure
     def test_moe_mlp_pattern(self):
         self.run_pattern(self.make_moe_mlp_pattern())
 
