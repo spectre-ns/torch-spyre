@@ -15,7 +15,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE, Operation
+from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -27,7 +27,11 @@ from torch_spyre._inductor.scratchpad.passes import (
     CloneInputNodesPass,
     ScratchpadOptimizationPass,
 )
-from torch_spyre._inductor.scratchpad.utils import mem_usage_by_op, buf_analysis, calculate_liveness
+from torch_spyre._inductor.scratchpad.utils import (
+    mem_usage_by_op,
+    buf_analysis,
+    calculate_liveness,
+)
 
 from torch_spyre._inductor import config
 
@@ -81,7 +85,7 @@ class ScratchpadAllocator(ABC):
 
     def _filter_buffers(
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
-        ) -> list[LifetimeBoundBuffer]:
+    ) -> list[LifetimeBoundBuffer]:
         """
         From the list of buffers, drop buffers that are outputs of
         unpermitted ops, graph outputs, and graph inputs
@@ -126,9 +130,7 @@ class ScratchpadAllocator(ABC):
         buffers = list({obj.name: obj for obj in buffers}.values())
         return buffers
 
-    def _determine_in_place(
-        self, graph: GraphLowering
-    ) -> dict[str, list[str]]:
+    def _determine_in_place(self, graph: GraphLowering) -> dict[str, list[str]]:
         allow_inplace: dict[str, list[str]] = {}
         _, _, core_div_mismatch = buf_analysis(graph)
         mem_usage = mem_usage_by_op(graph, core_div_mismatch)
@@ -136,9 +138,14 @@ class ScratchpadAllocator(ABC):
         for _, op_name in mem_usage.items():
             for input_buf in op_name["all_inputs"]:
                 for output_buf in op_name["all_outputs"]:
-                    if op_name[output_buf]["is_lx_viable"] and op_name[input_buf]["is_lx_viable"]:
+                    if (
+                        op_name[output_buf]["is_lx_viable"]
+                        and op_name[input_buf]["is_lx_viable"]
+                    ):
                         allow_inplace[output_buf] = allow_inplace.get(output_buf, [])
-                        out_ten_layout = graph.get_buffer(output_buf).layout.device_layout
+                        out_ten_layout = graph.get_buffer(
+                            output_buf
+                        ).layout.device_layout
                         in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
                         out_start = lifetimes[output_buf]["liveness_start"]
                         in_end = lifetimes[input_buf]["liveness_end"]
@@ -194,7 +201,7 @@ class DefaultAllocator(ScratchpadAllocator):
 
         - MultiInputBuffer
         - MutationBuffer
-        
+
 
         Args:
             layout_planning (MemoryPlanSolver | None, optional): _description_. Defaults to None.
