@@ -98,8 +98,10 @@ class ScratchpadAllocator(ABC):
                 for mem_dep in rw.writes:
                     drop_list.add(mem_dep.name)
 
-        drop_list.update([key for key, mismatch in core_div_mismatch.items() if mismatch])
-        
+        drop_list.update(
+            [key for key, mismatch in core_div_mismatch.items() if mismatch]
+        )
+
         # These can be relaxed once node cloning is implemented as a post-solve optimization
         # rather than just filling the scratchpad at t = 0
         drop_list.update(graph.get_output_names())
@@ -107,13 +109,12 @@ class ScratchpadAllocator(ABC):
 
         # Clean up inplace so as to not rely on the solver to exclude inplace options which
         # are not valid scratchpad buffers.
-        filtered_buffers =  [b for b in buffers if b.name not in drop_list]
+        filtered_buffers = [b for b in buffers if b.name not in drop_list]
         valid_buffers = [buf.name for buf in filtered_buffers]
         for buf in filtered_buffers:
             buf.in_place = [name for name in buf.in_place if name in valid_buffers]
 
         return filtered_buffers
-        
 
     def _build_bound_buffers(
         self,
@@ -127,7 +128,10 @@ class ScratchpadAllocator(ABC):
         buffers = []
         for _, op in mem_usage.items():
             for buffer_name in op["all_buf_used"]:
-                if op[buffer_name]["is_lx_viable"] and not op[buffer_name]["core_div_mismatch"]:
+                if (
+                    op[buffer_name]["is_lx_viable"]
+                    and not op[buffer_name]["core_div_mismatch"]
+                ):
                     buffers.append(
                         LifetimeBoundBuffer(
                             buffer_name,
@@ -171,7 +175,12 @@ class ScratchpadAllocator(ABC):
                             op_name[output_buf]["core_div_mismatch"]
                             or op_name[input_buf]["core_div_mismatch"]
                         )
-                        if inp_i_size_match and inp_i_lay_match and inp_i_eol and no_core_div_mismatch:
+                        if (
+                            inp_i_size_match
+                            and inp_i_lay_match
+                            and inp_i_eol
+                            and no_core_div_mismatch
+                        ):
                             allow_inplace[output_buf].append(input_buf)
         return allow_inplace
 
