@@ -169,9 +169,6 @@ class ScratchpadAllocator(ABC):
         return allow_inplace
 
     def _generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
-        # operations = [
-        #     op for op in graph.operations if self._op_output_good_for_lx_reuse(op)
-        # ]
         in_place = self._determine_in_place(graph)
         buffers = self._build_bound_buffers(graph, in_place)
         filtered_buffers = self._filter_buffers(graph, buffers)
