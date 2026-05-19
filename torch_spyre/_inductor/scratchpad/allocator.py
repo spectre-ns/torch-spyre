@@ -153,17 +153,7 @@ class ScratchpadAllocator(ABC):
                         in_size = op_name[input_buf]["size_per_core"]
                         inp_i_size_match = out_size == in_size
                         inp_i_lay_match = out_ten_layout == in_ten_layout
-                        # Reuse input buffer if the incoming buffer is going out of scope
-                        # on the next time step after the current op completes indicating
-                        # that is not needed downstream.
                         inp_i_eol = in_end == out_start + 1
-                        # There could optionally be a check here for if a buffer is used as an
-                        # input or output to HBM where the buffer won't land in HBM. We can rely
-                        # on downstream checks to ensure those buffers don't land in scratchpad
-                        # and can therefore not be used in-place. Any optimizations that seek to
-                        # move buffers into scratchpad from HBM enabling in-place operations
-                        # should maintain consistency downstream. If the scheduler algorithm allows
-                        # placement of a buffer in scratchpad it's valid to use it for inlining.
                         if inp_i_size_match and inp_i_lay_match and inp_i_eol:
                             allow_inplace[output_buf].append(input_buf)
         return allow_inplace
