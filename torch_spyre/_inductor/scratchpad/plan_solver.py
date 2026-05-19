@@ -30,7 +30,7 @@ class LifetimeBoundBuffer:
     start_time: int
     end_time: int
     address: Optional[int] = None
-    in_place: list[str] = field(default_factory=list)
+    in_place_parents: list[str] = field(default_factory=list)
 
 
 class MemoryPlanSolver(ABC):
@@ -121,7 +121,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
 
     def _try_allocate(self, buffer: LifetimeBoundBuffer):
         # Check if the current buffer can be in-placed
-        for in_place_opt in buffer.in_place:
+        for in_place_opt in buffer.in_place_parents:
             matched_obj = next((u for u in self.usage if u.name == in_place_opt), None)
             if matched_obj is not None and buffer.size <= matched_obj.size:
                 buffer.address = matched_obj.address

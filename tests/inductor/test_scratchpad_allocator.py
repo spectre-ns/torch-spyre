@@ -395,14 +395,14 @@ class TestScratchpadAllocatorBase(TestCase):
         graph.get_output_names.return_value = []
         graph.graph_input_names = []
         bufs = [
-            LifetimeBoundBuffer("out", 100, 1, 2, in_place=["inp"]),
+            LifetimeBoundBuffer("out", 100, 1, 2, in_place_parents=["inp"]),
             LifetimeBoundBuffer("inp", 100, 0, 1),
         ]
 
         result = self.allocator._filter_buffers(graph, bufs)
 
         self.assertEqual([b.name for b in result], ["out"])
-        self.assertEqual(result[0].in_place, [])
+        self.assertEqual(result[0].in_place_parents, [])
 
     # --- _build_bound_buffers ---
 
@@ -457,7 +457,7 @@ class TestScratchpadAllocatorBase(TestCase):
         result = self.allocator._build_bound_buffers(graph, {"out": ["inp"]})
 
         out_buf = next(b for b in result if b.name == "out")
-        self.assertEqual(out_buf.in_place, ["inp"])
+        self.assertEqual(out_buf.in_place_parents, ["inp"])
 
     @patch("torch_spyre._inductor.scratchpad.allocator.mem_usage_by_op")
     @patch("torch_spyre._inductor.scratchpad.allocator.buf_analysis")

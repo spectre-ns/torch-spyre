@@ -112,7 +112,7 @@ class ScratchpadAllocator(ABC):
         filtered_buffers = [b for b in buffers if b.name not in drop_list]
         valid_buffers = [buf.name for buf in filtered_buffers]
         for buf in filtered_buffers:
-            buf.in_place = [name for name in buf.in_place if name in valid_buffers]
+            buf.in_place_parents = [name for name in buf.in_place_parents if name in valid_buffers]
 
         return filtered_buffers
 
@@ -138,7 +138,7 @@ class ScratchpadAllocator(ABC):
                             op[buffer_name]["size_per_core"],
                             lifetimes[buffer_name]["liveness_start"],
                             lifetimes[buffer_name]["liveness_end"],
-                            in_place=in_place[buffer_name]
+                            in_place_parents=in_place[buffer_name]
                             if buffer_name in in_place
                             else [],
                         )
