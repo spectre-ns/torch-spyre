@@ -378,7 +378,9 @@ class TestScratchpadAllocatorBase(TestCase):
         self.assertEqual(result, bufs)
 
     @patch("torch_spyre._inductor.scratchpad.allocator.buf_analysis")
-    @patch.object(ScratchpadAllocator, "_op_output_good_for_lx_reuse", return_value=True)
+    @patch.object(
+        ScratchpadAllocator, "_op_output_good_for_lx_reuse", return_value=True
+    )
     def test_filter_buffers_removes_dropped_buffer_from_in_place(
         self, _mock_reuse, mock_ba
     ):
@@ -407,7 +409,9 @@ class TestScratchpadAllocatorBase(TestCase):
     @patch("torch_spyre._inductor.scratchpad.allocator.mem_usage_by_op")
     @patch("torch_spyre._inductor.scratchpad.allocator.buf_analysis")
     @patch("torch_spyre._inductor.scratchpad.allocator.calculate_liveness")
-    def test_build_bound_buffers_skips_non_viable(self, mock_liveness, mock_ba, mock_mem):
+    def test_build_bound_buffers_skips_non_viable(
+        self, mock_liveness, mock_ba, mock_mem
+    ):
         mock_ba.return_value = ({}, {}, {})
         mock_liveness.return_value = {"buf0": {"liveness_start": 0, "liveness_end": 1}}
         mock_mem.return_value = {
@@ -436,8 +440,16 @@ class TestScratchpadAllocatorBase(TestCase):
         mock_mem.return_value = {
             "op0": {
                 "all_buf_used": ["inp", "out"],
-                "inp": {"is_lx_viable": True, "size_per_core": 256, "core_div_mismatch": False},
-                "out": {"is_lx_viable": True, "size_per_core": 256, "core_div_mismatch": False},
+                "inp": {
+                    "is_lx_viable": True,
+                    "size_per_core": 256,
+                    "core_div_mismatch": False,
+                },
+                "out": {
+                    "is_lx_viable": True,
+                    "size_per_core": 256,
+                    "core_div_mismatch": False,
+                },
             }
         }
         graph = MagicMock(spec=GraphLowering)
@@ -460,11 +472,19 @@ class TestScratchpadAllocatorBase(TestCase):
         mock_mem.return_value = {
             "op0": {
                 "all_buf_used": ["shared"],
-                "shared": {"is_lx_viable": True, "size_per_core": 128, "core_div_mismatch": False},
+                "shared": {
+                    "is_lx_viable": True,
+                    "size_per_core": 128,
+                    "core_div_mismatch": False,
+                },
             },
             "op1": {
                 "all_buf_used": ["shared"],
-                "shared": {"is_lx_viable": True, "size_per_core": 128, "core_div_mismatch": False},
+                "shared": {
+                    "is_lx_viable": True,
+                    "size_per_core": 128,
+                    "core_div_mismatch": False,
+                },
             },
         }
         graph = MagicMock(spec=GraphLowering)
@@ -485,7 +505,11 @@ class TestScratchpadAllocatorBase(TestCase):
         mock_mem.return_value = {
             "op0": {
                 "all_buf_used": ["buf0"],
-                "buf0": {"is_lx_viable": True, "size_per_core": 512, "core_div_mismatch": True},
+                "buf0": {
+                    "is_lx_viable": True,
+                    "size_per_core": 512,
+                    "core_div_mismatch": True,
+                },
             }
         }
         graph = MagicMock(spec=GraphLowering)
@@ -512,7 +536,7 @@ class TestMemUsageByOp(TestCase):
 
     def test_size_per_core_divides_by_num_cores(self):
         dep = _make_dep("buf0")
-        op = _make_op("op0", [], [dep], splits=[{8 : 4}])  # 4 cores
+        op = _make_op("op0", [], [dep], splits=[{8: 4}])  # 4 cores
         graph = MagicMock(spec=GraphLowering)
         graph.operations = [op]
         graph.get_buffer.return_value = _make_buf(8)  # 8 sticks * 128 = 1024
@@ -551,6 +575,7 @@ class TestMemUsageByOp(TestCase):
         self.assertEqual(result["op0"]["all_outputs"], ["out"])
         self.assertEqual(sorted(result["op0"]["all_buf_used"]), ["inp", "out"])
 
+
 class TestDetermineInPlace(TestCase):
     def setUp(self):
         self.allocator = _ConcreteAllocator()
@@ -560,8 +585,16 @@ class TestDetermineInPlace(TestCase):
             "some_op": {
                 "all_inputs": ["inp"],
                 "all_outputs": ["out"],
-                "inp": {"size_per_core": inp_size, "is_lx_viable": True, "core_div_mismatch": False},
-                "out": {"size_per_core": out_size, "is_lx_viable": True, "core_div_mismatch": False},
+                "inp": {
+                    "size_per_core": inp_size,
+                    "is_lx_viable": True,
+                    "core_div_mismatch": False,
+                },
+                "out": {
+                    "size_per_core": out_size,
+                    "is_lx_viable": True,
+                    "core_div_mismatch": False,
+                },
             }
         }
         lifetimes = {
