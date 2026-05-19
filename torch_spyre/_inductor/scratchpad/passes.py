@@ -224,7 +224,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         buf_users = get_buffer_users(graph)
 
         operations = graph.operations
-        _, _, core_div_mismatch = buf_analysis(graph.operations)
+        _, _, core_div_mismatch = buf_analysis(graph)
         if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
             self.try_insert_clone_op_for_inputs(
                 graph,
