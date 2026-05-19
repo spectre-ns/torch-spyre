@@ -15,12 +15,11 @@
 
 import math
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation, ComputedBuffer
+from torch._inductor.ir import Operation
 from torch_spyre._inductor import config
 
 
-def calculate_liveness(graph: GraphLowering
-) -> dict:
+def calculate_liveness(graph: GraphLowering) -> dict:
     mem_usage: dict[str, dict[str, bool | int]] = {}
     for i, op in enumerate(graph.operations):
         rw = op.get_read_writes()
@@ -67,7 +66,7 @@ def mem_usage_by_op(
                         math.prod(dev_layout.device_size[:-1]) * 128
                     )  # num_sticks * bytes_per_stick
                     mem_usage[op.name][dep.name] = {
-                        "is_lx_viable" : True,
+                        "is_lx_viable": True,
                         "is_input": is_input,
                         "size": dev_size,
                         "size_per_core": dev_size // num_cores,
@@ -75,8 +74,8 @@ def mem_usage_by_op(
                     }
                 except AttributeError:
                     mem_usage[op.name][dep.name] = {
-                            "is_lx_viable" : False,
-                        }
+                        "is_lx_viable": False,
+                    }
 
                 if is_input:
                     mem_usage[op.name]["all_inputs"].append(dep.name)
