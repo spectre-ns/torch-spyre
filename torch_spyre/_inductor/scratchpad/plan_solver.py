@@ -78,16 +78,10 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         return 0
 
     def _get_highest_addr_in_use(self):
-        if self.usage:
-            return max(
-                [
-                    rec.address + rec.size
-                    for rec in self.usage
-                    if rec.address is not None
-                ],
-                default=-1,
-            )
-        return -1
+        return max(
+            (rec.address + rec.size for rec in self.usage if rec.address is not None),
+            default=-1,
+        )
 
     def _find_free_block(self, size_needed: int) -> Optional[int]:
         assert all(x.address is not None for x in self.usage)
