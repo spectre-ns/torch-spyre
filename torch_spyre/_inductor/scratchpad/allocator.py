@@ -27,7 +27,7 @@ from torch_spyre._inductor.scratchpad.passes import (
     CloneInputNodesPass,
     ScratchpadOptimizationPass,
 )
-from torch_spyre._inductor.scratchpad.utils import mem_usage_by_op
+from torch_spyre._inductor.scratchpad.utils import mem_usage_by_op, buf_analysis, calculate_liveness
 
 from torch_spyre._inductor import config
 
@@ -80,8 +80,8 @@ class ScratchpadAllocator(ABC):
         return org_op_name in OP_GOOD_FOR_LX_INPLACE
 
     def _filter_buffers(
-        self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer], ops: Operation
-    ) -> list[LifetimeBoundBuffer]:
+        self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
+        ) -> list[LifetimeBoundBuffer]:
         """
         From the list of buffers, drop buffers that are outputs of
         unpermitted ops, graph outputs, and graph inputs
@@ -103,67 +103,71 @@ class ScratchpadAllocator(ABC):
         self,
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
-        ops: Operation,
     ) -> list[LifetimeBoundBuffer]:
-        mem_usage, lifetimes = mem_usage_by_op(graph, ops)
+        lifetimes = calculate_liveness(graph)
+        mem_usage = mem_usage_by_op(graph)
         in_place = {} if in_place is None else in_place
         buffers = []
         for _, op in mem_usage.items():
-            for buffer_name in op["all_inputs"] + op["all_outputs"]:
-                buffers.append(
-                    LifetimeBoundBuffer(
-                        buffer_name,
-                        op[buffer_name]["size_per_core"],
-                        lifetimes[buffer_name]["liveness_start"],
-                        lifetimes[buffer_name]["liveness_end"],
-                        in_place=in_place[buffer_name]
-                        if buffer_name in in_place
-                        else [],
+            for buffer_name in op["all_buf_used"]:
+                if op[buffer_name]["is_lx_viable"]:
+                    buffers.append(
+                        LifetimeBoundBuffer(
+                            buffer_name,
+                            op[buffer_name]["size_per_core"],
+                            lifetimes[buffer_name]["liveness_start"],
+                            lifetimes[buffer_name]["liveness_end"],
+                            in_place=in_place[buffer_name]
+                            if buffer_name in in_place
+                            else [],
+                        )
                     )
-                )
 
         buffers = list({obj.name: obj for obj in buffers}.values())
         return buffers
 
     def _determine_in_place(
-        self, graph: GraphLowering, ops: Operation
+        self, graph: GraphLowering
     ) -> dict[str, list[str]]:
         allow_inplace: dict[str, list[str]] = {}
-        mem_usage, lifetimes = mem_usage_by_op(graph, ops)
+        _, _, core_div_mismatch = buf_analysis(graph)
+        mem_usage = mem_usage_by_op(graph, core_div_mismatch)
+        lifetimes = calculate_liveness(graph)
         for _, op_name in mem_usage.items():
             for input_buf in op_name["all_inputs"]:
                 for output_buf in op_name["all_outputs"]:
-                    allow_inplace[output_buf] = allow_inplace.get(output_buf, [])
-                    out_ten_layout = graph.get_buffer(output_buf).layout.device_layout
-                    in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
-                    out_start = lifetimes[output_buf]["liveness_start"]
-                    in_end = lifetimes[input_buf]["liveness_end"]
-                    out_size = op_name[output_buf]["size_per_core"]
-                    in_size = op_name[input_buf]["size_per_core"]
-                    inp_i_size_match = out_size == in_size
-                    inp_i_lay_match = out_ten_layout == in_ten_layout
-                    # Reuse input buffer if the incoming buffer is going out of scope
-                    # on the next time step after the current op completes indicating
-                    # that is not needed downstream.
-                    inp_i_eol = in_end == out_start + 1
-                    # There could optionally be a check here for if a buffer is used as an
-                    # input or output to HBM where the buffer won't land in HBM. We can rely
-                    # on downstream checks to ensure those buffers don't land in scratchpad
-                    # and can therefore not be used in-place. Any optimizations that seek to
-                    # move buffers into scratchpad from HBM enabling in-place operations
-                    # should maintain consistency downstream. If the scheduler algorithm allows
-                    # placement of a buffer in scratchpad it's valid to use it for inlining.
-                    if inp_i_size_match and inp_i_lay_match and inp_i_eol:
-                        allow_inplace[output_buf].append(input_buf)
+                    if op_name[output_buf]["is_lx_viable"] and op_name[input_buf]["is_lx_viable"]:
+                        allow_inplace[output_buf] = allow_inplace.get(output_buf, [])
+                        out_ten_layout = graph.get_buffer(output_buf).layout.device_layout
+                        in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
+                        out_start = lifetimes[output_buf]["liveness_start"]
+                        in_end = lifetimes[input_buf]["liveness_end"]
+                        out_size = op_name[output_buf]["size_per_core"]
+                        in_size = op_name[input_buf]["size_per_core"]
+                        inp_i_size_match = out_size == in_size
+                        inp_i_lay_match = out_ten_layout == in_ten_layout
+                        # Reuse input buffer if the incoming buffer is going out of scope
+                        # on the next time step after the current op completes indicating
+                        # that is not needed downstream.
+                        inp_i_eol = in_end == out_start + 1
+                        # There could optionally be a check here for if a buffer is used as an
+                        # input or output to HBM where the buffer won't land in HBM. We can rely
+                        # on downstream checks to ensure those buffers don't land in scratchpad
+                        # and can therefore not be used in-place. Any optimizations that seek to
+                        # move buffers into scratchpad from HBM enabling in-place operations
+                        # should maintain consistency downstream. If the scheduler algorithm allows
+                        # placement of a buffer in scratchpad it's valid to use it for inlining.
+                        if inp_i_size_match and inp_i_lay_match and inp_i_eol:
+                            allow_inplace[output_buf].append(input_buf)
         return allow_inplace
 
     def _generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
-        operations = [
-            op for op in graph.operations if self._op_output_good_for_lx_reuse(op)
-        ]
-        in_place = self._determine_in_place(graph, operations)
-        buffers = self._build_bound_buffers(graph, in_place, operations)
-        filtered_buffers = self._filter_buffers(graph, buffers, operations)
+        # operations = [
+        #     op for op in graph.operations if self._op_output_good_for_lx_reuse(op)
+        # ]
+        in_place = self._determine_in_place(graph)
+        buffers = self._build_bound_buffers(graph, in_place)
+        filtered_buffers = self._filter_buffers(graph, buffers)
         return filtered_buffers
 
     def _push_allocation(
@@ -184,6 +188,19 @@ class DefaultAllocator(ScratchpadAllocator):
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
     ):
+        """
+        Sub-components need to be able to handle non-computed buffer objects on their
+        own. The harness will not filter out the incompatible types.
+
+        - MultiInputBuffer
+        - MutationBuffer
+        
+
+        Args:
+            layout_planning (MemoryPlanSolver | None, optional): _description_. Defaults to None.
+            pre_optimization_passes (list[ScratchpadOptimizationPass] | None, optional): _description_. Defaults to None.
+            post_optimization_passes (list[ScratchpadOptimizationPass] | None, optional): _description_. Defaults to None.
+        """
         size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
         if layout_planning is None:
             layout_planning = GreedyLayoutSolver(size)
