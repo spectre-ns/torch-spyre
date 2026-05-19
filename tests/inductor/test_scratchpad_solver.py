@@ -14,11 +14,13 @@
 
 """Tests for layout solvers"""
 
+import unittest
 from unittest import TestCase
 from torch_spyre._inductor.scratchpad.plan_solver import (
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
     OrToolsMemoryPlanSolver,
+    _ORTOOLS_AVAILABLE,
 )
 
 LARGE_SIZE = 512
@@ -141,6 +143,7 @@ class TestGreedySolver(TestCase):
         self.verify_layout(buffers, [None], size=SMALL_SIZE)
 
 
+@unittest.skipUnless(_ORTOOLS_AVAILABLE, "ortools not installed")
 class TestOrToolsMemoryPlanSolver(TestCase):
     """Tests derived from the canonical planning demo scenarios."""
 

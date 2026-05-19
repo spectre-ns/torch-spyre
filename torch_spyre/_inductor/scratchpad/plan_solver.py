@@ -18,8 +18,14 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Optional
 from abc import ABC, abstractmethod
-from ortools.sat.python import cp_model
 from collections import defaultdict
+
+try:
+    from ortools.sat.python import cp_model as cp_model
+
+    _ORTOOLS_AVAILABLE = True
+except ImportError:
+    _ORTOOLS_AVAILABLE = False
 
 
 @dataclass
@@ -262,6 +268,11 @@ class OrToolsMemoryPlanSolver(MemoryPlanSolver):
         time_limit_seconds: float = 10.0,
         max_path_length: int = 8,
     ) -> None:
+        if not _ORTOOLS_AVAILABLE:
+            raise ImportError(
+                "ortools is required for OrToolsMemoryPlanSolver. "
+                "Install it with: pip install ortools"
+            )
         self._buffer_size = buffer_size // alignment
         self._alignment = alignment
         self._time_limit_seconds = time_limit_seconds

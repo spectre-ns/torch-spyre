@@ -9,7 +9,6 @@ requires = [
     "numpy",
     "pyyaml", # needed for codegen
     "regex",
-    "ortools",
     "setuptools>=70.1.0,<80.0",
     "torch~=2.11.0",
 #    "torch>=2.11.0",
@@ -26,7 +25,6 @@ description = "Torch-Spyre out of tree registration"
 dependencies = [
     "numpy",
     "regex",
-    "ortools",
     "torch~=2.11.0",
 #    "torch>=2.11.0",
     "psutil~=7.2.1"
@@ -35,7 +33,10 @@ requires-python = ">=3.11"
 dynamic = ["version"]
 
 [project.optional-dependencies]
-build = [ # no-isolation build 
+ortools = [
+    "ortools",
+]
+build = [ # no-isolation build
     # any change here should be reflected in the build system above
     "build",  # only required to build torch_sendnn
     "cmake>=3.27,<4.0.0",

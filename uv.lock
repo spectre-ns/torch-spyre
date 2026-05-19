@@ -1244,7 +1244,6 @@ name = "torch-spyre"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
-    { name = "ortools" },
     { name = "psutil" },
     { name = "regex" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
@@ -1272,6 +1271,9 @@ lint = [
     { name = "types-pyyaml" },
     { name = "uv" },
 ]
+ortools = [
+    { name = "ortools" },
+]
 test = [
     { name = "pydantic" },
     { name = "pytest" },
@@ -1289,7 +1291,7 @@ requires-dist = [
     { name = "ninja", marker = "extra == 'build'" },
     { name = "numpy" },
     { name = "numpy", marker = "extra == 'build'" },
-    { name = "ortools" },
+    { name = "ortools", marker = "extra == 'ortools'" },
     { name = "pre-commit", marker = "extra == 'lint'", specifier = "~=4.5.0" },
     { name = "psutil", specifier = "~=7.2.1" },
     { name = "pydantic", marker = "extra == 'test'" },
@@ -1306,7 +1308,7 @@ requires-dist = [
     { name = "uv", marker = "extra == 'lint'", specifier = "~=0.10.0" },
     { name = "wheel", marker = "extra == 'build'" },
 ]
-provides-extras = ["build", "test", "lint"]
+provides-extras = ["ortools", "build", "test", "lint"]
 
 [[package]]
 name = "tqdm"
