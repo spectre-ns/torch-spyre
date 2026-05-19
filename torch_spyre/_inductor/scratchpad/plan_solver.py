@@ -80,7 +80,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
     def _get_highest_addr_in_use(self):
         return max(
             (rec.address + rec.size for rec in self.usage if rec.address is not None),
-            default=-1,
+            default=0,
         )
 
     def _find_free_block(self, size_needed: int) -> Optional[int]:
@@ -93,7 +93,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         if not self.usage or curr_lo >= size_needed:
             return 0
 
-        address = math.ceil((curr_hi + 1) / self.alignment) * self.alignment
+        address = math.ceil(curr_hi  / self.alignment) * self.alignment
         if address + size_needed <= self.limit:
             return address
 
