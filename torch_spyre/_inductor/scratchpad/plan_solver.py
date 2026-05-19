@@ -203,6 +203,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
 
         return buffers
 
+
 @dataclass
 class _InPlaceCandidate:
     src: str
@@ -425,9 +426,7 @@ class OrToolsMemoryPlanSolver(MemoryPlanSolver):
         spill_cost_expr = SPILL_WEIGHT * sum(
             int(
                 round(
-                    t.size
-                    * (t.heuristic if t.heuristic is not None else 1.0)
-                    * SCALE
+                    t.size * (t.heuristic if t.heuristic is not None else 1.0) * SCALE
                 )
             )
             * (1 - in_buffer[t.name])

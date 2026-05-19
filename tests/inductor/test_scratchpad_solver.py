@@ -275,9 +275,7 @@ class TestOrToolsMemoryPlanSolver(TestCase):
             LifetimeBoundBuffer("WALL", 150, 0, 20, heuristic=10.0),
             LifetimeBoundBuffer("A", 50, 0, 6, heuristic=1.0),
             LifetimeBoundBuffer("B", 50, 5, 6, heuristic=1.0),
-            LifetimeBoundBuffer(
-                "C", 50, 6, 15, heuristic=10.0, in_place=["A", "B"]
-            ),
+            LifetimeBoundBuffer("C", 50, 6, 15, heuristic=10.0, in_place=["A", "B"]),
             LifetimeBoundBuffer("T_BLOCKER", 50, 3, 4, heuristic=10.0),
         ]
         results = self._solve(buffers, 200)
