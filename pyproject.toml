@@ -26,6 +26,7 @@ description = "Torch-Spyre out of tree registration"
 dependencies = [
     "numpy",
     "regex",
+    "ortools",
     "torch~=2.11.0",
 #    "torch>=2.11.0",
     "psutil~=7.2.1"
