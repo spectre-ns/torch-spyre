@@ -73,9 +73,10 @@ class MemoryPlanSolver(ABC):
 
 class GreedyLayoutSolver(MemoryPlanSolver):
     def _get_lowest_addr_in_use(self):
-        if self.usage:
-            return min([rec.address for rec in self.usage if rec.address is not None])
-        return 0
+        return min(
+            (rec.address for rec in self.usage if rec.address is not None),
+            default=0,
+        )
 
     def _get_highest_addr_in_use(self):
         return max(
@@ -93,7 +94,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         if not self.usage or curr_lo >= size_needed:
             return 0
 
-        address = math.ceil(curr_hi  / self.alignment) * self.alignment
+        address = math.ceil(curr_hi / self.alignment) * self.alignment
         if address + size_needed <= self.limit:
             return address
 
