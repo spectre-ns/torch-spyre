@@ -20,17 +20,17 @@ from torch_spyre._inductor import config
 
 
 def calculate_liveness(graph: GraphLowering) -> dict:
-    mem_usage: dict[str, dict[str, bool | int]] = {}
+    liveness: dict[str, dict[str, bool | int]] = {}
     for i, op in enumerate(graph.operations):
         rw = op.get_read_writes()
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
-            if buf_name not in mem_usage:
-                mem_usage[buf_name] = {}
-            if "liveness_start" not in mem_usage[buf_name]:
-                mem_usage[buf_name]["liveness_start"] = i
-            mem_usage[buf_name]["liveness_end"] = i + 1
-    return mem_usage
+            if buf_name not in liveness:
+                liveness[buf_name] = {}
+            if "liveness_start" not in liveness[buf_name]:
+                liveness[buf_name]["liveness_start"] = i
+            liveness[buf_name]["liveness_end"] = i + 1
+    return liveness
 
 
 def mem_usage_by_op(

@@ -93,7 +93,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
 
         return new_Loop
 
-    def insert_op_after(
+    def _insert_op_after(
         self,
         graph,
         buf: TensorBox,
@@ -183,7 +183,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         operations.remove(new_com_buf)
         operations.insert(idx_to_first_user, new_com_buf)
 
-    def try_insert_clone_op_for_inputs(
+    def _try_insert_clone_op_for_inputs(
         self,
         graph,
         operations: list[Operation],
@@ -209,7 +209,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
             ):
                 continue
 
-            self.insert_op_after(graph, buf, clone_lowering, buf_users, operations)
+            self._insert_op_after(graph, buf, clone_lowering, buf_users, operations)
 
             lx_free_total -= dev_size
 
@@ -226,7 +226,7 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         operations = graph.operations
         _, _, core_div_mismatch = buf_analysis(graph)
         if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
-            self.try_insert_clone_op_for_inputs(
+            self._try_insert_clone_op_for_inputs(
                 graph,
                 operations,
                 self.limit,
