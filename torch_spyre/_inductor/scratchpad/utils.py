@@ -71,27 +71,27 @@ def mem_usage_by_op(graph: GraphLowering | GraphView) -> dict:
     if a buf is not in core_div_mismatch => it has no users => graph output
     if a buf is on release_next => it's the last time it'll be used => allow inplace
     """
-    num_cores = get_ncores_for_buffers(graph)
+    num_cores_per_op = get_ncores_for_buffers(graph)
     mem_usage: dict = {}
+    bufs = [op.name for op in graph.operations] + graph.graph_input_names
+    for buf_name in bufs:
+        buf = graph.get_buffer(buf_name)
+        num_cores = num_cores_per_op.get(buf_name, -1)
+        dev_layout = buf.layout.device_layout
+        dev_size = (
+            math.prod(dev_layout.device_size[:-1]) * 128
+        )  # num_sticks * bytes_per_stick
+        mem_usage[buf_name] = {
+            "size": dev_size,
+            "size_per_core": dev_size // num_cores,
+            "core_div_mismatch": num_cores < 0,
+            "all_inputs": [],
+        }
+
     for op in graph.operations:
         rw = op.get_read_writes()
-        mem_usage[op.name] = {"all_inputs": []}
-        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
-            for dep in deps:
-                buf = graph.get_buffer(dep.name)
-                dev_layout = buf.layout.device_layout
-                dev_size = (
-                    math.prod(dev_layout.device_size[:-1]) * 128
-                )  # num_sticks * bytes_per_stick
-                mem_usage[op.name][dep.name] = {
-                    "is_input": is_input,
-                    "size": dev_size,
-                    "size_per_core": dev_size // num_cores[op.name],
-                    "core_div_mismatch": num_cores[op.name] < 0,
-                }
+        mem_usage[op.name]["all_inputs"] = [dep.name for dep in rw.reads]
 
-                if is_input:
-                    mem_usage[op.name]["all_inputs"].append(dep.name)
     return mem_usage
 
 

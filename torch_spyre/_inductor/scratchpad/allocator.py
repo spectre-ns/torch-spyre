@@ -105,16 +105,14 @@ class ScratchpadAllocator(ABC):
         mem_usage = mem_usage_by_op(GraphView(graph, self._filter_ops))
         in_place = {} if in_place is None else in_place
         buffers = []
-        for output_name, op in mem_usage.items():
+        for output_name, info in mem_usage.items():
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
-                    op[output_name]["size_per_core"],
+                    info["size_per_core"],
                     lifetimes[output_name]["liveness_start"],
                     lifetimes[output_name]["liveness_end"],
-                    in_place_parents=in_place[output_name]
-                    if output_name in in_place
-                    else [],
+                    in_place_parents=in_place.get(output_name, []),
                 )
             )
 
@@ -126,24 +124,21 @@ class ScratchpadAllocator(ABC):
             return [op for op in ops if self._op_good_for_lx_inplace(op)]
 
         allow_inplace: dict[str, list[str]] = {}
-        mem_usage = mem_usage_by_op(GraphView(graph, filter_inplace))
+        mem_usage = mem_usage_by_op(GraphView(graph, self._filter_ops))
         lifetimes = calculate_liveness(graph)
-        for op_name, op in mem_usage.items():
-            for input_buf in op["all_inputs"]:
-                allow_inplace[op_name] = allow_inplace.get(op_name, [])
-                out_ten_layout = graph.get_buffer(op_name).layout.device_layout
-                in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
-                out_start = lifetimes[op_name]["liveness_start"]
+        for op_name, info in mem_usage.items():
+            allow_inplace[op_name] = []
+            out_start = lifetimes[op_name]["liveness_start"]
+            out_ten_layout = graph.get_buffer(op_name).layout.device_layout
+            out_size = info["size_per_core"]
+            for input_buf in info["all_inputs"]:
                 in_end = lifetimes[input_buf]["liveness_end"]
-                out_size = op[op_name]["size_per_core"]
-                in_size = op[input_buf]["size_per_core"]
+                in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
+                in_size = mem_usage[input_buf]["size_per_core"]
                 inp_i_size_match = out_size == in_size
                 inp_i_lay_match = out_ten_layout == in_ten_layout
                 inp_i_eol = in_end == out_start + 1
-                no_core_div_mismatch = not (
-                    op[op_name]["core_div_mismatch"]
-                    or op[input_buf]["core_div_mismatch"]
-                )
+                no_core_div_mismatch = not info["core_div_mismatch"]
                 if (
                     inp_i_size_match
                     and inp_i_lay_match
