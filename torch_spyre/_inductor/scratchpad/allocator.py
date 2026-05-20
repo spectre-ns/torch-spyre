@@ -196,9 +196,6 @@ class DefaultAllocator(ScratchpadAllocator):
     ):
         """Configure the allocator with an optional solver and graph passes.
 
-        Sub-components must handle types other than ComputeBuffer without
-        filtering from the harness.
-
         Args:
             layout_planning: Solver that assigns LX addresses to lifetime-bound
                 buffers. Defaults to GreedyLayoutSolver sized to available LX memory.
