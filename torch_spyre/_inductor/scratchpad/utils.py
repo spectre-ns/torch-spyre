@@ -69,24 +69,23 @@ def mem_usage_by_op(graph: GraphLowering | GraphView) -> dict:
     mem_usage: dict = {}
     for op in graph.operations:
         rw = op.get_read_writes()
-        destination = rw.writes.pop()
-        mem_usage[destination.name] = {"all_inputs": []}
-        for is_input, deps in [(True, rw.reads), (False, [destination])]:
+        mem_usage[op.name] = {"all_inputs": []}
+        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
             for dep in deps:
                 buf = graph.get_buffer(dep.name)
                 dev_layout = buf.layout.device_layout
                 dev_size = (
                     math.prod(dev_layout.device_size[:-1]) * 128
                 )  # num_sticks * bytes_per_stick
-                mem_usage[destination.name][dep.name] = {
+                mem_usage[op.name][dep.name] = {
                     "is_input": is_input,
                     "size": dev_size,
-                    "size_per_core": dev_size // num_cores[destination.name],
-                    "core_div_mismatch": num_cores[destination.name] < 0,
+                    "size_per_core": dev_size // num_cores[op.name],
+                    "core_div_mismatch": num_cores[op.name] < 0,
                 }
 
                 if is_input:
-                    mem_usage[destination.name]["all_inputs"].append(dep.name)
+                    mem_usage[op.name]["all_inputs"].append(dep.name)
     return mem_usage
 
 

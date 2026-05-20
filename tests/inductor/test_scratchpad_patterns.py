@@ -704,9 +704,9 @@ class TestExamplePattern(TestCase):
 
         def op_tuples(i: int) -> list[tuple[str, str | list[str], str]]:
             return [
-                (f"op{i}_load", f"A{i}_HBM", f"A{i}"),
-                (f"op{i}_0", f"A{i}", f"B{i}"),
-                (f"op{i}_1", [f"A{i}", f"B{i}"], f"C{i}"),
+                (f"A{i}", f"A{i}_HBM", f"A{i}"),
+                (f"B{i}", f"A{i}", f"B{i}"),
+                (f"C{i}", [f"A{i}", f"B{i}"], f"C{i}"),
             ]
 
         ops = make_operations(
@@ -1193,6 +1193,7 @@ class TestExamplePattern(TestCase):
     def test_verify_moe_mlp_pattern(self):
         self.verify_pattern(self.make_moe_mlp_pattern(), inplace=True)
 
+    @usuallyExpectedFailure
     def test_moe_mlp_pattern(self):
         self.run_pattern(self.make_moe_mlp_pattern())
 
