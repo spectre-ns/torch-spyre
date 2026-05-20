@@ -109,7 +109,7 @@ class Operation:
     @property
     def outputs(self):
         return [self.output]
-    
+
     def get_read_writes(self) -> ReadWrites:
         # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
         reads = OrderedSet(
@@ -125,8 +125,9 @@ class Operation:
 
 
 def make_operations(
-        names_inputs_outputs: Iterable[tuple[str, str | list[str], str]],
-            buffers: dict[str, Buffer]) -> list[Operation]:
+    names_inputs_outputs: Iterable[tuple[str, str | list[str], str]],
+    buffers: dict[str, Buffer],
+) -> list[Operation]:
     result = []
     for name, ins, out in names_inputs_outputs:
         if isinstance(ins, str):
@@ -852,7 +853,10 @@ class TestExamplePattern(TestCase):
 
         op_spec = [
             [
-                *[(f"op{i}_{j}_load", f"S{i}_HBM", group[j]) for j in range(len(group))],
+                *[
+                    (f"op{i}_{j}_load", f"S{i}_HBM", group[j])
+                    for j in range(len(group))
+                ],
                 *[(f"op{i}_{j}", group, f"C{i}_{j}") for j in range(4)],
             ]
             for i, group in enumerate(pattern)
@@ -872,7 +876,9 @@ class TestExamplePattern(TestCase):
         for i, group in enumerate(pattern):
             input_buffer = []
             for buffer in group:
-                input_buffer.append(Allocation(buffer=buffer, address=addresses_per_group[i][buffer]))
+                input_buffer.append(
+                    Allocation(buffer=buffer, address=addresses_per_group[i][buffer])
+                )
                 good_allocations.append(
                     [Allocation(buffer=f"S{i}_HBM", component=Component.HBM)]
                     + input_buffer
@@ -880,7 +886,8 @@ class TestExamplePattern(TestCase):
 
             for j in range(4):
                 good_allocations.append(
-                    input_buffer + [Allocation(buffer=f"C{i}_{j}", component=Component.HBM)]
+                    input_buffer
+                    + [Allocation(buffer=f"C{i}_{j}", component=Component.HBM)]
                 )
 
         pattern = Pattern(
