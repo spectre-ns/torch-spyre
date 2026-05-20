@@ -38,6 +38,7 @@ class GraphView:
     Simple wrapper which allows filtering of returned operations
     without mutating the underlying graph.
     """
+
     def __init__(self, graph, predicate):
         self.graph = graph
         self.operations = predicate(graph)
