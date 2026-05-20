@@ -86,9 +86,9 @@ class ReadWrites:
 
 @dataclass
 class Operation:
-    name: str
+    _opname: str
     inputs: list[str]
-    outputs: list[str]
+    output: str
     _buffer_registry: dict[str, "Buffer"]
 
     # To make scratchpad.py work, we add origin_node and target fields that point to the op itself,
@@ -98,14 +98,18 @@ class Operation:
     op_it_space_splits = None
     origin_node = None
     target = None
-    _opname = None
+    name = None
 
     def __post_init__(self):
         self.op_it_space_splits = []
         self.origin_node = self
         self.target = self
-        self._opname = self.name
+        self.name = self.output
 
+    @property
+    def outputs(self):
+        return [self.output]
+    
     def get_read_writes(self) -> ReadWrites:
         # Returns a list of (buffer_name, "read" or "write") for all buffers used by this operation.
         reads = OrderedSet(
@@ -121,16 +125,14 @@ class Operation:
 
 
 def make_operations(
-    names_inputs_outputs: Iterable[tuple[str, str | list[str], str | list[str]]],
-    buffers: dict[str, Buffer],
-) -> list[Operation]:
+        names_inputs_outputs: Iterable[tuple[str, str | list[str], str]],
+            buffers: dict[str, Buffer]) -> list[Operation]:
     result = []
-    for name, ins, outs in names_inputs_outputs:
+    for name, ins, out in names_inputs_outputs:
         if isinstance(ins, str):
             ins = [ins]
-        if isinstance(outs, str):
-            outs = [outs]
-        result.append(Operation(name, ins, outs, buffers))
+        assert isinstance(out, str)
+        result.append(Operation(name, ins, out, buffers))
     return result
 
 
@@ -850,7 +852,7 @@ class TestExamplePattern(TestCase):
 
         op_spec = [
             [
-                (f"op{i}_load", f"S{i}_HBM", group),
+                *[(f"op{i}_{j}_load", f"S{i}_HBM", group[j]) for j in range(len(group))],
                 *[(f"op{i}_{j}", group, f"C{i}_{j}") for j in range(4)],
             ]
             for i, group in enumerate(pattern)
@@ -868,23 +870,17 @@ class TestExamplePattern(TestCase):
 
         good_allocations = []
         for i, group in enumerate(pattern):
-            good_allocations.append(
-                [Allocation(buffer=f"S{i}_HBM", component=Component.HBM)]
-                + [
-                    Allocation(buffer=buffer, address=addresses_per_group[i][buffer])
-                    for buffer in group
-                ]
-            )
+            input_buffer = []
+            for buffer in group:
+                input_buffer.append(Allocation(buffer=buffer, address=addresses_per_group[i][buffer]))
+                good_allocations.append(
+                    [Allocation(buffer=f"S{i}_HBM", component=Component.HBM)]
+                    + input_buffer
+                )
 
             for j in range(4):
                 good_allocations.append(
-                    [
-                        Allocation(
-                            buffer=buffer, address=addresses_per_group[i][buffer]
-                        )
-                        for buffer in group
-                    ]
-                    + [Allocation(buffer=f"C{i}_{j}", component=Component.HBM)]
+                    input_buffer + [Allocation(buffer=f"C{i}_{j}", component=Component.HBM)]
                 )
 
         pattern = Pattern(
