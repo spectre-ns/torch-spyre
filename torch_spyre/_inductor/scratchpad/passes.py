@@ -25,18 +25,10 @@ from torch._inductor.virtualized import V
 from ..ir import FixedTiledLayout, TensorBox
 
 from torch_spyre._inductor.scratchpad.utils import (
+    OP_OUTPUT_GOOD_FOR_LX_REUSE,
     get_buffer_users,
     get_ncores_for_buffers,
 )
-
-OP_OUTPUT_GOOD_FOR_LX_REUSE = [
-    "max",
-    "sum",
-    # "clone",
-    "exp",
-    "sub",
-    # "mul",
-]
 
 
 class ScratchpadOptimizationPass(ABC):

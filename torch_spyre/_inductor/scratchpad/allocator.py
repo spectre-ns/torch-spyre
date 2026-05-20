@@ -28,6 +28,8 @@ from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
 from torch_spyre._inductor.scratchpad.utils import (
+    OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    OP_GOOD_FOR_LX_INPLACE,
     mem_usage_by_op,
     calculate_liveness,
     get_ncores_for_buffers,
@@ -35,21 +37,6 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 
 from torch_spyre._inductor import config
-
-
-OP_OUTPUT_GOOD_FOR_LX_REUSE = [
-    "max",
-    "sum",
-    # "clone",
-    "exp",
-    "sub",
-    # "mul",
-]
-
-OP_GOOD_FOR_LX_INPLACE = [
-    "exp",
-    "sub",
-]
 
 
 class ScratchpadAllocator(ABC):
@@ -67,6 +54,47 @@ class ScratchpadAllocator(ABC):
             graph (GraphLowering): Graph to be considered for scratchpad planning
         """
         pass
+
+    def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
+        return (
+            isinstance(op, ComputedBuffer)
+            and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+            and (
+                config.allow_all_ops_in_lx_planning
+                or (
+                    op.origin_node is not None
+                    and op.origin_node.target._opname in OP_OUTPUT_GOOD_FOR_LX_REUSE
+                )
+            )
+        )
+
+    def _op_good_for_lx_inplace(self, op: Any) -> bool:
+        return (
+            op.origin_node is not None
+            and op.origin_node.target._opname in OP_GOOD_FOR_LX_INPLACE
+        )
+
+    def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
+        core_div_mismatch = get_ncores_for_buffers(graph)
+        drop_list = set()
+
+        # filter out by permitted operations
+        for op in graph.operations:
+            if not self._op_output_good_for_lx_reuse(op):
+                drop_list.add(op.name)
+
+        # filter out core division mismatches
+        drop_list.update(
+            [key for key, mismatch in core_div_mismatch.items() if mismatch == -1]
+        )
+
+        # filter out the graph inputs and outputs. The inputs shouldn't appear here anyways.
+        # These can be relaxed once node cloning is implemented as a post-solve optimization
+        # rather than just filling the scratchpad at t = 0
+        drop_list.update(graph.get_output_names())
+        drop_list.update(graph.graph_input_names)
+
+        return [op for op in graph.operations if op.name not in drop_list]
 
     def _build_bound_buffers(
         self,
@@ -139,52 +167,6 @@ class ScratchpadAllocator(ABC):
                 buf = graph.get_buffer(b.name)
                 layout = buf.get_layout()
                 layout.allocation["lx"] = b.address
-
-    def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
-        return (
-            isinstance(op, ComputedBuffer)
-            and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-            and (
-                config.allow_all_ops_in_lx_planning
-                or (
-                    op.origin_node is not None
-                    and op.origin_node.target._opname in OP_OUTPUT_GOOD_FOR_LX_REUSE
-                )
-            )
-        )
-
-    def _op_good_for_lx_inplace(self, op: Any) -> bool:
-        return (
-            op.origin_node is not None
-            and op.origin_node.target._opname in OP_GOOD_FOR_LX_INPLACE
-        )
-
-    def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
-        """
-        From the list of buffers, drop buffers that are outputs of
-        unpermitted ops, graph outputs, and graph inputs
-        """
-        core_div_mismatch = get_ncores_for_buffers(graph)
-        drop_list = set()
-        for op in graph.operations:
-            if not self._op_output_good_for_lx_reuse(op):
-                rw = op.get_read_writes()
-                for mem_dep in rw.writes:
-                    drop_list.add(mem_dep.name)
-
-        drop_list.update(
-            [key for key, mismatch in core_div_mismatch.items() if mismatch == -1]
-        )
-
-        # These can be relaxed once node cloning is implemented as a post-solve optimization
-        # rather than just filling the scratchpad at t = 0
-        drop_list.update(graph.get_output_names())
-        drop_list.update(graph.graph_input_names)
-
-        # Clean up inplace so as to not rely on the solver to exclude inplace options which
-        # are not valid scratchpad buffers.
-        ops = [op for op in graph.operations if op.name not in drop_list]
-        return ops
 
 
 class DefaultAllocator(ScratchpadAllocator):
