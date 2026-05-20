@@ -17,7 +17,6 @@ import math
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation
 from torch_spyre._inductor import config
-from typing import Callable
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
     "max",
@@ -33,6 +32,7 @@ OP_GOOD_FOR_LX_INPLACE = [
     "sub",
 ]
 
+
 class GraphView:
     def __init__(self, graph, predicate):
         self.graph = graph
@@ -40,6 +40,7 @@ class GraphView:
 
     def __getattr__(self, name):
         return getattr(self.graph, name)
+
 
 def calculate_liveness(graph: GraphLowering) -> dict:
     liveness: dict[str, dict[str, bool | int]] = {}
