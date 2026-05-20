@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Callable
+from typing import Any, Optional
 
 from torch._inductor.ir import ComputedBuffer, Operation, MutationLayoutSHOULDREMOVE
 from torch._inductor.graph import GraphLowering
@@ -31,7 +31,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     mem_usage_by_op,
     calculate_liveness,
     get_ncores_for_buffers,
-    GraphView
+    GraphView,
 )
 
 from torch_spyre._inductor import config
