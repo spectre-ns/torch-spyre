@@ -19,6 +19,20 @@ from torch._inductor.ir import Operation
 from torch_spyre._inductor import config
 from typing import Callable
 
+OP_OUTPUT_GOOD_FOR_LX_REUSE = [
+    "max",
+    "sum",
+    # "clone",
+    "exp",
+    "sub",
+    # "mul",
+]
+
+OP_GOOD_FOR_LX_INPLACE = [
+    "exp",
+    "sub",
+]
+
 
 def calculate_liveness(graph: GraphLowering) -> dict:
     liveness: dict[str, dict[str, bool | int]] = {}
