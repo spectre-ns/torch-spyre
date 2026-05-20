@@ -1189,7 +1189,6 @@ class TestExamplePattern(TestCase):
     def test_verify_moe_mlp_pattern(self):
         self.verify_pattern(self.make_moe_mlp_pattern(), inplace=True)
 
-    @usuallyExpectedFailure
     def test_moe_mlp_pattern(self):
         self.run_pattern(self.make_moe_mlp_pattern())
 
