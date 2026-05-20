@@ -33,6 +33,13 @@ OP_GOOD_FOR_LX_INPLACE = [
     "sub",
 ]
 
+class GraphView:
+    def __init__(self, graph, predicate):
+        self.graph = graph
+        self.operations = predicate(graph)
+
+    def __getattr__(self, name):
+        return getattr(self.graph, name)
 
 def calculate_liveness(graph: GraphLowering) -> dict:
     liveness: dict[str, dict[str, bool | int]] = {}
@@ -48,7 +55,7 @@ def calculate_liveness(graph: GraphLowering) -> dict:
     return liveness
 
 
-def mem_usage_by_op(graph: GraphLowering) -> dict:
+def mem_usage_by_op(graph: GraphLowering | GraphView) -> dict:
     """
     Get a summary of memory usage of the given operation. Two types of info can be found
     1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
@@ -62,27 +69,28 @@ def mem_usage_by_op(graph: GraphLowering) -> dict:
     mem_usage: dict = {}
     for op in graph.operations:
         rw = op.get_read_writes()
-        mem_usage[op.name] = {"all_inputs": []}
-        for is_input, deps in [(True, rw.reads), (False, rw.writes)]:
+        destination = rw.writes.pop()
+        mem_usage[destination.name] = {"all_inputs": []}
+        for is_input, deps in [(True, rw.reads), (False, [destination])]:
             for dep in deps:
                 buf = graph.get_buffer(dep.name)
                 dev_layout = buf.layout.device_layout
                 dev_size = (
                     math.prod(dev_layout.device_size[:-1]) * 128
                 )  # num_sticks * bytes_per_stick
-                mem_usage[op.name][dep.name] = {
+                mem_usage[destination.name][dep.name] = {
                     "is_input": is_input,
                     "size": dev_size,
-                    "size_per_core": dev_size // num_cores[op.name],
-                    "core_div_mismatch": num_cores[op.name] < 0,
+                    "size_per_core": dev_size // num_cores[destination.name],
+                    "core_div_mismatch": num_cores[destination.name] < 0,
                 }
 
                 if is_input:
-                    mem_usage[op.name]["all_inputs"].append(dep.name)
+                    mem_usage[destination.name]["all_inputs"].append(dep.name)
     return mem_usage
 
 
-def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
+def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operation]]:
     buf_users_read_and_write: dict[str, list[Operation]] = {}
     for op in graph.operations:
         rw = op.get_read_writes()
@@ -92,7 +100,7 @@ def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
     return buf_users_read_and_write
 
 
-def get_ncores_for_buffers(graph: GraphLowering) -> dict[str, int]:
+def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
     used by all the operations that uses the buffer.
@@ -117,13 +125,3 @@ def get_ncores_for_buffers(graph: GraphLowering) -> dict[str, int]:
             num_cores = 1
         result[buf_name] = num_cores
     return result
-
-
-class GraphView(GraphLowering):
-    def __init__(
-        self, graph: GraphLowering, predicate: Callable[[GraphLowering], list[Operation]]
-    ):
-        object.__init__(self)
-        self.__dict__.update(graph.__dict__)
-        self.graph = graph
-        self.operations = predicate(graph)
