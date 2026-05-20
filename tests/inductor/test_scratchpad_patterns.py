@@ -255,7 +255,7 @@ class InstrumentedAllocator(DefaultAllocator):
     def _op_output_good_for_lx_reuse(self, op: Operation) -> bool:
         return True
 
-    def _op_good_for_lx_inplace(self, org_op_name: str) -> bool:
+    def _op_good_for_lx_inplace(self, op: Operation) -> bool:
         return True
 
     def _push_allocation(
