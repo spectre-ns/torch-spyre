@@ -48,7 +48,7 @@ def calculate_liveness(graph: GraphLowering) -> dict:
     return liveness
 
 
-def mem_usage_by_op(graph: GraphLowering, ignore: list[str] = []) -> dict:
+def mem_usage_by_op(graph: GraphLowering) -> dict:
     """
     Get a summary of memory usage of the given operation. Two types of info can be found
     1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
@@ -121,7 +121,7 @@ def get_ncores_for_buffers(graph: GraphLowering) -> dict[str, int]:
 
 class GraphView(GraphLowering):
     def __init__(
-        self, graph: GraphLowering, predicate: Callable[[GraphLowering], Operation]
+        self, graph: GraphLowering, predicate: Callable[[GraphLowering], list[Operation]]
     ):
         object.__init__(self)
         self.__dict__.update(graph.__dict__)
