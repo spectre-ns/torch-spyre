@@ -13,9 +13,9 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
-from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import ComputedBuffer, Operation, MutationLayoutSHOULDREMOVE
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -29,8 +29,9 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     mem_usage_by_op,
-    buf_analysis,
     calculate_liveness,
+    get_ncores_for_buffers,
+    GraphView
 )
 
 from torch_spyre._inductor import config
@@ -67,6 +68,78 @@ class ScratchpadAllocator(ABC):
         """
         pass
 
+    def _build_bound_buffers(
+        self,
+        graph: GraphLowering,
+        in_place: Optional[dict[str, list[str]]],
+    ) -> list[LifetimeBoundBuffer]:
+        lifetimes = calculate_liveness(graph)
+        mem_usage = mem_usage_by_op(GraphView(graph, self._filter_ops))
+        in_place = {} if in_place is None else in_place
+        buffers = []
+        for output_name, op in mem_usage.items():
+            buffers.append(
+                LifetimeBoundBuffer(
+                    output_name,
+                    op[output_name]["size_per_core"],
+                    lifetimes[output_name]["liveness_start"],
+                    lifetimes[output_name]["liveness_end"],
+                    in_place_parents=in_place[output_name]
+                    if output_name in in_place
+                    else [],
+                )
+            )
+
+        return buffers
+
+    def _determine_in_place(self, graph: GraphLowering) -> dict[str, list[str]]:
+        def filter_inplace(graph: GraphLowering) -> list[Operation]:
+            ops = self._filter_ops(graph)
+            return [op for op in ops if self._op_good_for_lx_inplace(op)]
+
+        allow_inplace: dict[str, list[str]] = {}
+        mem_usage = mem_usage_by_op(GraphView(graph, filter_inplace))
+        lifetimes = calculate_liveness(graph)
+        for op_name, op in mem_usage.items():
+            for input_buf in op["all_inputs"]:
+                allow_inplace[op_name] = allow_inplace.get(op_name, [])
+                out_ten_layout = graph.get_buffer(op_name).layout.device_layout
+                in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
+                out_start = lifetimes[op_name]["liveness_start"]
+                in_end = lifetimes[input_buf]["liveness_end"]
+                out_size = op[op_name]["size_per_core"]
+                in_size = op[input_buf]["size_per_core"]
+                inp_i_size_match = out_size == in_size
+                inp_i_lay_match = out_ten_layout == in_ten_layout
+                inp_i_eol = in_end == out_start + 1
+                no_core_div_mismatch = not (
+                    op[op_name]["core_div_mismatch"]
+                    or op[input_buf]["core_div_mismatch"]
+                )
+                if (
+                    inp_i_size_match
+                    and inp_i_lay_match
+                    and inp_i_eol
+                    and no_core_div_mismatch
+                ):
+                    allow_inplace[op_name].append(input_buf)
+        return allow_inplace
+
+    def _generate_buffers(self, graph: GraphLowering) -> list[Operation]:
+        in_place = self._determine_in_place(graph)
+        buffers = self._build_bound_buffers(graph, in_place)
+        return buffers
+
+    def _push_allocation(
+        self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
+    ):
+        # push the allocation into the code generation
+        for b in buffers:
+            if b.address is not None:
+                buf = graph.get_buffer(b.name)
+                layout = buf.get_layout()
+                layout.allocation["lx"] = b.address
+
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
         return (
             isinstance(op, ComputedBuffer)
@@ -80,17 +153,18 @@ class ScratchpadAllocator(ABC):
             )
         )
 
-    def _op_good_for_lx_inplace(self, org_op_name: str) -> bool:
-        return org_op_name in OP_GOOD_FOR_LX_INPLACE
+    def _op_good_for_lx_inplace(self, op: Any) -> bool:
+        return (
+            op.origin_node is not None
+            and op.origin_node.target._opname in OP_GOOD_FOR_LX_INPLACE
+        )
 
-    def _filter_buffers(
-        self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
-    ) -> list[LifetimeBoundBuffer]:
+    def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
         """
         From the list of buffers, drop buffers that are outputs of
         unpermitted ops, graph outputs, and graph inputs
         """
-        _, _, core_div_mismatch = buf_analysis(graph)
+        core_div_mismatch = get_ncores_for_buffers(graph)
         drop_list = set()
         for op in graph.operations:
             if not self._op_output_good_for_lx_reuse(op):
@@ -99,7 +173,7 @@ class ScratchpadAllocator(ABC):
                     drop_list.add(mem_dep.name)
 
         drop_list.update(
-            [key for key, mismatch in core_div_mismatch.items() if mismatch]
+            [key for key, mismatch in core_div_mismatch.items() if mismatch == -1]
         )
 
         # These can be relaxed once node cloning is implemented as a post-solve optimization
@@ -109,98 +183,8 @@ class ScratchpadAllocator(ABC):
 
         # Clean up inplace so as to not rely on the solver to exclude inplace options which
         # are not valid scratchpad buffers.
-        filtered_buffers = [b for b in buffers if b.name not in drop_list]
-        valid_buffers = [buf.name for buf in filtered_buffers]
-        for buf in filtered_buffers:
-            buf.in_place_parents = [
-                name for name in buf.in_place_parents if name in valid_buffers
-            ]
-
-        return filtered_buffers
-
-    def _build_bound_buffers(
-        self,
-        graph: GraphLowering,
-        in_place: Optional[dict[str, list[str]]],
-    ) -> list[LifetimeBoundBuffer]:
-        lifetimes = calculate_liveness(graph)
-        _, _, core_div_mismatch = buf_analysis(graph)
-        mem_usage = mem_usage_by_op(graph, core_div_mismatch)
-        in_place = {} if in_place is None else in_place
-        buffers = []
-        for _, op in mem_usage.items():
-            for buffer_name in op["all_buf_used"]:
-                if (
-                    op[buffer_name]["is_lx_viable"]
-                    and not op[buffer_name]["core_div_mismatch"]
-                ):
-                    buffers.append(
-                        LifetimeBoundBuffer(
-                            buffer_name,
-                            op[buffer_name]["size_per_core"],
-                            lifetimes[buffer_name]["liveness_start"],
-                            lifetimes[buffer_name]["liveness_end"],
-                            in_place_parents=in_place[buffer_name]
-                            if buffer_name in in_place
-                            else [],
-                        )
-                    )
-
-        buffers = list({obj.name: obj for obj in buffers}.values())
-        return buffers
-
-    def _determine_in_place(self, graph: GraphLowering) -> dict[str, list[str]]:
-        allow_inplace: dict[str, list[str]] = {}
-        _, _, core_div_mismatch = buf_analysis(graph)
-        mem_usage = mem_usage_by_op(graph, core_div_mismatch)
-        lifetimes = calculate_liveness(graph)
-        for _, op_name in mem_usage.items():
-            for input_buf in op_name["all_inputs"]:
-                for output_buf in op_name["all_outputs"]:
-                    if (
-                        op_name[output_buf]["is_lx_viable"]
-                        and op_name[input_buf]["is_lx_viable"]
-                    ):
-                        allow_inplace[output_buf] = allow_inplace.get(output_buf, [])
-                        out_ten_layout = graph.get_buffer(
-                            output_buf
-                        ).layout.device_layout
-                        in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
-                        out_start = lifetimes[output_buf]["liveness_start"]
-                        in_end = lifetimes[input_buf]["liveness_end"]
-                        out_size = op_name[output_buf]["size_per_core"]
-                        in_size = op_name[input_buf]["size_per_core"]
-                        inp_i_size_match = out_size == in_size
-                        inp_i_lay_match = out_ten_layout == in_ten_layout
-                        inp_i_eol = in_end == out_start + 1
-                        no_core_div_mismatch = not (
-                            op_name[output_buf]["core_div_mismatch"]
-                            or op_name[input_buf]["core_div_mismatch"]
-                        )
-                        if (
-                            inp_i_size_match
-                            and inp_i_lay_match
-                            and inp_i_eol
-                            and no_core_div_mismatch
-                        ):
-                            allow_inplace[output_buf].append(input_buf)
-        return allow_inplace
-
-    def _generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
-        in_place = self._determine_in_place(graph)
-        buffers = self._build_bound_buffers(graph, in_place)
-        filtered_buffers = self._filter_buffers(graph, buffers)
-        return filtered_buffers
-
-    def _push_allocation(
-        self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
-    ):
-        # push the allocation into the code generation
-        for b in buffers:
-            if b.address is not None:
-                buf = graph.get_buffer(b.name)
-                layout = buf.get_layout()
-                layout.allocation["lx"] = b.address
+        ops = [op for op in graph.operations if op.name not in drop_list]
+        return ops
 
 
 class DefaultAllocator(ScratchpadAllocator):
