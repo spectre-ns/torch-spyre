@@ -104,6 +104,7 @@ def get_ncores_for_buffers(graph: GraphLowering) -> dict[str, int]:
         result[buf_name] = num_cores
     return result
 
+
 class GraphView(GraphLowering):
     def __init__(
         self, graph: GraphLowering, predicate: Callable[[GraphLowering], Operation]
