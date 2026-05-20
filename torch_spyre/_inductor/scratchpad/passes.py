@@ -26,7 +26,7 @@ from ..ir import FixedTiledLayout, TensorBox
 
 from torch_spyre._inductor.scratchpad.utils import (
     get_buffer_users,
-    get_ncores_for_buffers
+    get_ncores_for_buffers,
 )
 
 OP_OUTPUT_GOOD_FOR_LX_REUSE = [
@@ -224,7 +224,9 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         buf_users = get_buffer_users(graph)
 
         operations = graph.operations
-        core_div_mismatch = {key: cores > 0 for key, cores in get_ncores_for_buffers(graph).items()}
+        core_div_mismatch = {
+            key: cores > 0 for key, cores in get_ncores_for_buffers(graph).items()
+        }
         if "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE:
             self._try_insert_clone_op_for_inputs(
                 graph,
