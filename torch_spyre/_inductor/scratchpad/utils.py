@@ -61,7 +61,7 @@ def calculate_liveness(graph: GraphLowering) -> dict:
     return liveness
 
 
-def mem_usage_by_op(graph: GraphLowering | GraphView) -> dict:
+def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
     """
     Get a summary of memory usage of each operation.
     Includes detailed info of individual buf, e.g. mem_usage[<buf_name>],
