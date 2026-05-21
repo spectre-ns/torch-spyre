@@ -63,34 +63,31 @@ def calculate_liveness(graph: GraphLowering) -> dict:
 
 def mem_usage_by_op(graph: GraphLowering | GraphView) -> dict:
     """
-    Get a summary of memory usage of the given operation. Two types of info can be found
-    1. Name lists, e.g. mem_usage["all_inputs"], or "all_outputs", "all_buf_used"
-    2. Detailed info of individual buf, e.g. mem_usage[<buf_name>], which has
-        "is_input", "size", "core_div_mismatch", "last_usage" fields
+    Get a summary of memory usage of each operation.
+    Includes detailed info of individual buf, e.g. mem_usage[<buf_name>],
+    which has "size_per_core", "size", "core_div_mismatch", "op_inputs" fields
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
-    if a buf is on release_next => it's the last time it'll be used => allow inplace
     """
     num_cores_per_op = get_ncores_for_buffers(graph)
     mem_usage: dict = {}
-    bufs = [op.name for op in graph.operations] + graph.graph_input_names
-    for buf_name in bufs:
+
+    buf_names = {op.name for op in graph.operations}
+    for op in graph.operations:
+        buf_name = op.name
         buf = graph.get_buffer(buf_name)
         num_cores = num_cores_per_op.get(buf_name, -1)
         dev_layout = buf.layout.device_layout
         dev_size = (
             math.prod(dev_layout.device_size[:-1]) * 128
         )  # num_sticks * bytes_per_stick
+        rw = op.get_read_writes()
         mem_usage[buf_name] = {
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
             "core_div_mismatch": num_cores < 0,
-            "all_inputs": [],
+            "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
         }
-
-    for op in graph.operations:
-        rw = op.get_read_writes()
-        mem_usage[op.name]["all_inputs"] = [dep.name for dep in rw.reads]
 
     return mem_usage
 
