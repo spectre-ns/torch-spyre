@@ -30,7 +30,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     OP_GOOD_FOR_LX_INPLACE,
-    mem_usage_by_op,
+    mem_usage_by_buf,
     calculate_liveness,
     get_ncores_for_buffers,
     GraphView,
@@ -55,6 +55,16 @@ class ScratchpadAllocator(ABC):
         """
         pass
 
+    def _get_op_name(self, op: Any) -> str:
+        target = getattr(getattr(op, "origin_node", None), "target", None)
+        org_op_name = (
+            getattr(target, "_opname", None)
+            or getattr(target, "__name__", None)
+            or getattr(target, "name", None)
+            or str(target)
+        )
+        return org_op_name
+
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
         return (
             isinstance(op, ComputedBuffer)
@@ -62,17 +72,13 @@ class ScratchpadAllocator(ABC):
             and (
                 config.allow_all_ops_in_lx_planning
                 or (
-                    op.origin_node is not None
-                    and op.origin_node.target._opname in OP_OUTPUT_GOOD_FOR_LX_REUSE
+                    self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
                 )
             )
         )
 
     def _op_good_for_lx_inplace(self, op: Any) -> bool:
-        return (
-            op.origin_node is not None
-            and op.origin_node.target._opname in OP_GOOD_FOR_LX_INPLACE
-        )
+        return self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE
 
     def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
         core_div_mismatch = get_ncores_for_buffers(graph)
@@ -102,7 +108,7 @@ class ScratchpadAllocator(ABC):
         in_place: Optional[dict[str, list[str]]],
     ) -> list[LifetimeBoundBuffer]:
         lifetimes = calculate_liveness(graph)
-        mem_usage = mem_usage_by_op(GraphView(graph, self._filter_ops))
+        mem_usage = mem_usage_by_buf(GraphView(graph, self._filter_ops))
         in_place = {} if in_place is None else in_place
         buffers = []
         for output_name, info in mem_usage.items():
@@ -119,17 +125,17 @@ class ScratchpadAllocator(ABC):
         return buffers
 
     def _determine_in_place(self, graph: GraphLowering) -> dict[str, list[str]]:
-        def filter_inplace(graph: GraphLowering) -> list[Operation]:
-            ops = self._filter_ops(graph)
-            return [op for op in ops if self._op_good_for_lx_inplace(op)]
-
         allow_inplace: dict[str, list[str]] = {}
-        mem_usage = mem_usage_by_op(GraphView(graph, self._filter_ops))
+        graph_view = GraphView(graph, self._filter_ops)
+        mem_usage = mem_usage_by_buf(graph_view)
+        in_place_allowed = {op.name: self._op_good_for_lx_inplace(op) for op in graph_view.operations}
         lifetimes = calculate_liveness(graph)
-        for op_name, info in mem_usage.items():
-            allow_inplace[op_name] = []
-            out_start = lifetimes[op_name]["liveness_start"]
-            out_ten_layout = graph.get_buffer(op_name).layout.device_layout
+        for buf_name, info in mem_usage.items():
+            allow_inplace[buf_name] = []
+            if not in_place_allowed[buf_name]:
+                continue
+            out_start = lifetimes[buf_name]["liveness_start"]
+            out_ten_layout = graph.get_buffer(buf_name).layout.device_layout
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
                 in_end = lifetimes[input_buf]["liveness_end"]
@@ -145,8 +151,7 @@ class ScratchpadAllocator(ABC):
                     and inp_i_eol
                     and no_core_div_mismatch
                 ):
-                    allow_inplace[op_name].append(input_buf)
-        print("allow inplace", allow_inplace)
+                    allow_inplace[buf_name].append(input_buf)
         return allow_inplace
 
     def _generate_buffers(self, graph: GraphLowering) -> list[Operation]:
