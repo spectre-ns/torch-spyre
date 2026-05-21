@@ -71,9 +71,7 @@ class ScratchpadAllocator(ABC):
             and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
             and (
                 config.allow_all_ops_in_lx_planning
-                or (
-                    self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
-                )
+                or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
             )
         )
 
@@ -128,7 +126,9 @@ class ScratchpadAllocator(ABC):
         allow_inplace: dict[str, list[str]] = {}
         graph_view = GraphView(graph, self._filter_ops)
         mem_usage = mem_usage_by_buf(graph_view)
-        in_place_allowed = {op.name: self._op_good_for_lx_inplace(op) for op in graph_view.operations}
+        in_place_allowed = {
+            op.name: self._op_good_for_lx_inplace(op) for op in graph_view.operations
+        }
         lifetimes = calculate_liveness(graph)
         for buf_name, info in mem_usage.items():
             allow_inplace[buf_name] = []
