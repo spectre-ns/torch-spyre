@@ -131,7 +131,7 @@ class ScratchpadAllocator(ABC):
             out_start = lifetimes[op_name]["liveness_start"]
             out_ten_layout = graph.get_buffer(op_name).layout.device_layout
             out_size = info["size_per_core"]
-            for input_buf in info["all_inputs"]:
+            for input_buf in info["op_inputs"]:
                 in_end = lifetimes[input_buf]["liveness_end"]
                 in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
                 in_size = mem_usage[input_buf]["size_per_core"]
@@ -146,6 +146,7 @@ class ScratchpadAllocator(ABC):
                     and no_core_div_mismatch
                 ):
                     allow_inplace[op_name].append(input_buf)
+        print("allow inplace", allow_inplace)
         return allow_inplace
 
     def _generate_buffers(self, graph: GraphLowering) -> list[Operation]:
