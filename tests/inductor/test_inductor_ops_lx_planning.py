@@ -109,6 +109,10 @@ def _copy_canonical_tests(src_cls, dst_cls, suffix, test_failures):
         setattr(dst_cls, f"{name}_{suffix}", new_test)
     if hasattr(src_cls, "is_dtype_supported"):
         dst_cls.is_dtype_supported = src_cls.is_dtype_supported
+    if hasattr(src_cls, "_get_core_reduction_invalid_dim_cases"):
+        dst_cls._get_core_reduction_invalid_dim_cases = (
+            src_cls._get_core_reduction_invalid_dim_cases
+        )
 
 
 POINTWISE_TEST_FAILURES = [
