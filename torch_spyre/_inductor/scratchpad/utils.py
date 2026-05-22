@@ -47,6 +47,16 @@ class GraphView:
         return getattr(self.graph, name)
 
 
+def calculate_usage_times(graph: GraphLowering) -> dict[str, list[int]]:
+    """Return sorted list of operation indices at which each buffer is accessed."""
+    times: dict[str, list[int]] = {}
+    for i, op in enumerate(graph.operations):
+        rw = op.get_read_writes()
+        for mem_dep in rw.reads | rw.writes:
+            times.setdefault(mem_dep.name, []).append(i)
+    return {k: sorted(set(v)) for k, v in times.items()}
+
+
 def calculate_liveness(graph: GraphLowering) -> dict:
     liveness: dict[str, dict[str, bool | int]] = {}
     for i, op in enumerate(graph.operations):

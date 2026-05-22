@@ -39,7 +39,8 @@ class LifetimeBoundBuffer:
     start_time: int
     end_time: int
     address: Optional[int] = None
-    in_place_parents: list[str] = field(default_factory=list)
+    in_place: list[str] = field(default_factory=list)
+    heuristic: Optional[float] = None
 
 
 class MemoryPlanSolver(ABC):
@@ -123,7 +124,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
 
     def _try_allocate(self, buffer: LifetimeBoundBuffer):
         # Check if the current buffer can be in-placed
-        for in_place_opt in buffer.in_place_parents:
+        for in_place_opt in buffer.in_place:
             matched_obj = next((u for u in self.usage if u.name == in_place_opt), None)
             if matched_obj is not None and buffer.size <= matched_obj.size:
                 buffer.address = matched_obj.address
@@ -370,25 +371,29 @@ class OrToolsMemoryPlanSolver(MemoryPlanSolver):
             var = mg["var"]
             ts = [by_name[n] for n in names]
             size = max(t.size for t in ts)
-            start = min(t.start_time for t in ts)
-            end = max(t.end_time for t in ts) + 1
             max_off = max(0, M - size)
 
             m_off[names] = model.new_int_var(0, max_off, f"off_merge_{'_'.join(names)}")
-            time_intervals.append(
-                model.new_optional_fixed_size_interval_var(
-                    start, end - start, var, f"x_merge_{'_'.join(names)}"
+            # Use one time interval per tensor (not a single spanning interval).
+            # This lets gaps between non-adjacent segments remain free for other
+            # buffers while still constraining all tensors in the group to the
+            # same memory offset via m_off[names].
+            for t in ts:
+                seg_len = (t.end_time + 1) - t.start_time
+                time_intervals.append(
+                    model.new_optional_fixed_size_interval_var(
+                        t.start_time, seg_len, var, f"x_merge_{t.name}"
+                    )
                 )
-            )
-            memory_intervals.append(
-                model.new_optional_interval_var(
-                    m_off[names],
-                    size,
-                    m_off[names] + size,
-                    var,
-                    f"y_merge_{'_'.join(names)}",
+                memory_intervals.append(
+                    model.new_optional_interval_var(
+                        m_off[names],
+                        size,
+                        m_off[names] + size,
+                        var,
+                        f"y_merge_{t.name}",
+                    )
                 )
-            )
 
         ######################################
         # Define constraints

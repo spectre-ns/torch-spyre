@@ -92,7 +92,8 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         lowering_func: Callable,
         buf_users: dict,
         operations: list[Operation],
-    ) -> None:
+        users_to_redirect: list[Operation] | None = None,
+    ) -> str:
         """
         Insert an operation using the provided lowering function (e.g. clone_lowering) in
         GraphLowering.operations list after the given op (buf, a TensorBox representing a
@@ -108,11 +109,20 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         - Even though it is not a necessary condition, we assume FX graph and Operations are
           fully consistent and we will try to maintain it that way.
         - To update existing users of the old buffer -> hack the inner_fn then refresh LoopIR
+
+        Args:
+            users_to_redirect: If provided, only these operations are redirected to read
+                from the newly inserted buffer.  All other users keep reading from the
+                original.  When None (default) every user is redirected.
+
+        Returns:
+            The name of the newly created buffer.
         """
 
         # Step 1: Add a new FX node for clone and update dependencies
         buf_name = buf.data.data.name  # buf is a TensorBox
         buf_fx = list(buf.origins)[0]  # .origin_node may not exist
+        redirect_set = set(users_to_redirect) if users_to_redirect is not None else None
         old_users = list(buf_fx.users.keys())
         # make sure the user-provided lowering_func is legit
         assert lowering_func in lowerings.values(), (
@@ -159,8 +169,13 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         graph.name_to_users[buf_name] = users_of_inp
         graph.name_to_users[new_buf_name] = users_of_new_buf
 
-        # Step 4: Hack user nodes' inner_fn
-        for old_com_buf in buf_users[buf_name]:
+        # Step 4: Hack user nodes' inner_fn — only for the requested subset of users.
+        ops_to_redirect = (
+            buf_users[buf_name]
+            if redirect_set is None
+            else [op for op in buf_users[buf_name] if op in redirect_set]
+        )
+        for old_com_buf in ops_to_redirect:
             # hack inner_fn with a nameSwapper ops handler and make a new LoopIR
             new_Loop = self._create_loop_hack_inner_fn(
                 old_com_buf.data, name_map={buf_name: new_buf_name}
@@ -174,6 +189,8 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
         idx_to_first_user = operations.index(first_user)
         operations.remove(new_com_buf)
         operations.insert(idx_to_first_user, new_com_buf)
+
+        return new_buf_name
 
     def _try_insert_clone_op_for_inputs(
         self,
@@ -227,3 +244,103 @@ class CloneInputNodesPass(ScratchpadOptimizationPass):
                 buf_users,
                 core_div_mismatch,
             )
+
+
+class EvictionReloadPass(CloneInputNodesPass):
+    """Insert HBM-to-LX reload clones for evicted buffer segments.
+
+    After the memory planner assigns LX addresses to segment-split buffers,
+    some non-first segments may have had their LX address reused during the gap
+    by another buffer.  This pass detects those cases and inserts a clone
+    operation that reloads the original buffer from HBM into a fresh LX slot,
+    then redirects only the reads belonging to that segment to the new clone.
+
+    Non-first segments whose address was *not* reused during the gap require no
+    action — the data is still intact at the same LX address.
+    """
+
+    def __init__(
+        self,
+        seg_to_orig: dict[str, str],
+        planned_buffers: list,
+        lx_address: int,
+    ):
+        """
+        Args:
+            seg_to_orig: Maps segment buffer name to its originating buffer name.
+            planned_buffers: The full list of LifetimeBoundBuffers returned by the solver,
+                including segment buffers.  Used to detect gap conflicts.
+            lx_address: LX address assigned to the first segment (seg0).  Only
+                used to initialise the CloneInputNodesPass size guard; a value
+                of 0 disables the guard (reload clones are always inserted when
+                needed regardless of remaining free space).
+        """
+        super().__init__(limit=lx_address)
+        self._seg_to_orig = seg_to_orig
+        self._planned: dict[str, object] = {b.name: b for b in planned_buffers}
+
+    def _gap_reused(self, seg_prev, seg_curr) -> bool:
+        """Return True if any planned buffer occupied seg_curr.address during the gap."""
+        if seg_curr.address is None or seg_prev.address is None:
+            return False
+        gap_start = seg_prev.end_time
+        gap_end = seg_curr.start_time
+        addr = seg_curr.address
+        for b in self._planned.values():
+            if b.name in (seg_prev.name, seg_curr.name):
+                continue
+            if b.address == addr and b.start_time < gap_end and b.end_time > gap_start:
+                return True
+        return False
+
+    def _needs_reload(self, seg_prev, seg_curr) -> bool:
+        if seg_curr.address is None:
+            return False
+        if seg_prev.address != seg_curr.address:
+            return True
+        return self._gap_reused(seg_prev, seg_curr)
+
+    def apply_pass(self, graph: GraphLowering) -> None:
+        from collections import defaultdict
+
+        orig_to_segs: dict[str, list] = defaultdict(list)
+        for seg_name, orig_name in self._seg_to_orig.items():
+            if seg_name in self._planned:
+                orig_to_segs[orig_name].append(self._planned[seg_name])
+
+        buf_users = get_buffer_users(graph)
+        op_idx: dict[object, int] = {op: i for i, op in enumerate(graph.operations)}
+
+        for orig_name, segs in orig_to_segs.items():
+            segs.sort(key=lambda s: s.start_time)
+            for i in range(1, len(segs)):
+                seg_prev = segs[i - 1]
+                seg_curr = segs[i]
+                if not self._needs_reload(seg_prev, seg_curr):
+                    continue
+                if seg_curr.address is None:
+                    continue
+
+                # Identify the subset of orig_name readers within this segment's window.
+                seg_readers = [
+                    op
+                    for op in buf_users.get(orig_name, [])
+                    if seg_curr.start_time
+                    <= op_idx.get(op, -1)
+                    < seg_curr.end_time
+                ]
+                if not seg_readers:
+                    continue
+
+                orig_buf_tb = graph.get_buffer(orig_name)
+                new_name = self._insert_op_after(
+                    graph,
+                    orig_buf_tb,
+                    clone_lowering,
+                    buf_users,
+                    graph.operations,
+                    users_to_redirect=seg_readers,
+                )
+                # Assign the segment's planned LX address to the reload clone.
+                new_buf = graph.get_buffer(new_name)
+                new_buf.get_layout().allocation["lx"] = seg_curr.address

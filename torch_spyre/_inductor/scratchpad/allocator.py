@@ -25,6 +25,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.passes import (
     CloneInputNodesPass,
+    EvictionReloadPass,
     ScratchpadOptimizationPass,
 )
 from torch_spyre._inductor.scratchpad.utils import (
@@ -32,6 +33,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     OP_GOOD_FOR_LX_INPLACE,
     mem_usage_by_buf,
     calculate_liveness,
+    calculate_usage_times,
     get_ncores_for_buffers,
     GraphView,
 )
@@ -116,7 +118,7 @@ class ScratchpadAllocator(ABC):
                     info["size_per_core"],
                     lifetimes[output_name]["liveness_start"],
                     lifetimes[output_name]["liveness_end"],
-                    in_place_parents=in_place.get(output_name, []),
+                    in_place=in_place.get(output_name, []),
                 )
             )
 
@@ -154,20 +156,88 @@ class ScratchpadAllocator(ABC):
                     allow_inplace[buf_name].append(input_buf)
         return allow_inplace
 
-    def _generate_buffers(self, graph: GraphLowering) -> list[Operation]:
+    def _split_buffers_on_gaps(
+        self,
+        buffers: list[LifetimeBoundBuffer],
+        usage_times: dict[str, list[int]],
+        gap_threshold: int,
+    ) -> tuple[list[LifetimeBoundBuffer], dict[str, str]]:
+        """Split buffers with large usage gaps into per-segment LifetimeBoundBuffers.
+
+        Each segment is linked to the previous one via `in_place` so the solver
+        can reuse the same LX address across the gap when it is free.  Buffers
+        without gaps are returned unchanged.
+
+        Returns:
+            expanded: flat list of LifetimeBoundBuffers (originals replaced by segments)
+            seg_to_orig: mapping from segment name to the originating buffer name
+        """
+        expanded: list[LifetimeBoundBuffer] = []
+        seg_to_orig: dict[str, str] = {}
+
+        for buf in buffers:
+            times = usage_times.get(buf.name, [])
+            if len(times) < 2:
+                expanded.append(buf)
+                continue
+
+            # Find gap positions: indices where gap to next access exceeds threshold.
+            split_points = [
+                i for i in range(len(times) - 1)
+                if times[i + 1] - times[i] > gap_threshold
+            ]
+
+            if not split_points:
+                expanded.append(buf)
+                continue
+
+            # Build segment boundaries: each segment covers [times[start], times[end]+1].
+            boundaries: list[tuple[int, int]] = []
+            seg_start = 0
+            for sp in split_points:
+                boundaries.append((times[seg_start], times[sp] + 1))
+                seg_start = sp + 1
+            boundaries.append((times[seg_start], times[-1] + 1))
+
+            prev_seg_name: Optional[str] = None
+            for idx, (seg_s, seg_e) in enumerate(boundaries):
+                seg_name = f"{buf.name}_evict_seg{idx}"
+                seg_to_orig[seg_name] = buf.name
+                seg_buf = LifetimeBoundBuffer(
+                    name=seg_name,
+                    size=buf.size,
+                    start_time=seg_s,
+                    end_time=seg_e,
+                    in_place=[prev_seg_name] if prev_seg_name is not None else [],
+                    heuristic=buf.heuristic,
+                )
+                expanded.append(seg_buf)
+                prev_seg_name = seg_name
+
+        return expanded, seg_to_orig
+
+    def _generate_buffers(self, graph: GraphLowering) -> list[LifetimeBoundBuffer]:
         in_place = self._determine_in_place(graph)
         buffers = self._build_bound_buffers(graph, in_place)
         return buffers
 
     def _push_allocation(
-        self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
+        self,
+        graph: GraphLowering,
+        buffers: list[LifetimeBoundBuffer],
+        seg_to_orig: dict[str, str] | None = None,
     ):
-        # push the allocation into the code generation
+        seg_to_orig = seg_to_orig or {}
         for b in buffers:
-            if b.address is not None:
-                buf = graph.get_buffer(b.name)
-                layout = buf.get_layout()
-                layout.allocation["lx"] = b.address
+            if b.address is None:
+                continue
+            orig_name = seg_to_orig.get(b.name, b.name)
+            # Non-first segments (in_place is set) are handled by EvictionReloadPass.
+            if b.name in seg_to_orig and b.in_place:
+                continue
+            buf = graph.get_buffer(orig_name)
+            layout = buf.get_layout()
+            layout.allocation["lx"] = b.address
 
 
 class DefaultAllocator(ScratchpadAllocator):
@@ -202,17 +272,37 @@ class DefaultAllocator(ScratchpadAllocator):
     def plan_allocation(self, graph: GraphLowering):
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
 
+        When config.lx_eviction_gap_threshold > 0, buffers with long usage gaps
+        are split into per-segment LifetimeBoundBuffers before planning.  The
+        solver treats each segment as an independent buffer linked to the previous
+        one via in_place, allowing the scratchpad address to be freed during gaps.
+        An EvictionReloadPass is applied afterward to insert any required
+        HBM-to-LX reload clones.
+
         Args:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
                 addresses where viable.
         """
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
+
         buffers = self._generate_buffers(graph)
+
+        seg_to_orig: dict[str, str] = {}
+        if config.lx_eviction_gap_threshold > 0:
+            usage_times = calculate_usage_times(graph)
+            buffers, seg_to_orig = self._split_buffers_on_gaps(
+                buffers, usage_times, config.lx_eviction_gap_threshold
+            )
+
         allocation = self.layout_planning.plan_layout(buffers)
-        self._push_allocation(graph, allocation)
+        self._push_allocation(graph, allocation, seg_to_orig)
+
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
+
+        if seg_to_orig:
+            EvictionReloadPass(seg_to_orig, allocation, lx_address=0).apply_pass(graph)
 
 
 def scratchpad_planning(

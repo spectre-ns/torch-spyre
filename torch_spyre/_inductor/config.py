@@ -25,6 +25,11 @@ allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
+# Minimum gap (in operation time steps) between accesses to the same buffer
+# that triggers splitting its LX lifetime into evictable segments.  0 disables
+# segment splitting entirely.
+lx_eviction_gap_threshold: int = int(os.environ.get("LX_EVICTION_GAP", "0"))
+
 sencores: int = int(os.getenv("SENCORES", "32"))
 
 # k_fast: a two-layer optimisation for K-split matmul work-divisions.
