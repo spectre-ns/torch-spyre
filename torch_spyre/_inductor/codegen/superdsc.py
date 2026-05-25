@@ -35,7 +35,7 @@ from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
-from .compute_ops import generate_sdsc
+from .compute_ops import generate_sdsc, num_bytes
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -317,6 +317,7 @@ def _create_sdsc_tensors(
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
+        lx_byte_offset: int = 0
         use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
@@ -356,8 +357,17 @@ def _create_sdsc_tensors(
             if dev_dim_size > it_dim_size:
                 dim_coord = arg.device_coordinates[-stride_idx - 2]
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
-                offsets[dim] = dim_offset * dim_device_stride
-                backGap[dim] = dev_dim_size - it_dim_size
+                if "lx" in arg.allocation and not arg.is_input:
+                    # backGapCore_ only supports the HBM component id (-1).
+                    # For LX scatter outputs, encode the slice offset directly
+                    # in start_address so the bundler writes to the correct
+                    # location, and omit backGap to avoid the invalid -1 coreId.
+                    lx_byte_offset += (
+                        dim_offset * dim_device_stride * num_bytes(arg.device_dtype)
+                    )
+                else:
+                    offsets[dim] = dim_offset * dim_device_stride
+                    backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
             max_dim_sizes[dim] = -1
@@ -381,7 +391,7 @@ def _create_sdsc_tensors(
                 allocation=arg.allocation,
                 start_address=arg.allocation.get("pool")
                 if "pool" in arg.allocation
-                else arg.allocation.get("lx")
+                else arg.allocation.get("lx") + lx_byte_offset
                 if "lx" in arg.allocation
                 else arg.allocation.get("hbm"),
                 backGap=backGap,
