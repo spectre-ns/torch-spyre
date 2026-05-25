@@ -42,6 +42,8 @@ tests_lx_planning_run_skips: bool = (
 tests_lx_planning_full: bool = os.environ.get("TEST_LX_PLANNING_FULL", "0") == "1"
 
 
+
+
 def make_lx_planning_class(cls):
     return make_test_cls_with_patches(
         cls,
@@ -52,6 +54,10 @@ def make_lx_planning_class(cls):
         (torch_spyre._inductor.config, "sencores", 1),
     )
 
+def _copy_inherited_methods(src, dst, attrs):
+    for attr in attrs:
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr)) 
 
 def _canonical_test_names(test_cls):
     """Pick one representative test name per (prefix, op) cell of
@@ -84,7 +90,7 @@ def _canonical_test_names(test_cls):
     return canonical
 
 
-def _copy_canonical_tests(src_cls, dst_cls, suffix, test_failures):
+def _copy_canonical_tests(src_cls, dst_cls, suffix, test_failures, inherited_test_attributes):
     """Copy test methods from ``src_cls`` into ``dst_cls`` with ``_{suffix}``
     appended to each name. Unless ``TEST_LX_PLANNING_FULL`` is set, restrict
     to the canonical subset derived from ``TestOps.PARAMS``."""
@@ -107,13 +113,13 @@ def _copy_canonical_tests(src_cls, dst_cls, suffix, test_failures):
         if test_failures and name in test_failures:
             new_test = unittest.skip("Skipped!")(new_test)
         setattr(dst_cls, f"{name}_{suffix}", new_test)
-    if hasattr(src_cls, "is_dtype_supported"):
-        dst_cls.is_dtype_supported = src_cls.is_dtype_supported
-    if hasattr(src_cls, "_get_core_reduction_invalid_dim_cases"):
-        dst_cls._get_core_reduction_invalid_dim_cases = (
-            src_cls._get_core_reduction_invalid_dim_cases
-        )
+    _copy_inherited_methods(src_cls, dst_cls, inherited_test_attributes)
 
+INHERITED_TEST_ATTRIBUTES = [
+    "is_dtype_supported",
+    "_get_core_reduction_invalid_dim_cases",
+    "_get_single_dim_reduction_invalid_dim_cases"
+]
 
 POINTWISE_TEST_FAILURES = [
     "test_addmm_1152_10x1152_1152x1152",
@@ -254,6 +260,7 @@ _copy_canonical_tests(
     LxPlanningTwoOpPointwiseAdditionTest,
     "lx_planning_pointwise",
     POINTWISE_TEST_FAILURES if not tests_lx_planning_run_skips else None,
+    INHERITED_TEST_ATTRIBUTES
 )
 
 
@@ -386,4 +393,5 @@ _copy_canonical_tests(
     LxPlanningTwoOpReductionTest,
     "lx_planning_reduction",
     REDUCTION_TEST_FAILURES if not tests_lx_planning_run_skips else None,
+    INHERITED_TEST_ATTRIBUTES
 )
