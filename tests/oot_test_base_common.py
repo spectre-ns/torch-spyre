@@ -1,5 +1,6 @@
 """
 Shared class and methods for all OOT PyTorch test overrides.
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
 
 """
 
@@ -12,7 +13,7 @@ import regex as re
 import pytest  # type: ignore
 import torch
 
-from spyre_test_constants import (
+from oot_test_constants import (
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
     MODE_MANDATORY_SUCCESS,
@@ -21,18 +22,18 @@ from spyre_test_constants import (
     MODE_XFAIL_STRICT,
     UNLISTED_MODE_XFAIL,
 )
-from spyre_test_matching import (
+from oot_test_matching import (
     extract_dtype_from_name,
     parse_dtype,
 )
-from spyre_test_parsing import (
+from oot_test_parsing import (
     FileEntry,
     apply_op_config_overrides,
     load_yaml_config,
     resolve_current_file,
 )
 
-from spyre_upstream_patcher import (
+from oot_upstream_patcher import (
     _OOTDtypePatcher,
     _OOTModuleMarkerPatcher,
     _OOTOnlyOnPatcher,
@@ -43,17 +44,18 @@ from spyre_upstream_patcher import (
     _OOTOpMarkerPatcher,
     _OOTPrecisionOverridePatcher,
 )
-from spyre_test_config_models import (
+from oot_test_config_models import (
     OOTTestConfig,
     Precision,
     SupportedOpConfig,
     SupportedModuleConfig,
     TestEntry,
 )
-from spyre_test_common_methods_invocations import (
+from oot_test_common_methods_invocations import (
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
+from oot_test_utilities import _get_privateuse1_device_type
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 
@@ -76,14 +78,7 @@ def _log_error(msg: str) -> None:
 # Resolve the actual backend name registered for privateuse1.
 # torch._C._get_privateuse1_backend_name() returns e.g. "spyre".
 # This is what slf.device_type will be at test runtime.
-def _get_privateuse1_device_type() -> str:
-    try:
-        return torch._C._get_privateuse1_backend_name()
-    except Exception:
-        return "privateuse1"  # fallback if not registered yet
-
-
-_SPYRE_DEVICE_TYPE: str = _get_privateuse1_device_type()
+_OOT_DEVICE_TYPE: str = _get_privateuse1_device_type()
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +229,7 @@ def _extract_op_name_from_method(
 ) -> Optional[str]:
     """Extract the op name from a parametrized method name.
 
-    method_name: test_scalar_support_add_spyre_float16
+    method_name: test_scalar_support_add_<device>_float16
     base_test_name: test_scalar_support
     returns: "add"
 
@@ -242,11 +237,10 @@ def _extract_op_name_from_method(
     """
     if not method_name.startswith(base_test_name + "_"):
         return None
-    remainder = method_name[len(base_test_name) + 1 :]  # "add_spyre_float16"
+    remainder = method_name[len(base_test_name) + 1 :]  # "add_<device>_float16"
     # op name is the first segment before the device suffix
-    device_type = "spyre"  # or read from _SPYRE_DEVICE_TYPE
-    if f"_{device_type}_" in remainder:
-        return remainder.split(f"_{device_type}_")[0]  # "add"
+    if f"_{_OOT_DEVICE_TYPE}_" in remainder:
+        return remainder.split(f"_{_OOT_DEVICE_TYPE}_")[0]
     return None
 
 
@@ -261,7 +255,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
     All configuration is loaded lazily from the YAML file pointed to by
     PYTORCH_TEST_CONFIG.  The YAML is validated by Pydantic on load.
-    See spyre_test_config_schema.json for the full schema.
+    See oot_test_config_schema.json for the full schema.
     """
 
     device_type: str = "privateuse1"
@@ -285,12 +279,11 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # PrivateUse1TestBase.setUpClass sets cls.device_type = "spyre"
-        # (the registered backend name). This mutates the base class's
-        # device_type, causing subsequent instantiate_device_type_tests calls
-        # to generate class names like TestOldViewOpsSPYRE instead of
-        # TestOldViewOpsPRIVATEUSE1, which then get filtered out by
-        # PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
+        # PrivateUse1TestBase.setUpClass sets cls.device_type to the registered
+        # backend name (e.g. "spyre").  This mutates the base class's device_type,
+        # causing subsequent instantiate_device_type_tests calls to generate class
+        # names like TestOldViewOpsSPYRE instead of TestOldViewOpsPRIVATEUSE1,
+        # which then get filtered out by PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
         # Reset TorchTestBase.device_type to "privateuse1" so subsequent
         # calls generate the correct class name.
         TorchTestBase.device_type = "privateuse1"
@@ -529,7 +522,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
         # resolve final decision
         if effective_mode == MODE_SKIP:
-            return False, "Skipped for Spyre", False, False
+            return False, "Skipped by OOT config", False, False
         elif effective_mode == MODE_XFAIL:
             return True, None, True, False  # run, xfail non-strict
         elif effective_mode == MODE_XFAIL_STRICT:
@@ -552,7 +545,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
     # ------------------------------------------------------------------
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
-        _OOTOnlyOnPatcher(test, _SPYRE_DEVICE_TYPE).patch()
+        _OOTOnlyOnPatcher(test, _OOT_DEVICE_TYPE).patch()
         cls._load_test_suite_config()
 
         # Retrieve all entries for this base test name.
@@ -759,7 +752,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
 
             # if not enabled:
             #     @wraps(test)
-            #     def _skip(self, _reason=reason or "Skipped for Spyre"):
+            #     def _skip(self, _reason=reason or "Skipped by OOT config"):
             #         raise unittest.SkipTest(_reason)
 
             #     setattr(cls, method_name, _skip)
@@ -793,7 +786,7 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                 existing_fn = cls.__dict__.get(method_name)
                 if existing_fn is not None:
                     # Store BEFORE marking so the attribute is on the base function
-                    existing_fn._spyre_method_tags = method_tags
+                    existing_fn._oot_method_tags = method_tags
                     marked_fn = existing_fn
                     for tag in method_tags:
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)

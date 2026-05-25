@@ -31,17 +31,17 @@ from torch.testing._internal.common_utils import TestCase
 
 import shared_config
 from op_registry import OP_REGISTRY, OpAdapter
-from spyre_test_constants import ENV_TEST_CONFIG
-from spyre_test_config_models import (
+
+from oot_test_constants import ENV_TEST_CONFIG
+from oot_test_config_models import (
     InputArgTensor,
     InputArgTensorList,
     OOTTestConfig,
     OpsNamedItem,
     TestEntry,
 )
-from spyre_test_parsing import load_yaml_config, resolve_current_file
-from spyre_test_utilities import print_test_tags_oot
-
+from oot_test_parsing import load_yaml_config, resolve_current_file
+from oot_test_utilities import print_test_tags_oot
 
 # ---------------------------------------------------------------------------
 # ModelOpInfo
@@ -391,14 +391,14 @@ class TestSpyreModelOps(TestCase):
             SampleInput=SampleInput,
         )
 
-        def _to_spyre(x: Any) -> Any:
+        def _to_target_device(x: Any) -> Any:
             if torch.is_tensor(x):
                 return x.to(test_device)
             if isinstance(x, list):
                 return [t.to(test_device) if torch.is_tensor(t) else t for t in x]
             return x
 
-        test_sample: SampleInput = cpu_sample.transform(_to_spyre)
+        test_sample: SampleInput = cpu_sample.transform(_to_target_device)
 
         # Adapter pre-hook (e.g. dropout sets training=False)
         if adapter.pre is not None:

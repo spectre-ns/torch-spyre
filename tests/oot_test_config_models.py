@@ -1,7 +1,9 @@
 """
+# Copyright Author: Anubhav Jana (Anubhav.Jana97@ibm.com)
+
 Pydantic models for the OOT PyTorch test framework YAML config.
 
-Used by spyre_test_parsing.py to validate and parse the YAML config.
+Used by oot_test_parsing.py to validate and parse the YAML config.
 """
 
 import ast
@@ -14,7 +16,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 import torch
 from pydantic import BaseModel, field_validator, model_validator  # type: ignore
 
-from spyre_test_constants import (
+from oot_test_constants import (
     DTYPE_STR_MAP,
     MODE_MANDATORY_SUCCESS,
     MODE_SKIP,
@@ -22,7 +24,7 @@ from spyre_test_constants import (
     MODE_XFAIL_STRICT,
     REL_PATH_TOKENS,
 )
-from spyre_test_matching import parse_dtype
+from oot_test_matching import parse_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +195,7 @@ class InputTensorSpec(BaseModel):
 
     shape: List[int]
     dtype: str
-    device: str = "spyre"
+    device: str = "privateuse1"
     init: str = "rand"
     init_args: InputInitArgs = InputInitArgs()
     stride: Optional[List[int]] = None
