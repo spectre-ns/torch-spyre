@@ -15,7 +15,13 @@
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from torch._inductor.ir import ComputedBuffer, Operation, MutationLayoutSHOULDREMOVE
+from torch._inductor.ir import (
+    ComputedBuffer,
+    ExternKernel,
+    FallbackKernel,
+    MutationLayoutSHOULDREMOVE,
+    Operation,
+)
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -30,6 +36,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     OP_GOOD_FOR_LX_INPLACE,
+    get_buffer_users,
     mem_usage_by_buf,
     calculate_liveness,
     get_ncores_for_buffers,
@@ -86,6 +93,11 @@ class ScratchpadAllocator(ABC):
         for op in graph.operations:
             if not self._op_output_good_for_lx_reuse(op):
                 drop_list.add(op.name)
+
+        # filter out buffers consumed by ops that cannot read from LX.
+        for buf_name, users in get_buffer_users(graph).items():
+            if any(isinstance(u, (FallbackKernel, ExternKernel)) for u in users):
+                drop_list.add(buf_name)
 
         # filter out core division mismatches
         drop_list.update(
