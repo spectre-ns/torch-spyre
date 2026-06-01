@@ -4929,6 +4929,92 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    # ------------------------------------------------------------------
+    # Tests for new eager registrations (PR #5): eq/le scalar & Tensor_out,
+    # index_copy.Tensor/index_copy.out, logical_not decomposition tweak
+    # ------------------------------------------------------------------
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_eq_scalar_cpu(self, x, scalar):
+        """aten.eq.Scalar: tensor == scalar"""
+        def fn(a, s):
+            return torch.eq(a, s)
+
+        self.compare_with_cpu(fn, x, scalar, run_eager=True, run_compile=True)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_eq_scalar_out_cpu(self, x):
+        """aten.eq.Scalar_out: out-variant for eq with scalar"""
+        def fn(x):
+            out = torch.empty_like(x, dtype=torch.bool)
+            torch.eq(x, 0.0, out=out)
+            return out
+
+        self.compare_with_cpu(fn, x, run_eager=True, run_compile=True)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_le_scalar_cpu(self, x, scalar):
+        """aten.le.Scalar: tensor <= scalar"""
+        def fn(a, s):
+            return torch.le(a, s)
+
+        self.compare_with_cpu(fn, x, scalar, run_eager=True, run_compile=True)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_le_tensor_out_cpu(self, x, y):
+        """aten.le.Tensor_out: out-variant for le between tensors"""
+        def fn(x, y):
+            out = torch.empty_like(x, dtype=torch.bool)
+            torch.le(x, y, out=out)
+            return out
+
+        self.compare_with_cpu(fn, x, y, run_eager=True, run_compile=True)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_copy_tensor_cpu(self):
+        """aten.index_copy.Tensor along dim=0"""
+        def fn(src, indices, dim):
+            return torch.index_copy(torch.zeros(4, 3, device="spyre"), dim, indices, src)
+
+        src = torch.randn(2, 3, device="spyre")
+        indices = torch.tensor([0, 2], device="spyre")
+        ref = torch.index_copy(torch.zeros(4, 3), 0, indices.cpu(), src.cpu())
+
+        result = fn(src, indices, 0)
+        torch.testing.assert_close(result.cpu(), ref)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_copy_out_cpu(self):
+        """aten.index_copy.out along dim=1"""
+        def fn(src, indices, dim):
+            out = torch.empty(3, 4, device="spyre")
+            torch.index_copy(torch.zeros(3, 4, device="spyre"), dim, indices, src, out=out)
+            return out
+
+        src = torch.randn(2, 4, device="spyre")
+        indices = torch.tensor([1, 3], device="spyre")
+        ref = torch.empty(3, 4)
+        torch.index_copy(ref, 1, indices.cpu(), src.cpu())
+
+        result = fn(src, indices, 1)
+        torch.testing.assert_close(result.cpu(), ref)
+
+    def test_logical_not_bool_decomp(self):
+        """Verify logical_not on bool tensors uses zeros_like (not ne trick).
+
+        The decomposition should produce a graph constant the Spyre codegen
+        accepts, rather than a ne(input, input) expression."""
+        x = torch.tensor([True, False, True, False], device="spyre")
+        result = torch.logical_not(x)
+        expected = torch.tensor([False, True, False, True])
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_logical_not_float_decomp(self):
+        """Verify logical_not on float tensors falls back to zeros_like."""
+        x = torch.tensor([1.0, 0.0, 2.5], device="spyre", dtype=torch.float16)
+        result = torch.logical_not(x)
+        expected = torch.tensor([False, True, False])
+        torch.testing.assert_close(result.cpu(), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
