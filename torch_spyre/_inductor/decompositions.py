@@ -343,10 +343,10 @@ def new_ones_decomp(
 
 @register_spyre_decomposition([torch.ops.aten.logical_not])
 def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
-    # Currently falling back to torch.zeros_like for dtypes other than bool
-    # This is needed until scalar False/0.0 or constant tensor [False]/[0.0] is supported
+    # For bool tensors, use zeros_like instead of ne(input, input) trick.
+    # The ne trick produces a graph constant that the Spyre codegen rejects.
     if input.dtype is torch.bool:
-        zero = torch.ne(input, input)
+        zero = torch.zeros_like(input, dtype=torch.bool)
     else:
         zero = torch.zeros_like(input)
     return torch.eq(input, zero)
