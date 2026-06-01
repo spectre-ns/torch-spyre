@@ -96,10 +96,34 @@ def _patch_tensor_for_spyre():
                 and _dtype is not None
                 and self.device.type == DEVICE_NAME
             ):
-                # Step 1: cast dtype on CPU
+                # D2D: source on spyre, target also spyre but dtype differs.
+                # Step 1: cast dtype on CPU (D2D dtype change is not supported on-device)
                 tmp = orig_to(self, dtype=_dtype)
                 # Step 2: plain H2D copy with no dtype change
                 return orig_to(tmp, _device)
+
+            # Detect int64→spyre copy: Spyre backend uses int32 internally,
+            # so H2D int64→spyre fails with "does not support type conversion
+            # during copy" in DCI C++ code. Auto-downcast int64→int32 on CPU
+            # before the H2D copy.
+            target_is_spyre = False
+            if (
+                _device is not None
+                and isinstance(_device, (str, torch.device))
+            ):
+                if isinstance(_device, str):
+                    target_is_spyre = _device == DEVICE_NAME
+                elif _device.type == DEVICE_NAME:
+                    target_is_spyre = True
+
+            if (
+                target_is_spyre
+                and self.dtype == torch.int64
+                and self.device.type != DEVICE_NAME
+            ):
+                # Downcast int64→int32 on CPU before H2D copy
+                tmp = self.to(torch.int32)
+                return orig_to(tmp, *args, **kwargs)
 
             return orig_to(self, *args, **kwargs)
         else:
