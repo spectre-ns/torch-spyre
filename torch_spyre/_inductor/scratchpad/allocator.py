@@ -80,6 +80,13 @@ class ScratchpadAllocator(ABC):
         return org_op_name
 
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
+        """Whether ``op``'s output buffer is eligible for LX reuse.
+
+        Note: membership is an *exact* match against
+        ``OP_OUTPUT_GOOD_FOR_LX_REUSE`` (``in`` on a list of names), not the
+        substring matching this code used to do. So ``sum`` no longer also
+        matches ``cumsum``; any new alias must be added to the list verbatim.
+        """
         return (
             isinstance(op, ComputedBuffer)
             and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)

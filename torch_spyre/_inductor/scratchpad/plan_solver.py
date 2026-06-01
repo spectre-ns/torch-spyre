@@ -85,7 +85,9 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         )
 
     def _find_free_block(self, size_needed: int) -> Optional[int]:
-        assert all(x.address is not None for x in self.usage)
+        # self.usage only ever holds placed buffers (_try_allocate appends a
+        # buffer only after assigning a non-None address), so every entry here
+        # has address is not None by construction.
         curr_lo = self._get_lowest_addr_in_use()
         curr_hi = self._get_highest_addr_in_use()
         if self.limit < size_needed:
@@ -98,7 +100,10 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         if address + size_needed <= self.limit:
             return address
 
-        # Search for a gap between existing allocations
+        # Search for a gap between existing allocations.
+        # Sort by address; the `x.address is None` term is only there to give
+        # the key a sortable type (address is Optional[int]) and is always
+        # False in practice, since self.usage holds only placed buffers.
         self.usage.sort(key=lambda x: (x.address is None, x.address))
         for i in range(len(self.usage) - 1):
             assert (current_address := self.usage[i].address) is not None

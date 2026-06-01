@@ -276,6 +276,13 @@ class CustomPreSchedulingPasses(CustomGraphPass):
                 if config.co_optimizing_lx_planning
                 else None
             )
+            # scratchpad_planning takes the GraphLowering, not the bare
+            # `operations` list the other passes above receive. Buffer/liveness
+            # analysis needs graph-level context (get_buffer, graph_input_names,
+            # get_output_names), and passing it in explicitly avoids reaching
+            # into V.graph global scope, which keeps the pass testable in
+            # isolation. New passes that need graph metadata should follow the
+            # same convention.
             scratchpad_planning(graph, allocator=allocator)
 
         if logger.isEnabledFor(logging.INFO):
