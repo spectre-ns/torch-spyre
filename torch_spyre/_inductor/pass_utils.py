@@ -842,11 +842,10 @@ def _per_core_view_on_buf(
     # stride_map=[64, 128, 1] and elems_per_stick=64. With M-split×4
     # (h=128) and N-split×2 (h=1), N's h=1 → outer-stick dim 0;
     # M's h=128 → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
-    device_stride_to_dims = {}
+    device_stride_to_dims: dict[int, list[int]] = {}
     for i, s in enumerate(stride_map):
         if s > 0:
-            device_stride_to_dims.setdefault(s, []).append(i)   # no reassignment
-
+            device_stride_to_dims.setdefault(s, []).append(i)  # no reassignment
 
     work_slice_dims: dict[int, int] = {}
     sym_to_device_dim: dict["sympy.Symbol", int] = {}
@@ -870,7 +869,6 @@ def _per_core_view_on_buf(
         )
         work_slice_dims[dev_dim] = split
         sym_to_device_dim[sym] = dev_dim
-
 
     # Step 4: build the core→slot mapping using the same gate codegen
     # uses (_should_use_k_fast_mapping), so K-fast matmul ops compare
