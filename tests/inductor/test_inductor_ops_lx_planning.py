@@ -266,7 +266,7 @@ class LxPlanningTwoOpPointwiseAdditionTest(_LxPlanningTwoOpTestBase):
         def make_seq_of_ops(*fn_args, **fn_kwargs):
             result = fn(*fn_args, **fn_kwargs)
             return pytree.tree_map(
-                lambda x: x + x
+                lambda x: (x + x)/2
                 if isinstance(x, torch.Tensor) and x.dtype == torch.float16
                 else x,
                 result,
