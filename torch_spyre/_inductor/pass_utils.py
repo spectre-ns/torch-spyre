@@ -45,23 +45,6 @@ from .ir import FixedTiledLayout, SpyreConstantFallback
 from .views import compute_coordinates, matching_dim
 
 
-def _resolve_layout(buf: Buffer) -> "FixedTiledLayout":
-    """Return the FixedTiledLayout for buf, unwrapping MutationLayoutSHOULDREMOVE.
-
-    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
-    scheduler can identify them as in-place writes.  Their target buffer already
-    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
-    real_layout() gives us the correct device layout for work division.
-    """
-    layout = buf.get_layout()
-    if isinstance(layout, MutationLayoutSHOULDREMOVE):
-        layout = layout.real_layout()
-    assert isinstance(layout, FixedTiledLayout), (
-        f"Expected FixedTiledLayout for {buf.get_name()}, got {type(layout)}"
-    )
-    return layout
-
-
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: "FixedTiledLayout"
@@ -849,7 +832,7 @@ def _per_core_view_on_buf(
             work_slice_dims=tuple(),
             core_to_slot=tuple(),
         )
-        result = (view,  has_partial_reduction)
+        result = (view, has_partial_reduction)
         if cache is not None:
             cache[key] = result
         return result
