@@ -800,6 +800,7 @@ def _per_core_view_on_buf(
     Pass an optional `cache` dict to memoize results across calls,
     keyed by (op.op_it_space_splits, dep, buf_name).
     """
+    key = None
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:
         # dicts aren't hashable; freeze each into a frozenset of items so
@@ -842,10 +843,20 @@ def _per_core_view_on_buf(
             continue
         splits_by_stride[host_stride] = (int(split), sym)
 
-    buf_layout = _resolve_layout(V.graph.get_buffer(buf_name)).device_layout
-    device_size = buf_layout.device_size
-    stride_map = buf_layout.stride_map
-    elems_per_stick = buf_layout.device_dtype.elems_per_stick()
+    buf_layout = V.graph.get_buffer(buf_name).layout
+    if isinstance(buf_layout, MutationLayoutSHOULDREMOVE):
+        view = PerCoreView(
+            work_slice_dims=tuple(),
+            core_to_slot=tuple(),
+        )
+        result = (view,  has_partial_reduction)
+        if cache is not None:
+            cache[key] = result
+        return result
+    device_layout = buf_layout.device_layout
+    device_size = device_layout.device_size
+    stride_map = device_layout.stride_map
+    elems_per_stick = device_layout.device_dtype.elems_per_stick()
 
     # Step 3: place each split on a device dim via stride lookup. h=1
     # maps to elems_per_stick when present (sticks are atomic, so a
