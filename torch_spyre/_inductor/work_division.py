@@ -21,7 +21,6 @@ from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 import torch
 from torch._inductor.ir import (
-    ComputedBuffer,
     ExternKernel,
     FallbackKernel,
     MultiOutput,
@@ -71,6 +70,7 @@ class TensorDep:
 
     def __post_init__(self):
         self.device_coords = device_coordinates(self.layout.device_layout, self.dep)
+
 
 def core_split(size: int, max_cores: int) -> int:
     """
@@ -454,6 +454,7 @@ def prioritize_dimensions(
 
     return [t[0] for t in output_pairs], [t[0] for t in reduction_pairs]
 
+
 def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
 
@@ -469,6 +470,7 @@ def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
         f"Expected FixedTiledLayout for {op.get_name()}, got {type(layout)}"
     )
     return layout
+
 
 def collect_tensor_deps(
     op: ComputedBuffer, args: list[SchedNodeArg]
