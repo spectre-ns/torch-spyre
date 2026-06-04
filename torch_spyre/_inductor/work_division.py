@@ -72,24 +72,6 @@ class TensorDep:
     def __post_init__(self):
         self.device_coords = device_coordinates(self.layout.device_layout, self.dep)
 
-
-def _resolve_layout(buf: Buffer) -> "FixedTiledLayout":
-    """Return the FixedTiledLayout for buf, unwrapping MutationLayoutSHOULDREMOVE.
-
-    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
-    scheduler can identify them as in-place writes.  Their target buffer already
-    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
-    real_layout() gives us the correct device layout for work division.
-    """
-    layout = buf.get_layout()
-    if isinstance(layout, MutationLayoutSHOULDREMOVE):
-        layout = layout.real_layout()
-    assert isinstance(layout, FixedTiledLayout), (
-        f"Expected FixedTiledLayout for {buf.get_name()}, got {type(layout)}"
-    )
-    return layout
-
-
 def core_split(size: int, max_cores: int) -> int:
     """
     Find the largest divisor of size that doesn't exceed max_cores.
@@ -472,6 +454,21 @@ def prioritize_dimensions(
 
     return [t[0] for t in output_pairs], [t[0] for t in reduction_pairs]
 
+def _resolve_layout(buf: Buffer) -> "FixedTiledLayout":
+    """Return the FixedTiledLayout for buf, unwrapping MutationLayoutSHOULDREMOVE.
+
+    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
+    scheduler can identify them as in-place writes.  Their target buffer already
+    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
+    real_layout() gives us the correct device layout for work division.
+    """
+    layout = buf.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    assert isinstance(layout, FixedTiledLayout), (
+        f"Expected FixedTiledLayout for {buf.get_name()}, got {type(layout)}"
+    )
+    return layout
 
 def collect_tensor_deps(
     op: ComputedBuffer, args: list[SchedNodeArg]
