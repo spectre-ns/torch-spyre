@@ -842,28 +842,30 @@ def _per_core_view_on_buf(
     # stride_map=[64, 128, 1] and elems_per_stick=64. With M-split×4
     # (h=128) and N-split×2 (h=1), N's h=1 → outer-stick dim 0;
     # M's h=128 → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
-    device_stride_to_dims: dict[int, list[int]] = {}
+    # Map each device stride to a single device dim. If multiple device
+    # dims share the same stride, prefer the one with the larger
+    # device_size (heuristic to pick outer/stick dim). Skip non-positive
+    # stride_map entries which are sentinels.
+    device_stride_to_dim: dict[int, int] = {}
     for i, s in enumerate(stride_map):
-        if s > 0:
-            device_stride_to_dims.setdefault(s, []).append(i)  # no reassignment
+        if s <= 0:
+            continue
+        prev = device_stride_to_dim.get(s)
+        if prev is None or device_size[i] > device_size[prev]:
+            device_stride_to_dim[s] = i
 
     work_slice_dims: dict[int, int] = {}
     sym_to_device_dim: dict["sympy.Symbol", int] = {}
     for h, (split, sym) in sorted(splits_by_stride.items()):
-        lookup = (
-            elems_per_stick
-            if h == 1 and elems_per_stick in device_stride_to_dims
-            else h
-        )
-        dev_dim = next(
-            (
-                d
-                for d in device_stride_to_dims.get(lookup, ())
-                if d not in work_slice_dims and device_size[d] % split == 0
-            ),
-            None,
-        )
-        assert dev_dim is not None, (
+        if h == 1 and elems_per_stick in device_stride_to_dim:
+            dev_dim = device_stride_to_dim.get(elems_per_stick)
+        else:
+            dev_dim = device_stride_to_dim.get(h)
+        assert (
+            dev_dim is not None
+            and dev_dim not in work_slice_dims
+            and device_size[dev_dim] % split == 0
+        ), (
             f"could not place split h={h} factor={split} on "
             f"stride_map={stride_map} device_size={device_size}"
         )
