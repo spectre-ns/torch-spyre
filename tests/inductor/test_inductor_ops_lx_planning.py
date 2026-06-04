@@ -241,7 +241,7 @@ POINTWISE_TEST_FAILURES = [
     "test_vector_norm_keepdim1_vector_norm_ord2_5d_mixed_1_neg1",
     "test_vector_norm_keepdim1_vector_norm_ordinf_4d_dim_neg1",
     "test_vector_norm_keepdim1_vector_norm_ordneginf_4d_dim_23",
-    "test_where_self_out_where_fp16_2d"
+    "test_where_self_out_where_fp16_2d",
 ]
 
 
@@ -420,7 +420,7 @@ REDUCTION_TEST_FAILURES = [
     "test_transpose_3d_contiguous_dim_0_2",
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_3",
-    "test_where_self_out_where_fp16_2d"
+    "test_where_self_out_where_fp16_2d",
 ]
 
 
