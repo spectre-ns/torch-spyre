@@ -29,7 +29,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
     MutationLayoutSHOULDREMOVE,
-    Buffer,
+    ComputedBuffer,
 )
 
 from torch._inductor.dependencies import MemoryDep
@@ -454,7 +454,7 @@ def prioritize_dimensions(
 
     return [t[0] for t in output_pairs], [t[0] for t in reduction_pairs]
 
-def _resolve_layout(buf: Buffer) -> "FixedTiledLayout":
+def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     """Return the FixedTiledLayout for buf, unwrapping MutationLayoutSHOULDREMOVE.
 
     Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
@@ -462,11 +462,11 @@ def _resolve_layout(buf: Buffer) -> "FixedTiledLayout":
     has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
     real_layout() gives us the correct device layout for work division.
     """
-    layout = buf.get_layout()
+    layout = op.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         layout = layout.real_layout()
     assert isinstance(layout, FixedTiledLayout), (
-        f"Expected FixedTiledLayout for {buf.get_name()}, got {type(layout)}"
+        f"Expected FixedTiledLayout for {op.get_name()}, got {type(layout)}"
     )
     return layout
 

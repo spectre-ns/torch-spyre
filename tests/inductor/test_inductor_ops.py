@@ -4572,9 +4572,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_flatten_cpu(self, start_dim, end_dim, x):
         """Test flatten operation with various dimension ranges."""
-        self.compare_with_cpu(
-            lambda x: x.flatten(start_dim, end_dim).clone(), x
-        )  # SPIKE: materialize
+        self.compare_with_cpu(lambda x: x.flatten(start_dim, end_dim), x)
 
     def test_dropout_functional(self, input, kwargs):
         self.compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
