@@ -455,7 +455,7 @@ def prioritize_dimensions(
     return [t[0] for t in output_pairs], [t[0] for t in reduction_pairs]
 
 def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
-    """Return the FixedTiledLayout for buf, unwrapping MutationLayoutSHOULDREMOVE.
+    """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
 
     Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
     scheduler can identify them as in-place writes.  Their target buffer already
