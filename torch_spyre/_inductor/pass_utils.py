@@ -45,6 +45,23 @@ from .ir import FixedTiledLayout, SpyreConstantFallback
 from .views import compute_coordinates, matching_dim
 
 
+def _resolve_layout(buf: Buffer) -> "FixedTiledLayout":
+    """Return the FixedTiledLayout for buf, unwrapping MutationLayoutSHOULDREMOVE.
+
+    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
+    scheduler can identify them as in-place writes.  Their target buffer already
+    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
+    real_layout() gives us the correct device layout for work division.
+    """
+    layout = buf.get_layout()
+    if isinstance(layout, MutationLayoutSHOULDREMOVE):
+        layout = layout.real_layout()
+    assert isinstance(layout, FixedTiledLayout), (
+        f"Expected FixedTiledLayout for {buf.get_name()}, got {type(layout)}"
+    )
+    return layout
+
+
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: "FixedTiledLayout"
@@ -825,7 +842,7 @@ def _per_core_view_on_buf(
             continue
         splits_by_stride[host_stride] = (int(split), sym)
 
-    buf_layout = V.graph.get_buffer(buf_name).layout.device_layout
+    buf_layout = _resolve_layout(V.graph.get_buffer(buf_name)).device_layout
     device_size = buf_layout.device_size
     stride_map = buf_layout.stride_map
     elems_per_stick = buf_layout.device_dtype.elems_per_stick()
@@ -846,13 +863,12 @@ def _per_core_view_on_buf(
     # dims share the same stride, prefer the one with the larger
     # device_size (heuristic to pick outer/stick dim). Skip non-positive
     # stride_map entries which are sentinels.
-    device_stride_to_dim: dict[int, int] = {}
-    for i, s in enumerate(stride_map):
-        if s <= 0:
-            continue
-        prev = device_stride_to_dim.get(s)
-        if prev is None or device_size[i] > device_size[prev]:
-            device_stride_to_dim[s] = i
+
+    device_stride_to_dim = {
+        s: i
+        for i, s in enumerate(stride_map)
+        if s > 0 and device_size[i] != 1  # drop backward strides and degenerate axes
+    }
 
     work_slice_dims: dict[int, int] = {}
     sym_to_device_dim: dict["sympy.Symbol", int] = {}

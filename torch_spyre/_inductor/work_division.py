@@ -25,7 +25,6 @@ from torch._inductor.ir import (
     ExternKernel,
     FallbackKernel,
     MultiOutput,
-    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -44,6 +43,7 @@ from .pass_utils import (
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
+    _resolve_layout,
 )
 from typing import Callable
 
@@ -453,23 +453,6 @@ def prioritize_dimensions(
     reduction_pairs.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
 
     return [t[0] for t in output_pairs], [t[0] for t in reduction_pairs]
-
-
-def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
-    """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
-
-    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
-    scheduler can identify them as in-place writes.  Their target buffer already
-    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
-    real_layout() gives us the correct device layout for work division.
-    """
-    layout = op.get_layout()
-    if isinstance(layout, MutationLayoutSHOULDREMOVE):
-        layout = layout.real_layout()
-    assert isinstance(layout, FixedTiledLayout), (
-        f"Expected FixedTiledLayout for {op.get_name()}, got {type(layout)}"
-    )
-    return layout
 
 
 def collect_tensor_deps(
