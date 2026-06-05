@@ -17,6 +17,7 @@
 import logging
 import sympy
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.pattern_matcher import (
     Arg,
@@ -284,7 +285,7 @@ def _find_spec_op(ops: list[Operation]) -> Operation:
     )
 
 
-def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
+def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
 
     coarse_tile() requires ops to be grouped: all ops in a group share the same
@@ -293,6 +294,7 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
     identical hints into one group, breaking whenever the hint changes or an
     op has no hint at all.
     """
+    operations = graph.operations
 
     def _key(op):
         resolved = getattr(op, "dim_hints", [])

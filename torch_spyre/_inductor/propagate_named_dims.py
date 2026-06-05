@@ -30,11 +30,12 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from .errors import Unsupported
-from .pass_utils import host_coordinates, device_coordinates
-from .views import matching_dim, compute_coordinates
+from .pass_utils import SpyreConstantFallback, host_coordinates, device_coordinates
 from .propagate_hints import DimHint, get_op_hints
+from .views import matching_dim, compute_coordinates
 from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
@@ -311,15 +312,17 @@ def _log_op(op: Operation) -> None:
 
 
 def propagate_named_dims(
-    operations: list[Operation],
+    graph: GraphLowering,
 ) -> None:
     """Propagate named dims from annotated inputs through the op graph."""
+    global _enabled
+    operations = graph.operations
     if not _enabled:
         return
-    if len(V.graph.graph_input_names) > 0:
-        for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
+    if len(graph.graph_input_names) > 0:
+        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
-                tb = V.graph.graph_inputs[name]
+                tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
                     or not isinstance(tb.data, StorageBox)
@@ -341,6 +344,24 @@ def propagate_named_dims(
         elif isinstance(op, ComputedBuffer):
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 continue
+            hint = False
+            for hint_dict in get_op_hints(op).values():
+                if "named_dims" in hint_dict:
+                    hint = True
+                    named_dims = hint_dict["named_dims"]
+                    break
+            if hint:
+                coords = op_out_coords(op)
+                loop_var_dims = {
+                    _lone_sym(coord): [dim_name]
+                    for coord, dim_name in zip(coords, named_dims)
+                    if len(coord.free_symbols) == 1
+                }
+                op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
+                    named_dims=named_dims,
+                    loop_var_dims=loop_var_dims,
+                )
+                continue
             origins: set = getattr(op.data, "origins", set())
             aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
             reduction_type = getattr(op.data, "reduction_type", None)
@@ -360,6 +381,8 @@ def propagate_named_dims(
             else:
                 logger.warning(f"Warning: unhandled node type {type(op.data)}")
                 _set_no_named_dims(op)
+        elif isinstance(op, SpyreConstantFallback):
+            _set_no_named_dims(op)
         else:
             logger.warning(f"unhandled operation type {type(op)}")
             _set_no_named_dims(op)
@@ -370,8 +393,8 @@ def propagate_named_dims(
         logger.info(f"  {name} = {size}")
 
     logger.info("INPUT TENSORS")
-    for name in V.graph.graph_input_names:
-        tb = V.graph.graph_inputs[name]
+    for name in graph.graph_input_names:
+        tb = graph.graph_inputs[name]
         if isinstance(tb, TensorBox):
             dp = getattr(tb, "_dim_prop_info", None)
             logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
@@ -379,6 +402,8 @@ def propagate_named_dims(
     logger.info("OPS")
     for op in operations:
         _log_op(op)
+    # Reset _enabled so that it does not leak True into the next compilation
+    _enabled = False
 
 
 def _get_hint_scopes(op) -> list[dict[str, int]]:
@@ -397,7 +422,7 @@ def _get_hint_scopes(op) -> list[dict[str, int]]:
     return scopes
 
 
-def assign_dim_hints(operations: list[Operation]) -> None:
+def assign_dim_hints(graph: GraphLowering) -> None:
     """Combine spyre_hint scope annotations with propagated named dimensions.
 
     Reads the hint scopes (from spyre_hint() context managers in user code,
@@ -412,6 +437,7 @@ def assign_dim_hints(operations: list[Operation]) -> None:
 
     Deletes op._dim_prop_info when done — those fields are only needed here.
     """
+    operations = graph.operations
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue

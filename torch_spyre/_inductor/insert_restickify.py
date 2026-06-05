@@ -17,11 +17,13 @@ from collections import defaultdict
 
 import torch
 
+from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import host_coordinates, device_coordinates, stick_compatible
 from .pass_utils import compute_restickify_target_layout, copy_fx_custom_meta
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -200,14 +202,15 @@ def insert_restickify_on_node_inputs(
     ComputedBuffer.get_default_sizes_body.clear_cache(new_consumer_buffer)
 
 
-def insert_restickify(operations: list[Operation]) -> None:
+def insert_restickify(graph: GraphLowering) -> None:
     """Insert restickify operations before all nodes in restickify_plan.
 
-    Consumes V.graph.restickify_plan (built by finalize_layouts) and splices the
+    Consumes graph.restickify_plan (built by finalize_layouts) and splices the
     necessary ComputedBuffer nodes into the operations list in-place.
     No scheduler state is touched.
     """
-    restickify_plan = V.graph.restickify_plan
+    operations = graph.operations
+    restickify_plan = graph.restickify_plan
     if not restickify_plan:
         return
 
@@ -220,9 +223,9 @@ def insert_restickify(operations: list[Operation]) -> None:
             )
 
 
-def finalize_layouts(operations: list) -> None:
+def finalize_layouts(graph: GraphLowering) -> None:
     """Convert committed STLs (set by the optimizer) to FixedTiledLayouts and build
-    V.graph.restickify_plan for insert_restickify.
+    graph.restickify_plan for insert_restickify.
 
     Three steps:
     - Commit: wrap each op's committed_stl in a FixedTiledLayout and assign it to
@@ -233,8 +236,9 @@ def finalize_layouts(operations: list) -> None:
     - Mutation ops: check inputs of MutationLayoutSHOULDREMOVE ops and schedule
       restickifies where the input stick doesn't match the target buffer's stick.
     """
-    for name in V.graph.graph_input_names:
-        tensor_box = V.graph.graph_inputs[name]
+    operations = graph.operations
+    for name in graph.graph_input_names:
+        tensor_box = graph.graph_inputs[name]
         if (
             isinstance(tensor_box, TensorBox)
             and isinstance(tensor_box.data, StorageBox)
@@ -269,8 +273,13 @@ def finalize_layouts(operations: list) -> None:
         if not cost_fn:
             continue
         for edge, target_stl in cost_fn.required_input_stls(committed):
-            input_buf = V.graph.get_buffer(edge.dep.name)
+            input_buf = graph.get_buffer(edge.dep.name)
             in_layout = input_buf.get_layout()
+            if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
+                assert getattr(input_buf, ELIDED_COPY_BACK_ATTR, False), (
+                    f"unexpected mutation layout on {edge.dep.name}"
+                )
+                in_layout = in_layout.real_layout()
             in_stl = in_layout.device_layout
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
@@ -286,6 +295,8 @@ def finalize_layouts(operations: list) -> None:
     for op in operations:
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             continue
+        if getattr(op, ELIDED_COPY_BACK_ATTR, False):
+            continue
         target = op.layout.target
         while isinstance(target, ReinterpretView):
             target = target.data  # Traverse view chain to underlying buffer
@@ -299,7 +310,7 @@ def finalize_layouts(operations: list) -> None:
         for dep in read_writes.reads:
             if not isinstance(dep, MemoryDep):
                 continue
-            input_buf = V.graph.get_buffer(dep.name)
+            input_buf = graph.get_buffer(dep.name)
             in_layout = input_buf.get_layout()
             if not isinstance(in_layout, FixedTiledLayout):
                 continue
@@ -329,12 +340,12 @@ def finalize_layouts(operations: list) -> None:
             )
             _record_restickify(op, dep.name, restick_target, plan)
 
-    V.graph.restickify_plan = plan
+    graph.restickify_plan = plan
     if logger.isEnabledFor(logging.DEBUG):
         if plan:
             lines = ["restickify plan:"]
             for op_name, resticks in plan.items():
-                consumer = V.graph.get_buffer(op_name)
+                consumer = graph.get_buffer(op_name)
                 if isinstance(consumer, ComputedBuffer) and hasattr(
                     consumer.data, "reduction_type"
                 ):
@@ -346,7 +357,7 @@ def finalize_layouts(operations: list) -> None:
                 for r in resticks:
                     tgt = r["target_layout"]
                     arg_name = r["arg_name"]
-                    arg_buf = V.graph.get_buffer(arg_name)
+                    arg_buf = graph.get_buffer(arg_name)
                     if (
                         isinstance(arg_buf, TensorBox)
                         and isinstance(arg_buf.data, StorageBox)
