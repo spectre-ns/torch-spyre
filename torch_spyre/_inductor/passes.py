@@ -33,14 +33,14 @@ except ImportError:
     # _pre_fusion_custom_pass to be a CustomGraphPass instance or it bypasses
     # caching entirely (see torch._inductor.codecache). This mirrors the
     # pre-refactor base class (CustomNodePassBase(CustomGraphPass)).
-    class CustomSchedulerPass(ABC):  # type: ignore[no-redef]
+    class CustomSchedulerPass(CustomGraphPass):  # type: ignore[no-redef]
         """Fallback scheduler-pass base for torch < 2.13 (a CustomGraphPass).
 
         Subclasses implement ``__call__(nodes) -> nodes`` and ``uuid()``.
         """
 
         @abstractmethod
-        def __call__(
+        def __call__( # type: ignore[no-redef]
             self, nodes: list["BaseSchedulerNode"]
         ) -> list["BaseSchedulerNode"]:
             """Implementation of the custom pass."""
@@ -242,7 +242,7 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     """
 
     # build_loop_scheduler_nodes runs unconditionally: it is a no-op when
-    # coarse_tiling=False because no nodes carry loop_group_id attributes.
+    # no ops carry loop_group_id attributes (i.e. no spyre_hint annotations).
     # Running here (before Inductor's fusion pass) ensures CountedLoopSchedulerNodes
     # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
     # False), so loop groups survive Inductor fusion intact.
