@@ -17,7 +17,7 @@ import inspect
 import io
 import logging
 from typing import Optional, Any, Callable
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 
 import torch
 import torch.fx.graph
@@ -40,7 +40,7 @@ except ImportError:
         """
 
         @abstractmethod
-        def __call__( # type: ignore[no-redef]
+        def __call__(  # type: ignore[no-redef]
             self, nodes: list["BaseSchedulerNode"]
         ) -> list["BaseSchedulerNode"]:
             """Implementation of the custom pass."""
