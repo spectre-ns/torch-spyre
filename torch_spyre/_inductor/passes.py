@@ -17,7 +17,6 @@ import inspect
 import io
 import logging
 from typing import Optional, Any, Callable
-from abc import abstractmethod
 
 import torch
 import torch.fx.graph
@@ -28,29 +27,8 @@ try:
     from torch._inductor.custom_graph_pass import CustomSchedulerPass
 except ImportError:
     # torch < 2.13 has no dedicated scheduler-pass base. Fall back to
-    # CustomGraphPass so the node-pass pipelines stay isinstance-compatible
-    # with CustomGraphPass: torch's FxGraphCache requires the registered
-    # _pre_fusion_custom_pass to be a CustomGraphPass instance or it bypasses
-    # caching entirely (see torch._inductor.codecache). This mirrors the
-    # pre-refactor base class (CustomNodePassBase(CustomGraphPass)).
-    class CustomSchedulerPass(CustomGraphPass):  # type: ignore[no-redef]
-        """Fallback scheduler-pass base for torch < 2.13 (a CustomGraphPass).
-
-        Subclasses implement ``__call__(nodes) -> nodes`` and ``uuid()``.
-        """
-
-        @abstractmethod
-        def __call__(  # type: ignore[no-redef]
-            self, nodes: list["BaseSchedulerNode"]
-        ) -> list["BaseSchedulerNode"]:
-            """Implementation of the custom pass."""
-
-        @abstractmethod
-        def uuid(self) -> Any | None:
-            """
-            Return an ID to uniquely identify your custom pass implementation. Return None
-            to skip inductor code caching entirely.
-            """
+    # CustomGraphPass
+    CustomSchedulerPass = CustomGraphPass
 
 
 from torch._inductor.graph import GraphLowering
