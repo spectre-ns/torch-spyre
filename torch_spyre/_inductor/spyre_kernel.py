@@ -424,7 +424,7 @@ class SpyreKernel(Kernel[CSEVariable]):
     ) -> OpSpec:
         for arg in args:
             if not (
-                op in [IDENTITY_OP, RESTICKIFY_OP]
+                op == IDENTITY_OP
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or arg.device_dtype == DataFormats.SEN169_FP16
@@ -455,7 +455,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         # list[list[int]] (nested multi-level, outermost first).  Flatten all
         # levels so that tiled_symbols covers every loop variable from outermost
         # to innermost — matching the loop_vars ordering in bundle.py _emit_specs.
-        raw_tiled_dims: list[list[int]] = getattr(ir_node, "loop_tiled_dims", [])
+        li = getattr(ir_node, "loop_info", None)
+        raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
         all_tiled_dims = [d for level in raw_tiled_dims for d in level]
         it_space_keys = list(it_space.keys())
         tiled_syms = [
