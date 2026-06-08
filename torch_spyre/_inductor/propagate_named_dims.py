@@ -399,33 +399,17 @@ def propagate_named_dims(
         for name, size in _named_dims.items():
             logger.info(f"  {name} = {size}")
 
-    logger.info("INPUT TENSORS")
-    for name in graph.graph_input_names:
-        tb = graph.graph_inputs[name]
-        if isinstance(tb, TensorBox):
-            dp = getattr(tb, "_dim_prop_info", None)
-            logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
+        logger.info("INPUT TENSORS")
+        for name in graph.graph_input_names:
+            tb = graph.graph_inputs[name]
+            if isinstance(tb, TensorBox):
+                dp = getattr(tb, "_dim_prop_info", None)
+                logger.info(f"  {name}: named_dims={dp.named_dims if dp else []}")
 
     for op in operations:
         _log_op(op)
     # Reset _enabled so that it does not leak True into the next compilation
     _enabled = False
-
-
-def _get_hint_scopes(op) -> list[dict[str, int]]:
-    """Return hint scopes the op is inside, outermost first (sorted by hint ID).
-
-    Each entry is {dim_name: split_count} for one spyre_hint() scope.
-    """
-    scopes = []
-    for _, hint_dict in sorted(get_op_hints(op).items()):
-        scope: dict[str, int] = {}
-        for key in ("tiles", "slices", "num_tiles_per_dim"):
-            if isinstance(hint_dict.get(key), dict):
-                scope.update(hint_dict[key])
-        if scope:
-            scopes.append(scope)
-    return scopes
 
 
 def assign_dim_hints(graph: GraphLowering) -> None:

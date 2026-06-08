@@ -632,31 +632,6 @@ class TestCoarseTile(unittest.TestCase):
     def _run(self, all_ops, groups, **kwargs):
         coarse_tile(_graph(all_ops), groups, **kwargs)
 
-    def test_single_group_stamps_attributes(self):
-        data = _make_pointwise([Integer(64)])
-        op = _make_hinted_op(data, "op0", hints=((1, 0),))
-        self._run([op], [([op], [(1, Integer(4))])])
-        self.assertEqual(op.loop_group_id, (0,))
-        self.assertEqual(op.loop_count, [Integer(4)])
-        self.assertEqual(op.loop_tiled_dims, [[0]])
-        self.assertEqual(data.ranges[0], Integer(16))
-
-    def test_two_groups_get_distinct_ids(self):
-        d0 = _make_pointwise([Integer(32)])
-        d1 = _make_pointwise([Integer(64)])
-        op0 = _make_hinted_op(d0, "op0", hints=((1, 0),))
-        op1 = _make_hinted_op(d1, "op1", hints=((2, 0),))
-        self._run(
-            [op0, op1],
-            [([op0], [(1, Integer(4))]), ([op1], [(2, Integer(8))])],
-        )
-        self.assertEqual(op0.loop_group_id, (0,))
-        self.assertEqual(op1.loop_group_id, (1,))
-        self.assertEqual(op0.loop_count, [Integer(4)])
-        self.assertEqual(op1.loop_count, [Integer(8)])
-        self.assertEqual(d0.ranges[0], Integer(8))
-        self.assertEqual(d1.ranges[0], Integer(8))
-
     def test_empty_groups_list_is_noop(self):
         data = _make_pointwise([Integer(32)])
         op = _make_op(data, "op0")

@@ -136,7 +136,7 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     groups: list[tuple] = []
     current_ops: list[Operation] = []
     current_key = None
-    
+
     operations = graph.operations
     for op in operations:
         if not isinstance(op, ComputedBuffer):
