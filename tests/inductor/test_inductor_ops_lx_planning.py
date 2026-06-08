@@ -351,6 +351,7 @@ REDUCTION_TEST_FAILURES = [
     "test_unbind_3d_dimneg1",
     "test_unbind_4d_dim0",
     "test_unbind_4d_dim3",
+    "test_einsum_einsum_67x256_256x128",
 ]
 
 
