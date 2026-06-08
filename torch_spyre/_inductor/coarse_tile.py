@@ -110,7 +110,7 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     return []
 
 
-def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
+def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
 
     coarse_tile() requires ops to be grouped: all ops in a group share the same
@@ -135,7 +135,8 @@ def hints_to_coarse_tile_groups(operations: list[Operation]) -> list[tuple]:
     groups: list[tuple] = []
     current_ops: list[Operation] = []
     current_key = None
-
+    
+    operations = graph.operations
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
