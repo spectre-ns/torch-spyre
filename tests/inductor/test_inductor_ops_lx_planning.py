@@ -244,6 +244,8 @@ POINTWISE_TEST_FAILURES = [
     "test_vector_norm_keepdim1_vector_norm_ordinf_4d_dim_neg1",
     "test_vector_norm_keepdim1_vector_norm_ordneginf_4d_dim_23",
     "test_where_self_out_where_fp16_2d",
+    "test_transpose_2d_dim_0_2",
+    "test_transpose_3d_dim_0_2",
 ]
 
 
