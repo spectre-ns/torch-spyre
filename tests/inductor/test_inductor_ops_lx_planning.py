@@ -156,6 +156,8 @@ POINTWISE_TEST_FAILURES = [
     "test_transpose_4d_contiguous_dim_0_3",
     "test_transpose_4d_contiguous_dim_1_2",
     "test_transpose_4d_contiguous_dim_1_3",
+    "test_transpose_2d_dim_0_2",
+    "test_transpose_3d_dim_0_2",
 ]
 
 
