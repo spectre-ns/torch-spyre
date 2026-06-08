@@ -42,6 +42,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .errors import Unsupported
 
+
 logger = get_inductor_logger("insert_restickify")
 
 
@@ -227,14 +228,12 @@ def finalize_layouts(graph: GraphLowering) -> None:
     """Convert committed STLs (set by the optimizer) to FixedTiledLayouts and build
     graph.restickify_plan for insert_restickify.
 
-    Three steps:
+    Two steps:
     - Commit: wrap each op's committed_stl in a FixedTiledLayout and assign it to
       op.layout; clean up optimizer-only attributes (layouts, restick_cost_fn,
       committed_stl).
     - Schedule restickifies: for each input edge where the committed input STL is
       incompatible with what the op requires, record a restickify in the plan.
-    - Mutation ops: check inputs of MutationLayoutSHOULDREMOVE ops and schedule
-      restickifies where the input stick doesn't match the target buffer's stick.
     """
     operations = graph.operations
     for name in graph.graph_input_names:
@@ -264,6 +263,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 delattr(op, attr)
 
         # Commit the chosen STL and wrap in a FixedTiledLayout
+        # Exclude mutation ops because their op.layout must not be set
+        # until after the scheduler runs
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, stl)
