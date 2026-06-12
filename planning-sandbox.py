@@ -57,6 +57,17 @@ class LifetimeBoundBuffer:
     chosen_division: Optional[int] = None
 
 
+@dataclass
+class Box:
+    """A merge group's memory layout spanning [start_time, end_time)."""
+
+    start_time: int
+    end_time: int
+    goff: z3.ArithRef
+    gsize: z3.ArithRef
+    var: z3.BoolRef
+
+
 def plot_layout(capacity: int, buffers: list[LifetimeBoundBuffer]):
     assert np.all([b.start_time is not None for b in buffers]), (
         "Start time must be defined"
@@ -283,9 +294,9 @@ class Z3MemoryPlanSolver:
         return m
 
     @staticmethod
-    def _apply_no_overlap_constraint(opt: z3.Solver, boxes: list[tuple]) -> None:
-        def time_overlap(a, b):
-            return a[0] < b[1] and b[0] < a[1]
+    def _apply_no_overlap_constraint(opt: z3.Solver, boxes: list[Box]) -> None:
+        def time_overlap(a: Box, b: Box) -> bool:
+            return a.start_time < b.end_time and b.start_time < a.end_time
 
         for i in range(len(boxes)):
             for j in range(i + 1, len(boxes)):
@@ -294,14 +305,15 @@ class Z3MemoryPlanSolver:
                 # are unrelated and have no relative constraints
                 if not time_overlap(a, b):
                     continue
-                _, _, goff_a, gsize_a, var_a = a
-                _, _, goff_b, gsize_b, var_b = b
                 # if a and b are active, then max of a must be less than
                 # or equal to min or vice versa.
                 opt.add(
                     z3.Implies(
-                        z3.And(var_a, var_b),
-                        z3.Or(goff_a + gsize_a <= goff_b, goff_b + gsize_b <= goff_a),
+                        z3.And(a.var, b.var),
+                        z3.Or(
+                            a.goff + a.gsize <= b.goff,
+                            b.goff + b.gsize <= a.goff,
+                        ),
                     )
                 )
 
@@ -311,13 +323,13 @@ class Z3MemoryPlanSolver:
         goff: z3.ArithRef,
         gsize: z3.ArithRef,
         var: z3.BoolRef,
-    ) -> tuple:
-        return (
-            min(t.start_time for t in tensors),
-            max(t.end_time for t in tensors),
-            goff,
-            gsize,
-            var,
+    ) -> Box:
+        return Box(
+            start_time=min(t.start_time for t in tensors),
+            end_time=max(t.end_time for t in tensors),
+            goff=goff,
+            gsize=gsize,
+            var=var,
         )
 
     def _add_buffer_vars(
