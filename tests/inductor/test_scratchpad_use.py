@@ -523,6 +523,80 @@ class TestCloneAtGraphBoundaries(TestScratchpadUsage):
         )
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "ortools not installed")
+class TestCpSatCloneAtGraphBoundaries(TestCloneAtGraphBoundaries):
+    """Re-run the boundary-clone tests through the CP-SAT joint allocator."""
+
+    @override
+    def setUp(self):
+        self.patchers.append(ts_inductor_config.patch("layout_solver", "cpsat"))
+        super().setUp()
+
+    def test_input_cloned_under_multicore_split(self):
+        """At ``sencores=32`` the input clone's per-core split must be re-keyed
+        consistently for every consumer, which the joint solver enforces by
+        forcing one shared slicing (or leaving the input in HBM). Asserts the
+        input is pinned and the multi-core result matches CPU -- the case the
+        placement path cannot co-optimize when consumers' committed divisions
+        disagree.
+        """
+        x = self.rand_device((512, 1024))
+
+        def fn(x):
+            # x is read by exp and by the trailing add -> two reads -> eligible.
+            return torch.exp(x) + x
+
+        cpu_result = fn(x.to("cpu"))
+
+        with ts_inductor_config.patch(lx_planning=True):
+            with ts_inductor_config.patch(sencores=32):
+                result, mem_usages = self.compile_and_collect_mem_usage(fn, (x,))
+
+        self.assertTrue(
+            any(u["location"] == "LX" for u in mem_usages.values()),
+            "Expected an LX-pinned buffer (the input clone) at multi-core",
+        )
+        torch.testing.assert_close(
+            result,
+            cpu_result,
+            atol=0.1,
+            rtol=0.1,
+            msg="multi-core input clone miscompiled — is the split re-keyed?",
+        )
+
+    def test_input_feeding_reduction_multicore_is_correct(self):
+        """The dangerous case the clone re-keying exists for: an input that feeds
+        a *reduction* at ``sencores=32``, where the consumer's output space (the
+        reduced shape) differs from its read space on the input. The reduction
+        consumer's split is keyed to its reduced-shape output; the clone (a
+        full-shape identity copy) must re-key that split onto the input's own axes
+        or it slices the wrong axis (wrong values / SDSC abort at multi-core). The
+        joint solver also has to converge the reduction and the pointwise consumer
+        on one shared slicing for the clone to pin at all.
+        """
+        x = self.rand_device((512, 256))
+
+        def fn(x):
+            # x feeds the dim=1 max reduction (output (512,)) and the subtract
+            # (output (512, 256)) -> the two consumers read x in different spaces.
+            return x - torch.unsqueeze(torch.max(x, dim=1).values, dim=1)
+
+        cpu_result = fn(x.to("cpu"))
+
+        with ts_inductor_config.patch(lx_planning=True):
+            with ts_inductor_config.patch(sencores=32):
+                result, mem_usages = self.compile_and_collect_mem_usage(fn, (x,))
+
+        torch.testing.assert_close(
+            result,
+            cpu_result,
+            atol=0.1,
+            rtol=0.1,
+            msg="reduction-fed input clone miscompiled at multi-core — is the "
+            "consumer's reduced-output split re-keyed onto the input axes?",
+        )
+
+
 class TestIntermediatePartialReadNotPinned(TestScratchpadUsage):
     """An *intermediate* buffer read partially (sliced) must not be LX-pinned.
 

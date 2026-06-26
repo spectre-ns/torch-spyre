@@ -197,7 +197,15 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         # Solve on copies so we never mutate the caller's buffers.
         working = {
             b.name: _CoreDivisionBufferWithCpVars(
-                replace(b, size=int(np.ceil(b.size / self.alignment))),
+                replace(
+                    b,
+                    size=int(np.ceil(b.size / self.alignment)),
+                    # boundary_cost / spill_write_cost are HBM traffic in the same
+                    # units as ``size``; rescale them alongside so the objective
+                    # compares like with like.
+                    boundary_cost=int(np.ceil(b.boundary_cost / self.alignment)),
+                    spill_write_cost=int(np.ceil(b.spill_write_cost / self.alignment)),
+                ),
                 model,
                 self._capacity_units,
             )
@@ -233,19 +241,32 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
 
         # TODO: Update objective to a maxmin optimization to optimize overall
         # throughput.
-        
+
         # Two-phase lexicographic objective: residency is the hard priority and
         # core division is chosen only in service of it.
         #
         # Phase 1 -- residency: put as much in LX as possible by minimizing HBM
-        # transfer traffic. Spilling a buffer forces each of its consumers to
-        # re-read it from HBM, so a spill costs ``num_consumers * size``. The
-        # division is whatever maximizes residency -- even no split at all, if
-        # that is what lets a buffer match its consumers and reside.
+        # transfer traffic. The division is whatever maximizes residency -- even
+        # no split at all, if that is what lets a buffer match its consumers and
+        # reside.
+        #
+        # A *spilled* buffer pays its producer's HBM write (``spill_write_cost``,
+        # which a resident buffer writes to LX for free) plus one HBM re-read per
+        # consumer (``children * size``). A *resident* buffer normally pays
+        # nothing, except a graph boundary: a resident input clone still reads HBM
+        # once and a resident output clone still writes HBM once (both
+        # ``boundary_cost``). The spilled and resident costs are mutually exclusive
+        # via ``in_buffer``.
+        def spill_cost(sb):
+            return (
+                len(children_of.get(sb.name, [])) * sb.buffer.size
+                + sb.buffer.spill_write_cost
+            )
+
         hbm_terms = [
-            len(children_of.get(sb.name, [])) * sb.buffer.size * (1 - sb.in_buffer)
+            spill_cost(sb) * (1 - sb.in_buffer) + sb.buffer.boundary_cost * sb.in_buffer
             for sb in tensors.values()
-            if len(children_of.get(sb.name, [])) * sb.buffer.size
+            if spill_cost(sb) or sb.buffer.boundary_cost
         ]
         if hbm_terms:
             model.Minimize(sum(hbm_terms))
