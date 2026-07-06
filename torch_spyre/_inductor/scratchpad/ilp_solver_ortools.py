@@ -71,19 +71,15 @@ else:
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
-    MemoryPlanSolver,
+    CoOptimizingSolver,
+    _SOLVER_CHOSE_SPILL,
+    _assert_core_divisions_enumerated,
     _assert_in_place_relationships,
 )
 
 __all__ = ["CpSatLayoutSolver"]
 
 logger = logging.getLogger(__name__)
-
-# Drop cause for a buffer the solver chose to spill (rather than one pinned out
-# up front by _add_core_division): it fit but residency gave no benefit, or
-# there was no room once higher-value buffers were placed. Shared so the DEBUG
-# log and the reasons surfaced to the allocator agree.
-_SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
 
 @dataclass
@@ -96,14 +92,6 @@ class _PlacementUnit:
     end_time: int
     original_offset: int  # offset the solver chose, before bottom-justify
     justified_offset: int = 0  # final justified offset
-
-
-def _assert_core_divisions_enumerated(buffers: Sequence[CoreDivisionBuffer]):
-    """Assert that all buffers have enumerated core divisions."""
-    for b in buffers:
-        assert len(b.core_divisions) != 0, (
-            "All buffers must have at least 1 valid core division"
-        )
 
 
 @dataclass
@@ -162,7 +150,7 @@ class _CoreDivisionBufferWithCpVars:
         self.model.AddElement(self.division, cores_used, self.cores)
 
 
-class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
+class CpSatLayoutSolver(CoOptimizingSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
     model (joint division, slicing-match residency gate, 2D no-overlap with
@@ -188,12 +176,8 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
-        # Per-buffer drop cause for the most recent solve ({buffer name: reason},
-        # spilled buffers only). The allocator reads this to populate its own
-        # ``reject_reasons`` so cpsat spills show up in the LX-pinning debug log.
-        self.spill_reasons: dict[str, str] = {}
 
-    def plan_layout(
+    def plan_layout_and_core_divs(
         self, buffers: Sequence[CoreDivisionBuffer], log_lx_usage: bool = False
     ) -> list[CoreDivisionBuffer]:
         self.spill_reasons = {}
@@ -269,19 +253,14 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         #
         # A *spilled* buffer pays its producer's HBM write (``spill_write_cost``,
         # which a resident buffer writes to LX for free) plus one HBM re-read per
-        # consumer (``children * size``). ``unallocated_reads`` adds the consumers
-        # the solver never sees as candidates (filtered-out ops, graph outputs, or
-        # every consumer on the placement-only path): they still read the buffer
-        # from LX when it resides, so they count toward its spill cost too. It is 0
-        # on the joint path, where every consumer is a candidate. A *resident*
-        # buffer normally pays nothing, except a graph boundary: a resident input
-        # clone still reads HBM once and a resident output clone still writes HBM
-        # once (both ``boundary_cost``). The spilled and resident costs are mutually
-        # exclusive via ``in_buffer``.
+        # consumer (``children * size``). A *resident* buffer normally pays nothing,
+        # except a graph boundary: a resident input clone still reads HBM once and a
+        # resident output clone still writes HBM once (both ``boundary_cost``). The
+        # spilled and resident costs are mutually exclusive via ``in_buffer``.
         def spill_cost(sb):
-            return (
-                len(children_of.get(sb.name, [])) + sb.buffer.unallocated_reads
-            ) * sb.buffer.size + sb.buffer.spill_write_cost
+            # Shared formula (CoOptimizingSolver._spill_cost) so the DFS and CP-SAT
+            # objectives agree; here in alignment-scaled units.
+            return self._spill_cost(sb.buffer, len(children_of.get(sb.name, [])))
 
         hbm_terms = [
             spill_cost(sb) * (1 - sb.in_buffer) + sb.buffer.boundary_cost * sb.in_buffer
@@ -530,13 +509,6 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
             t = sb.buffer
             kids = children_of.get(t.name, [])
             if not kids:
-                if t.unallocated_reads:
-                    # Read only by consumers the solver never sees (filtered-out
-                    # ops / graph outputs). They still read it from LX when it
-                    # resides, so residency is worthwhile; there is no resident
-                    # consumer to constrain the division against, so no gate.
-                    # TODO: Remove this when the other solvers are brought to parity
-                    continue
                 # Nothing consumes this buffer from LX -> it can never reside.
                 forced.setdefault(t.name, "no consumer reads it from LX")
                 model.Add(sb.in_buffer == 0)

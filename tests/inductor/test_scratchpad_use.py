@@ -254,7 +254,6 @@ class _ParameterizedScratchpadMeta(type):
     _AXIS_LABELS = {
         "solver_method": lambda v: str(v),
         "sencores": lambda v: f"sc{v}",
-        "co_optimization": lambda v: "coopt" if v else "nocoopt",
         "boundary_clones": lambda v: "clones" if v else "noclones",
     }
 
@@ -317,9 +316,13 @@ class ParameterizedScratchpadUsage(
     """Full cartesian product of the scratchpad-planning configuration knobs.
 
     Replaces the hand-written solver-variant classes: the metaclass injects a
-    ``test_<model>__<solver>_sc<n>_<coopt>_<clones>`` method for every model in
+    ``test_<model>__<solver>_sc<n>_<clones>`` method for every model in
     ``parameter_models`` and every point in ``parameter_axes``. Edit
     ``parameter_axes`` to widen or narrow the sweep.
+
+    The solver name is the co-optimization switch: ``greedy``/``bestfit``/
+    ``firstfit`` are placement-only, while ``dfs``/``cpsat`` co-optimize core
+    divisions and placement.
     """
 
     # Models swept by the parameterized suites, as ``(label, factory)`` where
@@ -336,9 +339,8 @@ class ParameterizedScratchpadUsage(
         return mlp, args, {"atol": 0.1, "rtol": 0.1}
 
     parameter_axes = {
-        "solver_method": ("greedy", "bestfit", "firstfit", "cpsat"),
+        "solver_method": ("greedy", "bestfit", "firstfit", "dfs", "cpsat"),
         "sencores": (1, 32),
-        "co_optimization": (False, True),
         "boundary_clones": (False, True),
     }
 
@@ -351,7 +353,6 @@ class ParameterizedScratchpadUsage(
         with ts_inductor_config.patch(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
-            co_optimizing_lx_planning=params["co_optimization"],
             lx_boundary_clones=params["boundary_clones"],
         ):
             model, args, kwargs = factory(self)
@@ -388,7 +389,7 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     where adjacent ops disagree on which iteration-space dim to split. The
     canonical case is softmax(dim=0): work_distribution picks rows for the
     pointwise ops and cols for the reductions, forcing 3 of 4 shared buffers to
-    HBM by default — Strategy B reconciles them and pins all 4.
+    HBM by default — the DFS co-optimizing solver reconciles them and pins all 4.
     """
 
     @override
@@ -399,15 +400,17 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
         strict: bool = False,
         **kwargs,
     ):
-        """Compare HBM transfers with cooptimization off vs on. If
-        `strict`, asserts coopt < default; otherwise coopt ≤ default."""
+        """Compare HBM transfers with co-optimization off vs on. If
+        `strict`, asserts coopt < default; otherwise coopt ≤ default. Co-opt off
+        is the placement-only greedy solver; co-opt on is the DFS co-optimizing
+        solver (the solver name is the co-optimization switch)."""
         # Cooptimization needs > 1 core to have anything to optimize; this class
         # applies its own config here at the test-case level.
         with ts_inductor_config.patch(sencores=4, lx_planning=True):
-            with ts_inductor_config.patch(co_optimizing_lx_planning=False):
+            with ts_inductor_config.patch(layout_solver="greedy"):
                 result_default, hbm_default = self.measure_hbm_transfers(model, args)
             torch.compiler.reset()
-            with ts_inductor_config.patch(co_optimizing_lx_planning=True):
+            with ts_inductor_config.patch(layout_solver="dfs"):
                 result_coopt, hbm_coopt = self.measure_hbm_transfers(model, args)
 
         cmp = self.assertLess if strict else self.assertLessEqual
@@ -426,15 +429,17 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     def test_softmax_dim0_strictly_lower_hbm(self):
         """The canonical motivating case from the design doc. softmax(dim=0)
         has every adjacent op pair disagreeing on which dim to split, so
-        DefaultAllocator only pins 1 of 4 shared buffers; Strategy B should
-        flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
+        DefaultAllocator only pins 1 of 4 shared buffers; the DFS co-optimizing
+        solver should flip the pointwise ops to cols and pin all 4 → strictly
+        lower HBM."""
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,), strict=True)
 
     def test_softmax_dim_neg1_no_regression(self):
         """softmax(dim=-1) is the well-behaved baseline where DefaultAllocator
-        already pins everything pinnable. Strategy B must match (no regression)."""
+        already pins everything pinnable. The DFS co-optimizing solver must match
+        (no regression)."""
         f = functools.partial(torch.softmax, dim=-1)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,))
@@ -527,8 +532,8 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
 
     @unittest.skipUnless(_HAS_ORTOOLS, "joint CP-SAT boundary-clone test needs ortools")
     def test_input_clone_supported_under_joint_cpsat(self):
-        """The joint CP-SAT allocator (``layout_solver="cpsat"`` with
-        ``co_optimizing_lx_planning``) inserts an *input* boundary clone.
+        """The joint CP-SAT allocator (``layout_solver="cpsat"``) inserts an
+        *input* boundary clone.
 
         A graph input read by multiple ops is offered to the joint solver as a
         clone-eligible input (``_eligible_clone_inputs`` /
@@ -555,7 +560,6 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
         with ts_inductor_config.patch(
             lx_planning=True,
             layout_solver="cpsat",
-            co_optimizing_lx_planning=True,
         ):
             _, n_ops_with_lx, _ = self._compile_and_inspect(fn, (x,))
 
@@ -570,8 +574,8 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
 
     @unittest.skipUnless(_HAS_ORTOOLS, "joint CP-SAT boundary-clone test needs ortools")
     def test_output_clone_supported_under_joint_cpsat(self):
-        """The joint CP-SAT allocator (``layout_solver="cpsat"`` with
-        ``co_optimizing_lx_planning``) inserts an *output* boundary clone.
+        """The joint CP-SAT allocator (``layout_solver="cpsat"``) inserts an
+        *output* boundary clone.
 
         Output-side counterpart to
         ``test_input_clone_supported_under_joint_cpsat``. A buffer that is both a
@@ -603,7 +607,6 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
         with ts_inductor_config.patch(
             lx_planning=True,
             layout_solver="cpsat",
-            co_optimizing_lx_planning=True,
         ):
             (res_y, res_z), n_ops_with_lx, _ = self._compile_and_inspect(fn, (x,))
 
@@ -854,11 +857,10 @@ class TestCpSatCloneAtGraphBoundaries(TestCloneAtGraphBoundaries):
 
         cpu_y, cpu_z = fn(x.to("cpu"))
 
-        # setUp patches layout_solver="cpsat"; co_optimizing routes to the joint
+        # setUp patches layout_solver="cpsat", which routes to the joint
         # allocator. sencores=32 forces the multi-core split the clone re-keys to.
         with ts_inductor_config.patch(
             lx_planning=True,
-            co_optimizing_lx_planning=True,
             sencores=32,
         ):
             (res_y, res_z), _, mem_usages = self._compile_and_inspect(fn, (x,))
@@ -960,14 +962,13 @@ class TestCpSatAllocatorIntegration(BaseTestScratchpadUsage):
                 splits[op.name] = getattr(op, "op_it_space_splits", ({}, {}))
 
         with ts_inductor_config.patch(sencores=32):
+            # layout_solver="cpsat" routes to CoOptimizingAllocator (see class
+            # docstring); the solver name is the co-optimization switch.
             with ts_inductor_config.patch(layout_solver="cpsat"):
-                # co_optimizing routes to CoOptimizingAllocator (see class
-                # docstring); cpsat alone is the placement-only DefaultAllocator.
-                with ts_inductor_config.patch(co_optimizing_lx_planning=True):
-                    with ts_inductor_config.patch(lx_planning=True):
-                        with self.pre_scheduling_iterating_pass(visitor):
-                            compiled = torch.compile(model, fullgraph=True)
-                            device_result = compiled(a, b).to("cpu")
+                with ts_inductor_config.patch(lx_planning=True):
+                    with self.pre_scheduling_iterating_pass(visitor):
+                        compiled = torch.compile(model, fullgraph=True)
+                        device_result = compiled(a, b).to("cpu")
 
         # 1. Correctness end-to-end through the glue.
         torch.testing.assert_close(
@@ -996,10 +997,10 @@ class TestCpSatAllocatorIntegration(BaseTestScratchpadUsage):
 
 class TestCpSatAllocatorFallback(BaseTestScratchpadUsage):
     """When ``layout_solver="cpsat"`` is selected but ortools is unavailable, the
-    CoOptimizingAllocator falls back to the greedy DefaultAllocator. The compile
-    must still succeed, still place a buffer in LX, and still match CPU -- which
-    exercises the fallback through the real pipeline rather than asserting on it
-    directly.
+    CoOptimizingAllocator falls back to the pure-Python DFS co-optimizing solver
+    (still co-optimizing, not placement-only). The compile must still succeed,
+    still place a buffer in LX, and still match CPU -- which exercises the fallback
+    through the real pipeline rather than asserting on it directly.
     """
 
     @contextmanager
@@ -1048,7 +1049,6 @@ class TestSelectAllocator(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             CoOptimizingAllocator,
             DefaultAllocator,
-            StrategyBCoOptimizingAllocator,
             select_allocator,
         )
         from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
@@ -1058,45 +1058,36 @@ class TestSelectAllocator(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
             CpSatLayoutSolver,
         )
+        from torch_spyre._inductor.scratchpad.dfs_solver import DfsLayoutSolver
 
-        with ts_inductor_config.patch(
-            layout_solver="greedy", co_optimizing_lx_planning=False
-        ):
+        # Placement-only solvers -> DefaultAllocator.
+        with ts_inductor_config.patch(layout_solver="greedy"):
             a = select_allocator()
             self.assertIs(type(a), DefaultAllocator)
             self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
 
-        with ts_inductor_config.patch(
-            layout_solver="bestfit", co_optimizing_lx_planning=False
-        ):
+        with ts_inductor_config.patch(layout_solver="bestfit"):
             a = select_allocator()
             self.assertIs(type(a), DefaultAllocator)
             self.assertIsInstance(a.layout_planning, BestFitLayoutSolver)
 
-        with ts_inductor_config.patch(
-            layout_solver="greedy", co_optimizing_lx_planning=True
-        ):
-            self.assertIsInstance(select_allocator(), StrategyBCoOptimizingAllocator)
-
-        # cpsat + co-optimizing -> joint CoOptimizingAllocator.
-        with ts_inductor_config.patch(
-            layout_solver="cpsat", co_optimizing_lx_planning=True
-        ):
-            self.assertIsInstance(select_allocator(), CoOptimizingAllocator)
-
-        # cpsat alone -> placement-only DefaultAllocator driven by CP-SAT
-        # (greedy fallback when ortools is absent). Must not raise.
-        with ts_inductor_config.patch(
-            layout_solver="cpsat", co_optimizing_lx_planning=False
-        ):
+        # dfs -> co-optimizing CoOptimizingAllocator with a DFS solver.
+        with ts_inductor_config.patch(layout_solver="dfs"):
             a = select_allocator()
-            self.assertIs(type(a), DefaultAllocator)
+            self.assertIs(type(a), CoOptimizingAllocator)
+            self.assertIsInstance(a.layout_planning, DfsLayoutSolver)
+
+        # cpsat -> co-optimizing CoOptimizingAllocator; its solver is CP-SAT when
+        # ortools is present, else the pure-Python DFS fallback.
+        with ts_inductor_config.patch(layout_solver="cpsat"):
+            a = select_allocator()
+            self.assertIs(type(a), CoOptimizingAllocator)
             if _HAS_ORTOOLS:
                 self.assertIsInstance(a.layout_planning, CpSatLayoutSolver)
+            else:
+                self.assertIsInstance(a.layout_planning, DfsLayoutSolver)
 
-        with ts_inductor_config.patch(
-            layout_solver="bogus", co_optimizing_lx_planning=False
-        ):
+        with ts_inductor_config.patch(layout_solver="bogus"):
             with self.assertRaises(ValueError):
                 select_allocator()
 

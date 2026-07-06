@@ -15,7 +15,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Generic, Optional, TypeVar
+from typing import Optional
 from abc import ABC, abstractmethod
 import math
 
@@ -39,6 +39,13 @@ class LifetimeBoundBuffer:
 
     ``start_time`` and ``end_time`` are convenience properties derived from
     ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
+
+    ``placement`` is the residency flag every solver honors: ``False`` means the
+    solver must never assign this buffer an address (it stays in HBM). The buffer
+    is still passed to the solver so it participates as a producer/consumer edge
+    and informs the plan, but it is never made resident. This replaces
+    allocator-side filtering: an ineligible buffer is passed with
+    ``placement=False`` rather than omitted from the list.
     """
 
     name: str
@@ -47,6 +54,7 @@ class LifetimeBoundBuffer:
     first_use_is_read: bool = False
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
+    placement: bool = True
 
     @property
     def start_time(self) -> int:
@@ -142,22 +150,18 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # forced-out consumer keeps its producers' residency viable instead of
     # orphaning them.
     residency_reason: Optional[str] = None
-    # Count of reads of this buffer by consumers the solver never sees as
-    # candidates -- ops filtered out of the candidate set (e.g. under the
-    # placement-only conversion in ``_as_core_division_buffers``) or graph
-    # outputs. Such a consumer still reads this buffer *from LX* when it resides,
-    # so the read counts toward the buffer's spill cost even though no ``parents``
-    # edge represents it, and it lets the buffer reside despite having no resident
-    # (candidate) consumer to match a division against. Zero for the joint
-    # allocator, where every consumer is a candidate, so the objective and
-    # residency gate are unchanged there.
-    # TODO: Drop this and make other solvers use the placement = False flag
-    unallocated_reads: int = 0
+
+    def __post_init__(self) -> None:
+        # ``residency_reason`` is the human-readable spill cause; setting one also
+        # disables residency via the base ``placement`` flag, so callers set only
+        # the reason and every solver honors the flag uniformly.
+        if self.residency_reason is not None:
+            self.placement = False
 
     @property
     def residency_allowed(self) -> bool:
-        """True iff the buffer carries no blocking ``residency_reason``."""
-        return self.residency_reason is None
+        """True iff the buffer may be made resident (the ``placement`` flag)."""
+        return self.placement
 
 
 def _assert_in_place_relationships(
@@ -187,20 +191,33 @@ def _assert_in_place_relationships(
                 )
 
 
-_BufferT = TypeVar("_BufferT", bound=LifetimeBoundBuffer)
+# Drop cause for a buffer the co-optimizing solver chose to spill (rather than one
+# pinned out up front): it fit but residency gave no benefit, or there was no room
+# once higher-value buffers were placed. Shared so every solver's DEBUG log and the
+# reasons surfaced to the allocator agree.
+_SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
 
-class MemoryPlanSolver(ABC, Generic[_BufferT]):
+def _assert_core_divisions_enumerated(buffers: Sequence["CoreDivisionBuffer"]) -> None:
+    """Assert every buffer carries at least one candidate core division.
+
+    The co-optimizing solvers pick a division per buffer, so an undivided buffer
+    is a usage error (the allocator always supplies at least the whole-buffer /
+    fixed division).
     """
-    An abstract class for defining algorithms which solve
-    memory layout patterns based on provided sizes, lifetimes.
+    for b in buffers:
+        assert len(b.core_divisions) != 0, (
+            "All buffers must have at least 1 valid core division"
+        )
 
-    Parameterized by the buffer type the solver consumes: the placement-only
-    solvers work on :class:`LifetimeBoundBuffer`, while :class:`CpSatLayoutSolver`
-    reads the richer :class:`CoreDivisionBuffer` metadata. Since
-    ``CoreDivisionBuffer`` subclasses ``LifetimeBoundBuffer``, the allocator always
-    hands over ``CoreDivisionBuffer``s and every solver accepts them (LSP): the
-    placement solvers simply ignore the extra fields.
+
+class MemoryPlanSolver(ABC):
+    """Abstract placement-only layout solver.
+
+    Consumes :class:`LifetimeBoundBuffer`s and assigns each an LX address (or
+    ``None`` when it does not fit / is not placeable). Placement-only solvers
+    (greedy / first-fit / best-fit) never look at core divisions; the joint
+    core-division + placement solvers live under :class:`CoOptimizingSolver`.
     """
 
     def __init__(self, size: int, alignment: int = 128):
@@ -218,29 +235,67 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
 
     @abstractmethod
     def plan_layout(
-        self, buffers: Sequence[_BufferT], log_lx_usage: bool = False
-    ) -> list[_BufferT]:
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+    ) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
         if and where buffers should be placed in scratchpad memory based
         on their attributes.
 
-        ``buffers`` is a :class:`Sequence` (not ``list``) so a caller may pass a
-        ``list`` of a *subtype* -- e.g. the allocator always converts to
-        ``CoreDivisionBuffer`` and hands the same list to any solver (LSP);
-        covariance lets that type-check against every solver's element type.
+        A buffer with ``placement=False`` is never assigned an address (it stays
+        in HBM) but may still be passed in so it informs the plan.
 
         Args:
             buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
             log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
-            list[_BufferT]: The set of buffers with their placements defined.
+            list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
         """
         pass
 
 
-class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class CoOptimizingSolver(ABC):
+    """Abstract joint core-division + LX-placement solver.
+
+    Consumes :class:`CoreDivisionBuffer`s (each carrying candidate
+    ``core_divisions`` and the ``cd_parent_matches`` slicing gate) and jointly
+    chooses a division and an LX placement per buffer, writing back ``address``
+    and ``chosen_division`` and populating ``spill_reasons``. Concrete solvers:
+    :class:`CpSatLayoutSolver` (OR-Tools constraint solve) and
+    :class:`DfsLayoutSolver` (brute-force DFS delegating placement to an inner
+    :class:`MemoryPlanSolver`).
+    """
+
+    def __init__(self, size: int, alignment: int = 128):
+        self.limit = size
+        self.alignment = alignment
+        # Per-buffer drop cause for the most recent solve ({name: reason}, spilled
+        # buffers only). The allocator reads this to populate its ``reject_reasons``
+        # so spills show up in the LX-pinning debug log.
+        self.spill_reasons: dict[str, str] = {}
+
+    @abstractmethod
+    def plan_layout_and_core_divs(
+        self, buffers: Sequence["CoreDivisionBuffer"], log_lx_usage: bool = False
+    ) -> list["CoreDivisionBuffer"]:
+        """Choose a core division and LX placement for each buffer.
+
+        Returns the same buffers with ``address`` (``None`` when spilled) and
+        ``chosen_division`` set, and ``self.spill_reasons`` populated.
+        """
+        pass
+
+    @staticmethod
+    def _spill_cost(buffer: "CoreDivisionBuffer", num_children: int) -> int:
+        """HBM traffic if ``buffer`` is spilled: one re-read per consumer times its
+        size, plus the producer's own HBM write (``spill_write_cost``). Shared by
+        every co-opt solver so their objectives agree. Units follow ``buffer.size``
+        (the caller decides raw vs alignment-scaled)."""
+        return num_children * buffer.size + buffer.spill_write_cost
+
+
+class GreedyLayoutSolver(MemoryPlanSolver):
     def __init__(self, size: int, alignment: int = 128):
         super().__init__(size, alignment)
         # `usage` tracks live placements during planning. It is specific to the
@@ -288,6 +343,12 @@ class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         return None
 
     def _try_allocate(self, buffer: LifetimeBoundBuffer):
+        # A non-placeable buffer stays in HBM: never assign an address, never add
+        # it to the usage table (so it occupies nothing).
+        if not buffer.placement:
+            buffer.address = None
+            return None
+
         # Check if the current buffer can be in-placed
         for in_place_opt in buffer.in_place_parents:
             matched_obj = next((u for u in self.usage if u.name == in_place_opt), None)

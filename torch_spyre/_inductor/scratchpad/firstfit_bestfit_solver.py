@@ -78,7 +78,7 @@ def _topological_sort(
     return result
 
 
-class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class FirstFitLayoutSolver(MemoryPlanSolver):
     """Allocates buffers by priority score, placing each in the first gap that fits.
 
     Buffers are sorted topologically (parents before children) with ties broken by ascending
@@ -185,8 +185,13 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         )
         _assert_in_place_relationships(buffers)
 
+        # A non-placeable buffer (``placement=False``) stays in HBM: exclude it so
+        # it is never assigned an address and never obstructs another buffer's gaps.
+        # It keeps its default ``address=None`` in the returned list.
         buffers_filtered = [
-            buffer for buffer in buffers if buffer.end_time >= buffer.start_time + 1
+            buffer
+            for buffer in buffers
+            if buffer.placement and buffer.end_time >= buffer.start_time + 1
         ]
         parent_names = {p for b in buffers_filtered for p in b.in_place_parents}
 
