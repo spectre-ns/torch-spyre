@@ -196,33 +196,18 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
   // Create and launch operation through SpyreStream's typed launch methods.
   if (host2device) {
-    flex::DmaParams params(cpu_ptr, host2device, device_address,
-                           std::move(dci_ptr));
-    launchH2D(&params);
+    auto* params =
+        flex::createDmaParams(cpu_ptr, device_address->total_size(),
+                              host2device, device_address, std::move(dci_ptr));
+    launchH2D(params);
+    flex::destroyDmaParams(params);
   } else {
-    flex::DmaParams params(cpu_ptr, host2device, device_address,
-                           std::move(dci_ptr));
-    launchD2H(&params);
+    auto* params =
+        flex::createDmaParams(cpu_ptr, device_address->total_size(),
+                              host2device, device_address, std::move(dci_ptr));
+    launchD2H(params);
+    flex::destroyDmaParams(params);
   }
-}
-
-void SpyreStream::executeProgramAsync(
-    const KernelArtifacts& arts, const std::vector<at::Tensor>& args) const {
-  // NOTE: Maybe it's better/faster if we know the exact number of arguments
-  // as it is tracked inside KerntlArtifacts
-  std::vector<const flex::CompositeAddress*> tensor_allocs;
-  for (size_t i = 0; i < args.size(); ++i) {
-    auto* ctx = static_cast<SharedOwnerCtx*>(
-        args[i].storage().data_ptr().get_context());
-    tensor_allocs.push_back(&ctx->composite_addr);
-  }
-
-  // Program
-  auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
-  flex::ComputeParams params(&ctx->composite_addr, std::move(tensor_allocs),
-                             arts.bundle_mlir_path);
-
-  launchCompute(&params);
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
@@ -370,8 +355,10 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   // Create corresponding flex stream handle (if not exists)
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
-    flex::RuntimeStream* flex_handle =
-        runtime->createStream(runtime->toPriority(priority));
+    flex::RuntimeStreamPriority streamPriority =
+        priority < 0 ? flex::RuntimeStreamPriority::HIGH
+                     : flex::RuntimeStreamPriority::NORMAL;
+    flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 

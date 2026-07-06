@@ -728,6 +728,107 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertIsNotNone(res["c"].address, "child should reside")
         self.assertEqual(res["gp"].address, res["c"].address)
 
+    def test_spill_reasons_recorded(self):
+        # The solver records a per-buffer drop cause for every spilled buffer so
+        # the allocator can report why each landed in HBM. `leaf` has divisions
+        # but no consumer edge (forced out by the residency gate); `big`'s
+        # smallest footprint exceeds capacity (forced out up front).
+        leaf = CoreDivisionBuffer("leaf", 40, [0, 1], core_divisions=_whole())
+        big = CoreDivisionBuffer(
+            "big", 1000, [0, 1], core_divisions=[CoreDivision(output_splits={256: 4})]
+        )
+        C = CoreDivisionBuffer(
+            "C",
+            100,
+            [1, 2],
+            core_divisions=[CoreDivision(output_splits={256: 4})],
+            parents=["big"],
+        )
+        solver = self.solver_class(size=200, alignment=1)
+        result = {b.name: b for b in solver.plan_layout([leaf, big, C])}
+
+        # All three spill; each carries a reason keyed by buffer name.
+        self.assertIsNone(result["big"].address)
+        self.assertIn("big", solver.spill_reasons)
+        self.assertIn("capacity", solver.spill_reasons["big"])
+        self.assertIn("leaf", solver.spill_reasons)
+        self.assertIn("no consumer", solver.spill_reasons["leaf"])
+        # A resident buffer gets no spill reason.
+        for name, buf in result.items():
+            self.assertEqual(buf.address is None, name in solver.spill_reasons)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class TestCpSatUnallocatedReads(TestCase):
+    """Device-free coverage of the CP-SAT objective/residency gate for the
+    placement-only path.
+
+    ``_as_core_division_buffers`` hands the solver single-fixed-division buffers
+    (the placement-only path: each buffer's only ``CoreDivision`` is the division
+    the upstream passes already committed, so the solver cannot re-divide -- it
+    only places) and records reads by consumers outside the candidate set
+    (filtered-out ops, graph outputs) as ``unallocated_reads``. These check that
+    such a read is enough to pin a buffer that has no candidate children, that a
+    truly-unread buffer is still forced out, that an ordinary parent edge pins,
+    and -- since the conversion now derives each edge's match from the two ops'
+    fixed divisions -- that an edge whose divisions disagree (empty
+    ``cd_parent_matches``) does *not* pin the producer. All without a Spyre device.
+    """
+
+    def _mk(self, name, uses, parents=(), unallocated_reads=0, matches=None):
+        """A single-fixed-division ``CoreDivisionBuffer`` as emitted by
+        ``_as_core_division_buffers``. ``matches`` overrides the per-parent match
+        pairs; by default every parent edge is compatible (``[(0, 0)]``), matching
+        a producer/consumer whose fixed divisions slice the buffer identically.
+        """
+        if matches is None:
+            matches = {p: [(0, 0)] for p in parents}
+        return CoreDivisionBuffer(
+            name,
+            128,
+            list(uses),
+            first_use_is_read=False,
+            core_divisions=[CoreDivision()],
+            parents=list(parents),
+            cd_parent_matches=matches,
+            unallocated_reads=unallocated_reads,
+        )
+
+    def _pinned(self, bufs):
+        out = CpSatLayoutSolver(1 << 20).plan_layout(bufs)
+        return {b.name for b in out if b.address is not None}
+
+    def test_only_unallocated_reads_is_pinned(self):
+        """A buffer read solely by a non-candidate consumer (no children) is
+        pinned on the strength of its unallocated read."""
+        self.assertIn("b0", self._pinned([self._mk("b0", [0, 1], unallocated_reads=1)]))
+
+    def test_no_reads_is_not_pinned(self):
+        """A buffer with no children and no unallocated reads is forced to HBM
+        (nothing reads it from LX)."""
+        self.assertNotIn("b0", self._pinned([self._mk("b0", [0, 1])]))
+
+    def test_candidate_parent_edge_still_pins(self):
+        """The ordinary producer->consumer edge still pins the producer."""
+        pinned = self._pinned(
+            [self._mk("b0", [0, 1]), self._mk("b1", [1, 2], parents=["b0"])]
+        )
+        self.assertIn("b0", pinned)
+
+    def test_mismatched_fixed_divisions_do_not_pin(self):
+        """When the producer and consumer fixed divisions slice the shared buffer
+        differently, ``_as_core_division_buffers`` records an *empty* match for
+        that edge. The producer then has no compatible child and no unallocated
+        read, so the solver declines to pin it (it falls back to HBM) even though
+        the consumer still lists it as a parent."""
+        pinned = self._pinned(
+            [
+                self._mk("b0", [0, 1]),
+                self._mk("b1", [1, 2], parents=["b0"], matches={"b0": []}),
+            ]
+        )
+        self.assertNotIn("b0", pinned)
+
 
 class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
     solver_class = GreedyLayoutSolver

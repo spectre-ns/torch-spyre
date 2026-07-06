@@ -38,7 +38,7 @@ from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
-    _finite_upper_or_none,
+    finite_upper_or_none,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -70,7 +70,9 @@ class TensorDep:
     device_coords: list[Expr] = dataclasses.field(init=False)
 
     def __post_init__(self):
-        self.device_coords = device_coordinates(self.layout.device_layout, self.dep)
+        self.device_coords = device_coordinates(
+            self.layout.device_layout, self.dep, None
+        )
 
 
 # Per-symbol (max_size, granularity) bucket metadata for symbolic iteration vars.
@@ -96,7 +98,7 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
     for sym, expr in it_space.items():
         if not (hasattr(expr, "free_symbols") and expr.free_symbols):
             continue
-        if _finite_upper_or_none(expr) is None:
+        if finite_upper_or_none(expr) is None:
             logger.debug(
                 f"[work_division/symbolic] skipping auto-dynamic symbol "
                 f"{sym}; use mark_dynamic(max=...) to enable symbolic planning"
@@ -734,10 +736,12 @@ def _resolve_work_div_hint(
 
     loop_var_dims = getattr(op, "work_div_loop_info", {})
     splits: dict[Symbol, int] = {}
-    for sym in it_space:
-        for name in loop_var_dims.get(sym, []):
-            if name in dim_to_split:
-                splits[sym] = dim_to_split[name]
+    for name, split in dim_to_split.items():
+        for sym in it_space:
+            if sym in splits:
+                continue
+            if name in loop_var_dims.get(sym, []):
+                splits[sym] = split
                 break
     return splits if splits else None
 
@@ -749,9 +753,12 @@ def _apply_user_hint(
     output_td: TensorDep,
     max_cores: int,
 ) -> dict[Symbol, int]:
+    """Apply splits in insertion order, pruning lower-priority overflows."""
     op_name = op.get_name()
 
     splits: dict[Symbol, int] = {}
+    cores_used = 1
+    loop_var_dims = getattr(op, "work_div_loop_info", {})
     for sym, split_val in user_splits.items():
         # bool is an int subclass in Python, but it is not a meaningful split.
         if isinstance(split_val, bool) or not isinstance(split_val, (int, Integer)):
@@ -770,7 +777,29 @@ def _apply_user_hint(
                 f"work_division_hint: {op_name} dim {sym} is not in the "
                 f"work-division iteration space."
             )
+
+        next_cores = cores_used * split
+        if next_cores > max_cores:
+            logger.info(
+                "work_division_hint: %s skipping named dim(s) %s (split=%s) "
+                "because cores would be %s, exceeding SENCORES=%s",
+                op_name,
+                loop_var_dims.get(sym, []),
+                split,
+                next_cores,
+                max_cores,
+            )
+            continue
+
+        dim_size = concretize_expr(it_space_adjusted[sym])
+        if dim_size % split != 0:
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} size={dim_size} "
+                f"is not evenly divisible by split={split}."
+            )
+
         splits[sym] = split
+        cores_used = next_cores
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars_to_split = {
@@ -782,21 +811,6 @@ def _apply_user_hint(
             f"{len(reduction_vars_to_split)} reduction dimensions "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
-
-    cores_used = math.prod(splits.values())
-    if cores_used > max_cores:
-        raise Unsupported(
-            f"work_division_hint: {op_name} total cores={cores_used} "
-            f"exceeds SENCORES={max_cores}."
-        )
-
-    for sym, split in splits.items():
-        dim_size = concretize_expr(it_space_adjusted[sym])
-        if dim_size % split != 0:
-            raise Unsupported(
-                f"work_division_hint: {op_name} dim {sym} size={dim_size} "
-                f"is not evenly divisible by split={split}."
-            )
 
     return splits
 
@@ -1391,13 +1405,30 @@ def _iter_computed_buffers(operations: list[Operation]):
             logger.warning(f"unhandled operation type {type(op)}")
 
 
+def _apply_input_layout_overrides(
+    op: ComputedBuffer, args: list[SchedNodeArg]
+) -> list[SchedNodeArg]:
+    """Apply per-op input layout overrides stored in op._input_layout_overrides.
+
+    insert_post_mutation_restickify uses this to make work division treat an
+    input buffer with an override layout instead of its committed layout.
+
+    The same tag is also used by SpyreKernel.create_tensor_arg, so work
+    division and codegen agree on the input layout.
+    """
+    overrides: dict[str, FixedTiledLayout] = getattr(op, "_input_layout_overrides", {})
+    if not overrides:
+        return args
+    return [SchedNodeArg(a.dep, overrides.get(a.dep.name, a.layout)) for a in args]
+
+
 def span_reduction(graph: GraphLowering) -> None:
     """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
     operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
         rw = op.get_read_writes()
-        args = get_mem_deps_from_rw(rw)
+        args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, span_reduction_pass)
         elif isinstance(op.data, Reduction):
@@ -1419,7 +1450,7 @@ def work_distribution(
         if op in preassigned_ops:
             continue
         rw = op.get_read_writes()
-        args = get_mem_deps_from_rw(rw)
+        args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, work_distribution_pass)
         elif isinstance(op.data, Reduction):

@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -78,6 +79,12 @@ __all__ = ["CpSatLayoutSolver"]
 
 logger = logging.getLogger(__name__)
 
+# Drop cause for a buffer the solver chose to spill (rather than one pinned out
+# up front by _add_core_division): it fit but residency gave no benefit, or
+# there was no room once higher-value buffers were placed. Shared so the DEBUG
+# log and the reasons surfaced to the allocator agree.
+_SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
+
 
 @dataclass
 class _PlacementUnit:
@@ -91,7 +98,7 @@ class _PlacementUnit:
     justified_offset: int = 0  # final justified offset
 
 
-def _assert_core_divisions_enumerated(buffers: list[CoreDivisionBuffer]):
+def _assert_core_divisions_enumerated(buffers: Sequence[CoreDivisionBuffer]):
     """Assert that all buffers have enumerated core divisions."""
     for b in buffers:
         assert len(b.core_divisions) != 0, (
@@ -181,10 +188,15 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
+        # Per-buffer drop cause for the most recent solve ({buffer name: reason},
+        # spilled buffers only). The allocator reads this to populate its own
+        # ``reject_reasons`` so cpsat spills show up in the LX-pinning debug log.
+        self.spill_reasons: dict[str, str] = {}
 
     def plan_layout(
-        self, buffers: list[CoreDivisionBuffer]
+        self, buffers: Sequence[CoreDivisionBuffer], log_lx_usage: bool = False
     ) -> list[CoreDivisionBuffer]:
+        self.spill_reasons = {}
         if not buffers:
             return []
         assert all(b.address is None for b in buffers), (
@@ -197,28 +209,25 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         # Solve on copies so we never mutate the caller's buffers.
         working = {
             b.name: _CoreDivisionBufferWithCpVars(
-                replace(
-                    b,
-                    size=int(np.ceil(b.size / self.alignment)),
-                    # boundary_cost / spill_write_cost are HBM traffic in the same
-                    # units as ``size``; rescale them alongside so the objective
-                    # compares like with like.
-                    boundary_cost=int(np.ceil(b.boundary_cost / self.alignment)),
-                    spill_write_cost=int(np.ceil(b.spill_write_cost / self.alignment)),
-                ),
+                replace(b, size=int(np.ceil(b.size / self.alignment))),
                 model,
                 self._capacity_units,
             )
             for b in buffers
         }
 
-        offsets, spilled, chosen_div = self._run(model, working)
+        offsets, spilled, chosen_div, forced_reasons = self._run(model, working)
         offsets = {k: v * self.alignment for k, v in offsets.items()}
+        # Surface a drop cause for every spilled buffer: the pre-solve forced
+        # reason when we have one, otherwise the solver chose to spill it.
+        self.spill_reasons = {
+            name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL) for name in spilled
+        }
 
         for b in buffers:
             b.address = None if b.name in spilled else offsets.get(b.name)
             b.chosen_division = chosen_div.get(b.name, b.chosen_division)
-        return buffers
+        return list(buffers)
 
     # ------------------------------------------------------------------
     # Model build + solve
@@ -227,7 +236,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         self,
         model: "cp_model.CpModel",
         tensors: dict[str, _CoreDivisionBufferWithCpVars],
-    ) -> tuple[dict[str, int], set[str], dict[str, int]]:
+    ) -> tuple[dict[str, int], set[str], dict[str, int], dict[str, str]]:
         children_of = self._get_children(tensors)
         self._add_inplace_relaxation(model, tensors)
         forced_reasons = self._add_core_division(model, tensors, children_of)
@@ -246,27 +255,23 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         # core division is chosen only in service of it.
         #
         # Phase 1 -- residency: put as much in LX as possible by minimizing HBM
-        # transfer traffic. The division is whatever maximizes residency -- even
-        # no split at all, if that is what lets a buffer match its consumers and
-        # reside.
+        # transfer traffic. Spilling a buffer forces each of its consumers to
+        # re-read it from HBM, so a spill costs ``num_consumers * size``. The
+        # division is whatever maximizes residency -- even no split at all, if
+        # that is what lets a buffer match its consumers and reside.
         #
-        # A *spilled* buffer pays its producer's HBM write (``spill_write_cost``,
-        # which a resident buffer writes to LX for free) plus one HBM re-read per
-        # consumer (``children * size``). A *resident* buffer normally pays
-        # nothing, except a graph boundary: a resident input clone still reads HBM
-        # once and a resident output clone still writes HBM once (both
-        # ``boundary_cost``). The spilled and resident costs are mutually exclusive
-        # via ``in_buffer``.
-        def spill_cost(sb):
-            return (
-                len(children_of.get(sb.name, [])) * sb.buffer.size
-                + sb.buffer.spill_write_cost
-            )
+        # ``unallocated_reads`` adds the consumers the solver never sees as
+        # candidates (filtered-out ops, graph outputs): they still read the
+        # buffer from LX when it resides, so they count toward its spill cost.
+        # It is 0 on the joint path, leaving this weight equal to the candidate
+        # consumer count there.
+        def _spill_weight(sb: "_CoreDivisionBufferWithCpVars") -> int:
+            return len(children_of.get(sb.name, [])) + sb.buffer.unallocated_reads
 
         hbm_terms = [
-            spill_cost(sb) * (1 - sb.in_buffer) + sb.buffer.boundary_cost * sb.in_buffer
+            _spill_weight(sb) * sb.buffer.size * (1 - sb.in_buffer)
             for sb in tensors.values()
-            if spill_cost(sb) or sb.buffer.boundary_cost
+            if _spill_weight(sb) * sb.buffer.size
         ]
         if hbm_terms:
             model.Minimize(sum(hbm_terms))
@@ -303,12 +308,10 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
                 logger.debug(
                     "[CP-SAT layout solver]   %s -> HBM: %s",
                     name,
-                    forced_reasons.get(
-                        name, "spilled by solver (no residency benefit / no room)"
-                    ),
+                    forced_reasons.get(name, _SOLVER_CHOSE_SPILL),
                 )
 
-        return offsets, spilled, chosen_div
+        return offsets, spilled, chosen_div, forced_reasons
 
     def _add_inplace_relaxation(
         self,
@@ -474,8 +477,9 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
     ) -> dict[str, str]:
         """Pin out of LX the buffers whose non-residency is fixed up front: those
         whose *smallest* candidate footprint still exceeds capacity, and those
-        marked ``residency_allowed=False`` by the allocator. Returns ``name ->
-        reason`` for the buffers it forces out (drop-cause debug logging)."""
+        the allocator marked non-resident (``residency_reason`` set). Returns
+        ``name -> reason`` for the buffers it forces out (drop-cause debug
+        logging), using the allocator's specific reason when it has one."""
         forced: dict[str, str] = {}
         for sb in bufs.values():
             t = sb.buffer
@@ -489,7 +493,9 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
                 )
                 model.Add(sb.in_buffer == 0)
             elif not t.residency_allowed:
-                forced[t.name] = "residency not allowed by allocator"
+                forced[t.name] = (
+                    t.residency_reason or "residency not allowed by allocator"
+                )
                 model.Add(sb.in_buffer == 0)
         return forced
 
@@ -509,6 +515,13 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
             t = sb.buffer
             kids = children_of.get(t.name, [])
             if not kids:
+                if t.unallocated_reads:
+                    # Read only by consumers the solver never sees (filtered-out
+                    # ops / graph outputs). They still read it from LX when it
+                    # resides, so residency is worthwhile; there is no resident
+                    # consumer to constrain the division against, so no gate.
+                    # TODO: Remove this when the other solvers are brought to parity
+                    continue
                 # Nothing consumes this buffer from LX -> it can never reside.
                 forced.setdefault(t.name, "no consumer reads it from LX")
                 model.Add(sb.in_buffer == 0)

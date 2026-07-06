@@ -14,8 +14,7 @@
 
 
 import math
-from typing import Any
-
+from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation, IRNode, Pointwise
@@ -29,6 +28,7 @@ from torch_spyre._inductor.pass_utils import (
     _per_core_view_on_buf,
     concretize_expr,
     op_read_writes,
+    device_coordinates,
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 
@@ -46,15 +46,14 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "mean",
         "add",
         "rsqrt",
-    }
-)
-
-OP_GOOD_FOR_LX_INPLACE = frozenset(
-    {
-        "exp",
-        "sub",
-        "add",
-        "rsqrt",
+        "neg",
+        "mm",
+        "bmm",
+        "batched_matmul",
+        "div",
+        "realdiv",
+        "expand",
+        "silu",
     }
 )
 
@@ -107,7 +106,10 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
-def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
+def mem_usage_by_buf(
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+) -> dict:
     """
     Get a summary of memory usage of each operation.
     Includes detailed info of individual buf, e.g. mem_usage[<buf_name>],
@@ -115,7 +117,7 @@ def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
     """
-    num_cores_per_op = get_ncores_for_buffers(graph)
+    num_cores_per_op = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
     buf_names = {op.name for op in graph.operations}
@@ -192,13 +194,13 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
     except (TypeError, ValueError):
         return True
     for op in graph.operations:
-        for dep in op.get_read_writes().reads:
+        for dep in op_read_writes(op).reads:
             if dep.name != buf_name:
                 continue
             try:
                 if int(dep.get_numel()) < full:
                     return True
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 return True
     return False
 
@@ -244,12 +246,20 @@ def _op_num_cores(op: Operation) -> int:
     return math.prod([s for p in splits for s in p.values()])
 
 
-def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
+def get_ncores_for_buffers(
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
     used by all the operations that uses the buffer.
     If there is a core division mismatch return -1 instead of the
     number of cores.
+
+    Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
+    results across calls (e.g. across co-opt search leaves). Safe to
+    share only within a single graph, since the cache key includes the
+    op name and `dep` (which carries the buffer name).
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
@@ -266,7 +276,7 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
             ref_view = None
             mismatch = False
             for op, dep in users:
-                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name)
+                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
                 if (flag and dep in op_read_writes(op).writes) or (view != ref_view):
@@ -316,3 +326,41 @@ def get_op_pointwise_inputs(node: IRNode) -> list[str]:
         for inp, load_index in loads.items()
         if all(store_index == load_index for store_index in stores.values())
     ]
+
+
+def _would_produce_lx_back_gap(
+    graph: GraphLowering,
+    buf_name: str,
+    uses: list[int],
+) -> bool:
+    """Check if pinning a buffer to LX would produce a backGapCore_.
+
+    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
+    The backend supports backGap for HBM but not for LX, so buffers triggering
+    this condition must stay in HBM.
+    """
+    buf = graph.get_buffer(buf_name)
+    stl = buf.layout.device_layout
+    device_size = stl.device_size
+
+    for use_idx in uses:
+        op = graph.operations[use_idx]
+        rw = op.get_read_writes()
+        for dep in rw.reads | rw.writes:
+            if dep.name != buf_name:
+                continue
+            try:
+                coords = device_coordinates(stl, dep, None)
+            except Exception:
+                continue
+            for d, coord_expr in enumerate(coords[:-1]):
+                syms = coord_expr.free_symbols
+                if not syms:
+                    if device_size[d] > 1:
+                        return True
+                    continue
+                sym = next(iter(syms))
+                it_dim_size = int(dep.ranges[sym])
+                if device_size[d] > it_dim_size:
+                    return True
+    return False

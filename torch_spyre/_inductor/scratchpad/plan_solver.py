@@ -19,6 +19,10 @@ from typing import Generic, Optional, TypeVar
 from abc import ABC, abstractmethod
 import math
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("scratchpad.plan_solver")
+
 
 @dataclass
 class LifetimeBoundBuffer:
@@ -116,26 +120,29 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     chosen_division: Optional[int] = None
-    # When False the buffer may not be made resident (e.g. a graph boundary that
-    # can't be LX-pinned without a clone). It is still handed to the solver so it
-    # participates in matching -- a forced-out consumer keeps its producers'
-    # residency viable instead of orphaning them.
-    residency_allowed: bool = True
-    # HBM traffic a *resident* buffer still incurs, in the same units as ``size``.
-    # Zero for an intermediate (a resident producer writes straight to LX). An
-    # *input* clone still reads HBM once when pinned (the clone copy); a *graph
-    # output* still writes HBM once when pinned (the clone returns the value). So
-    # both graph boundaries are charged ``size`` here. The solver adds
-    # ``boundary_cost`` whenever the buffer is resident.
-    boundary_cost: int = 0
-    # HBM traffic a *spilled* buffer incurs beyond its consumers' re-reads, in the
-    # same units as ``size`` -- i.e. the producer's own write to HBM, which lands
-    # in LX (free) when the buffer is resident. ``size`` for any buffer produced by
-    # an in-graph op (intermediate or graph output); zero for an input clone (the
-    # input is already in HBM, not produced here). The solver adds
-    # ``spill_write_cost`` whenever the buffer is spilled, so residency is credited
-    # for saving the write, not just the re-reads (see ``CpSatLayoutSolver._run``).
-    spill_write_cost: int = 0
+    # Why the buffer may not be made resident, or ``None`` if it may. A non-None
+    # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
+    # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
+    # is handed to the solver either way so it participates in matching -- a
+    # forced-out consumer keeps its producers' residency viable instead of
+    # orphaning them.
+    residency_reason: Optional[str] = None
+    # Count of reads of this buffer by consumers the solver never sees as
+    # candidates -- ops filtered out of the candidate set (e.g. under the
+    # placement-only conversion in ``_as_core_division_buffers``) or graph
+    # outputs. Such a consumer still reads this buffer *from LX* when it resides,
+    # so the read counts toward the buffer's spill cost even though no ``parents``
+    # edge represents it, and it lets the buffer reside despite having no resident
+    # (candidate) consumer to match a division against. Zero for the joint
+    # allocator, where every consumer is a candidate, so the objective and
+    # residency gate are unchanged there.
+    # TODO: Drop this and make other solvers use the placement = False flag
+    unallocated_reads: int = 0
+
+    @property
+    def residency_allowed(self) -> bool:
+        """True iff the buffer carries no blocking ``residency_reason``."""
+        return self.residency_reason is None
 
 
 def _assert_in_place_relationships(
@@ -175,7 +182,10 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
 
     Parameterized by the buffer type the solver consumes: the placement-only
     solvers work on :class:`LifetimeBoundBuffer`, while :class:`CpSatLayoutSolver`
-    requires the richer :class:`CoreDivisionBuffer`.
+    reads the richer :class:`CoreDivisionBuffer` metadata. Since
+    ``CoreDivisionBuffer`` subclasses ``LifetimeBoundBuffer``, the allocator always
+    hands over ``CoreDivisionBuffer``s and every solver accepts them (LSP): the
+    placement solvers simply ignore the extra fields.
     """
 
     def __init__(self, size: int, alignment: int = 128):
@@ -192,14 +202,22 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
         self.alignment = alignment
 
     @abstractmethod
-    def plan_layout(self, buffers: list[_BufferT]) -> list[_BufferT]:
+    def plan_layout(
+        self, buffers: Sequence[_BufferT], log_lx_usage: bool = False
+    ) -> list[_BufferT]:
         """
         Utilizes an implementation defined algorithm to determine
         if and where buffers should be placed in scratchpad memory based
         on their attributes.
 
+        ``buffers`` is a :class:`Sequence` (not ``list``) so a caller may pass a
+        ``list`` of a *subtype* -- e.g. the allocator always converts to
+        ``CoreDivisionBuffer`` and hands the same list to any solver (LSP);
+        covariance lets that type-check against every solver's element type.
+
         Args:
-            buffers (list[_BufferT]): The set of candidate buffers for memory planning
+            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
+            log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
             list[_BufferT]: The set of buffers with their placements defined.
@@ -283,7 +301,7 @@ class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
                 self.usage.remove(buf)
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         """Allocates addresses to the provided buffer list
 
@@ -341,4 +359,15 @@ class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
                 if idx == buffer.start_time:
                     self._try_allocate(buffer)
 
-        return buffers
+        if log_lx_usage and logger.isEnabledFor(10):  # logging.DEBUG
+            logger.debug("scratchpad limit: %d KB", self.limit // 1024)
+            for idx in range(sorted_times[0], sorted_times[-1]):
+                live = []
+                used = 0
+                for b in buffers:
+                    if b.address is not None and b.start_time <= idx < b.end_time:
+                        live.append(f"{b.name}_{b.size // 1024}KB@{hex(b.address)}")
+                        used += b.size
+                logger.debug("t=%d: %d KB  [%s]", idx, used // 1024, ", ".join(live))
+
+        return list(buffers)

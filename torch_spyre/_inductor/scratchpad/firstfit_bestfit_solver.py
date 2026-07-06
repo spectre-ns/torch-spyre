@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import heapq
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Optional, Callable
 
@@ -175,7 +176,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         return None
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         if not buffers:
             return []
@@ -221,7 +222,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
                     buffer.address = round_up_to_alignment(gap.start, self.alignment)
                     names_to_addresses[buffer.name] = buffer.address
 
-        return buffers
+        return list(buffers)
 
 
 class BestFitLayoutSolver(FirstFitLayoutSolver):
