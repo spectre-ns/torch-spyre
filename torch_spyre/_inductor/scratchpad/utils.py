@@ -27,8 +27,8 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import (
     _per_core_view_on_buf,
     concretize_expr,
-    op_read_writes,
     device_coordinates,
+    op_read_writes,
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 

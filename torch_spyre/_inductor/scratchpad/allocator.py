@@ -134,9 +134,14 @@ class ScratchpadAllocator(ABC):
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
             return reads
-        if hasattr(op, "data"):
-            return get_op_pointwise_inputs(op.data)
-        return []
+        # Fallback/constant ops (e.g. SpyreConstantFallback) carry no Pointwise
+        # ``data`` to inspect; they can't in-place-alias an input, so allow none.
+        # The greedy path never reaches here (``_determine_in_place`` iterates
+        # ``_filter_ops``-filtered ops), but the co-opt path inspects every op.
+        data = getattr(op, "data", None)
+        if data is None:
+            return []
+        return get_op_pointwise_inputs(data)
 
     def _filter_ops(
         self,
@@ -221,7 +226,6 @@ class ScratchpadAllocator(ABC):
             uses = lifetimes[output_name]
             parents = in_place.get(output_name, [])
             size = info["size_per_core"]
-
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
@@ -1274,8 +1278,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             p.apply_pass(graph)
         buffers = self._generate_cd_buffers(graph, self._division_map(graph))
         allocation = self.layout_planning.plan_layout(buffers)
-        self._push_allocation(graph, allocation)
+        # Commit divisions before pushing: clone materialization in
+        # ``_push_allocation`` (``push_allocation_with_clone``) re-keys the clone
+        # from the consumer's ``op_it_space_splits``, which ``_commit_divisions``
+        # writes from the solver's chosen divisions.
         self._commit_divisions(graph, allocation)
+        self._push_allocation(graph, allocation)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
@@ -1302,11 +1310,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         }
 
     def _fixed_division(self, op: Operation) -> CoreDivision:
-        """The op's upstream-committed division as a single pinned CoreDivision;
-        used as the fallback for ops with no enumerable candidates, so every
-        buffer carries at least one division. See :func:`_fixed_core_division`.
+        """The op's upstream-committed division (``op.op_it_space_splits``) as a
+        single pinned CoreDivision; a never-divided op yields a one-core empty
+        split. Used as the fallback for ops with no enumerable candidates, so
+        every buffer carries at least one division.
         """
-        return _fixed_core_division(op)
+        seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", None) or ({}, {})
+        return CoreDivision(output_splits=dict(seed[0]), reduction_splits=dict(seed[1]))
 
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int
@@ -1505,9 +1515,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return "extern kernel user"
         if name in mutated_buffers:
             return "mutation target"
-        if name in graph_output_names:
-            return "graph output"
+        if name in graph_output_names and not clone_at_graph_boundaries():
+            # The caller holds the HBM reference; without a clone to redirect the
+            # return through, a pinned graph output would never be written to HBM.
+            return "graph output (no clone)"
         if buffer_not_read_in_full(graph, name):
+            # A pinned graph output is cloned for the HBM return (see
+            # ``_push_allocation``); a partial/offset read of a single LX base
+            # (input or output) mis-addresses under SDSC, so never pin it.
             return "partial/offset read"
         if len(uses) <= 1:
             return "single use"
@@ -1532,6 +1547,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
+        graph_output_names = set(graph.get_output_names())
 
         # Caches the candidate-invariant view prep (``_prepare_per_core_view``)
         # keyed by (op, dep, buf), so a parent read by several consumers prepares
@@ -1544,6 +1560,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         residency_by_buf = self._residency_by_buf(
             graph, mem_usage, op_by_name, lifetimes
         )
+
+        # loop through the used buffers and determine the valid core division
+        # of all the child nodes. Matches is the make between eqivalent per core
+        # views from the valid division for the clone op and relative to the
+        # child operations.
+        input_clone_divs: dict[str, list[CoreDivision]] = {}
+        input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        if clone_at_graph_boundaries():
+            buffer_users = get_buffer_users(graph)
+            for input_name in self._eligible_clone_inputs(graph, lifetimes):
+                consumers = [
+                    op
+                    for op in buffer_users.get(input_name, [])
+                    if input_name in {d.name for d in op_read_writes(op).reads}
+                ]
+                divs, matches = self._clone_divisions_and_matches(
+                    input_name, consumers, divisions, prep_cache
+                )
+                input_clone_divs[input_name] = divs
+                input_clone_matches[input_name] = matches
+                # The raw input is not a resident *producer* (it has no op to take
+                # a write-view from); its clone edges are added to consumers below.
+                # A non-None reason keeps ``_cd_parent_matches`` from matching the
+                # raw input as a producer, mirroring the default for graph inputs.
+                residency_by_buf[input_name] = "input clone"
+
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
 
@@ -1553,7 +1595,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             buf_divisions = divisions[output_name]
             parents = in_place.get(output_name, [])
             size = info["size"]  # total footprint; solver divides per chosen cd
-            parent_proj = info["op_inputs"]
+            parent_proj = list(info["op_inputs"])
             cd_parent_matches = self._cd_parent_matches(
                 op,
                 buf_divisions,
@@ -1564,6 +1606,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 residency_by_buf,
             )
 
+            # Add any graph-input clone this op reads as an extra producer edge,
+            # with the compatible-by-construction pairs computed up front. Done
+            # here (not in ``_cd_parent_matches``) because the input has no op to
+            # take a write-view from.
+            for input_name, per_consumer in input_clone_matches.items():
+                if output_name in per_consumer:
+                    parent_proj.append(input_name)
+                    cd_parent_matches[input_name] = per_consumer[output_name]
+
+            # Every main-loop buffer is produced by an in-graph op, so spilling it
+            # costs that producer's HBM write (saved when resident -> written to
+            # LX). A graph output additionally still writes HBM once when resident
+            # (the clone returns it), so it carries that as boundary_cost; the two
+            # net to "pinning saves only the internal re-reads", which is correct.
+            boundary_cost = size if output_name in graph_output_names else 0
             buffers.append(
                 CoreDivisionBuffer(
                     output_name,
@@ -1575,10 +1632,147 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     parents=parent_proj,
                     cd_parent_matches=cd_parent_matches,
                     residency_reason=residency_reason,
+                    boundary_cost=boundary_cost,
+                    spill_write_cost=size,
                 )
             )
 
+        buffers.extend(self._cd_input_buffers(graph, lifetimes, input_clone_divs))
         return buffers
+
+    def _eligible_clone_inputs(
+        self, graph: GraphLowering, lifetimes: dict[str, list[int]]
+    ) -> list[str]:
+        """Graph inputs eligible to be cloned into LX, applying the same
+        correctness guards as the placement path's input loop
+        (``_build_bound_buffers``): the input must be read more than once, every
+        consumer must be a rewritable (Pointwise/Reduction) op, and it must be
+        read in full (a single LX base can't address a partial/multi-offset read).
+
+        Unlike the placement path we do NOT gate on ``get_ncores_for_buffers``
+        agreement: the joint solver re-divides consumers and the slicing-match
+        gate makes them converge on one shared slicing, or leaves the input in
+        HBM. A committed-division mismatch is therefore not a blocker here.
+        """
+        eligible: list[str] = []
+        for input_name in graph.graph_input_names:
+            uses = lifetimes[input_name]
+            if len(uses) <= 1:
+                continue
+            if not GraphEditor.all_uses_are_rewritable(graph, uses):
+                continue
+            if buffer_not_read_in_full(graph, input_name):
+                continue
+            eligible.append(input_name)
+        return eligible
+
+    def _clone_divisions_and_matches(
+        self,
+        input_name: str,
+        consumers: list[Operation],
+        divisions: dict[str, list[CoreDivision]],
+        prep_cache: dict,
+    ) -> tuple[list[CoreDivision], dict[str, list[tuple[int, int]]]]:
+        """Candidate divisions for an input clone, plus per-consumer
+        ``(clone_div_idx, consumer_div_idx)`` match pairs.
+
+        The clone is an identity copy of ``input_name``, so for any slicing it
+        writes its per-core view of ``input_name`` equals a consumer's read-view
+        of that same slicing. The divisions worth offering are exactly the
+        distinct representable read-views the consumers exhibit; each is realized
+        as a ``CoreDivision`` by re-keying the consumer's split onto the buffer's
+        own read index -- the identical re-keying ``push_allocation_with_clone``
+        applies when it later materializes the clone op. A ``(clone, consumer)``
+        pair is compatible iff their views match AND their total core counts agree
+        (the same broadcast-axis guard as ``_cd_parent_matches``: equal view but
+        unequal core count means the consumer splits an axis the clone, sliced
+        only on ``input_name``'s own axes, cannot replicate).
+        """
+        clone_divs: list[CoreDivision] = []
+        clone_views: list[tuple] = []  # parallel: the view each clone div reproduces
+        matches: dict[str, list[tuple[int, int]]] = {}
+        for consumer in consumers:
+            cname = consumer.get_name()
+            consumer_divs = divisions[cname]
+            rw = op_read_writes(consumer)
+            read_dep = next(
+                (r for r in rw.reads if r.name == input_name and hasattr(r, "index")),
+                None,
+            )
+            write = next((w for w in rw.writes if hasattr(w, "index")), None)
+            if read_dep is None or write is None:
+                continue
+            iter_space = iteration_space_from_op(consumer)
+            views = self._views_for_divs(
+                consumer, read_dep, input_name, consumer_divs, prep_cache
+            )
+            pairs: list[tuple[int, int]] = []
+            for j, (view, _, repr_ok) in enumerate(views):
+                if not repr_ok:
+                    continue
+                k = next((idx for idx, v in enumerate(clone_views) if v == view), None)
+                if k is None:
+                    cd = consumer_divs[j]
+                    per_sym = apply_splits_from_index_coeff(
+                        (cd.output_splits, cd.reduction_splits),
+                        write.index,
+                        read_dep.index,
+                        iter_space,
+                    )
+                    clone_out, _ = splits_by_index_coeff(
+                        per_sym, read_dep.index, read_dep.index
+                    )
+                    k = len(clone_divs)
+                    clone_divs.append(
+                        CoreDivision(
+                            output_splits=clone_out, reduction_splits={}
+                        )  # a clone op cannot have a division split
+                    )
+                    clone_views.append(view)
+                if clone_divs[k].cores_used == consumer_divs[j].cores_used:
+                    pairs.append((k, j))
+            if pairs:
+                matches[cname] = pairs
+        # Every buffer must carry >=1 division (``_assert_core_divisions_enumerated``);
+        # a whole-buffer fallback also lets a whole-read consumer match.
+        if not clone_divs:
+            clone_divs.append(CoreDivision())
+        return clone_divs, matches
+
+    def _cd_input_buffers(
+        self,
+        graph: GraphLowering,
+        lifetimes: dict[str, list[int]],
+        input_clone_divs: dict[str, list[CoreDivision]],
+    ) -> list[CoreDivisionBuffer]:
+        """Build the ``CoreDivisionBuffer`` for each clone-eligible graph input.
+
+        Sized by the input's *total* device footprint (the solver divides by the
+        chosen division's ``output_partition``, matching the rest of the CD path).
+        ``residency_reason=None`` (residency allowed) and ``boundary_cost=size``
+        because a resident input clone still reads HBM once. It has no LX parent
+        (``parents=[]``); its
+        consumers carry the match pairs that gate its residency.
+        """
+        out: list[CoreDivisionBuffer] = []
+        for input_name, divs in input_clone_divs.items():
+            dev_layout = graph.get_buffer(input_name).layout.device_layout
+            size = math.prod(dev_layout.device_size[:-1]) * 128
+            out.append(
+                CoreDivisionBuffer(
+                    input_name,
+                    size,
+                    lifetimes[input_name],
+                    first_use_is_read=True,
+                    in_place_parents=[],
+                    core_divisions=divs,
+                    parents=[],
+                    cd_parent_matches={},
+                    residency_reason=None,
+                    boundary_cost=size,
+                )
+            )
+        return out
 
     def _cd_parent_matches(
         self,

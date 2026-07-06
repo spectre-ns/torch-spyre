@@ -120,6 +120,21 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     chosen_division: Optional[int] = None
+    # HBM traffic a *resident* buffer still incurs, in the same units as ``size``.
+    # Zero for an intermediate (a resident producer writes straight to LX). An
+    # *input* clone still reads HBM once when pinned (the clone copy); a *graph
+    # output* still writes HBM once when pinned (the clone returns the value). So
+    # both graph boundaries are charged ``size`` here. The solver adds
+    # ``boundary_cost`` whenever the buffer is resident.
+    boundary_cost: int = 0
+    # HBM traffic a *spilled* buffer incurs beyond its consumers' re-reads, in the
+    # same units as ``size`` -- i.e. the producer's own write to HBM, which lands
+    # in LX (free) when the buffer is resident. ``size`` for any buffer produced by
+    # an in-graph op (intermediate or graph output); zero for an input clone (the
+    # input is already in HBM, not produced here). The solver adds
+    # ``spill_write_cost`` whenever the buffer is spilled, so residency is credited
+    # for saving the write, not just the re-reads (see ``CpSatLayoutSolver._run``).
+    spill_write_cost: int = 0
     # Why the buffer may not be made resident, or ``None`` if it may. A non-None
     # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
     # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
