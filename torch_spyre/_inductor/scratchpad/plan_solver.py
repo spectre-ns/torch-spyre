@@ -19,12 +19,20 @@ from typing import Generic, Optional, TypeVar
 from abc import ABC, abstractmethod
 import math
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from enum import Enum
 
 logger = get_inductor_logger("scratchpad.plan_solver")
 
 
 class SolveError(Exception):
     """Raised when a solver is unable to find a solution"""
+
+
+# class syntax
+class BufferType(Enum):
+    Intermediate = 0
+    Input = 1
+    Output = 2
 
 
 @dataclass
@@ -140,6 +148,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # residency gate are unchanged there.
     # TODO: Drop this and make other solvers use the placement = False flag
     unallocated_reads: int = 0
+    boundary: BufferType = BufferType.Intermediate
 
     @property
     def residency_allowed(self) -> bool:
