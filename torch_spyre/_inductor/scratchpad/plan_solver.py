@@ -28,7 +28,6 @@ class SolveError(Exception):
     """Raised when a solver is unable to find a solution"""
 
 
-# class syntax
 class BufferType(Enum):
     Intermediate = 0
     Input = 1

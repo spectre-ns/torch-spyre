@@ -1309,6 +1309,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             p.apply_pass(graph)
         buffers = self._generate_cd_buffers(graph, self._division_map(graph))
         allocation = self.layout_planning.plan_layout(buffers)
+        # the divisions must be committed such that any buffer clones can correctly
+        # pull the selected core division from the dependent buffers when
+        # the graph is updated with clones in ``_push_allocation``
         self._commit_divisions(graph, allocation)
         self._push_allocation(graph, allocation)
         for p in self.post_optimization_passes:
@@ -1623,6 +1626,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs, matches = self._clone_divisions_and_matches(
                     input_name, consumers, divisions, prep_cache
                 )
+                # No division matched any consumer -> the clone has no valid core
+                # division and could never reside, so don't hand an unplaceable
+                # buffer to the solver (it would trip the >=1-division invariant).
+                # The input simply stays in HBM, as it would uncloned.
+                if not divs:
+                    continue
                 input_clone_matches[input_name] = matches
                 residency_by_buf[input_name] = None
                 dev_layout = graph.get_buffer(input_name).layout.device_layout
@@ -1651,7 +1660,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             buf_divisions = divisions[output_name]
             parents = in_place.get(output_name, [])
             size = info["size"]  # total footprint; solver divides per chosen cd
-            parent_proj = list(info["op_inputs"])
+            parent_proj = info["op_inputs"].copy()
             cd_parent_matches = self._cd_parent_matches(
                 op,
                 buf_divisions,
@@ -1765,6 +1774,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             write = next((w for w in rw.writes if hasattr(w, "index")), None)
             if read_dep is None or write is None:
+                matches[cname] = []
                 continue
             iter_space = iteration_space_from_op(consumer)
             views = self._views_for_divs(
@@ -1795,12 +1805,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     clone_views.append(view)
                 if clone_divs[k].cores_used == consumer_divs[j].cores_used:
                     pairs.append((k, j))
-            if pairs:
-                matches[cname] = pairs
-        # Every buffer must carry >=1 division (``_assert_core_divisions_enumerated``);
-        # a whole-buffer fallback also lets a whole-read consumer match.
-        if not clone_divs:
-            clone_divs.append(CoreDivision())
+            matches[cname] = pairs
+        # An empty ``clone_divs`` means no consumer matched the clone under any
+        # division, so it has no valid core division. Return it empty rather than
+        # fabricating a whole-buffer fallback that no consumer matches: the caller
+        # drops such a clone (it can never reside), keeping it out of the solver's
+        # >=1-division invariant.
         return clone_divs, matches
 
     def _cd_parent_matches(
