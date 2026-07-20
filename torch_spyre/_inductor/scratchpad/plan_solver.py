@@ -158,6 +158,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         """True iff the buffer carries no blocking ``residency_reason``."""
         return self.residency_reason is None
 
+
 def _assert_in_place_relationships(
     buffers: Sequence["LifetimeBoundBuffer"],
 ) -> None:

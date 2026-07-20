@@ -90,9 +90,9 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
+    _assert_in_place_relationships,
     SolveError,
     BufferType,
-    _assert_in_place_relationships,
 )
 
 __all__ = ["CpSatLayoutSolver"]
@@ -439,7 +439,6 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         assert all(b.address is None for b in buffers), (
             "Buffers cannot be previously or partially planned"
         )
-
         _assert_in_place_relationships(buffers)
 
         model = cp_model.CpModel()
@@ -463,7 +462,6 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
         return list(buffers)
-
 
     # ------------------------------------------------------------------
     # Model build + solve
