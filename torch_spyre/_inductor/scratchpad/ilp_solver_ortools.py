@@ -405,12 +405,12 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
             "plan_layout_and_core_divisions requires CoreDivisionBuffers"
         )
         assert (len(b.core_divisions) != 0 for b in buffers), (
-                "All buffers must have at least 1 valid core division"
-            )
+            "All buffers must have at least 1 valid core division"
+        )
         return cast(
             "list[CoreDivisionBuffer]", list(self._plan_layout_generic(buffers))
         )
-    
+
     def _wrap(
         self, model: "cp_model.CpModel", buffer: LifetimeBoundBuffer
     ) -> _LifetimeBufferWithCpVars:
@@ -466,7 +466,6 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
         return list(buffers)
-
 
     # ------------------------------------------------------------------
     # Model build + solve
