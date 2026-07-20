@@ -784,15 +784,81 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             b.name: b for b in solver.plan_layout_and_core_divisions([leaf, big, C])
         }
 
-        # All three spill; each carries a reason keyed by buffer name.
+        # All three spill; each carries its own reason.
         self.assertIsNone(result["big"].address)
-        self.assertIn("big", solver.spill_reasons)
-        self.assertIn("capacity", solver.spill_reasons["big"])
-        self.assertIn("leaf", solver.spill_reasons)
-        self.assertIn("no consumer", solver.spill_reasons["leaf"])
-        # A resident buffer gets no spill reason.
-        for name, buf in result.items():
-            self.assertEqual(buf.address is None, name in solver.spill_reasons)
+        self.assertIn("capacity", result["big"].spill_reason)
+        self.assertIn("no consumer", result["leaf"].spill_reason)
+        # The reason travels on the buffer: exactly the spilled buffers carry
+        # one, and a resident buffer's is cleared back to None.
+        for buf in result.values():
+            self.assertEqual(buf.address is None, buf.spill_reason is not None)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
+    """CP-SAT driven through ``plan_layout`` on plain ``LifetimeBoundBuffer``s.
+
+    This is the placement-only contract: the core division is already fixed
+    upstream, so the footprint is just ``size`` and the division-dependent parts
+    of the model drop out. Unlike the joint path there is *no* residency gate --
+    a buffer needs no consumer edge to reside -- so the base suite's buffers
+    need no synthetic sink. ``make_buffer`` is inherited from
+    :class:`BaseLayoutSolverTests`, so every shared test below runs against
+    plain buffers; only ``check_result`` is relaxed, because CP-SAT returns a
+    valid packing rather than the gap heuristics' exact addresses.
+    """
+
+    solver_class = CpSatLayoutSolver
+
+    def solve(self, buffers, size=LARGE_SIZE, alignment=1):
+        if not buffers:
+            return []
+        if size // alignment < 1:
+            # Below one alignment unit the unit-scaled capacity rounds to zero
+            # and the solver cannot represent any placement.
+            return buffers
+        return self.solver_class(size, alignment).plan_layout(buffers)
+
+    def check_result(self, result, expected_addresses, size, alignment):
+        _assert_legal_packing(self, result, expected_addresses, size, alignment)
+
+    def test_consumerless_buffer_still_resides(self):
+        # The joint path force-spills a buffer no one reads from LX (the slicing
+        # gate needs a consumer to match against). Placement-only has no such
+        # gate, so the same buffer resides. This is the behavioural difference
+        # between the two entry points.
+        (buf,) = self.solve([LifetimeBoundBuffer("solo", 40, [0, 1])], size=256)
+        self.assertIsNotNone(buf.address)
+        self.assertIsNone(buf.spill_reason)
+
+    def test_spilled_buffer_records_reason(self):
+        # A buffer larger than capacity is pinned out up front and carries the
+        # capacity cause; the one that fits resides with no reason.
+        small = LifetimeBoundBuffer("small", 40, [0, 1])
+        huge = LifetimeBoundBuffer("huge", 4000, [0, 1])
+        result = {b.name: b for b in self.solve([small, huge], size=256)}
+        self.assertIsNone(result["huge"].address)
+        self.assertIn("capacity", result["huge"].spill_reason)
+        self.assertIsNotNone(result["small"].address)
+        self.assertIsNone(result["small"].spill_reason)
+
+    def test_inplace_child_shares_parent_address(self):
+        # In-place reuse is a placement-model feature (the merge relaxation of
+        # no-overlap), not a division feature, so it must still fire when there
+        # is no division to choose. Capacity fits only one of the two.
+        parent = LifetimeBoundBuffer("parent", 100, [0, 1])
+        child = LifetimeBoundBuffer("child", 100, [1, 2], in_place_parents=["parent"])
+        result = {b.name: b for b in self.solve([parent, child], size=150)}
+        self.assertIsNotNone(result["parent"].address)
+        self.assertEqual(result["parent"].address, result["child"].address)
+
+    def test_core_division_buffer_without_divisions_is_placement_only(self):
+        # ``_wrap`` dispatches on *having candidate divisions*, not on the class:
+        # a CoreDivisionBuffer with an empty candidate list has nothing to
+        # choose, so plan_layout treats it as placement-only instead of
+        # tripping the joint path's enumeration assert.
+        (buf,) = self.solve([CoreDivisionBuffer("x", 40, [0, 1])], size=256)
+        self.assertIsNotNone(buf.address)
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")

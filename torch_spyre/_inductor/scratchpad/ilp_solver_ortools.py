@@ -140,6 +140,22 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
 
 
+def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
+    """Enforce, when ``enforce_lit`` is true, that ``(src_div, dst_div)`` is
+    one of the ``compatible`` (i, j) pairs. With no compatible pairs the
+    relation is unsatisfiable, so ``enforce_lit`` is forced false."""
+    if not compatible:
+        model.Add(enforce_lit == 0)
+        return
+    pair_lits = []
+    for i, j in compatible:
+        lit = model.NewBoolVar("")
+        model.Add(src_div == i).OnlyEnforceIf(lit)
+        model.Add(dst_div == j).OnlyEnforceIf(lit)
+        pair_lits.append(lit)
+    model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
+
+
 @dataclass
 class _LifetimeBufferWithCpVars(Generic[_BufT]):
     """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
@@ -373,10 +389,26 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
-        # Per-buffer drop cause for the most recent solve ({buffer name: reason},
-        # spilled buffers only). The allocator reads this to populate its own
-        # ``reject_reasons`` so cpsat spills show up in the LX-pinning debug log.
-        self.spill_reasons: dict[str, str] = {}
+
+    def _wrap(
+        self, model: "cp_model.CpModel", buffer: LifetimeBoundBuffer
+    ) -> _LifetimeBufferWithCpVars:
+        """Bundle a *copy* of ``buffer`` with its CP-SAT vars, scaled into the
+        alignment units the solver works in.
+
+        A buffer carrying enumerated core divisions gets the joint wrapper (its
+        ``size`` is the total device footprint, divided down by the chosen
+        division); anything else -- a plain :class:`LifetimeBoundBuffer`, or a
+        :class:`CoreDivisionBuffer` with nothing to choose from -- gets the
+        placement-only wrapper, whose footprint is ``size`` as given."""
+        units = int(np.ceil(buffer.size / self.alignment))
+        if isinstance(buffer, CoreDivisionBuffer) and buffer.core_divisions:
+            return _CoreDivisionBufferWithCpVars(
+                replace(buffer, size=units), model, self._capacity_units
+            )
+        return _LifetimeBufferWithCpVars(
+            replace(buffer, size=units), model, self._capacity_units
+        )
 
     def plan_layout(
         self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
@@ -475,7 +507,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
     ) -> tuple[dict[str, LifetimeBoundBuffer], dict[str, str]]:
         children_of = self._get_children(tensors)
         self._add_inplace_relaxation(model, tensors)
-        forced_reasons = self._add_core_division(model, tensors, children_of)
+        self._add_core_division(model, tensors, children_of)
 
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
@@ -539,7 +571,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
                 logger.debug(
                     "[CP-SAT layout solver]   %s -> HBM: %s",
                     name,
-                    forced_reasons.get(name, _SOLVER_CHOSE_SPILL),
+                    final_tensors[name].spill_reason or _SOLVER_CHOSE_SPILL,
                 )
 
         return final_tensors, forced_reasons
@@ -677,10 +709,9 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
     ) -> dict[str, str]:
         """Pin out of LX the buffers whose non-residency is fixed up front: those
         whose *smallest* candidate footprint still exceeds capacity, and those
-        the allocator marked non-resident (``residency_reason`` set). Returns
-        ``name -> reason`` for the buffers it forces out (drop-cause debug
-        logging), using the allocator's specific reason when it has one."""
-        forced: dict[str, str] = {}
+        the allocator marked non-resident (``residency_reason`` set), recording
+        the drop cause on the buffer (using the allocator's specific reason when
+        it has one) so the solve can log why it went to HBM."""
         for sb in bufs.values():
             min_size = sb.min_footprint
             if min_size > self._capacity_units:
