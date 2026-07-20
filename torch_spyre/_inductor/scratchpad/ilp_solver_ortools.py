@@ -72,7 +72,7 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 import torch
 import numpy as np
 
@@ -116,14 +116,6 @@ class _PlacementUnit:
     end_time: int
     original_offset: int  # offset the solver chose, before bottom-justify
     justified_offset: int = 0  # final justified offset
-
-
-def _assert_core_divisions_enumerated(buffers: Sequence[CoreDivisionBuffer]):
-    """Assert that all buffers have enumerated core divisions."""
-    for b in buffers:
-        assert len(b.core_divisions) != 0, (
-            "All buffers must have at least 1 valid core division"
-        )
 
 
 def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
@@ -383,6 +375,39 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         # ``reject_reasons`` so cpsat spills show up in the LX-pinning debug log.
         self.spill_reasons: dict[str, str] = {}
 
+    def plan_layout(
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+    ) -> list[LifetimeBoundBuffer]:
+        """Place buffers on their already-fixed core divisions (placement-only).
+
+        Same model as :meth:`plan_layout_and_core_divisions` minus the joint
+        division choice: each buffer's footprint is its ``size``, so there is no
+        slicing gate on residency and no parallelism phase -- the solve reduces
+        to minimising HBM traffic under the 2D no-overlap with in-place reuse.
+        A :class:`CoreDivisionBuffer` handed in here still gets the full joint
+        treatment, since the allocator converts to that type before calling."""
+        assert all(isinstance(b, LifetimeBoundBuffer) for b in buffers), (
+            "plan_layout requires LifetimeBoundBuffers"
+        )
+        return cast(
+            "list[LifetimeBoundBuffer]", list(self._plan_layout_generic(buffers))
+        )
+
+    def plan_layout_and_core_divisions(
+        self, buffers: Sequence[CoreDivisionBuffer]
+    ) -> list[CoreDivisionBuffer]:
+        """Jointly choose each buffer's core division and its LX placement.
+
+        The full model described in the module docstring. Every buffer must
+        carry enumerated candidate divisions; the chosen index is written back
+        to ``chosen_division`` for the allocator to commit."""
+        assert all(isinstance(b, CoreDivisionBuffer) for b in buffers), (
+            "plan_layout_and_core_divisions requires CoreDivisionBuffers"
+        )
+        return cast(
+            "list[CoreDivisionBuffer]", list(self._plan_layout_generic(buffers))
+        )
+
     def _wrap(
         self, model: "cp_model.CpModel", buffer: LifetimeBoundBuffer
     ) -> _LifetimeBufferWithCpVars:
@@ -403,23 +428,18 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
             replace(buffer, size=units), model, self._capacity_units
         )
 
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
-        """Place buffers on their already-fixed core divisions (placement-only).
-
-        Same model as :meth:`plan_layout_and_core_divisions` minus the joint
-        division choice: each buffer's footprint is its ``size``, so there is no
-        slicing gate on residency and no parallelism phase -- the solve reduces
-        to minimising HBM traffic under the 2D no-overlap with in-place reuse.
-        A :class:`CoreDivisionBuffer` handed in here still gets the full joint
-        treatment, since the allocator converts to that type before calling."""
+    def _plan_layout_generic(
+        self,
+        buffers: Sequence[LifetimeBoundBuffer | CoreDivisionBuffer],
+        log_lx_usage: bool = False,
+    ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
         self.spill_reasons = {}
         if not buffers:
             return []
         assert all(b.address is None for b in buffers), (
             "Buffers cannot be previously or partially planned"
         )
+
         _assert_in_place_relationships(buffers)
 
         model = cp_model.CpModel()
@@ -440,46 +460,10 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         for b in buffers:
             sb = solved[b.name]
             b.address = None if sb.address is None else sb.address * self.alignment
+            if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
+                b.chosen_division = sb.chosen_division
         return list(buffers)
 
-    def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
-    ) -> list[CoreDivisionBuffer]:
-        """Jointly choose each buffer's core division and its LX placement.
-
-        The full model described in the module docstring. Every buffer must
-        carry enumerated candidate divisions; the chosen index is written back
-        to ``chosen_division`` for the allocator to commit."""
-        self.spill_reasons = {}
-        if not buffers:
-            return []
-        assert all(b.address is None for b in buffers), (
-            "Buffers cannot be previously or partially planned"
-        )
-        _assert_in_place_relationships(buffers)
-        _assert_core_divisions_enumerated(buffers)
-
-        model = cp_model.CpModel()
-        # Solve on copies so we never mutate the caller's buffers.
-        working = {b.name: self._wrap(model, b) for b in buffers}
-
-        solved, forced_reasons = self._run(model, working)
-        spilled = {name for name, sb in solved.items() if sb.address is None}
-        # Surface a drop cause for every spilled buffer: the pre-solve forced
-        # reason when we have one, otherwise the solver chose to spill it.
-        self.spill_reasons = {
-            name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL) for name in spilled
-        }
-
-        # Copy the solved results back onto the caller's buffers. Offsets come
-        # back in alignment units (the solver works in aligned units), so scale
-        # the address to bytes on the way out.
-        for b in buffers:
-            sb = solved[b.name]
-            assert isinstance(sb, CoreDivisionBuffer)
-            b.address = None if sb.address is None else sb.address * self.alignment
-            b.chosen_division = sb.chosen_division
-        return list(buffers)
 
     # ------------------------------------------------------------------
     # Model build + solve
