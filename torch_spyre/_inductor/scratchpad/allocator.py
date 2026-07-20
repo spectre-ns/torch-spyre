@@ -40,7 +40,6 @@ from torch_spyre._inductor.pass_utils import (
     op_read_writes,
     _prepare_per_core_view,
     _per_core_view_from_prep,
-    _per_core_view_on_buf,
 )
 from torch_spyre._inductor.work_division import enumerate_work_division_candidates
 from torch_spyre._inductor.errors import Unsupported
@@ -136,14 +135,6 @@ class ScratchpadAllocator:
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
         buffers = self._generate_buffers(graph)
-        # CoreDivisionBuffer subclasses LifetimeBoundBuffer and the placement
-        # solvers read only the base fields, so every solver accepts the converted
-        # buffers (LSP); convert unconditionally rather than probing the solver.
-        # The conversion keeps each buffer's already-per-core size and a trivial
-        # division, so the placement solvers see the same footprint as before while
-        # CpSatLayoutSolver additionally gets the parent-edge slicing matches (it
-        # requires core_divisions on every buffer).
-        buffers = _as_core_division_buffers(buffers, graph)
         assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
@@ -533,171 +524,6 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     """
     seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", None) or ({}, {})
     return CoreDivision(output_splits=dict(seed[0]), reduction_splits=dict(seed[1]))
-
-
-def _as_core_division_buffers(
-    buffers: Sequence[LifetimeBoundBuffer],
-    graph: GraphLowering,
-) -> list[CoreDivisionBuffer]:
-    """Convert plain ``LifetimeBoundBuffer``s to ``CoreDivisionBuffer``s for
-    solvers that require the richer type (e.g. :class:`CpSatLayoutSolver`).
-
-    ``CoreDivisionBuffer`` subclasses ``LifetimeBoundBuffer`` and the placement
-    solvers read only the base fields, so any solver can consume the result (LSP):
-    the caller always converts, regardless of which solver is configured. To stay
-    correct across both worlds -- the placement solvers use ``size`` directly as
-    the footprint, while ``CpSatLayoutSolver`` divides it by the chosen division's
-    ``output_partition`` -- ``size`` stays the already-per-core footprint
-    (``_build_bound_buffers`` divided by the op's pre-determined core division) and
-    each buffer gets a single *trivial* ``CoreDivision`` (empty splits,
-    ``output_partition == 1``). With one candidate the solver cannot re-divide the
-    buffer: it loses the joint core-division optimization path and merely *places*
-    the buffer on its fixed, pre-determined division (placement-only CP-SAT).
-
-    ``parents`` is populated with each op's read deps that are themselves
-    candidates, because CP-SAT scores residency per producer->consumer edge and
-    gates it on a slicing-compatible division: a buffer with no children, or any
-    child lacking a compatible pair, can never reside (see
-    ``_implicate_core_division``). Although each buffer's stored ``CoreDivision``
-    is trivial (for sizing, above), the match pairs are derived from the two ops'
-    *fixed* divisions (``op.op_it_space_splits``, read via ``_per_core_view_on_buf``
-    -- independent of the stored trivial ``CoreDivision``). Unlike the old
-    conversion -- which asserted every edge compatible with a blanket ``[(0, 0)]``
-    pair -- the pair is ``[(0, 0)]`` only when the producer's write-view and the
-    consumer's read-view slice the shared buffer identically (same per-core view,
-    same core count, no partial reduction). When the fixed divisions disagree --
-    which they may, since the upstream passes size each op independently -- the
-    edge gets an **empty** match list, so the producer falls back to HBM across it
-    (always correct) instead of being wrongly pinned to a slicing its consumer
-    does not read. An input parent (no producing op) keeps ``[(0, 0)]``: its clone
-    is laid out to match its consumer.
-
-    Reads by consumers that are *not* candidates -- ops filtered out of the LX
-    set, or graph outputs -- are counted in ``unallocated_reads`` instead: they
-    still read the buffer from LX when it resides (no output cloning needed for
-    an intermediate), so they justify pinning it even though no ``parents`` edge
-    represents them. This matches the greedy allocator, which pins any buffer
-    read more than once regardless of where its consumers live. Buffers that are
-    already ``CoreDivisionBuffer``s (e.g. from the joint allocator) pass through
-    unchanged.
-    """
-    candidate_names = {b.name for b in buffers}
-    op_by_name = {op.name: op for op in graph.operations}
-    # Memoizes _per_core_view_on_buf across the edge checks below; scoped to this
-    # graph (the key carries dep + buffer name).
-    view_cache: dict = {}
-
-    # Whole-graph consumer scan: every op that reads a buffer, candidate or not.
-    # Split below into candidate parents (edges) and unallocated reads.
-    consumers_of: dict[str, set[str]] = {}
-    for op in graph.operations:
-        for dep in op_read_writes(op).reads:
-            if dep.name != op.name:
-                consumers_of.setdefault(dep.name, set()).add(op.name)
-
-    def _edge_matches(consumer_op: Operation, parent: str) -> bool:
-        """True iff ``consumer_op`` reads ``parent`` with the same per-core slicing
-        the producer wrote it, under both ops' fixed divisions (the solver can only
-        pin ``parent`` across an edge whose divisions agree)."""
-        parent_op = op_by_name.get(parent)
-        if parent_op is None:
-            # Graph-input parent: no producing op to compare against; its clone is
-            # sliced to match this consumer, so treat the edge as compatible.
-            return True
-        write_dep = next(
-            (
-                w
-                for w in op_read_writes(parent_op).writes
-                if w.name == parent and hasattr(w, "index")
-            ),
-            None,
-        )
-        read_dep = next(
-            (
-                r
-                for r in op_read_writes(consumer_op).reads
-                if r.name == parent and hasattr(r, "index")
-            ),
-            None,
-        )
-        if write_dep is None or read_dep is None:
-            return False
-        prod_view, prod_partial, prod_ok = _per_core_view_on_buf(
-            parent_op, write_dep, parent, view_cache
-        )
-        cons_view, _cons_partial, cons_ok = _per_core_view_on_buf(
-            consumer_op, read_dep, parent, view_cache
-        )
-        return (
-            prod_ok
-            and cons_ok
-            and not prod_partial
-            and prod_view == cons_view
-            and _fixed_core_division(parent_op).cores_used
-            == _fixed_core_division(consumer_op).cores_used
-        )
-
-    converted: list[CoreDivisionBuffer] = []
-    for b in buffers:
-        if isinstance(b, CoreDivisionBuffer):
-            converted.append(b)
-            continue
-        op = op_by_name.get(b.name)
-        parents: list[str] = []
-        if op is not None:
-            for dep in op_read_writes(op).reads:
-                if (
-                    dep.name in candidate_names
-                    # don't list the buffer as it's own inplace parent
-                    and dep.name != b.name
-                    and dep.name not in parents
-                ):
-                    parents.append(dep.name)
-
-        # Compatibility is per-edge: [(0, 0)] only when the two ops' fixed
-        # divisions slice the shared buffer identically, else [] (no pinning).
-        cd_parent_matches = {
-            p: ([(0, 0)] if op is not None and _edge_matches(op, p) else [])
-            for p in parents
-        }
-        # Consumers the solver never sees as candidates (each counted once).
-        unallocated_reads = sum(
-            1 for c in consumers_of.get(b.name, ()) if c not in candidate_names
-        )
-        # Restrict in-place parents to candidates: the solver indexes its buffer
-        # dict by every merge parent, so a filtered-out parent would KeyError.
-        in_place = [p for p in b.in_place_parents if p in candidate_names]
-        # Restickify cross-frame barrier (see
-        # ``ScratchpadAllocator._residency_reason``): the hazard is one-sided --
-        # only a buffer a restickify *reads* must stay in HBM, because a per-core
-        # LX slice of the restickify output could otherwise need another core's
-        # slice of the input. Marked non-resident directly here so the CP-SAT
-        # solver force-spills it up front (placement=False), matching the joint
-        # path. The restickify's *output* is not barred: given the input is HBM it
-        # is a normal core-local write. TODO(follow-up): a precise cross-STL gate
-        # would relax even the read side for the core-local cases.
-        residency_reason: Optional[str] = None
-        if any(
-            c in op_by_name and _op_short_name(op_by_name[c]) == "restickify"
-            for c in consumers_of.get(b.name, ())
-        ):
-            residency_reason = "read by restickify (cross-frame barrier)"
-        converted.append(
-            CoreDivisionBuffer(
-                b.name,
-                b.size,
-                b.uses,
-                first_use_is_read=b.first_use_is_read,
-                address=b.address,
-                in_place_parents=in_place,
-                core_divisions=[CoreDivision()],
-                parents=parents,
-                cd_parent_matches=cd_parent_matches,
-                unallocated_reads=unallocated_reads,
-                residency_reason=residency_reason,
-            )
-        )
-    return converted
 
 
 DEFAULT_VARIANT_CAP = 6
