@@ -16,7 +16,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import sympy
 import torch
@@ -63,6 +63,11 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        CpSatLayoutSolver,
+    )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     clone_at_graph_boundaries,
@@ -1309,7 +1314,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Greedy fallback for when CP-SAT is unavailable (ortools not installed).
         self._fallback = ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
 
-        self.layout_planning: Optional[MemoryPlanSolver[CoreDivisionBuffer]]
+        # Annotated as the concrete solver rather than ``MemoryPlanSolver``: this
+        # allocator drives the *joint* entry point
+        # (``plan_layout_and_core_divisions``), which only ``CpSatLayoutSolver``
+        # offers. Quoted + TYPE_CHECKING-only so the runtime import stays lazy.
+        self.layout_planning: Optional["CpSatLayoutSolver"]
         try:
             # Imported lazily so this module (and the greedy path) load even when
             # ortools is absent: CpSatLayoutSolver.__init__ raises ImportError
@@ -1342,7 +1351,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
         buffers = self._generate_cd_buffers(graph, self._division_map(graph))
-        allocation = self.layout_planning.plan_layout(buffers)
+        allocation = self.layout_planning.plan_layout_and_core_divisions(buffers)
         # the divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when
         # the graph is updated with clones in ``_push_allocation``
