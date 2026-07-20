@@ -90,8 +90,8 @@ else:
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+    CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
-    MemoryPlanSolver,
     SolveError,
     BufferType,
     _assert_in_place_relationships,
@@ -363,7 +363,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.buffer.chosen_division = solver.Value(self.division)
 
 
-class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
     model (joint division, slicing-match residency gate, 2D no-overlap with
@@ -386,7 +386,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         super().__init__(size, alignment)
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
-        self._capacity_units = self.limit // self.alignment
+        self._capacity_units = self.size // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
 
@@ -411,7 +411,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         )
 
     def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
         """Place buffers on their already-fixed core divisions (placement-only).
 

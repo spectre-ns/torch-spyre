@@ -78,7 +78,7 @@ def _topological_sort(
     return result
 
 
-class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class FirstFitLayoutSolver(MemoryPlanSolver):
     """Allocates buffers by priority score, placing each in the first gap that fits.
 
     Buffers are sorted topologically (parents before children) with ties broken by ascending
@@ -90,7 +90,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
     free address gaps during its lifetime are computed; the buffer is placed at the start of the
     first gap large enough to hold it (rounded up to alignment). In-place reuse is attempted
     first: if a declared parent has already been placed and its address falls within a free gap,
-    the child inherits that address.  Buffers that cannot fit within self.limit are evicted
+    the child inherits that address.  Buffers that cannot fit within self.size are evicted
     (address=None).
     """
 
@@ -132,7 +132,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         for reuse, not conflicts).
         Pass 2: for each remaining gap, record which declared parents fit entirely within it.
         """
-        gaps: list[Gap] = [Gap(0, self.limit)]
+        gaps: list[Gap] = [Gap(0, self.size)]
         parent_names = set(buffer.in_place_parents)
 
         for other in placed:
@@ -176,7 +176,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         return None
 
     def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
         if not buffers:
             return []

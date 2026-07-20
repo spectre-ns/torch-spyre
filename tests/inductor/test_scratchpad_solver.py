@@ -18,6 +18,7 @@ import unittest
 from unittest import TestCase
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
@@ -100,7 +101,7 @@ def _addr_overlap(a, b) -> bool:
 
 
 class BaseLayoutSolverTests:
-    solver_class: type[MemoryPlanSolver[LifetimeBoundBuffer]] = None  # type: ignore[assignment]
+    solver_class: type[MemoryPlanSolver] = None  # type: ignore[assignment]
 
     def make_buffer(self, name, size, uses, **kwargs):
         """Build the buffer flavour the solver under test consumes.
@@ -497,6 +498,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
     ``check_result`` validates the packing is legal and at least as full as the
     heuristic rather than asserting exact addresses.
     """
+
+    # Narrower than the base suite's: these tests drive the joint entry point.
+    solver_class: type[CoreDivisionLayoutSolver] = None  # type: ignore[assignment]
 
     def make_buffer(self, name, size, uses, **kwargs):
         # The joint solver requires every buffer to carry at least one core

@@ -101,7 +101,7 @@ SolverInitialOption: TypeAlias = (
 SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto"]
 
 
-class SimulatedAnnealingLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
     """We can only do the full initialization when we know the list of buffers, so
     this class is just a shim to create the actual solver."""
 
@@ -120,12 +120,12 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         self.random = random
 
     def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
         _buffers = list(buffers)
         solver = SimulatedAnnealingSolverWithBuffers(
             _buffers,
-            self.limit,
+            self.size,
             self.alignment,
             initial=self.initial,
             schedule=self.schedule,

@@ -15,7 +15,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Generic, Optional, TypeVar
+from typing import Optional
 from abc import ABC, abstractmethod
 import math
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -207,36 +207,77 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
             size (int): Total scratchpad size in bytes. Buffers whose aligned
                 placement would exceed this limit are evicted (address=None).
             alignment (int): Byte alignment boundary. Every buffer is placed at
-                the next address that is a multiple of this value. Defaults to 128
-                (one Spyre stick).
+                the next address that is a multiple of this value. Defaults to
+                128 (one Spyre stick), which is also what every concrete solver
+                defaults to.
         """
-        self.limit = size
+        self.size = size
         self.alignment = alignment
+
+
+class MemoryPlanSolver(ABC, BasePlanSolver):
+    """Solves *placement*: where, if anywhere, each buffer lives in scratchpad.
+
+    Every solver implements this. Each buffer's core division is already fixed
+    by the time a placement-only solver sees it, so the buffer's ``size`` is the
+    footprint to pack. :class:`CoreDivisionLayoutSolver` extends the contract for
+    solvers that can also choose the division.
+    """
 
     @abstractmethod
     def plan_layout(
-        self, buffers: Sequence[_BufferT], log_lx_usage: bool = False
-    ) -> list[_BufferT]:
-        """
-        Utilizes an implementation defined algorithm to determine
-        if and where buffers should be placed in scratchpad memory based
-        on their attributes.
+        self, buffers: Sequence[LifetimeBoundBuffer]
+    ) -> list[LifetimeBoundBuffer]:
+        """Assign an LX address to each buffer that should reside in scratchpad.
+
+        Implementations set ``address`` on every buffer they place and leave it
+        ``None`` on every buffer they spill to HBM, then return the same buffers.
 
         ``buffers`` is a :class:`Sequence` (not ``list``) so a caller may pass a
         ``list`` of a *subtype* -- e.g. a ``list[CoreDivisionBuffer]`` to a solver
         declared over ``LifetimeBoundBuffer``; covariance lets that type-check.
 
         Args:
-            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
-            log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
+            buffers: The candidate buffers for memory planning.
 
         Returns:
-            list[_BufferT]: The set of buffers with their placements defined.
+            The same buffers, with their placements defined.
         """
-        pass
 
 
-class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class CoreDivisionLayoutSolver(MemoryPlanSolver):
+    """A solver that chooses each buffer's *core division* jointly with its
+    placement, rather than accepting a division fixed upstream.
+
+    The two decisions are coupled: the division sets the per-core footprint the
+    placement has to fit, and residency requires a producer and its consumers to
+    slice the shared buffer the same way. Solving them together lets a buffer
+    take the division that lets it reside.
+
+    Such a solver still satisfies :meth:`plan_layout` -- placement-only is the
+    special case where there is nothing to choose.
+    """
+
+    @abstractmethod
+    def plan_layout_and_core_divisions(
+        self, buffers: Sequence[CoreDivisionBuffer]
+    ) -> list[CoreDivisionBuffer]:
+        """Choose each buffer's core division and its LX placement together.
+
+        On top of the :meth:`plan_layout` contract, implementations write the
+        index of the chosen division back to ``chosen_division`` for the
+        allocator to commit.
+
+        Args:
+            buffers: Candidate buffers, each carrying its enumerated candidate
+                core divisions.
+
+        Returns:
+            The same buffers, with placements and chosen divisions defined.
+        """
+
+
+class GreedyLayoutSolver(MemoryPlanSolver):
     def __init__(self, size: int, alignment: int = 128):
         super().__init__(size, alignment)
         # `usage` tracks live placements during planning. It is specific to the
@@ -259,14 +300,14 @@ class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         assert all(x.address is not None for x in self.usage)
         curr_lo = self._get_lowest_addr_in_use()
         curr_hi = self._get_highest_addr_in_use()
-        if self.limit < size_needed:
+        if self.size < size_needed:
             return None
 
         if not self.usage or curr_lo >= size_needed:
             return 0
 
         address = math.ceil(curr_hi / self.alignment) * self.alignment
-        if address + size_needed <= self.limit:
+        if address + size_needed <= self.size:
             return address
 
         # Search for a gap between existing allocations
@@ -312,13 +353,13 @@ class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
                 self.usage.remove(buf)
 
     def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer]
     ) -> list[LifetimeBoundBuffer]:
         """Allocates addresses to the provided buffer list
 
         Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
-        allocated addresses with 0 -> `limit` where the maximum starting address of
-        buffers are at most `self.limit` - `LifetimeBoundBuffer.size` - 1. The algorithm
+        allocated addresses with 0 -> `size` where the maximum starting address of
+        buffers are at most `self.size` - `LifetimeBoundBuffer.size` - 1. The algorithm
         increments through logical time where time increments 1 unit for each
         step in a computation graph. At each step the lifetimes of all buffers are
         evaluated for allocation and deallocation based on its lifetime relative
@@ -369,24 +410,5 @@ class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
             for buffer in buffers:
                 if idx == buffer.start_time:
                     self._try_allocate(buffer)
-
-        if log_lx_usage and logger.isEnabledFor(10):  # logging.DEBUG
-            logger.debug("scratchpad limit: %d KB", self.limit // 1024)
-            for idx in range(sorted_times[0], sorted_times[-1]):
-                live = []
-                # Sum by distinct address: an in-place reuse places two buffers
-                # (a dying parent and its just-born child) at the same address
-                # for one overlapping tick, and the child's region is contained
-                # in the parent's. Counting both would double-count the shared
-                # slot, so track the max size per address and sum those.
-                size_by_addr: dict[int, int] = {}
-                for b in buffers:
-                    if b.address is not None and b.start_time <= idx < b.end_time:
-                        live.append(f"{b.name}_{b.size // 1024}KB@{hex(b.address)}")
-                        size_by_addr[b.address] = max(
-                            size_by_addr.get(b.address, 0), b.size
-                        )
-                used = sum(size_by_addr.values())
-                logger.debug("t=%d: %d KB  [%s]", idx, used // 1024, ", ".join(live))
 
         return list(buffers)
