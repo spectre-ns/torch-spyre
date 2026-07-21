@@ -404,7 +404,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         assert all(isinstance(b, CoreDivisionBuffer) for b in buffers), (
             "plan_layout_and_core_divisions requires CoreDivisionBuffers"
         )
-        assert (len(b.core_divisions) != 0 for b in buffers), (
+        assert all(len(b.core_divisions) != 0 for b in buffers), (
             "All buffers must have at least 1 valid core division"
         )
         return cast(
