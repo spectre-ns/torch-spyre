@@ -57,6 +57,14 @@ class LifetimeBoundBuffer:
     first_use_is_read: bool = False
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
+    # Why the buffer may not be made resident, or ``None`` if it may. A non-None
+    # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
+    # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
+    # is handed to the solver either way so it still participates in matching and
+    # in-place chains -- a forced-out consumer keeps its producers' residency
+    # viable instead of orphaning them. Only :class:`CpSatLayoutSolver` honours
+    # this; the gap heuristics ignore it, as they always have.
+    residency_reason: Optional[str] = None
 
     @property
     def start_time(self) -> int:
@@ -133,17 +141,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     chosen_division: Optional[int] = None
-    # Why the buffer may not be made resident, or ``None`` if it may. A non-None
-    # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
-    # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
-    # is handed to the solver either way so it participates in matching -- a
-    # forced-out consumer keeps its producers' residency viable instead of
-    # orphaning them.
-    residency_reason: Optional[str] = None
     # Count of reads of this buffer by consumers the solver never sees as
-    # candidates -- ops filtered out of the candidate set (e.g. under the
-    # placement-only conversion in ``_as_core_division_buffers``) or graph
-    # outputs. Such a consumer still reads this buffer *from LX* when it resides,
+    # candidates -- ops filtered out of the candidate set or graph outputs.
+    # Such a consumer still reads this buffer *from LX* when it resides,
     # so the read counts toward the buffer's spill cost even though no ``parents``
     # edge represents it, and it lets the buffer reside despite having no resident
     # (candidate) consumer to match a division against. Zero for the joint
@@ -152,11 +152,6 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # TODO: Drop this and make other solvers use the placement = False flag
     unallocated_reads: int = 0
     boundary: BufferType = BufferType.Intermediate
-
-    @property
-    def residency_allowed(self) -> bool:
-        """True iff the buffer carries no blocking ``residency_reason``."""
-        return self.residency_reason is None
 
 
 def _assert_in_place_relationships(
@@ -194,12 +189,15 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
     An abstract class for defining algorithms which solve
     memory layout patterns based on provided sizes, lifetimes.
 
-    Parameterized by the buffer type the solver consumes: the placement-only
-    solvers work on :class:`LifetimeBoundBuffer`, while :class:`CpSatLayoutSolver`
-    reads the richer :class:`CoreDivisionBuffer` metadata. Since
-    ``CoreDivisionBuffer`` subclasses ``LifetimeBoundBuffer``, the allocator always
-    hands over ``CoreDivisionBuffer``s and every solver accepts them (LSP): the
-    placement solvers simply ignore the extra fields.
+    Parameterized by the buffer type the solver consumes. ``plan_layout`` is the
+    placement-only contract and works on :class:`LifetimeBoundBuffer`s, which is
+    what :class:`ScratchpadAllocator` builds. The richer
+    :class:`CoreDivisionBuffer` metadata is *not* part of this interface: the
+    joint core-division + placement solve lives on
+    :meth:`CpSatLayoutSolver.plan_layout_and_core_divisions`, driven by the
+    co-optimizing allocator. Since ``CoreDivisionBuffer`` subclasses
+    ``LifetimeBoundBuffer``, a solver parameterized on the subtype still satisfies
+    the ``plan_layout`` contract for callers that do hand over the richer buffers.
     """
 
     def __init__(self, size: int, alignment: int = 128):
@@ -225,9 +223,8 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
         on their attributes.
 
         ``buffers`` is a :class:`Sequence` (not ``list``) so a caller may pass a
-        ``list`` of a *subtype* -- e.g. the allocator always converts to
-        ``CoreDivisionBuffer`` and hands the same list to any solver (LSP);
-        covariance lets that type-check against every solver's element type.
+        ``list`` of a *subtype* -- e.g. a ``list[CoreDivisionBuffer]`` to a solver
+        declared over ``LifetimeBoundBuffer``; covariance lets that type-check.
 
         Args:
             buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning

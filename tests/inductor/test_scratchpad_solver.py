@@ -801,9 +801,10 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
 
     This is the placement-only contract: the core division is already fixed
     upstream, so the footprint is just ``size`` and the division-dependent parts
-    of the model drop out. Unlike the joint path there is *no* residency gate --
+    of the model drop out. Unlike the joint path there is no *slicing* gate --
     a buffer needs no consumer edge to reside -- so the base suite's buffers
-    need no synthetic sink. ``make_buffer`` is inherited from
+    need no synthetic sink; the allocator's ``residency_reason`` bars still
+    apply on both paths. ``make_buffer`` is inherited from
     :class:`BaseLayoutSolverTests`, so every shared test below runs against
     plain buffers; only ``check_result`` is relaxed, because CP-SAT returns a
     valid packing rather than the gap heuristics' exact addresses.
@@ -845,6 +846,26 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         self.assertIsNotNone(result["small"].address)
         self.assertNotIn("small", solver.spill_reasons)
 
+    def test_allocator_residency_reason_is_honoured(self):
+        # The allocator's hard bars (e.g. the restickify cross-frame barrier)
+        # ride on the buffer itself, so the placement-only path force-spills the
+        # buffer up front and surfaces the allocator's reason verbatim -- the
+        # same treatment the joint path gives it.
+        barred = LifetimeBoundBuffer(
+            "barred",
+            40,
+            [0, 1],
+            residency_reason="read by restickify (cross-frame barrier)",
+        )
+        free = LifetimeBoundBuffer("free", 40, [0, 1])
+        solver = self.solver_class(256, 1)
+        result = {b.name: b for b in solver.plan_layout([barred, free])}
+        self.assertIsNone(result["barred"].address)
+        self.assertEqual(
+            solver.spill_reasons["barred"], "read by restickify (cross-frame barrier)"
+        )
+        self.assertIsNotNone(result["free"].address)
+
     def test_inplace_child_shares_parent_address(self):
         # In-place reuse is a placement-model feature (the merge relaxation of
         # no-overlap), not a division feature, so it must still fire when there
@@ -869,23 +890,23 @@ class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.
 
-    ``_as_core_division_buffers`` hands the solver single-fixed-division buffers
-    (the placement-only path: each buffer's only ``CoreDivision`` is the division
-    the upstream passes already committed, so the solver cannot re-divide -- it
-    only places) and records reads by consumers outside the candidate set
+    A caller may hand the solver single-fixed-division buffers (the
+    placement-only path: each buffer's only ``CoreDivision`` is the division the
+    upstream passes already committed, so the solver cannot re-divide -- it only
+    places) and record reads by consumers outside the candidate set
     (filtered-out ops, graph outputs) as ``unallocated_reads``. These check that
     such a read is enough to pin a buffer that has no candidate children, that a
     truly-unread buffer is still forced out, that an ordinary parent edge pins,
-    and -- since the conversion now derives each edge's match from the two ops'
-    fixed divisions -- that an edge whose divisions disagree (empty
-    ``cd_parent_matches``) does *not* pin the producer. All without a Spyre device.
+    and -- when each edge's match is derived from the two ops' fixed divisions
+    -- that an edge whose divisions disagree (empty ``cd_parent_matches``) does
+    *not* pin the producer. All without a Spyre device.
     """
 
     def _mk(self, name, uses, parents=(), unallocated_reads=0, matches=None):
-        """A single-fixed-division ``CoreDivisionBuffer`` as emitted by
-        ``_as_core_division_buffers``. ``matches`` overrides the per-parent match
-        pairs; by default every parent edge is compatible (``[(0, 0)]``), matching
-        a producer/consumer whose fixed divisions slice the buffer identically.
+        """A single-fixed-division ``CoreDivisionBuffer``. ``matches`` overrides
+        the per-parent match pairs; by default every parent edge is compatible
+        (``[(0, 0)]``), matching a producer/consumer whose fixed divisions slice
+        the buffer identically.
         """
         if matches is None:
             matches = {p: [(0, 0)] for p in parents}
@@ -923,8 +944,8 @@ class TestCpSatUnallocatedReads(TestCase):
 
     def test_mismatched_fixed_divisions_do_not_pin(self):
         """When the producer and consumer fixed divisions slice the shared buffer
-        differently, ``_as_core_division_buffers`` records an *empty* match for
-        that edge. The producer then has no compatible child and no unallocated
+        differently, the caller records an *empty* match for that edge.
+        The producer then has no compatible child and no unallocated
         read, so the solver declines to pin it (it falls back to HBM) even though
         the consumer still lists it as a parent."""
         pinned = self._pinned(

@@ -59,8 +59,10 @@ The same model also serves plain :class:`LifetimeBoundBuffer`s via
 calls). Those buffers carry no candidate divisions, so the division-dependent
 pieces -- per-core sizing, the slicing-match gate, the merge division gate and
 the phase-2 parallelism objective -- simply drop out: the footprint is the
-buffer's ``size``, any buffer may reside, and the solve reduces to minimising
-HBM traffic under the 2D no-overlap with in-place reuse. That specialisation
+buffer's ``size`` and the solve reduces to minimising HBM traffic under the 2D
+no-overlap with in-place reuse. Residency is then gated only by capacity and by
+the allocator's own ``residency_reason`` bars (which both paths honour, since
+that field lives on the base buffer). That specialisation
 lives on the buffer wrappers (``_LifetimeBufferWithCpVars`` and its joint
 subclass ``_CoreDivisionBufferWithCpVars``), so the solver methods below are
 written once against whichever wrapper ``_wrap`` chose.
@@ -72,7 +74,7 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 import torch
 import numpy as np
 
@@ -105,6 +107,10 @@ logger = logging.getLogger(__name__)
 # log and the reasons surfaced to the allocator agree.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
+# Buffer type the wrapper carries: the base placement wrapper holds any
+# LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
+_BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
+
 
 @dataclass
 class _PlacementUnit:
@@ -135,7 +141,7 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
 
 
 @dataclass
-class _LifetimeBufferWithCpVars:
+class _LifetimeBufferWithCpVars(Generic[_BufT]):
     """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
     solver creates for it, so one object flows through the solve instead of a
     buffer list shadowed by a parallel ``name -> {var}`` dict.
@@ -158,7 +164,7 @@ class _LifetimeBufferWithCpVars:
     model and the unit capacity ``M`` and creates only the variables here; the
     constraints tying them together are added by the solver methods."""
 
-    buffer: LifetimeBoundBuffer
+    buffer: _BufT
     model: "cp_model.CpModel"
     capacity_units: int
 
@@ -201,8 +207,10 @@ class _LifetimeBufferWithCpVars:
 
     @property
     def residency_reason(self) -> "str | None":
-        """Allocator-supplied reason the buffer may not reside, if any."""
-        return None
+        """Allocator-supplied reason the buffer may not reside, if any. Carried
+        on the buffer itself, so both entry points honour the allocator's
+        hard bars (e.g. the restickify cross-frame barrier) identically."""
+        return self.buffer.residency_reason
 
     def spill_cost(self, num_children: int) -> int:
         """Differential HBM traffic a spill adds over residency. Without the
@@ -233,7 +241,7 @@ class _LifetimeBufferWithCpVars:
 
 
 @dataclass
-class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
+class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer]):
     """The joint-model wrapper: a :class:`CoreDivisionBuffer` plus the vars for
     its chosen core division (``division``), the per-core footprint that
     division implies (``eff_size``) and its total core usage (``cores`` =
@@ -241,9 +249,8 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
 
     On top of the base placement vars it supplies the division-aware pieces of
     the model: the slicing-match residency gate, the division gate on an
-    in-place merge, and the edge-counted spill cost."""
-
-    buffer: CoreDivisionBuffer
+    in-place merge, and the edge-counted spill cost. The ``buffer`` field is
+    narrowed to :class:`CoreDivisionBuffer` via the base's type parameter."""
 
     def __post_init__(self):
         super().__post_init__()
@@ -280,10 +287,6 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
         return min(
             int(np.ceil(t.size / cd.output_partition)) for cd in t.core_divisions
         )
-
-    @property
-    def residency_reason(self) -> "str | None":
-        return self.buffer.residency_reason
 
     def spill_cost(self, num_children: int) -> int:
         b = self.buffer
@@ -384,11 +387,9 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         division choice: each buffer's footprint is its ``size``, so there is no
         slicing gate on residency and no parallelism phase -- the solve reduces
         to minimising HBM traffic under the 2D no-overlap with in-place reuse.
-        A :class:`CoreDivisionBuffer` handed in here still gets the full joint
-        treatment, since the allocator converts to that type before calling."""
-        assert all(isinstance(b, LifetimeBoundBuffer) for b in buffers), (
-            "plan_layout requires LifetimeBoundBuffers"
-        )
+        Dispatch is per buffer and keys on whether it carries candidate
+        divisions, not on its class, so a :class:`CoreDivisionBuffer` with an
+        empty candidate list is placed here rather than divided."""
         return cast(
             "list[LifetimeBoundBuffer]", list(self._plan_layout_generic(buffers))
         )
@@ -401,9 +402,6 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         The full model described in the module docstring. Every buffer must
         carry enumerated candidate divisions; the chosen index is written back
         to ``chosen_division`` for the allocator to commit."""
-        assert all(isinstance(b, CoreDivisionBuffer) for b in buffers), (
-            "plan_layout_and_core_divisions requires CoreDivisionBuffers"
-        )
         assert all(len(b.core_divisions) != 0 for b in buffers), (
             "All buffers must have at least 1 valid core division"
         )
@@ -494,9 +492,11 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
             sb.spill_cost(len(children_of.get(sb.name, []))) * (1 - sb.in_buffer)
             for sb in tensors.values()
         ]
+        status = cp_model.INFEASIBLE
         if hbm_terms:
             model.minimize(sum(hbm_terms))
-            if solver.Solve(model) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
             # Lock in the residency optimum (the traffic value, not just the
             # count) so phase 2 can never trade a spill for parallelism.
@@ -509,14 +509,14 @@ class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         # core usage so every buffer (resident or spilled) takes its most
         # parallel division. Placement-only buffers have no division to choose
         # and so contribute no term; with none at all there is nothing to
-        # maximize and the phase-1 solution stands (re-solved under the locked-in
-        # traffic bound so the extract below reads a consistent assignment).
+        # maximize, so we skip the re-solve and the extract below reads the
+        # phase-1 assignment still held by ``solver``.
         core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
         if core_terms:
             model.maximize(sum(core_terms))
-        status = solver.Solve(model)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise SolveError("CP-SAT memory planner found no feasible plan")
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                raise SolveError("CP-SAT memory planner found no feasible plan")
 
         final_tensors = self._extract(solver, tensors)
 

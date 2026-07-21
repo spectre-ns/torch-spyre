@@ -236,6 +236,30 @@ class ScratchpadAllocator:
 
         return [op for op in graph.operations if op.name not in drop_list]
 
+    def _restickify_barrier(
+        self, graph: GraphLowering, name: str, uses: Sequence[int]
+    ) -> Optional[str]:
+        """The ``residency_reason`` for a buffer a restickify *reads*, else ``None``.
+
+        Restickify moves the stick dimension: its per-core read frame and write
+        frame are transposes, so a per-core (LX) slice of the OUTPUT can need
+        bytes from another core's slice of the INPUT. The hazard is one-sided --
+        it only bites when the input is core-sliced in LX -- so only a buffer a
+        restickify reads is barred. The restickify's own output (the use whose op
+        *is* this buffer's producer) is a normal core-local write and takes the
+        ordinary residency path. Mirrors
+        ``CoOptimizingAllocator._residency_reason``'s restickify guard so both
+        allocators bar the same buffers; only :class:`CpSatLayoutSolver` acts on
+        it, the gap heuristics ignore ``residency_reason``.
+        """
+        if any(
+            graph.operations[u].name != name
+            and self._get_op_name(graph.operations[u]) == "restickify"
+            for u in uses
+        ):
+            return "read by restickify (cross-frame barrier)"
+        return None
+
     def _build_bound_buffers(
         self,
         graph: GraphLowering,
@@ -295,6 +319,7 @@ class ScratchpadAllocator:
                     uses,
                     first_use_is_read=False,
                     in_place_parents=parents,
+                    residency_reason=self._restickify_barrier(graph, output_name, uses),
                 )
             )
 
@@ -338,6 +363,9 @@ class ScratchpadAllocator:
                         uses,
                         first_use_is_read=True,
                         in_place_parents=[],
+                        residency_reason=self._restickify_barrier(
+                            graph, input_name, uses
+                        ),
                     )
                 )
 
@@ -1287,12 +1315,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         The solver optimizes a core division for all buffers, not just resident
         ones: a resident producer and its consumers are pinned by
-        ``_implicate_core_division`` to one shared slicing (so those commits are
-        mutually consistent), while a spilled buffer is free of that gate -- its
-        accesses round-trip through HBM, which re-slices on load -- so it takes
-        its most parallel candidate. Committing the spilled buffers' divisions
-        too lets the joint solve optimize work division across the whole graph,
-        not only the LX-resident region.
+        ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
+        slicing (so those commits are mutually consistent), while a spilled
+        buffer is free of that gate -- its accesses round-trip through HBM,
+        which re-slices on load -- so it takes its most parallel candidate.
+        Committing the spilled buffers' divisions too lets the joint solve
+        optimize work division across the whole graph, not only the LX-resident
+        region.
         """
         op_by_name = {op.name: op for op in graph.operations}
         for buf in allocation:
