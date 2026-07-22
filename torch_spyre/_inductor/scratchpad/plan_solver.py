@@ -181,10 +181,7 @@ def _assert_in_place_relationships(
                 )
 
 
-_BufferT = TypeVar("_BufferT", bound=LifetimeBoundBuffer)
-
-
-class MemoryPlanSolver(ABC, Generic[_BufferT]):
+class BasePlanSolver:
     """
     An abstract class for defining algorithms which solve
     memory layout patterns based on provided sizes, lifetimes.
@@ -211,7 +208,7 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
                 128 (one Spyre stick), which is also what every concrete solver
                 defaults to.
         """
-        self.size = size
+        self.limit = size
         self.alignment = alignment
 
 
@@ -300,14 +297,14 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         assert all(x.address is not None for x in self.usage)
         curr_lo = self._get_lowest_addr_in_use()
         curr_hi = self._get_highest_addr_in_use()
-        if self.size < size_needed:
+        if self.limit < size_needed:
             return None
 
         if not self.usage or curr_lo >= size_needed:
             return 0
 
         address = math.ceil(curr_hi / self.alignment) * self.alignment
-        if address + size_needed <= self.size:
+        if address + size_needed <= self.limit:
             return address
 
         # Search for a gap between existing allocations

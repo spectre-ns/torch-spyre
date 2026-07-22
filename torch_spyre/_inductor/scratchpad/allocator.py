@@ -142,7 +142,7 @@ class ScratchpadAllocator:
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
                     f" size={b.size // 1024} KB)"
                 )
-        record_scratchpad_allocation(self.layout_planning.size, allocation)
+        record_scratchpad_allocation(self.layout_planning.limit, allocation)
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
@@ -1019,7 +1019,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
                     f" size={b.size // 1024} KB)"
                 )
-        record_scratchpad_allocation(self.layout_planning.size, allocation)
+        record_scratchpad_allocation(self.layout_planning.limit, allocation)
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
@@ -1205,7 +1205,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             p.apply_pass(graph)
         buffers = self._generate_cd_buffers(graph, self._division_map(graph))
         allocation = self.layout_planning.plan_layout_and_core_divisions(buffers)
-        record_scratchpad_allocation(self.layout_planning.size, allocation)
+        record_scratchpad_allocation(self.layout_planning.limit, allocation)
         # the divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when
         # the graph is updated with clones in ``_push_allocation``

@@ -386,7 +386,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         super().__init__(size, alignment)
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
-        self._capacity_units = self.size // self.alignment
+        self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
 

@@ -125,7 +125,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         _buffers = list(buffers)
         solver = SimulatedAnnealingSolverWithBuffers(
             _buffers,
-            self.size,
+            self.limit,
             self.alignment,
             initial=self.initial,
             schedule=self.schedule,

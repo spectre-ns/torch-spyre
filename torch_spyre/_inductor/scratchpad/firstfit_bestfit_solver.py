@@ -132,7 +132,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         for reuse, not conflicts).
         Pass 2: for each remaining gap, record which declared parents fit entirely within it.
         """
-        gaps: list[Gap] = [Gap(0, self.size)]
+        gaps: list[Gap] = [Gap(0, self.limit)]
         parent_names = set(buffer.in_place_parents)
 
         for other in placed:
