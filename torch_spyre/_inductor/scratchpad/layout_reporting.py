@@ -28,6 +28,27 @@ from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
+# The floor for every drop cause: what a solver reports when it has nothing
+# more specific to say than that the buffer did not fit. Solvers may set a
+# sharper reason on the buffer instead; this is what fills in when they don't.
+NOT_PLACED = "solver could not place buffer"
+
+
+def spill_reasons(buffers: Sequence[LifetimeBoundBuffer]) -> dict[str, str]:
+    """Return ``name -> drop cause`` for every buffer the solve left in HBM.
+
+    The cause rides on the buffer's ``residency_reason``, whether the allocator
+    barred it up front or the solver left it unplaced. A solver that says
+    nothing means only that it could not place the buffer, so fill in
+    :data:`NOT_PLACED` here rather than at each allocator -- the gap heuristics
+    attribute nothing, and this keeps their reports in the same vocabulary as
+    CP-SAT's.
+    """
+    return {
+        b.name: b.residency_reason or NOT_PLACED for b in buffers if b.address is None
+    }
+
+
 def record_scratchpad_allocation(
     size: int, buffers: Sequence[LifetimeBoundBuffer]
 ) -> None:
@@ -40,6 +61,9 @@ def record_scratchpad_allocation(
     logger = get_inductor_logger("scratchpad.plan_solver")
     if not logger.isEnabledFor(logging.DEBUG) or not buffers:
         return
+
+    for name, reason in sorted(spill_reasons(buffers).items()):
+        logger.debug("%s -> HBM: %s", name, reason)
 
     # ``address`` can legitimately be 0, so test ``is not None`` -- an ``if
     # buf.address`` truthiness check would drop a buffer placed at the base.

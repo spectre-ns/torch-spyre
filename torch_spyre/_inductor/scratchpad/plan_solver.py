@@ -57,13 +57,16 @@ class LifetimeBoundBuffer:
     first_use_is_read: bool = False
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
-    # Why the buffer may not be made resident, or ``None`` if it may. A non-None
-    # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
-    # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
-    # is handed to the solver either way so it still participates in matching and
-    # in-place chains -- a forced-out consumer keeps its producers' residency
-    # viable instead of orphaning them. Only :class:`CpSatLayoutSolver` honours
-    # this; the gap heuristics ignore it, as they always have.
+    # Why the buffer is not resident in LX, or ``None`` when it is. Both layers
+    # write this one field rather than each keeping its own: the allocator sets
+    # it up front to bar a buffer from residency (e.g. "lx back gap", "single
+    # use"), and the solver sets it on any buffer it leaves unplaced -- generic
+    # (``layout_reporting.NOT_PLACED``) unless the solver can say something more
+    # specific. It therefore holds a reason exactly when ``address is None``.
+    # A barred buffer is still handed to the solver so it participates in
+    # matching and in-place chains -- a forced-out consumer keeps its producers'
+    # residency viable instead of orphaning them. Only :class:`CpSatLayoutSolver`
+    # honours an incoming bar; the gap heuristics ignore it, as they always have.
     residency_reason: Optional[str] = None
 
     @property

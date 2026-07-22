@@ -62,6 +62,7 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 )
 from torch_spyre._inductor.scratchpad.layout_reporting import (
     record_scratchpad_allocation,
+    spill_reasons,
 )
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
@@ -136,12 +137,7 @@ class ScratchpadAllocator:
         buffers = self._generate_buffers(graph)
         assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers)
-        for b in allocation:
-            if b.address is None:
-                self.reject_reasons[b.name] = (
-                    f"no room on scratchpad (t={b.start_time}-{b.end_time},"
-                    f" size={b.size // 1024} KB)"
-                )
+        self.reject_reasons.update(spill_reasons(allocation))
         record_scratchpad_allocation(self.layout_planning.limit, allocation)
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
@@ -1013,12 +1009,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         )
         assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers)
-        for b in allocation:
-            if b.address is None:
-                self.reject_reasons[b.name] = (
-                    f"no room on scratchpad (t={b.start_time}-{b.end_time},"
-                    f" size={b.size // 1024} KB)"
-                )
+        self.reject_reasons.update(spill_reasons(allocation))
         record_scratchpad_allocation(self.layout_planning.limit, allocation)
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
@@ -1205,6 +1196,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             p.apply_pass(graph)
         buffers = self._generate_cd_buffers(graph, self._division_map(graph))
         allocation = self.layout_planning.plan_layout_and_core_divisions(buffers)
+        self.reject_reasons.update(spill_reasons(allocation))
         record_scratchpad_allocation(self.layout_planning.limit, allocation)
         # the divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when
@@ -1214,13 +1206,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
-        # Surface the solver's per-buffer spill causes so the LX-pinning debug
-        # log reports why each buffer landed in HBM, on par with the other
-        # allocators. The CP-SAT solver records the cause on each buffer's
-        # ``spill_reason``; a resident buffer has none.
-        self.reject_reasons = {
-            b.name: b.spill_reason for b in allocation if b.spill_reason
-        }
         self._log_lx_pinning(graph)
 
     def _division_map(self, graph: GraphLowering) -> dict[str, list[CoreDivision]]:
