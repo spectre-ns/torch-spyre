@@ -59,7 +59,6 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    NOT_PLACED,
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
@@ -134,12 +133,6 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         )
         solver.solve()
         solver.finalize()
-        # ``address`` can legitimately be 0, so test ``is None``, never
-        # truthiness. The inner permutation solver works on deep copies, so the
-        # reason has to be stamped here, on the buffers actually returned.
-        for b in _buffers:
-            if b.address is None:
-                b.residency_reason = NOT_PLACED
         return _buffers
 
 

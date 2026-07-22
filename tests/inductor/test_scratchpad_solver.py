@@ -46,7 +46,6 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
-from torch_spyre._inductor.scratchpad.plan_solver import NOT_PLACED
 
 LARGE_SIZE = 512
 SMALL_SIZE = 10
@@ -173,26 +172,6 @@ class BaseLayoutSolverTests:
             self.make_buffer("buffer2", 4, [0, 1]),
         ]
         self.verify_layout(buffers, [0, 128, 256], LARGE_SIZE, ALIGNMENT)
-
-    def test_residency_reason_applied(self):
-        # Every solver owes the same invariant: a buffer it leaves in HBM
-        # carries a reason, and one it places carries none. The resident half
-        # matters as much as the spilled half -- `buffer0` lands at address 0,
-        # which a truthiness check (`if not b.address`) would mistake for
-        # unplaced and wrongly stamp as spilled.
-        buffers = [
-            self.make_buffer("buffer0", 7, [0, 1]),
-            self.make_buffer("buffer1", 4, [0, 1]),
-        ]
-        result = self.solve(buffers, size=SMALL_SIZE)
-        placed = [b for b in result if b.address is not None]
-        spilled = [b for b in result if b.address is None]
-        self.assertTrue(placed and spilled, "test needs one of each to be useful")
-        self.assertEqual([b.address for b in placed], [0])
-        for b in placed:
-            self.assertIsNone(b.residency_reason, f"{b.name} is resident")
-        for b in spilled:
-            self.assertEqual(b.residency_reason, NOT_PLACED, f"{b.name} is spilled")
 
     def test_simple_eviction_layout(self):
         # buffer1 is evicted because it won't fit; buffer2 reuses buffer0's space.
@@ -788,7 +767,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertIsNotNone(res["c"].address, "child should reside")
         self.assertEqual(res["gp"].address, res["c"].address)
 
-    def test_residency_reasons_recorded(self):
+    def test_spill_reasons_recorded(self):
         # The solver records a per-buffer drop cause for every spilled buffer so
         # the allocator can report why each landed in HBM. `leaf` has divisions
         # but no consumer edge (forced out by the residency gate); `big`'s
@@ -811,12 +790,11 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 
         # All three spill; each carries its own reason.
         self.assertIsNone(result["big"].address)
-        self.assertIn("capacity", result["big"].residency_reason)
-        self.assertIn("no consumer", result["leaf"].residency_reason)
-        # The reason travels on the buffer: exactly the spilled buffers carry
-        # one, and a resident buffer's is cleared back to None.
-        for buf in result.values():
-            self.assertEqual(buf.address is None, buf.residency_reason is not None)
+        self.assertIn("capacity", solver.spill_reasons["big"])
+        self.assertIn("no consumer", solver.spill_reasons["leaf"])
+        # Exactly the spilled buffers get an entry; a resident one has none.
+        for name, buf in result.items():
+            self.assertEqual(buf.address is None, name in solver.spill_reasons)
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
@@ -853,20 +831,22 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         # gate needs a consumer to match against). Placement-only has no such
         # gate, so the same buffer resides. This is the behavioural difference
         # between the two entry points.
-        (buf,) = self.solve([LifetimeBoundBuffer("solo", 40, [0, 1])], size=256)
+        solver = self.solver_class(256, 1)
+        (buf,) = solver.plan_layout([LifetimeBoundBuffer("solo", 40, [0, 1])])
         self.assertIsNotNone(buf.address)
-        self.assertIsNone(buf.residency_reason)
+        self.assertNotIn("solo", solver.spill_reasons)
 
     def test_spilled_buffer_records_reason(self):
         # A buffer larger than capacity is pinned out up front and carries the
         # capacity cause; the one that fits resides with no reason.
         small = LifetimeBoundBuffer("small", 40, [0, 1])
         huge = LifetimeBoundBuffer("huge", 4000, [0, 1])
-        result = {b.name: b for b in self.solve([small, huge], size=256)}
+        solver = self.solver_class(256, 1)
+        result = {b.name: b for b in solver.plan_layout([small, huge])}
         self.assertIsNone(result["huge"].address)
-        self.assertIn("capacity", result["huge"].residency_reason)
+        self.assertIn("capacity", solver.spill_reasons["huge"])
         self.assertIsNotNone(result["small"].address)
-        self.assertIsNone(result["small"].residency_reason)
+        self.assertNotIn("small", solver.spill_reasons)
 
     def test_allocator_residency_reason_is_honoured(self):
         # The allocator's hard bars (e.g. the restickify cross-frame barrier)
@@ -880,25 +860,13 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
             residency_reason="read by restickify (cross-frame barrier)",
         )
         free = LifetimeBoundBuffer("free", 40, [0, 1])
-        result = {b.name: b for b in self.solve([barred, free], size=256)}
+        solver = self.solver_class(256, 1)
+        result = {b.name: b for b in solver.plan_layout([barred, free])}
         self.assertIsNone(result["barred"].address)
         self.assertEqual(
-            result["barred"].residency_reason,
-            "read by restickify (cross-frame barrier)",
+            solver.spill_reasons["barred"], "read by restickify (cross-frame barrier)"
         )
         self.assertIsNotNone(result["free"].address)
-
-    def test_solver_chosen_spill_gets_the_generic_reason(self):
-        # Both buffers fit individually and neither is barred, so nothing can
-        # attribute a cause up front -- the search simply cannot keep both. That
-        # is the floor case: whichever one it drops reports NOT_PLACED rather
-        # than the solver inventing a more specific story.
-        a = LifetimeBoundBuffer("a", 100, [0, 2])
-        b = LifetimeBoundBuffer("b", 100, [0, 2])
-        result = self.solve([a, b], size=150)
-        spilled = [buf for buf in result if buf.address is None]
-        self.assertEqual(len(spilled), 1)
-        self.assertEqual(spilled[0].residency_reason, NOT_PLACED)
 
     def test_inplace_child_shares_parent_address(self):
         # In-place reuse is a placement-model feature (the merge relaxation of

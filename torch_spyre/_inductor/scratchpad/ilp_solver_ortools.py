@@ -89,7 +89,6 @@ else:
         cp_model = None
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    NOT_PLACED,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
@@ -101,6 +100,12 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 __all__ = ["CpSatLayoutSolver"]
 
 logger = logging.getLogger(__name__)
+
+# Drop cause for a buffer the solver chose to spill (rather than one pinned out
+# up front by _add_core_division): it fit but residency gave no benefit, or
+# there was no room once higher-value buffers were placed. Shared so the DEBUG
+# log and the reasons surfaced to the allocator agree.
+_SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
 # Buffer type the wrapper carries: the base placement wrapper holds any
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
@@ -424,6 +429,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self,
         buffers: Sequence[LifetimeBoundBuffer],
     ) -> list[LifetimeBoundBuffer]:
+        self.spill_reasons = {}
         if not buffers:
             return []
         assert all(b.address is None for b in buffers), (
@@ -435,7 +441,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model = cp_model.CpModel()
         # Solve on copies so we never mutate the caller's buffers.
         working = {b.name: self._wrap(model, b) for b in buffers}
-        solved = self._run(model, working)
+
+        solved, forced_reasons = self._run(model, working)
+        spilled = {name for name, sb in solved.items() if sb.address is None}
+        # Surface a drop cause for every spilled buffer: the pre-solve forced
+        # reason when we have one, otherwise the solver chose to spill it.
+        self.spill_reasons = {
+            name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL) for name in spilled
+        }
 
         # Copy the solved results back onto the caller's buffers. Offsets come
         # back in alignment units (the solver works in aligned units), so scale
@@ -443,7 +456,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         for b in buffers:
             sb = solved[b.name]
             b.address = None if sb.address is None else sb.address * self.alignment
-            b.residency_reason = sb.residency_reason
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
         return list(buffers)
@@ -455,10 +467,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self,
         model: "cp_model.CpModel",
         tensors: dict[str, _LifetimeBufferWithCpVars],
-    ) -> dict[str, LifetimeBoundBuffer]:
+    ) -> tuple[dict[str, LifetimeBoundBuffer], dict[str, str]]:
         children_of = self._get_children(tensors)
         self._add_inplace_relaxation(model, tensors)
-        self._add_core_division(model, tensors, children_of)
+        forced_reasons = self._add_core_division(model, tensors, children_of)
 
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
@@ -504,10 +516,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         final_tensors = self._extract(solver, tensors)
 
         if logger.isEnabledFor(logging.DEBUG):
-            # Solver-specific stats only. The per-buffer drop causes ride on the
-            # buffers' ``residency_reason`` and are reported once, for every
-            # allocator alike, by ``layout_reporting``.
-            spilled = [t for t in final_tensors.values() if t.address is None]
+            spilled = [n for n, t in final_tensors.items() if t.address is None]
             logger.debug(
                 "[CP-SAT layout solver] tensors=%d resident=%d %s=%d "
                 "status=%s walltime=%.2f ms",
@@ -518,8 +527,17 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 solver.StatusName(status),
                 solver.WallTime() * 1e3,
             )
+            # Per-buffer drop cause: a pre-solve forced reason when we have one,
+            # otherwise the solver chose to spill it (residency gave no benefit,
+            # or there was no room once higher-value buffers were placed).
+            for name in sorted(spilled):
+                logger.debug(
+                    "[CP-SAT layout solver]   %s -> HBM: %s",
+                    name,
+                    final_tensors[name].spill_reason or _SOLVER_CHOSE_SPILL,
+                )
 
-        return final_tensors
+        return final_tensors, forced_reasons
 
     def _add_inplace_relaxation(
         self,
@@ -651,42 +669,43 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
-    ) -> None:
+    ) -> dict[str, str]:
         """Pin out of LX the buffers whose non-residency is fixed up front: those
         whose *smallest* candidate footprint still exceeds capacity, and those
-        the allocator already barred. Both leave a ``residency_reason`` on the
-        buffer for the report -- an allocator-barred buffer arrives carrying its
-        own, which is the more actionable of the two and so is left alone; only
-        the capacity case has a cause to record."""
+        the allocator marked non-resident (``residency_reason`` set), recording
+        the drop cause on the buffer (using the allocator's specific reason when
+        it has one) so the solve can log why it went to HBM."""
+        forced: dict[str, str] = {}
         for sb in bufs.values():
-            barred = sb.residency_reason is not None
-            oversized = sb.min_footprint > self._capacity_units
-            if oversized and not barred:
-                sb.buffer.residency_reason = (
-                    f"min per-core footprint {sb.min_footprint} > LX capacity "
+            min_size = sb.min_footprint
+            if min_size > self._capacity_units:
+                forced[sb.name] = (
+                    f"min per-core footprint {min_size} > LX capacity "
                     f"{self._capacity_units} (alignment units)"
                 )
-            if oversized or barred:
                 model.add(sb.in_buffer == 0)
+            elif sb.residency_reason is not None:
+                forced[sb.name] = sb.residency_reason
+                model.add(sb.in_buffer == 0)
+        return forced
 
     def _add_core_division(
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
-    ) -> None:
-        """Wire up forced spills and the per-buffer residency gate, leaving a
-        ``residency_reason`` on every buffer pinned non-resident up front so the
-        report can say why each was dropped to HBM. In the joint model the gate
-        is the slicing match, driven entirely by the precomputed
+    ) -> dict[str, str]:
+        """Wire up forced spills and the per-buffer residency gate. Returns
+        ``name -> reason`` for every buffer pinned non-resident up front, so the
+        solve can log why each buffer was dropped to HBM. In the joint model the
+        gate is the slicing match, driven entirely by the precomputed
         ``cd_parent_matches`` pairs; placement-only buffers have no gate."""
-        self._trim_oversized_tensors(model, bufs)
+        forced = self._trim_oversized_tensors(model, bufs)
         for sb in bufs.values():
             why = sb.constrain_residency(model, children_of.get(sb.name, []), bufs)
-            # A buffer barred by the allocator, or by the capacity trim above,
-            # already carries the reason that actually decided it.
-            if why is not None and sb.buffer.residency_reason is None:
-                sb.buffer.residency_reason = why
+            if why is not None:
+                forced.setdefault(sb.name, why)
+        return forced
 
     # ------------------------------------------------------------------
     # Extract
@@ -701,9 +720,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         Every buffer gets its ``chosen_division`` (a no-op for a placement-only
         buffer, whose division was fixed upstream) and, when resident, its LX
         ``address`` (in alignment units, as the solver works them; the caller
-        scales to bytes). A spilled buffer gets ``address = None`` and a
-        ``residency_reason``: whatever barred it up front if anything did,
-        otherwise the generic :data:`NOT_PLACED`. When
+        scales to bytes). A spilled buffer gets ``address = None``. When
         bottom_justify is set, each in-place-merged placement unit is slid down
         to the lowest free address (preserving merges, never raising the
         peak)."""
@@ -758,17 +775,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             sb.record_division(solver)
             if name in spilled:
                 t.address = None
-                # Nothing barred it up front, so the search itself dropped it --
-                # residency bought nothing, or there was no room left once the
-                # higher-value buffers were placed. Neither is worth a distinct
-                # string; the report only needs "the solver didn't place it".
-                if t.residency_reason is None:
-                    t.residency_reason = NOT_PLACED
             else:
                 t.address = offsets[name]
-                # Resident and spilled are mutually exclusive: the field reads as
-                # "why is this in HBM", so never leave a stale reason behind.
-                t.residency_reason = None
         return by_name
 
     @staticmethod

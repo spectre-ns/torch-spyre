@@ -18,7 +18,6 @@ from dataclasses import dataclass, field, replace
 from typing import Optional, Callable
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    NOT_PLACED,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
     _assert_in_place_relationships,
@@ -222,11 +221,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
                 if gap is not None:
                     buffer.address = round_up_to_alignment(gap.start, self.alignment)
                     names_to_addresses[buffer.name] = buffer.address
-        # ``address`` can legitimately be 0 (the gap at the base of the
-        # scratchpad), so test ``is None``, never truthiness.
-        for b in buffers:
-            if b.address is None:
-                b.residency_reason = NOT_PLACED
+
         return list(buffers)
 
 
