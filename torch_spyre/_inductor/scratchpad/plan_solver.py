@@ -12,16 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
-import math
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from enum import Enum
 
 logger = get_inductor_logger("scratchpad.plan_solver")
+
+# The floor for every drop cause: what a solver reports when it has nothing more
+# specific to say than that the buffer did not fit. Solvers that can attribute a
+# sharper cause set that on the buffer instead. Defined here, alongside the
+# buffer whose ``residency_reason`` it fills, so the solvers can reach it
+# without importing the reporting layer (which imports *them*).
+NOT_PLACED = "solver could not place buffer"
 
 
 class SolveError(Exception):
@@ -410,5 +416,11 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             for buffer in buffers:
                 if idx == buffer.start_time:
                     self._try_allocate(buffer)
+
+        # ``address`` can legitimately be 0 -- it is the *first* placement this
+        # solver makes -- so test ``is None``, never truthiness.
+        for b in buffers:
+            if b.address is None:
+                b.residency_reason = NOT_PLACED
 
         return list(buffers)

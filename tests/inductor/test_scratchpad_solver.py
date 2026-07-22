@@ -46,10 +46,7 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
-from torch_spyre._inductor.scratchpad.layout_reporting import (
-    NOT_PLACED,
-    spill_reasons,
-)
+from torch_spyre._inductor.scratchpad.plan_solver import NOT_PLACED
 
 LARGE_SIZE = 512
 SMALL_SIZE = 10
@@ -176,6 +173,26 @@ class BaseLayoutSolverTests:
             self.make_buffer("buffer2", 4, [0, 1]),
         ]
         self.verify_layout(buffers, [0, 128, 256], LARGE_SIZE, ALIGNMENT)
+
+    def test_residency_reason_set_exactly_when_spilled(self):
+        # Every solver owes the same invariant: a buffer it leaves in HBM
+        # carries a reason, and one it places carries none. The resident half
+        # matters as much as the spilled half -- `buffer0` lands at address 0,
+        # which a truthiness check (`if not b.address`) would mistake for
+        # unplaced and wrongly stamp as spilled.
+        buffers = [
+            self.make_buffer("buffer0", 7, [0, 1]),
+            self.make_buffer("buffer1", 4, [0, 1]),
+        ]
+        result = self.solve(buffers, size=SMALL_SIZE)
+        placed = [b for b in result if b.address is not None]
+        spilled = [b for b in result if b.address is None]
+        self.assertTrue(placed and spilled, "test needs one of each to be useful")
+        self.assertEqual([b.address for b in placed], [0])
+        for b in placed:
+            self.assertIsNone(b.residency_reason, f"{b.name} is resident")
+        for b in spilled:
+            self.assertEqual(b.residency_reason, NOT_PLACED, f"{b.name} is spilled")
 
     def test_simple_eviction_layout(self):
         # buffer1 is evicted because it won't fit; buffer2 reuses buffer0's space.
@@ -976,20 +993,6 @@ class TestCpSatUnallocatedReads(TestCase):
 
 class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
     solver_class = GreedyLayoutSolver
-
-    def test_unattributed_spill_reports_the_generic_reason(self):
-        # The gap heuristics never set a reason on a buffer they evict, so the
-        # fallback in ``spill_reasons`` is what keeps their reports in the same
-        # vocabulary CP-SAT uses -- the allocator needs no per-solver special
-        # case to say why a buffer went to HBM.
-        buffers = [
-            LifetimeBoundBuffer("buffer0", 7, [0, 1]),
-            LifetimeBoundBuffer("buffer1", 4, [0, 1]),
-        ]
-        result = self.solve(buffers, size=SMALL_SIZE)
-        self.assertIsNone(result[1].address)
-        self.assertIsNone(result[1].residency_reason)
-        self.assertEqual(spill_reasons(result), {"buffer1": NOT_PLACED})
 
 
 class TestSimulatedAnnealingLayoutSolver(

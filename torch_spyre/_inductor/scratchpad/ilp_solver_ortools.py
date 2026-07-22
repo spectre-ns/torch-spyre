@@ -89,6 +89,7 @@ else:
         cp_model = None
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    NOT_PLACED,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
@@ -96,8 +97,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     _assert_in_place_relationships,
 )
-
-from torch_spyre._inductor.scratchpad.layout_reporting import NOT_PLACED
 
 __all__ = ["CpSatLayoutSolver"]
 
