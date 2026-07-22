@@ -122,7 +122,7 @@ class ScratchpadAllocator:
         self.reject_reasons: dict[str, str] = {}
         self.pre_optimization_passes = pre_optimization_passes
         self.post_optimization_passes = post_optimization_passes
-        self.layout_planning: Optional[MemoryPlanSolver[Any]] = layout_planning
+        self.layout_planning: Optional[MemoryPlanSolver] = layout_planning
 
     def plan_allocation(self, graph: GraphLowering):
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.

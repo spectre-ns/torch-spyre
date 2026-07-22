@@ -15,7 +15,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Generic, Optional, TypeVar
+from typing import Optional
 from abc import ABC, abstractmethod
 import math
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -181,23 +181,17 @@ def _assert_in_place_relationships(
                 )
 
 
-_BufferT = TypeVar("_BufferT", bound=LifetimeBoundBuffer)
-
-
-class MemoryPlanSolver(ABC, Generic[_BufferT]):
+class MemoryPlanSolver(ABC):
     """
     An abstract class for defining algorithms which solve
     memory layout patterns based on provided sizes, lifetimes.
 
-    Parameterized by the buffer type the solver consumes. ``plan_layout`` is the
-    placement-only contract and works on :class:`LifetimeBoundBuffer`s, which is
-    what :class:`ScratchpadAllocator` builds. The richer
-    :class:`CoreDivisionBuffer` metadata is *not* part of this interface: the
-    joint core-division + placement solve lives on
+    ``plan_layout`` is the placement-only contract and works on
+    :class:`LifetimeBoundBuffer`s, which is what :class:`ScratchpadAllocator`
+    builds. The richer :class:`CoreDivisionBuffer` metadata is *not* part of this
+    interface: the joint core-division + placement solve lives on
     :meth:`CpSatLayoutSolver.plan_layout_and_core_divisions`, driven by the
-    co-optimizing allocator. Since ``CoreDivisionBuffer`` subclasses
-    ``LifetimeBoundBuffer``, a solver parameterized on the subtype still satisfies
-    the ``plan_layout`` contract for callers that do hand over the richer buffers.
+    co-optimizing allocator.
     """
 
     def __init__(self, size: int, alignment: int = 128):
@@ -215,28 +209,30 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
 
     @abstractmethod
     def plan_layout(
-        self, buffers: Sequence[_BufferT], log_lx_usage: bool = False
-    ) -> list[_BufferT]:
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+    ) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
         if and where buffers should be placed in scratchpad memory based
         on their attributes.
 
-        ``buffers`` is a :class:`Sequence` (not ``list``) so a caller may pass a
-        ``list`` of a *subtype* -- e.g. a ``list[CoreDivisionBuffer]`` to a solver
-        declared over ``LifetimeBoundBuffer``; covariance lets that type-check.
+        ``buffers`` is a :class:`Sequence` (not ``list``) because ``Sequence`` is
+        covariant in its element type: that lets a caller hand over a
+        ``list[CoreDivisionBuffer]`` -- a subtype of ``LifetimeBoundBuffer`` -- and
+        still type-check.
 
         Args:
-            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
+            buffers (Sequence[LifetimeBoundBuffer]): The set of candidate buffers
+                for memory planning
             log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
-            list[_BufferT]: The set of buffers with their placements defined.
+            list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
         """
         pass
 
 
-class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class GreedyLayoutSolver(MemoryPlanSolver):
     def __init__(self, size: int, alignment: int = 128):
         super().__init__(size, alignment)
         # `usage` tracks live placements during planning. It is specific to the

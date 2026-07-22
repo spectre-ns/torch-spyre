@@ -100,7 +100,7 @@ def _addr_overlap(a, b) -> bool:
 
 
 class BaseLayoutSolverTests:
-    solver_class: type[MemoryPlanSolver[LifetimeBoundBuffer]] = None  # type: ignore[assignment]
+    solver_class: type[MemoryPlanSolver] = None  # type: ignore[assignment]
 
     def make_buffer(self, name, size, uses, **kwargs):
         """Build the buffer flavour the solver under test consumes.

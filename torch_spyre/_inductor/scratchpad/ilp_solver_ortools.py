@@ -347,7 +347,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.buffer.chosen_division = solver.Value(self.division)
 
 
-class CpSatLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class CpSatLayoutSolver(MemoryPlanSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
     model (joint division, slicing-match residency gate, 2D no-overlap with
