@@ -174,7 +174,7 @@ class BaseLayoutSolverTests:
         ]
         self.verify_layout(buffers, [0, 128, 256], LARGE_SIZE, ALIGNMENT)
 
-    def test_residency_reason_set_exactly_when_spilled(self):
+    def test_residency_reason_applied(self):
         # Every solver owes the same invariant: a buffer it leaves in HBM
         # carries a reason, and one it places carries none. The resident half
         # matters as much as the spilled half -- `buffer0` lands at address 0,
