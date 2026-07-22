@@ -120,7 +120,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         self.random = random
 
     def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer]
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         _buffers = list(buffers)
         solver = SimulatedAnnealingSolverWithBuffers(

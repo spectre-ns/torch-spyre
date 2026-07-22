@@ -375,7 +375,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self._bottom_justify = bottom_justify
 
     def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer]
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         """Place buffers on their already-fixed core divisions (placement-only).
 

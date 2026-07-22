@@ -60,9 +60,6 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
-from torch_spyre._inductor.scratchpad.layout_reporting import (
-    record_scratchpad_allocation,
-)
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
@@ -135,14 +132,13 @@ class ScratchpadAllocator:
             p.apply_pass(graph)
         buffers = self._generate_buffers(graph)
         assert self.layout_planning is not None
-        allocation = self.layout_planning.plan_layout(buffers)
+        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
                 self.reject_reasons[b.name] = (
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
                     f" size={b.size // 1024} KB)"
                 )
-        record_scratchpad_allocation(self.layout_planning.limit, allocation)
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
@@ -1012,14 +1008,13 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
             lifetimes=None if clone_inserted else search_lifetimes,
         )
         assert self.layout_planning is not None
-        allocation = self.layout_planning.plan_layout(buffers)
+        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
                 self.reject_reasons[b.name] = (
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
                     f" size={b.size // 1024} KB)"
                 )
-        record_scratchpad_allocation(self.layout_planning.limit, allocation)
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
@@ -1205,7 +1200,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             p.apply_pass(graph)
         buffers = self._generate_cd_buffers(graph, self._division_map(graph))
         allocation = self.layout_planning.plan_layout_and_core_divisions(buffers)
-        record_scratchpad_allocation(self.layout_planning.limit, allocation)
         # the divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when
         # the graph is updated with clones in ``_push_allocation``
