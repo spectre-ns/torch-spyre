@@ -788,11 +788,13 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             b.name: b for b in solver.plan_layout_and_core_divisions([leaf, big, C])
         }
 
-        # All three spill; each carries its own reason.
+        # All three spill; each carries a reason keyed by buffer name.
         self.assertIsNone(result["big"].address)
+        self.assertIn("big", solver.spill_reasons)
         self.assertIn("capacity", solver.spill_reasons["big"])
+        self.assertIn("leaf", solver.spill_reasons)
         self.assertIn("no consumer", solver.spill_reasons["leaf"])
-        # Exactly the spilled buffers get an entry; a resident one has none.
+        # A resident buffer gets no spill reason.
         for name, buf in result.items():
             self.assertEqual(buf.address is None, name in solver.spill_reasons)
 

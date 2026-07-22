@@ -242,6 +242,38 @@ class MemoryPlanSolver(ABC, BasePlanSolver):
         """
 
 
+class CoreDivisionLayoutSolver(MemoryPlanSolver):
+    """A solver that chooses each buffer's *core division* jointly with its
+    placement, rather than accepting a division fixed upstream.
+
+    The two decisions are coupled: the division sets the per-core footprint the
+    placement has to fit, and residency requires a producer and its consumers to
+    slice the shared buffer the same way. Solving them together lets a buffer
+    take the division that lets it reside.
+
+    Such a solver still satisfies :meth:`plan_layout` -- placement-only is the
+    special case where there is nothing to choose.
+    """
+
+    @abstractmethod
+    def plan_layout_and_core_divisions(
+        self, buffers: Sequence[CoreDivisionBuffer]
+    ) -> list[CoreDivisionBuffer]:
+        """Choose each buffer's core division and its LX placement together.
+
+        On top of the :meth:`plan_layout` contract, implementations write the
+        index of the chosen division back to ``chosen_division`` for the
+        allocator to commit.
+
+        Args:
+            buffers: Candidate buffers, each carrying its enumerated candidate
+                core divisions.
+
+        Returns:
+            The same buffers, with placements and chosen divisions defined.
+        """
+
+
 class GreedyLayoutSolver(MemoryPlanSolver):
     def __init__(self, size: int, alignment: int = 128):
         super().__init__(size, alignment)
@@ -323,8 +355,8 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         """Allocates addresses to the provided buffer list
 
         Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
-        allocated addresses with 0 -> `size` where the maximum starting address of
-        buffers are at most `self.size` - `LifetimeBoundBuffer.size` - 1. The algorithm
+        allocated addresses with 0 -> `limit` where the maximum starting address of
+        buffers are at most `self.limit` - `LifetimeBoundBuffer.size` - 1. The algorithm
         increments through logical time where time increments 1 unit for each
         step in a computation graph. At each step the lifetimes of all buffers are
         evaluated for allocation and deallocation based on its lifetime relative

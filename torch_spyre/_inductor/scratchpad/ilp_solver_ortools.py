@@ -373,6 +373,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
+        # Per-buffer drop cause for the most recent solve ({buffer name: reason},
+        # spilled buffers only). The allocator reads this to populate its own
+        # ``reject_reasons`` so cpsat spills show up in the LX-pinning debug log.
+        self.spill_reasons: dict[str, str] = {}
 
     def plan_layout(
         self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
@@ -427,8 +431,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     def _plan_layout_generic(
         self,
-        buffers: Sequence[LifetimeBoundBuffer],
-    ) -> list[LifetimeBoundBuffer]:
+        buffers: Sequence[LifetimeBoundBuffer | CoreDivisionBuffer],
+        log_lx_usage: bool = False,
+    ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
         self.spill_reasons = {}
         if not buffers:
             return []
@@ -534,7 +539,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 logger.debug(
                     "[CP-SAT layout solver]   %s -> HBM: %s",
                     name,
-                    final_tensors[name].spill_reason or _SOLVER_CHOSE_SPILL,
+                    forced_reasons.get(name, _SOLVER_CHOSE_SPILL),
                 )
 
         return final_tensors, forced_reasons
@@ -672,9 +677,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     ) -> dict[str, str]:
         """Pin out of LX the buffers whose non-residency is fixed up front: those
         whose *smallest* candidate footprint still exceeds capacity, and those
-        the allocator marked non-resident (``residency_reason`` set), recording
-        the drop cause on the buffer (using the allocator's specific reason when
-        it has one) so the solve can log why it went to HBM."""
+        the allocator marked non-resident (``residency_reason`` set). Returns
+        ``name -> reason`` for the buffers it forces out (drop-cause debug
+        logging), using the allocator's specific reason when it has one."""
         forced: dict[str, str] = {}
         for sb in bufs.values():
             min_size = sb.min_footprint

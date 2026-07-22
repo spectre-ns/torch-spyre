@@ -90,7 +90,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
     free address gaps during its lifetime are computed; the buffer is placed at the start of the
     first gap large enough to hold it (rounded up to alignment). In-place reuse is attempted
     first: if a declared parent has already been placed and its address falls within a free gap,
-    the child inherits that address.  Buffers that cannot fit within self.size are evicted
+    the child inherits that address.  Buffers that cannot fit within self.limit are evicted
     (address=None).
     """
 

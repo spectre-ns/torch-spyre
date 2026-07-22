@@ -1208,6 +1208,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
+        # Surface the solver's per-buffer spill causes so the LX-pinning debug
+        # log reports why each buffer landed in HBM, on par with the other
+        # allocators. ``getattr`` because only ``CpSatLayoutSolver`` exposes it.
+        self.reject_reasons = dict(getattr(self.layout_planning, "spill_reasons", {}))
         self._log_lx_pinning(graph)
 
     def _division_map(self, graph: GraphLowering) -> dict[str, list[CoreDivision]]:
