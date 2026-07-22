@@ -186,15 +186,12 @@ class BasePlanSolver:
     An abstract class for defining algorithms which solve
     memory layout patterns based on provided sizes, lifetimes.
 
-    Parameterized by the buffer type the solver consumes. ``plan_layout`` is the
-    placement-only contract and works on :class:`LifetimeBoundBuffer`s, which is
-    what :class:`ScratchpadAllocator` builds. The richer
-    :class:`CoreDivisionBuffer` metadata is *not* part of this interface: the
-    joint core-division + placement solve lives on
+    ``plan_layout`` is the placement-only contract and works on
+    :class:`LifetimeBoundBuffer`s, which is what :class:`ScratchpadAllocator`
+    builds. The richer :class:`CoreDivisionBuffer` metadata is *not* part of this
+    interface: the joint core-division + placement solve lives on
     :meth:`CpSatLayoutSolver.plan_layout_and_core_divisions`, driven by the
-    co-optimizing allocator. Since ``CoreDivisionBuffer`` subclasses
-    ``LifetimeBoundBuffer``, a solver parameterized on the subtype still satisfies
-    the ``plan_layout`` contract for callers that do hand over the richer buffers.
+    co-optimizing allocator.
     """
 
     def __init__(self, size: int, alignment: int = 128):
@@ -223,54 +220,25 @@ class MemoryPlanSolver(ABC, BasePlanSolver):
 
     @abstractmethod
     def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer]
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
-        """Assign an LX address to each buffer that should reside in scratchpad.
-
-        Implementations set ``address`` on every buffer they place and leave it
-        ``None`` on every buffer they spill to HBM, then return the same buffers.
-
-        ``buffers`` is a :class:`Sequence` (not ``list``) so a caller may pass a
-        ``list`` of a *subtype* -- e.g. a ``list[CoreDivisionBuffer]`` to a solver
-        declared over ``LifetimeBoundBuffer``; covariance lets that type-check.
-
-        Args:
-            buffers: The candidate buffers for memory planning.
-
-        Returns:
-            The same buffers, with their placements defined.
         """
+        Utilizes an implementation defined algorithm to determine
+        if and where buffers should be placed in scratchpad memory based
+        on their attributes.
 
-
-class CoreDivisionLayoutSolver(MemoryPlanSolver):
-    """A solver that chooses each buffer's *core division* jointly with its
-    placement, rather than accepting a division fixed upstream.
-
-    The two decisions are coupled: the division sets the per-core footprint the
-    placement has to fit, and residency requires a producer and its consumers to
-    slice the shared buffer the same way. Solving them together lets a buffer
-    take the division that lets it reside.
-
-    Such a solver still satisfies :meth:`plan_layout` -- placement-only is the
-    special case where there is nothing to choose.
-    """
-
-    @abstractmethod
-    def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
-    ) -> list[CoreDivisionBuffer]:
-        """Choose each buffer's core division and its LX placement together.
-
-        On top of the :meth:`plan_layout` contract, implementations write the
-        index of the chosen division back to ``chosen_division`` for the
-        allocator to commit.
+        ``buffers`` is a :class:`Sequence` (not ``list``) because ``Sequence`` is
+        covariant in its element type: that lets a caller hand over a
+        ``list[CoreDivisionBuffer]`` -- a subtype of ``LifetimeBoundBuffer`` -- and
+        still type-check.
 
         Args:
-            buffers: Candidate buffers, each carrying its enumerated candidate
-                core divisions.
+            buffers (Sequence[LifetimeBoundBuffer]): The set of candidate buffers
+                for memory planning
+            log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
-            The same buffers, with placements and chosen divisions defined.
+            list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
         """
 
 
