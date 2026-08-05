@@ -36,9 +36,10 @@ constraint model over :class:`CoreDivisionBuffer`s:
   legally share an offset; the single-tick-overlap invariant
   (``_assert_in_place_relationships``) makes this exact (``_add_no_overlap_2d``).
 * **Objective** (two-phase lexicographic, in ``_run``). *Residency is the hard
-  priority.* Phase 1 minimizes total **HBM transfer traffic** via
-  ``spill_cost(b) * (1 - in_buffer)`` -- the *differential* traffic a spill adds
-  over residency (resident buffers contribute 0). An intermediate costs
+  priority.* Phase 1 minimizes total **HBM transfer traffic** by summing each
+  buffer's ``spill_cost()`` -- the *differential* traffic a spill adds over
+  residency, already gated on ``1 - in_buffer`` so resident buffers contribute
+  0. An intermediate costs
   ``(num_consumers + 1) * size`` (the producer's HBM write, which residency turns
   into a free LX write, plus one re-read per consumer); a graph input drops the
   producer write it never had and the clone-in read residency cannot avoid
@@ -200,23 +201,31 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         return []
 
     # ------------------------------ residency ------------------------------
-    def spill_cost(self) -> int:
-        """Differential HBM traffic a spill adds over residency: the reads
-        residency would have served from LX (``read_count``, computed by the
-        allocator) plus the producer's write, which residency turns into a free
-        LX write. A graph input has no producer write to save; a graph output's
-        write-out is unavoidable either way, so it too cancels. Both cases are
-        exactly ``boundary != Intermediate`` -- for a plain
+    def spill_cost(self) -> cp_model.LinearExpr:
+        """This buffer's term in the phase-1 HBM-traffic objective: the
+        differential traffic a spill adds over residency, gated on
+        ``1 - in_buffer`` so the term evaluates to 0 when the buffer resides
+        and ``_run`` can sum the terms as they come.
+
+        That differential is the reads residency would have served from LX
+        (``read_count``, computed by the allocator) plus the producer's write,
+        which residency turns into a free LX write. A graph input has no
+        producer write to save; a graph output's write-out is unavoidable
+        either way, so it too cancels. Both cases are exactly
+        ``boundary != Intermediate`` -- for a plain
         :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
         ``first_use_is_read`` marks the same distinction for inputs."""
         b = self.buffer
+        
         boundary = getattr(b, "boundary", None)
         is_intermediate = (
             boundary == BufferType.Intermediate
             if boundary is not None
             else not b.first_use_is_read
         )
-        return (b.read_count + (1 if is_intermediate else 0)) * b.size
+        return ((b.read_count + (1 if is_intermediate else 0)) * b.size) * (
+            1 - self.in_buffer
+        )
 
     def constrain_residency(self, model, kids, bufs) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
@@ -459,7 +468,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         # TODO: Update objective to a maxmin optimization to optimize overall
         # throughput.
-        hbm_terms = [sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()]
+        hbm_terms = [sb.spill_cost() for sb in tensors.values()]
         status = cp_model.INFEASIBLE
         if hbm_terms:
             model.minimize(sum(hbm_terms))
