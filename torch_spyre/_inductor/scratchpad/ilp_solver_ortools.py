@@ -216,7 +216,6 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
         ``first_use_is_read`` marks the same distinction for inputs."""
         b = self.buffer
-        
         boundary = getattr(b, "boundary", None)
         is_intermediate = (
             boundary == BufferType.Intermediate
