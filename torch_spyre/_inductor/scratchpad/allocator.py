@@ -64,6 +64,8 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 )
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
+    SpanReductionPass,
+    WorkDistributionPass,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     round_up_to_alignment,
@@ -153,12 +155,21 @@ class ScratchpadAllocator:
         in their buffer type, solver call, and post-solve commit. The base hooks
         implement the fixed-division, placement-only flow.
 
+        The pre-passes carry core division (:class:`SpanReductionPass`,
+        :class:`WorkDistributionPass`), so they run *before* the
+        ``config.lx_planning`` gate: codegen silently defaults a missing
+        ``op_it_space_splits`` to one core, so gating division would emit
+        single-core kernels and blow MAX_SPAN_BYTES with only a CRITICAL log.
+        LX planning owns core division whether or not placement runs.
+
         Args:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
                 addresses where viable.
         """
         self.reject_reasons = {}
         self._run_passes(self.pre_optimization_passes, graph)
+        if not config.lx_planning:
+            return
         buffers = self._prepare_buffers(graph)
         allocation = self._solve(buffers)
         self._post_solve(graph, allocation)
@@ -171,8 +182,18 @@ class ScratchpadAllocator:
     def _run_passes(
         passes: Sequence[ScratchpadOptimizationPass], graph: GraphLowering
     ) -> None:
+        # Timed per pass: these run inside one pipeline slot, so the pipeline's
+        # own per-pass timing (passes.py) can no longer attribute them. Without
+        # this, a slow span_reduction is indistinguishable from a slow solve.
         for p in passes:
+            t0 = time.perf_counter()
             p.apply_pass(graph)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "scratchpad pass %s: %.1fms",
+                    type(p).__name__,
+                    (time.perf_counter() - t0) * 1000,
+                )
 
     def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
         """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
@@ -1284,6 +1305,12 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         self.reject_reasons = {}
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
+        # Same gate as the base template method, which this overrides wholesale:
+        # the pre-passes (core division) always run, placement is config-gated.
+        # Without this, LX_PLANNING=0 CO_OPTIMIZING_LX_PLANNING=1 would still run
+        # the full co-optimization search.
+        if not config.lx_planning:
+            return
 
         # Enumerate options, run search, commit winners back to op_it_space_splits.
         ops = graph.operations
@@ -2154,8 +2181,19 @@ def select_allocator() -> ScratchpadAllocator:
       co-optimization via :class:`StrategyBCoOptimizingAllocator`.
     * otherwise -> placement-only :class:`ScratchpadAllocator` with the configured
       gap-based solver (greedy/bestfit/firstfit).
+
+    Every allocator gets the same core-division pre-passes: LX planning owns core
+    division regardless of solver or co-optimization. The co-optimizing
+    allocators do not skip them -- they re-open the heuristic's commits as their
+    search seed (``_fixed_core_division``, ``_enum_split_options`` option 0).
     """
     size = _lx_planning_size()
+    # One instance per allocator: the passes are stateless, but building the list
+    # here keeps "who divides" a single decision rather than six.
+    core_division: list[ScratchpadOptimizationPass] = [
+        SpanReductionPass(),
+        WorkDistributionPass(),
+    ]
     if config.layout_solver == "cpsat":
         # Both cpsat paths share the same ortools-missing degradation: build the
         # CP-SAT solver here and fall back to greedy placement (still correct)
@@ -2163,19 +2201,29 @@ def select_allocator() -> ScratchpadAllocator:
         solver = _make_cpsat_solver(size)
         if config.co_optimizing_lx_planning:
             if solver is None:
-                return ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
+                return ScratchpadAllocator(
+                    layout_planning=GreedyLayoutSolver(size),
+                    pre_optimization_passes=core_division,
+                )
             # CpSatLayoutSolver implements the core-division interface the joint
             # allocator drives; the narrowing is safe since this is the only
             # solver _make_cpsat_solver ever returns.
             assert isinstance(solver, CoreDivisionLayoutSolver)
-            return CoOptimizingAllocator(layout_planning=solver)
+            return CoOptimizingAllocator(
+                layout_planning=solver, pre_optimization_passes=core_division
+            )
         # Placement-only CP-SAT on the pre-determined core divisions.
         if solver is None:
             logger.debug(
                 "falling back to greedy solver. Make sure Or-Tools is available"
             )
-            return ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
-        return ScratchpadAllocator(layout_planning=solver)
+            return ScratchpadAllocator(
+                layout_planning=GreedyLayoutSolver(size),
+                pre_optimization_passes=core_division,
+            )
+        return ScratchpadAllocator(
+            layout_planning=solver, pre_optimization_passes=core_division
+        )
 
     try:
         solver_cls = _PLACEMENT_SOLVERS[config.layout_solver]
@@ -2186,18 +2234,24 @@ def select_allocator() -> ScratchpadAllocator:
     solver = solver_cls(size)
 
     if config.co_optimizing_lx_planning:
-        return StrategyBCoOptimizingAllocator(layout_planning=solver)
-    return ScratchpadAllocator(layout_planning=solver)
+        return StrategyBCoOptimizingAllocator(
+            layout_planning=solver, pre_optimization_passes=core_division
+        )
+    return ScratchpadAllocator(
+        layout_planning=solver, pre_optimization_passes=core_division
+    )
 
 
-def scratchpad_planning(
+def run_optimization(
     graph: GraphLowering,
     allocator: Optional[ScratchpadAllocator] = None,
 ) -> None:
-    """Assign LX scratchpad addresses to eligible buffers in a lowered graph.
+    """Assign core divisions and LX scratchpad addresses in a lowered graph.
 
-    Called after stickification and core-division are complete. Graph operations
-    are expected to be in topological order as guaranteed by GraphLowering.
+    Called after stickification. This stage owns core division: the allocator's
+    pre-passes commit ``op_it_space_splits`` before any placement happens, and
+    they run even when ``config.lx_planning`` is off. Graph operations are
+    expected to be in topological order as guaranteed by GraphLowering.
 
     Args:
         graph: Lowered graph to plan scratchpad memory for.
@@ -2213,6 +2267,13 @@ def scratchpad_planning(
         # meaning despite the solver failing. The allocator has not mutated
         # the state of the graph allowing a second attempt with a
         # greedy approach.
+        #
+        # Deliberately built WITHOUT pre_optimization_passes: core division
+        # already ran (and committed) on the first attempt, and it is not
+        # idempotent -- work_distribution and cost_model_matmul_division read
+        # committed splits as a hard floor, so re-running would ratchet them
+        # upward. The retry re-enters placement only. This can be dropped once
+        # the co-optimization solvers don't rely on re-exsiting entries.
         logger.debug("solve error detected. falling back to greedy solver.")
         ScratchpadAllocator(GreedyLayoutSolver(_lx_planning_size())).plan_allocation(
             graph

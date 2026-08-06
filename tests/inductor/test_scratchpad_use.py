@@ -1280,6 +1280,131 @@ class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
         x = self.rand_device((512, 1024))
         self._assert_timeout_falls_back_to_greedy(f, (x,))
 
+    def test_greedy_fallback_does_not_redivide(self):
+        """The greedy retry must re-enter placement only, never core division.
+
+        Core division is not idempotent: ``work_distribution`` and
+        ``cost_model_matmul_division`` read committed splits as a hard *floor*
+        and ``apply_splits`` never clears, so a second run would ratchet splits
+        upward rather than reproduce them. The fallback allocator at the bottom
+        of ``scratchpad_planning`` is therefore built without the core-division
+        pre-passes -- this pins that, since "the fallback is missing its
+        pre-passes" otherwise reads like a bug worth 'fixing'.
+        """
+        from torch_spyre._inductor.scratchpad import passes as sp_passes
+
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.rand_device((512, 1024))
+
+        real_span_reduction = sp_passes.span_reduction
+        divisions_per_compile: list[int] = []
+
+        def counting_span_reduction(graph):
+            divisions_per_compile.append(1)
+            return real_span_reduction(graph)
+
+        with (
+            patch.object(sp_passes, "span_reduction", counting_span_reduction),
+            ts_inductor_config.patch(
+                layout_solver="cpsat", sencores=32, co_optimizing_lx_planning=False
+            ),
+        ):
+            torch.compiler.reset()
+            with (
+                self._zero_solver_timeout(),
+                self._count_greedy_plan_layouts() as greedy_calls,
+                ts_inductor_config.patch(lx_planning=True),
+            ):
+                self.compile_and_collect_mem_usage(f, (x,))
+
+        self.assertGreater(
+            greedy_calls["count"],
+            0,
+            "test is vacuous unless the CP-SAT timeout actually triggered the "
+            "greedy fallback",
+        )
+        self.assertEqual(
+            len(divisions_per_compile),
+            1,
+            f"core division must run exactly once per compile even when the "
+            f"solve fails and retries, but ran {len(divisions_per_compile)} times",
+        )
+
+
+class TestCoreDivisionOwnedByLxPlanning(BaseTestScratchpadUsage):
+    """Core division lives in LX planning, but is not gated by it.
+
+    ``config.lx_planning`` gates *placement* only. If it ever gated division
+    too, codegen would silently fall back to one core per op (a missing
+    ``op_it_space_splits`` reads as unsplit) and per-core spans could exceed
+    MAX_SPAN_BYTES -- which only logs CRITICAL and fails later in the backend.
+    The result stays numerically correct throughout, so no other test in this
+    suite would notice.
+    """
+
+    def _collect_splits(
+        self, model: Callable[[Unpack[Ts]], torch.Tensor], args: tuple[Unpack[Ts]]
+    ) -> tuple[dict[str, int], dict[str, str]]:
+        """Compile ``model`` and return per-op core counts and LX/HBM locations."""
+        cores_per_op: dict[str, int] = {}
+        locations: dict[str, str] = {}
+
+        def visitor(graph: GraphLowering) -> None:
+            for op in graph.operations:
+                out_splits, red_splits = getattr(op, "op_it_space_splits", ({}, {}))
+                cores_per_op[op.name] = math.prod(out_splits.values()) * math.prod(
+                    red_splits.values()
+                )
+                allocation = getattr(
+                    graph.get_buffer(op.name).get_layout(), "allocation", {}
+                )
+                locations[op.name] = "LX" if "lx" in allocation else "HBM"
+
+        with self.pre_scheduling_iterating_pass(visitor):
+            torch.compile(model, fullgraph=True)(*args).to("cpu")
+
+        return cores_per_op, locations
+
+    def test_core_division_runs_with_lx_planning_off(self):
+        model, args = self._simple_mlp()
+
+        with ts_inductor_config.patch(
+            lx_planning=False, sencores=32, layout_solver="greedy"
+        ):
+            cores_per_op, locations = self._collect_splits(model, args)
+
+        self.assertTrue(cores_per_op, "no operations were visited")
+        self.assertTrue(
+            any(cores > 1 for cores in cores_per_op.values()),
+            f"expected core division to split at least one op across cores with "
+            f"LX planning off, but every op is single-core: {cores_per_op}",
+        )
+        # The gate must still gate: placement is skipped entirely.
+        self.assertTrue(
+            all(loc == "HBM" for loc in locations.values()),
+            f"LX planning is off, so no buffer may be LX-resident: {locations}",
+        )
+
+    def test_core_division_identical_with_lx_planning_on_and_off(self):
+        """Turning LX planning off must not change the divisions themselves.
+
+        Without co-optimization the LX half only *places* buffers, so both arms
+        run the same heuristic and must agree op-for-op.
+        """
+        model, args = self._simple_mlp()
+
+        with ts_inductor_config.patch(
+            sencores=32, layout_solver="greedy", co_optimizing_lx_planning=False
+        ):
+            torch.compiler.reset()
+            with ts_inductor_config.patch(lx_planning=False):
+                cores_off, _ = self._collect_splits(model, args)
+            torch.compiler.reset()
+            with ts_inductor_config.patch(lx_planning=True):
+                cores_on, _ = self._collect_splits(model, args)
+
+        self.assertEqual(cores_off, cores_on)
+
 
 class TestSelectAllocator(unittest.TestCase):
     """select_allocator maps config -> (allocator, solver) so the allocators
@@ -1351,6 +1476,82 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 select_allocator()
+
+    def test_every_allocator_gets_core_division_pre_passes(self):
+        """LX planning owns core division on every path.
+
+        The co-optimizing allocators must not be exempt: they re-open the
+        heuristic's commits as their search seed (``_fixed_core_division``,
+        ``_enum_split_options`` option 0), so an allocator without these
+        pre-passes would search from an empty division.
+        """
+        from torch_spyre._inductor.scratchpad.allocator import select_allocator
+        from torch_spyre._inductor.scratchpad.passes import (
+            SpanReductionPass,
+            WorkDistributionPass,
+        )
+
+        for layout_solver in ("greedy", "bestfit", "firstfit", "cpsat"):
+            for co_opt in (False, True):
+                with self.subTest(layout_solver=layout_solver, co_opt=co_opt):
+                    with ts_inductor_config.patch(
+                        layout_solver=layout_solver, co_optimizing_lx_planning=co_opt
+                    ):
+                        allocator = select_allocator()
+                    self.assertEqual(
+                        [type(p) for p in allocator.pre_optimization_passes],
+                        [SpanReductionPass, WorkDistributionPass],
+                        "core division must run as the allocator's pre-passes, in "
+                        "span-reduction-then-distribution order",
+                    )
+
+
+class TestCoreDivisionPasses(unittest.TestCase):
+    """Unit tests for the core-division ``ScratchpadOptimizationPass`` wrappers.
+
+    Pure dispatch, no device needed.
+    """
+
+    def test_work_distribution_pass_hands_off_preassigned_ops(self):
+        """``cost_model_matmul_division`` claims a subset of ops and
+        ``work_distribution`` must skip exactly those, so every op is divided by
+        exactly one of the two. The handoff is the whole contract of this pass.
+        """
+        from torch_spyre._inductor.scratchpad import passes as sp_passes
+
+        graph = object()
+        claimed = ["op_claimed_by_cost_model"]
+        calls: list[str] = []
+
+        def fake_cost_model(g):
+            self.assertIs(g, graph)
+            calls.append("cost_model")
+            return claimed
+
+        def fake_work_distribution(g, preassigned_ops):
+            self.assertIs(g, graph)
+            # Must receive the cost model's claim list, not a fresh/empty one.
+            self.assertIs(preassigned_ops, claimed)
+            calls.append("work_distribution")
+
+        with (
+            patch.object(sp_passes, "cost_model_matmul_division", fake_cost_model),
+            patch.object(sp_passes, "work_distribution", fake_work_distribution),
+        ):
+            sp_passes.WorkDistributionPass().apply_pass(graph)  # type: ignore[arg-type]
+
+        self.assertEqual(calls, ["cost_model", "work_distribution"])
+
+    def test_span_reduction_pass_delegates(self):
+        from torch_spyre._inductor.scratchpad import passes as sp_passes
+
+        graph = object()
+        seen = []
+
+        with patch.object(sp_passes, "span_reduction", lambda g: seen.append(g)):
+            sp_passes.SpanReductionPass().apply_pass(graph)  # type: ignore[arg-type]
+
+        self.assertEqual(seen, [graph])
 
 
 class TestInplaceEdgeGate(unittest.TestCase):

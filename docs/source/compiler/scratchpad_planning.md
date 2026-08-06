@@ -129,8 +129,9 @@ extra HBM round-trips.
 
 ## Pipeline position
 
-Scratchpad planning runs at the end of `CustomPreSchedulingPasses`,
-after work division has stamped per-op core splits:
+Scratchpad planning is the last stage of `CustomPreSchedulingPasses`, and
+it *owns* core division: the work-division passes run as the allocator's
+pre-optimization passes rather than as separate pipeline slots.
 
 ```
 deadcode_elimination
@@ -148,21 +149,40 @@ insert_post_mutation_restickify
 insert_bmm_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-span_reduction                        # work-division: enforce 255.996 MiB span
-cost_model_matmul_division            # work-division: matmul cost model
-work_distribution                     # work-division: default distributor
-_maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
+_core_division_and_lx_planning        # ← THIS PASS
+```
+
+That single slot runs, inside `ScratchpadAllocator.plan_allocation`:
+
+```
+SpanReductionPass                     # work-division: enforce 255.996 MiB span
+WorkDistributionPass                  # work-division: matmul cost model + distributor
+--- config.lx_planning gate ---       # placement only past this point
+_prepare_buffers -> _solve -> _post_solve -> _push_allocation
 ```
 
 Two ordering constraints fix this slot:
 
-- **Work division must run first.** Scratchpad planning needs
+- **Work division must run first**, which is why it is the allocator's
+  pre-pass rather than a later step. Scratchpad planning needs
   `op_it_space_splits` to compute per-core buffer sizes. Work division
   also decides whether adjacent ops have compatible core splits.
   Incompatible splits trigger `core_div_mismatch` and disqualify shared
   buffers from LX (see [Current limitations](#current-limitations)).
 - **Stickification must run first.** All buffers need `FixedTiledLayout`
   for device-memory size computation.
+
+`config.lx_planning` gates *placement only*: the pre-passes run on every
+compile. Core division is not optional — codegen reads a missing
+`op_it_space_splits` as "one core", so gating it would silently emit
+single-core kernels and let per-core spans exceed the hardware limit.
+
+Every allocator gets the same pre-passes, including the co-optimizing
+ones: they re-open the heuristic's commits as their search seed, so the
+worst case for co-optimization is the heuristic result. The greedy
+fallback built on `SolveError` is the one exception — it deliberately
+carries no pre-passes, because core division already ran and is not
+idempotent (both distribution passes read committed splits as a floor).
 
 ## Optimizations on softmax
 

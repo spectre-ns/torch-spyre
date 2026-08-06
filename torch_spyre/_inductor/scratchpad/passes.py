@@ -17,6 +17,12 @@ from abc import ABC, abstractmethod
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
 
+from torch_spyre._inductor.work_division import (
+    cost_model_matmul_division,
+    span_reduction,
+    work_distribution,
+)
+
 
 class ScratchpadOptimizationPass(ABC):
     """
@@ -35,6 +41,41 @@ class ScratchpadOptimizationPass(ABC):
             graph (GraphLowering): The graph to be optimized for scratchpad memory allocation
         """
         pass
+
+
+class SpanReductionPass(ScratchpadOptimizationPass):
+    """Commit the minimum per-op splits required by ``MAX_SPAN_BYTES``.
+
+    Mandatory: an op left unsplit whose per-core span exceeds the hardware
+    limit only logs CRITICAL (``warn_if_per_core_overflow``) and fails later in
+    the backend, so this must run on every compile -- including when
+    ``config.lx_planning`` is off, which is why the allocator runs its
+    pre-optimization passes before that gate.
+
+    NOT idempotent; see :class:`WorkDistributionPass`.
+    """
+
+    def apply_pass(self, graph: GraphLowering):
+        span_reduction(graph)
+
+
+class WorkDistributionPass(ScratchpadOptimizationPass):
+    """Spend the remaining cores across ops to maximize parallelism.
+
+    NOT idempotent, and must run exactly once per compile: both
+    ``work_distribution`` and ``cost_model_matmul_division`` read an
+    already-committed ``op_it_space_splits`` as a hard *floor*, and
+    ``apply_splits`` never clears a stale attribute -- so a second run ratchets
+    splits upward rather than reproducing them. It must also run before
+    ``_push_allocation`` inserts boundary clones, whose splits are hand-re-keyed
+    by ``GraphEditor`` and would be clobbered by a re-division.
+    """
+
+    def apply_pass(self, graph: GraphLowering):
+        # cost_model_matmul_division claims a subset of ops; work_distribution
+        # skips those so every op is divided by exactly one of the two passes.
+        preassigned_ops = cost_model_matmul_division(graph)
+        work_distribution(graph, preassigned_ops)
 
 
 class _NameSwapHandler(WrapperHandler):

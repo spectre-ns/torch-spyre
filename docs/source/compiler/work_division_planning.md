@@ -42,8 +42,13 @@ Every eligible op is finalised by either Pass 2 or Pass 3. Pass 1
 runs first and only writes to the op when a span violation forces a
 minimum split. The three passes are implemented in
 [work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py)
-and dispatched from `CustomPreSchedulingPasses` in
-[passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
+and dispatched by the LX scratchpad allocator, which wraps them as its
+`SpanReductionPass` / `WorkDistributionPass` pre-optimization passes (see
+[Scratchpad Planning](scratchpad_planning.md)). LX planning is therefore
+the single owner of core division, with or without co-optimization: the
+co-optimizing allocators re-open these commits as their search seed. The
+pre-passes run on every compile — `config.lx_planning` gates only the
+scratchpad placement that follows them.
 
 The planner only sees ops whose IR data is `Pointwise` or `Reduction`
 (and excluding TopK reductions, which return early). `FallbackKernel`,

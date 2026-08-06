@@ -73,6 +73,11 @@ from .insert_restickify import (
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
+
+# Referenced only by the @_runs tag on _core_division_and_lx_planning: these
+# passes now run as the scratchpad allocator's pre-optimization passes, but the
+# pipeline still declares them so uuid() keys the cache on work_division.py. Do
+# not drop these as "unused imports".
 from .work_division import (
     span_reduction,
     work_distribution,
@@ -80,7 +85,7 @@ from .work_division import (
 )
 from .pass_utils import format_operations
 from .scratchpad.allocator import (
-    scratchpad_planning,
+    run_optimization,
 )
 from .fusion import spyre_fuse_nodes
 from .scheduler import (
@@ -379,22 +384,6 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
 
 
-@_runs(cost_model_matmul_division, work_distribution)
-def _distribute_work(graph: GraphLowering) -> None:
-    # cost_model_matmul_division claims a subset of ops; work_distribution skips
-    # those so every op is divided by exactly one of the two passes.
-    preassigned_ops = cost_model_matmul_division(graph)
-    work_distribution(graph, preassigned_ops)
-
-
-@_runs(scratchpad_planning)
-def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
-    if not config.lx_planning:
-        return
-    # The allocator (and its layout solver) is selected from config by
-    # scratchpad_planning -> select_allocator; no allocator wiring here.
-    scratchpad_planning(graph)
-
 
 class CustomPreSchedulingPasses:
     """
@@ -407,9 +396,10 @@ class CustomPreSchedulingPasses:
 
     :meth:`get_passes` is the single ordered pipeline: plain passes appear
     directly, while config-gated or parameterized steps are wrapped (see the
-    ``_maybe_*`` / ``_distribute_work`` helpers above) so every entry is a
-    uniform ``Callable[[GraphLowering], None]``. :meth:`__call__` just runs them
-    in order, and the inherited :meth:`uuid` keys the cache on their sources.
+    ``_maybe_*`` / ``_core_division_and_lx_planning`` helpers above) so every
+    entry is a uniform ``Callable[[GraphLowering], None]``. :meth:`__call__` just
+    runs them in order, and the inherited :meth:`uuid` keys the cache on their
+    sources.
     """
 
     def __init__(self):
@@ -447,12 +437,9 @@ class CustomPreSchedulingPasses:
             # stride_map, elems_per_stick) for physical span arithmetic.
             _maybe_coarse_tile_span_overflow,
             #
-            # Core Division
-            span_reduction,
-            _distribute_work,
-            #
-            # LX Planning
-            _maybe_scratchpad_planning,
+            # Core Division + LX Planning (one stage; LX planning owns core
+            # division, with or without co-optimization -- see the wrapper).
+            run_optimization,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:
