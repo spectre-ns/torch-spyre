@@ -149,7 +149,7 @@ insert_post_mutation_restickify
 insert_bmm_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-_core_division_and_lx_planning        # ← THIS PASS
+run_optimization                      # ← THIS PASS (scratchpad/allocator.py)
 ```
 
 That single slot runs, inside `ScratchpadAllocator.plan_allocation`:
@@ -281,7 +281,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 
 | File | Responsibility |
 |---|---|
-| `passes.py` | `ScratchpadOptimizationPass` ABC, `_NameSwapHandler` |
+| `passes.py` | `ScratchpadOptimizationPass` ABC, the core-division pre-passes (`SpanReductionPass`, `WorkDistributionPass`), `_NameSwapHandler` |
 | `plan_solver.py` | `MemoryPlanSolver` ABC (declarative exclusion via `partition`/`excluded`), `LifetimeBoundBuffer` |
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
@@ -291,11 +291,25 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 ### Entry point
 
 ```python
-scratchpad_planning(graph, allocator=ScratchpadAllocator())
+run_optimization(graph, allocator=ScratchpadAllocator())
 ```
+
+`run_optimization` was named `scratchpad_planning` before core division moved
+under this stage; the rename reflects that the call now plans *both* core
+division and LX placement. Passing `allocator=` explicitly bypasses
+`select_allocator()`, and with it the `core_division` pre-pass list that
+`select_allocator` attaches — a bare `ScratchpadAllocator()` runs
+placement only. Tests that want the production wiring should call
+`run_optimization(graph)` and let it select.
 
 `ScratchpadAllocator` runs the following pipeline:
 
+0. **Pre-optimization passes (core division).** `SpanReductionPass` then
+   `WorkDistributionPass`, wrapping the `work_division.py` passes. These run
+   *before* the `config.lx_planning` gate, so core division happens on every
+   compile; if `lx_planning` is off, `plan_allocation` returns here and steps
+   1–5 are skipped. See [Pipeline position](#pipeline-position) for why the
+   gate sits after rather than before.
 1. **Input-boundary cloning.** When `clone_at_graph_boundaries()` is set,
    `_eligible_clone_inputs` walks graph inputs and inserts a `clone` for any
    HBM input that is read more than once *and* fits on LX. The clone output

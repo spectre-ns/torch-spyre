@@ -55,6 +55,51 @@ The planner only sees ops whose IR data is `Pointwise` or `Reduction`
 `ExternKernel`, `SpyreConstantFallback`, and `SpyreEmptyFallback`
 allocation kernels are filtered out earlier and never reach the passes.
 
+## Pipeline ownership
+
+Core division used to occupy two slots of its own in
+`CustomPreSchedulingPasses`. It now runs inside the single
+`run_optimization` slot, as the scratchpad allocator's pre-optimization
+passes:
+
+| Function in `work_division.py` | Wrapper in `scratchpad/passes.py` | Runs |
+|---|---|---|
+| `span_reduction` | `SpanReductionPass` | every compile |
+| `cost_model_matmul_division` + `work_distribution` | `WorkDistributionPass` | every compile |
+
+`select_allocator()` attaches both wrappers to every allocator it builds, so
+the owner of core division does not vary with `LAYOUT_SOLVER` or
+`CO_OPTIMIZING_LX_PLANNING`. The co-optimizing allocators do not replace the
+heuristic — they seed their search with its commits, which bounds their worst
+case at the heuristic result.
+
+Two consequences are worth spelling out:
+
+- **`LX_PLANNING=0` does not disable core division.** The gate sits *after*
+  the pre-passes in `plan_allocation`, and deliberately so: codegen reads a
+  missing `op_it_space_splits` as "one core", so skipping division would
+  silently emit single-core kernels and let per-core spans exceed
+  `MAX_SPAN_BYTES` with nothing but a CRITICAL log
+  (`warn_if_per_core_overflow`).
+- **These passes are not idempotent.** Both `work_distribution` and
+  `cost_model_matmul_division` read an already-committed
+  `op_it_space_splits` as a hard *floor*, and `apply_splits` never clears a
+  stale attribute, so a second run ratchets splits upward instead of
+  reproducing them. This is why the `SolveError` retry in `run_optimization`
+  builds its greedy fallback allocator *without* pre-optimization passes, and
+  why core division must precede the boundary clones inserted by
+  `_push_allocation` (whose splits `GraphEditor` re-keys by hand).
+
+:::{warning}
+`run_optimization` is currently listed in `CustomPreSchedulingPasses` without
+an `@_runs(...)` tag, so `uuid()` hashes only `scratchpad/allocator.py`.
+Edits confined to `work_division.py` or `scratchpad/passes.py` therefore do
+**not** invalidate the Inductor FX cache, and a cached graph can be replayed
+against changed division logic. Clear the cache manually
+(`torch._inductor.codecache`) when iterating on those files until the tag is
+added.
+:::
+
 ## Key concepts
 
 ### Iteration space

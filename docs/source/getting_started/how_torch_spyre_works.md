@@ -204,7 +204,9 @@ receive a safe default tiled layout.
 **Core work division** also runs on the LoopLevel IR, after layout propagation. Two passes
 cooperate. `span_reduction()` identifies which iteration dimensions can be parallelized across
 cores and how the span of each reduction partitions. `work_distribution()` then assigns those
-spans to the 32 cores and embeds the plan into the IR for codegen to consume.
+spans to the 32 cores and embeds the plan into the IR for codegen to consume. Both are driven
+by the LX scratchpad allocator, which runs them as its pre-optimization passes before it plans
+scratchpad placement, so core division and LX planning share a single pipeline stage.
 
 One caveat is worth mentioning. The scheduler pass hooks are underscore-prefixed private APIs.
 They have been stable for us, but they can change between PyTorch releases without notice. We
@@ -782,7 +784,7 @@ module. `flex::initializeRuntime()` starts only on the first device use.
 |---|---|---|---|
 | `FixedTiledLayout` | `inductor.ir.FixedLayout` (subclass) | Bridges the PyTorch stride model and Spyre tiled memory | Carries a `SpyreTensorLayout` descriptor with tiled device shape, dimension mapping (stick dims appear twice, once as tile index and once as intra-stick offset), stride mapping, and 128-byte padding |
 | `propagate_spyre_tensor_layouts()` | `CustomPreSchedulingPasses` (runs before `Scheduler` construction through a `GraphLowering._update_scheduler` monkey-patch) | Converts `FixedLayout` to `FixedTiledLayout` across the operation graph | Topological traversal of IR operations. Pointwise ops inherit the input layout. Matmul and reduction require special handling for the contracted output dimension. External kernels use a generic stick format. |
-| `span_reduction()` and `work_distribution()` | `CustomPreSchedulingPasses` (run after `propagate_spyre_tensor_layouts` in the same pre-scheduling pass) | Partitions iteration dimensions across 32 cores at compile time | Constrained by `SENCORES=32`. `span_reduction` determines how the span of each reduction can be split. `work_distribution` assigns spans to cores. Each core receives an equal number of sticks. Enforces the per-core addressable device memory limit (a hardware constraint that is distinct from the 2 MB LX SRAM scratchpad). Two-pass algorithm: minimum splits first, then remaining cores by priority. |
+| `span_reduction()` and `work_distribution()` | `CustomPreSchedulingPasses` (run after `propagate_spyre_tensor_layouts`, as the LX scratchpad allocator's pre-optimization passes) | Partitions iteration dimensions across 32 cores at compile time | Constrained by `SENCORES=32`. `span_reduction` determines how the span of each reduction can be split. `work_distribution` assigns spans to cores. Each core receives an equal number of sticks. Enforces the per-core addressable device memory limit (a hardware constraint that is distinct from the 2 MB LX SRAM scratchpad). Two-pass algorithm: minimum splits first, then remaining cores by priority. Runs on every compile — `LX_PLANNING` gates only the scratchpad placement that follows. |
 
 *Why the scheduler phase.* Tiled layouts must be resolved before codegen because they are
 needed for memory planning and core work division. Propagating through Dynamo and FakeTensor

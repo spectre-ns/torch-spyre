@@ -203,7 +203,9 @@ work distribution
   The second of two work-division passes (`work_distribution()`).
   Assigns the spans identified by {term}`span reduction` to the 32
   cores. Enforces equal stick counts per core (no load imbalance) and
-  per-core addressable device memory limits. See
+  per-core addressable device memory limits. Both work-division passes
+  run as pre-optimization passes of the LX scratchpad allocator, so
+  they happen on every compile even when `LX_PLANNING` is off. See
   [Work Division Planning](../compiler/work_division_planning.md).
 
 work slice

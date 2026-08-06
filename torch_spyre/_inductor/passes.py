@@ -78,11 +78,6 @@ from .hbm_pool_planning import hbm_pool_planning
 # passes now run as the scratchpad allocator's pre-optimization passes, but the
 # pipeline still declares them so uuid() keys the cache on work_division.py. Do
 # not drop these as "unused imports".
-from .work_division import (
-    span_reduction,
-    work_distribution,
-    cost_model_matmul_division,
-)
 from .pass_utils import format_operations
 from .scratchpad.allocator import (
     run_optimization,
@@ -382,7 +377,6 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
     coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
-
 
 
 class CustomPreSchedulingPasses:

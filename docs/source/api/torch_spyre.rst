@@ -610,8 +610,10 @@ Environment Variables
    * - ``DXP_LX_FRAC_AVAIL``
      - Fraction of LX scratchpad available to the planner (default ``0.2``)
    * - ``LX_PLANNING``
-     - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
-       ``scratchpad_planning`` pass)
+     - Enable LX scratchpad planning (default ``1``; set ``0`` to skip
+       scratchpad placement). Core division still runs when this is ``0``:
+       it is a pre-optimization pass of the allocator and the gate sits
+       after it.
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``HBM_POOL_PLANNING``

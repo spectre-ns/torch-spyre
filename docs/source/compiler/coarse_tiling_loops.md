@@ -177,8 +177,8 @@ therefore already inserts `coarse_tile_copy_buf1`, plus `_insert_read_copy_ops`
 for each direct graph-input read — see [Read-side adaptation: full-buffer
 inputs to a loop-internal
 op](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)),
-`span_reduction`, `work_distribution` (`_distribute_work`), and
-`scratchpad_planning` have all run, `graph.operations` contains seven ops.
+`span_reduction`, `work_distribution` (now driven by `WorkDistributionPass`),
+and LX placement have all run, `graph.operations` contains seven ops.
 This is the real, unedited output of `format_operations(graph.operations)`
 (the same helper `CustomPreSchedulingPasses` itself logs at `INFO`) at
 `sencores=4`, in topological order — the last op, `SpyreEmptyFallback` (`buf2`
@@ -342,8 +342,8 @@ Key points:
 - **`tiled_dims_per_read` and `output_tiled_dims` are already visible here**,
   not just at the moment `coarse_tile()` first stamps them (see [What the
   coarse-tiling pass stamps](#what-the-coarse-tiling-pass-stamps) above) —
-  they survive `span_reduction`, `work_distribution`, and
-  `scratchpad_planning` unchanged, since none of those passes touch
+  they survive `span_reduction`, `work_distribution`, and LX
+  placement unchanged, since none of those passes touch
   `loop_info`. `buf1`'s `tiled_dims_per_read=[[], [[], []]]` still shows its
   read of `buf0` (`y`) as loop-invariant at the outer level, because `buf0`'s
   own buffer was already divided down before `buf1`'s dependency was
@@ -381,7 +381,7 @@ Key points:
 - `op_it_space_splits={d0: 4, d1: 1}` is `format_operations`'s
   human-readable reconstruction (via `apply_splits_from_index_coeff`) of the
   `(dict, dict)` coefficient-keyed pair `work_distribution`
-  (`_distribute_work`) actually stamps: `d0` (the outer, row-tiled loop
+  (via `WorkDistributionPass`) actually stamps: `d0` (the outer, row-tiled loop
   symbol) is split 4 ways across `sencores`, and `d1` (the inner,
   column-tiled loop symbol) is not split (`1`) — every op in this example,
   including the copy, divides its per-tile work the same way. The
@@ -405,7 +405,7 @@ Key points:
   `buf1`'s own small buffer is loop-internal scratch by construction (written
   once per iteration, fully drained by the inserted `coarse_tile_copy_buf1`
   copy op before the next iteration overwrites it) regardless of why it took
-  the copy-op path. This is what lets `scratchpad_planning` place it in `lx`
+  the copy-op path. This is what lets `run_optimization` place it in `lx`
   rather than the `pool` HBM region — see the OpSpec and `bundle.mlir`
   sections below.
 
@@ -629,9 +629,9 @@ Key observations:
   lifetime `y` and `mul`'s own output have — but unlike those two, they do
   not get an `lx` slot here: three same-lifetime tile-sized buffers (the two
   read-copy outputs feeding `add`, plus `y`) are live across the same
-  iteration, and `scratchpad_planning`'s allocator did not fit all of them
+  iteration, and `run_optimization`'s allocator did not fit all of them
   in scratchpad, so it fell back to `hbm_pool` for the read copies. `y` and
-  `mul`'s own output still land in `lx` because `scratchpad_planning` runs
+  `mul`'s own output still land in `lx` because `run_optimization` runs
   after coarse tiling has already fixed each buffer's per-tile size and
   lifetime — it is a placement decision made per compilation, not a fixed
   property of being a read-copy output.
@@ -652,7 +652,7 @@ Key observations:
   buffer is fully drained by that copy op every iteration before the next
   iteration overwrites it, it is loop-internal scratch by construction.
   `_propagate_tiled_op` stamps `per_tile_fixed=True` on it directly inside
-  the copy-op branch, and `scratchpad_planning` places it in
+  the copy-op branch, and `run_optimization` places it in
   `lx` (address 0, aliasing `y`'s slot since `y` and `mul`'s output are never
   live at the same time within scratchpad's allocator).  The identity copy is
   still the op whose `MutationLayoutSHOULDREMOVE` targets the full buffer; the
@@ -675,7 +675,7 @@ Key observations:
   even though `mul`'s output also has an outside reader (the copy op) that
   `y` does not.  If `mul`'s tile-sized buffer did not fit in scratchpad (e.g.
   it were too large, or scratchpad were otherwise full),
-  `scratchpad_planning` would fall back to `allocation={'hbm_pool': ...}`
+  `run_optimization` would fall back to `allocation={'hbm_pool': ...}`
   instead — the same bulk-allocated HBM region
   (`constants.py`'s `INTERMEDIATES_SEGMENT`) that `a_tile`/`b_tile`/
   `c_tile` already use — and the buffer would still carry
@@ -1100,11 +1100,12 @@ self.passes = [
     # Working Set Reduction (device-layout-aware, post-stickification)
     _maybe_coarse_tile_span_overflow,  # span_overflow_groups + coarse_tile,
                                        # needs FixedTiledLayout.device_layout
-    # Core Division
-    span_reduction,
-    _distribute_work,             # calls cost_model_matmul_division + work_distribution
-    # LX Planning
-    _maybe_scratchpad_planning,   # config-gated; calls scratchpad_planning
+    # Core Division + LX Planning (one slot)
+    run_optimization,             # scratchpad/allocator.py. Its pre-optimization
+                                  # passes (SpanReductionPass, WorkDistributionPass)
+                                  # do core division on every compile;
+                                  # config.lx_planning gates only the placement
+                                  # that follows them.
 ]
 ```
 
@@ -1146,14 +1147,16 @@ space.  Running coarse tiling after `work_distribution` would produce
 `op_it_space_splits` values sized for the full range, which would then
 be wrong relative to the reduced `ranges` written by the tiling pass.
 `span_reduction` and `cost_model_matmul_division` have the same requirement
-and already run before `work_distribution`, so placing `coarse_tile` with
-them is consistent.
+and already run before `work_distribution`, so placing `coarse_tile` before
+all three is consistent.  Since core division now runs as the scratchpad
+allocator's pre-optimization passes, this constraint is discharged by
+`coarse_tile` preceding the single `run_optimization` slot.
 
-`scratchpad_planning` must run after coarse tiling because it sizes
+`run_optimization` must run after coarse tiling because LX placement sizes
 scratchpad allocations to fit the per-iteration working set.  If it ran
 before, it would see the full iteration space and allocate too much —
 defeating the working-set reduction that coarse tiling is designed to
-achieve.  `scratchpad_planning` receives the full `GraphLowering` object
+achieve.  `run_optimization` receives the full `GraphLowering` object
 (not just `operations`) because it needs access to graph-level metadata
 for buffer lifetime analysis.
 
@@ -1495,7 +1498,7 @@ are allocated to enable LX scratchpad placement of the inner accumulator
    output across all outer tiles).
 2. **Allocate `accum_tile`** (per-tile scratch, same per-tile output shape).
    `accum_tile.layout.per_tile_fixed = True` so `generate_bundle` never
-   advances its base address; `scratchpad_planning` can therefore place it
+   advances its base address; `run_optimization` can therefore place it
    in LX scratchpad memory.
 3. **Insert a fill op** (inside the outer loop, carrying the outer
    `loop_info`) that writes the identity value into `accum_tile` once per
@@ -2134,14 +2137,25 @@ tiled dims in `loop_info.loop_tiled_dims` on the corresponding
 `ir.Operation`, selected from the scheduler-level `iteration_space` keys.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
-before `span_reduction`, `cost_model_matmul_division`, `work_distribution`,
-and `scratchpad_planning`.  `build_loop_scheduler_nodes` must run in
+before `run_optimization`, which is where `span_reduction`,
+`cost_model_matmul_division`, `work_distribution`, and LX placement all now
+happen.  `build_loop_scheduler_nodes` must run in
 `CustomPreFusionPasses` (before Inductor's own fusion pass and before
 `spyre_fuse_nodes`) — see the ordering rationale above.
 
-**Cache invalidation**: `coarse_tile.py`, `scratchpad_planning`, and all
-other pass source files are included in `CustomPreSchedulingPasses.uuid()`
-so the Inductor FX cache is invalidated when any pass changes.
+**Cache invalidation**: `CustomPreSchedulingPasses.uuid()` hashes the source
+file of every entry in the pipeline list, so the Inductor FX cache is
+invalidated when a pass changes. An entry that is a *wrapper* (`_maybe_*`)
+only names its own file, so each one carries an `@_runs(...)` tag listing the
+passes it actually invokes; `_uuid` follows that tag via the `_pass_sources`
+attribute and hashes those files instead. `coarse_tile.py` reaches the hash
+this way, through `_maybe_coarse_tile_hints` / `_maybe_coarse_tile_span_overflow`.
+
+Note that `run_optimization` is an untagged entry, so today it contributes only
+`scratchpad/allocator.py`. The files it reaches indirectly —
+`work_division.py` and `scratchpad/passes.py` — are **not** currently hashed;
+see the caveat in
+[Work Division Planning](work_division_planning.md#pipeline-ownership).
 
 ## Rejected design alternatives
 

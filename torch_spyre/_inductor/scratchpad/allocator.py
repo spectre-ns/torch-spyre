@@ -2273,7 +2273,7 @@ def run_optimization(
         # idempotent -- work_distribution and cost_model_matmul_division read
         # committed splits as a hard floor, so re-running would ratchet them
         # upward. The retry re-enters placement only. This can be dropped once
-        # the co-optimization solvers don't rely on re-exsiting entries.
+        # the co-optimization solvers don't rely on pre-existing entries.
         logger.debug("solve error detected. falling back to greedy solver.")
         ScratchpadAllocator(GreedyLayoutSolver(_lx_planning_size())).plan_allocation(
             graph

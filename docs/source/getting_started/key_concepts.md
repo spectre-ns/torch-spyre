@@ -231,8 +231,9 @@ to enable a new one.
 
 The compiled path runs the standard PyTorch pipeline (FX capture,
 AOTAutograd, Inductor scheduler) and inserts three Spyre-specific
-passes: layout propagation, work division (`span_reduction` followed
-by `work_distribution`), and scratchpad / LX planning. The output is
+passes: layout propagation, then a combined stage that does work
+division (`span_reduction` followed by `work_distribution`) and
+scratchpad / LX planning together. The output is
 a SuperDSC JSON artifact that the Deeptools backend (a proprietary
 compiler) turns into a device binary.
 
