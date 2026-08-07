@@ -2151,10 +2151,10 @@ passes it actually invokes; `_uuid` follows that tag via the `_pass_sources`
 attribute and hashes those files instead. `coarse_tile.py` reaches the hash
 this way, through `_maybe_coarse_tile_hints` / `_maybe_coarse_tile_span_overflow`.
 
-Note that `run_optimization` is an untagged entry, so today it contributes only
-`scratchpad/allocator.py`. The files it reaches indirectly —
-`work_division.py` and `scratchpad/passes.py` — are **not** currently hashed;
-see the caveat in
+Core division and LX placement reach the hash the same way: `run_optimization`
+runs under the `_core_division_and_lx_planning` wrapper, whose `@_runs(...)` tag
+names `scratchpad/allocator.py`, `scratchpad/passes.py`, and `work_division.py`,
+so edits to any of those files invalidate the cache — see
 [Work Division Planning](work_division_planning.md#pipeline-ownership).
 
 ## Rejected design alternatives

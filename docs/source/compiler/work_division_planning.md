@@ -90,15 +90,12 @@ Two consequences are worth spelling out:
   why core division must precede the boundary clones inserted by
   `_push_allocation` (whose splits `GraphEditor` re-keys by hand).
 
-:::{warning}
-`run_optimization` is currently listed in `CustomPreSchedulingPasses` without
-an `@_runs(...)` tag, so `uuid()` hashes only `scratchpad/allocator.py`.
-Edits confined to `work_division.py` or `scratchpad/passes.py` therefore do
-**not** invalidate the Inductor FX cache, and a cached graph can be replayed
-against changed division logic. Clear the cache manually
-(`torch._inductor.codecache`) when iterating on those files until the tag is
-added.
-:::
+**Cache invalidation.** `run_optimization` runs in the pipeline under the
+`_core_division_and_lx_planning` wrapper, whose `@_runs(...)` tag names
+`scratchpad/allocator.py`, `scratchpad/passes.py`, and `work_division.py`.
+`CustomPreSchedulingPasses.uuid()` follows that tag (via `_pass_sources`), so
+edits confined to any of those files invalidate the Inductor FX cache, and a
+cached graph is never replayed against changed division logic.
 
 ## Key concepts
 

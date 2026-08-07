@@ -1303,8 +1303,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
 
     def plan_allocation(self, graph: GraphLowering):
         self.reject_reasons = {}
-        for p in self.pre_optimization_passes:
-            p.apply_pass(graph)
+        self._run_passes(self.pre_optimization_passes, graph)
         # Same gate as the base template method, which this overrides wholesale:
         # the pre-passes (core division) always run, placement is config-gated.
         # Without this, LX_PLANNING=0 CO_OPTIMIZING_LX_PLANNING=1 would still run
@@ -1355,8 +1354,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         # TODO simplify the previous pre-opt (at the beginning of this func), we will
         # run check core-div-mismatch a few times due to clone-insertion, speed-up?
         n_ops_before_clone = len(graph.operations)
-        for p in self.pre_optimization_passes:
-            p.apply_pass(graph)
+        self._run_passes(self.pre_optimization_passes, graph)
 
         # Standard downstream flow on the now-fixed winning splits. Mirrors
         # ScratchpadAllocator.plan_allocation past the pre-passes. Reuse the search's
@@ -2194,6 +2192,16 @@ def select_allocator() -> ScratchpadAllocator:
         SpanReductionPass(),
         WorkDistributionPass(),
     ]
+    if not config.lx_planning:
+        # Placement is gated off downstream: plan_allocation returns at the
+        # config.lx_planning gate before it ever touches the solver, so only the
+        # core-division pre-passes will run. Skip solver/OR-Tools construction
+        # entirely -- the solver here is inert, and greedy needs no OR-Tools --
+        # while still attaching the pre-passes so core division happens.
+        return ScratchpadAllocator(
+            layout_planning=GreedyLayoutSolver(size),
+            pre_optimization_passes=core_division,
+        )
     if config.layout_solver == "cpsat":
         # Both cpsat paths share the same ortools-missing degradation: build the
         # CP-SAT solver here and fall back to greedy placement (still correct)

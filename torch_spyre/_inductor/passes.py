@@ -74,13 +74,23 @@ from .insert_restickify import (
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
 
-# Referenced only by the @_runs tag on _core_division_and_lx_planning: these
-# passes now run as the scratchpad allocator's pre-optimization passes, but the
-# pipeline still declares them so uuid() keys the cache on work_division.py. Do
-# not drop these as "unused imports".
 from .pass_utils import format_operations
 from .scratchpad.allocator import (
     run_optimization,
+)
+
+# Imported so the @_runs tag on _core_division_and_lx_planning can name every
+# file whose contents this stage's behavior depends on, keeping the Inductor FX
+# cache keyed on all of them (see the wrapper's docstring). Not called directly
+# here -- do not drop as "unused imports".
+from .scratchpad.passes import (
+    SpanReductionPass,
+    WorkDistributionPass,
+)
+from .work_division import (
+    cost_model_matmul_division,
+    span_reduction,
+    work_distribution,
 )
 from .fusion import spyre_fuse_nodes
 from .scheduler import (
@@ -379,6 +389,29 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
 
 
+@_runs(
+    run_optimization,  # scratchpad/allocator.py: entry point + solver wiring
+    SpanReductionPass,  # scratchpad/passes.py: the core-division pre-passes
+    WorkDistributionPass,
+    span_reduction,  # work_division.py: the division logic the pre-passes wrap
+    cost_model_matmul_division,
+    work_distribution,
+)
+def _core_division_and_lx_planning(graph: GraphLowering) -> None:
+    """Core division (always) + LX placement (config-gated), in one stage.
+
+    ``run_optimization`` runs core division as its pre-optimization passes
+    (:class:`SpanReductionPass` / :class:`WorkDistributionPass`, wrapping the
+    ``work_division.py`` passes) on every compile; ``config.lx_planning`` gates
+    only the LX placement that follows. The ``@_runs`` tag names every file this
+    stage's behavior depends on -- ``scratchpad/allocator.py``,
+    ``scratchpad/passes.py``, and ``work_division.py`` -- so ``uuid()`` keys the
+    Inductor FX cache on all of them. Without it, edits confined to
+    ``work_division.py`` would not invalidate a cached compile.
+    """
+    run_optimization(graph)
+
+
 class CustomPreSchedulingPasses:
     """
     Spyre-specific passes that run on the GraphLowering immediately before the
@@ -433,7 +466,7 @@ class CustomPreSchedulingPasses:
             #
             # Core Division + LX Planning (one stage; LX planning owns core
             # division, with or without co-optimization -- see the wrapper).
-            run_optimization,
+            _core_division_and_lx_planning,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:
