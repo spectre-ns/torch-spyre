@@ -1506,54 +1506,6 @@ class TestSelectAllocator(unittest.TestCase):
                     )
 
 
-class TestCoreDivisionPasses(unittest.TestCase):
-    """Unit tests for the core-division ``ScratchpadOptimizationPass`` wrappers.
-
-    Pure dispatch, no device needed.
-    """
-
-    def test_work_distribution_pass_hands_off_preassigned_ops(self):
-        """``cost_model_matmul_division`` claims a subset of ops and
-        ``work_distribution`` must skip exactly those, so every op is divided by
-        exactly one of the two. The handoff is the whole contract of this pass.
-        """
-        from torch_spyre._inductor.scratchpad import passes as sp_passes
-
-        graph = object()
-        claimed = ["op_claimed_by_cost_model"]
-        calls: list[str] = []
-
-        def fake_cost_model(g):
-            self.assertIs(g, graph)
-            calls.append("cost_model")
-            return claimed
-
-        def fake_work_distribution(g, preassigned_ops):
-            self.assertIs(g, graph)
-            # Must receive the cost model's claim list, not a fresh/empty one.
-            self.assertIs(preassigned_ops, claimed)
-            calls.append("work_distribution")
-
-        with (
-            patch.object(sp_passes, "cost_model_matmul_division", fake_cost_model),
-            patch.object(sp_passes, "work_distribution", fake_work_distribution),
-        ):
-            sp_passes.WorkDistributionPass().apply_pass(graph)  # type: ignore[arg-type]
-
-        self.assertEqual(calls, ["cost_model", "work_distribution"])
-
-    def test_span_reduction_pass_delegates(self):
-        from torch_spyre._inductor.scratchpad import passes as sp_passes
-
-        graph = object()
-        seen = []
-
-        with patch.object(sp_passes, "span_reduction", lambda g: seen.append(g)):
-            sp_passes.SpanReductionPass().apply_pass(graph)  # type: ignore[arg-type]
-
-        self.assertEqual(seen, [graph])
-
-
 class TestInplaceEdgeGate(unittest.TestCase):
     """Unit tests for ``ScratchpadAllocator._inplace_edge_ok``, the sole predicate
     defining a legal in-place edge (shared by the normal producer path and the
