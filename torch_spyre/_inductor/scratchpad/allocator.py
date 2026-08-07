@@ -2250,7 +2250,7 @@ def select_allocator() -> ScratchpadAllocator:
     )
 
 
-def run_optimization(
+def plan_core_division_and_scratchpad(
     graph: GraphLowering,
     allocator: Optional[ScratchpadAllocator] = None,
 ) -> None:

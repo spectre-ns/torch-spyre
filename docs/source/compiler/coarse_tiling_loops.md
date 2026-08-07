@@ -405,7 +405,7 @@ Key points:
   `buf1`'s own small buffer is loop-internal scratch by construction (written
   once per iteration, fully drained by the inserted `coarse_tile_copy_buf1`
   copy op before the next iteration overwrites it) regardless of why it took
-  the copy-op path. This is what lets `run_optimization` place it in `lx`
+  the copy-op path. This is what lets `plan_core_division_and_scratchpad` place it in `lx`
   rather than the `pool` HBM region — see the OpSpec and `bundle.mlir`
   sections below.
 
@@ -629,9 +629,9 @@ Key observations:
   lifetime `y` and `mul`'s own output have — but unlike those two, they do
   not get an `lx` slot here: three same-lifetime tile-sized buffers (the two
   read-copy outputs feeding `add`, plus `y`) are live across the same
-  iteration, and `run_optimization`'s allocator did not fit all of them
+  iteration, and `plan_core_division_and_scratchpad`'s allocator did not fit all of them
   in scratchpad, so it fell back to `hbm_pool` for the read copies. `y` and
-  `mul`'s own output still land in `lx` because `run_optimization` runs
+  `mul`'s own output still land in `lx` because `plan_core_division_and_scratchpad` runs
   after coarse tiling has already fixed each buffer's per-tile size and
   lifetime — it is a placement decision made per compilation, not a fixed
   property of being a read-copy output.
@@ -652,7 +652,7 @@ Key observations:
   buffer is fully drained by that copy op every iteration before the next
   iteration overwrites it, it is loop-internal scratch by construction.
   `_propagate_tiled_op` stamps `per_tile_fixed=True` on it directly inside
-  the copy-op branch, and `run_optimization` places it in
+  the copy-op branch, and `plan_core_division_and_scratchpad` places it in
   `lx` (address 0, aliasing `y`'s slot since `y` and `mul`'s output are never
   live at the same time within scratchpad's allocator).  The identity copy is
   still the op whose `MutationLayoutSHOULDREMOVE` targets the full buffer; the
@@ -675,7 +675,7 @@ Key observations:
   even though `mul`'s output also has an outside reader (the copy op) that
   `y` does not.  If `mul`'s tile-sized buffer did not fit in scratchpad (e.g.
   it were too large, or scratchpad were otherwise full),
-  `run_optimization` would fall back to `allocation={'hbm_pool': ...}`
+  `plan_core_division_and_scratchpad` would fall back to `allocation={'hbm_pool': ...}`
   instead — the same bulk-allocated HBM region
   (`constants.py`'s `INTERMEDIATES_SEGMENT`) that `a_tile`/`b_tile`/
   `c_tile` already use — and the buffer would still carry
@@ -1101,7 +1101,7 @@ self.passes = [
     _maybe_coarse_tile_span_overflow,  # span_overflow_groups + coarse_tile,
                                        # needs FixedTiledLayout.device_layout
     # Core Division + LX Planning (one slot)
-    run_optimization,             # scratchpad/allocator.py. Its pre-optimization
+    plan_core_division_and_scratchpad,             # scratchpad/allocator.py. Its pre-optimization
                                   # passes (SpanReductionPass, WorkDistributionPass)
                                   # do core division on every compile;
                                   # config.lx_planning gates only the placement
@@ -1150,13 +1150,13 @@ be wrong relative to the reduced `ranges` written by the tiling pass.
 and already run before `work_distribution`, so placing `coarse_tile` before
 all three is consistent.  Since core division now runs as the scratchpad
 allocator's pre-optimization passes, this constraint is discharged by
-`coarse_tile` preceding the single `run_optimization` slot.
+`coarse_tile` preceding the single `plan_core_division_and_scratchpad` slot.
 
-`run_optimization` must run after coarse tiling because LX placement sizes
+`plan_core_division_and_scratchpad` must run after coarse tiling because LX placement sizes
 scratchpad allocations to fit the per-iteration working set.  If it ran
 before, it would see the full iteration space and allocate too much —
 defeating the working-set reduction that coarse tiling is designed to
-achieve.  `run_optimization` receives the full `GraphLowering` object
+achieve.  `plan_core_division_and_scratchpad` receives the full `GraphLowering` object
 (not just `operations`) because it needs access to graph-level metadata
 for buffer lifetime analysis.
 
@@ -1498,7 +1498,7 @@ are allocated to enable LX scratchpad placement of the inner accumulator
    output across all outer tiles).
 2. **Allocate `accum_tile`** (per-tile scratch, same per-tile output shape).
    `accum_tile.layout.per_tile_fixed = True` so `generate_bundle` never
-   advances its base address; `run_optimization` can therefore place it
+   advances its base address; `plan_core_division_and_scratchpad` can therefore place it
    in LX scratchpad memory.
 3. **Insert a fill op** (inside the outer loop, carrying the outer
    `loop_info`) that writes the identity value into `accum_tile` once per
@@ -2137,7 +2137,7 @@ tiled dims in `loop_info.loop_tiled_dims` on the corresponding
 `ir.Operation`, selected from the scheduler-level `iteration_space` keys.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
-before `run_optimization`, which is where `span_reduction`,
+before `plan_core_division_and_scratchpad`, which is where `span_reduction`,
 `cost_model_matmul_division`, `work_distribution`, and LX placement all now
 happen.  `build_loop_scheduler_nodes` must run in
 `CustomPreFusionPasses` (before Inductor's own fusion pass and before
@@ -2151,7 +2151,7 @@ passes it actually invokes; `_uuid` follows that tag via the `_pass_sources`
 attribute and hashes those files instead. `coarse_tile.py` reaches the hash
 this way, through `_maybe_coarse_tile_hints` / `_maybe_coarse_tile_span_overflow`.
 
-Core division and LX placement reach the hash the same way: `run_optimization`
+Core division and LX placement reach the hash the same way: `plan_core_division_and_scratchpad`
 runs under the `_core_division_and_lx_planning` wrapper, whose `@_runs(...)` tag
 names `scratchpad/allocator.py`, `scratchpad/passes.py`, and `work_division.py`,
 so edits to any of those files invalidate the cache — see

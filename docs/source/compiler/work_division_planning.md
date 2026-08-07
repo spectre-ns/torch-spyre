@@ -59,7 +59,7 @@ allocation kernels are filtered out earlier and never reach the passes.
 
 Core division used to occupy two slots of its own in
 `CustomPreSchedulingPasses`. It now runs inside the single
-`run_optimization` slot, as the scratchpad allocator's pre-optimization
+`plan_core_division_and_scratchpad` slot, as the scratchpad allocator's pre-optimization
 passes:
 
 | Function in `work_division.py` | Wrapper in `scratchpad/passes.py` | Runs |
@@ -85,12 +85,12 @@ Two consequences are worth spelling out:
   `cost_model_matmul_division` read an already-committed
   `op_it_space_splits` as a hard *floor*, and `apply_splits` never clears a
   stale attribute, so a second run ratchets splits upward instead of
-  reproducing them. This is why the `SolveError` retry in `run_optimization`
+  reproducing them. This is why the `SolveError` retry in `plan_core_division_and_scratchpad`
   builds its greedy fallback allocator *without* pre-optimization passes, and
   why core division must precede the boundary clones inserted by
   `_push_allocation` (whose splits `GraphEditor` re-keys by hand).
 
-**Cache invalidation.** `run_optimization` runs in the pipeline under the
+**Cache invalidation.** `plan_core_division_and_scratchpad` runs in the pipeline under the
 `_core_division_and_lx_planning` wrapper, whose `@_runs(...)` tag names
 `scratchpad/allocator.py`, `scratchpad/passes.py`, and `work_division.py`.
 `CustomPreSchedulingPasses.uuid()` follows that tag (via `_pass_sources`), so

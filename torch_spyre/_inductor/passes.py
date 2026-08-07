@@ -76,7 +76,7 @@ from .hbm_pool_planning import hbm_pool_planning
 
 from .pass_utils import format_operations
 from .scratchpad.allocator import (
-    run_optimization,
+    plan_core_division_and_scratchpad,
 )
 
 # Imported so the @_runs tag on _core_division_and_lx_planning can name every
@@ -390,7 +390,7 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
 
 
 @_runs(
-    run_optimization,  # scratchpad/allocator.py: entry point + solver wiring
+    plan_core_division_and_scratchpad,  # scratchpad/allocator.py: entry + wiring
     SpanReductionPass,  # scratchpad/passes.py: the core-division pre-passes
     WorkDistributionPass,
     span_reduction,  # work_division.py: the division logic the pre-passes wrap
@@ -400,16 +400,17 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
 def _core_division_and_lx_planning(graph: GraphLowering) -> None:
     """Core division (always) + LX placement (config-gated), in one stage.
 
-    ``run_optimization`` runs core division as its pre-optimization passes
-    (:class:`SpanReductionPass` / :class:`WorkDistributionPass`, wrapping the
-    ``work_division.py`` passes) on every compile; ``config.lx_planning`` gates
-    only the LX placement that follows. The ``@_runs`` tag names every file this
-    stage's behavior depends on -- ``scratchpad/allocator.py``,
-    ``scratchpad/passes.py``, and ``work_division.py`` -- so ``uuid()`` keys the
-    Inductor FX cache on all of them. Without it, edits confined to
-    ``work_division.py`` would not invalidate a cached compile.
+    ``plan_core_division_and_scratchpad`` runs core division as its
+    pre-optimization passes (:class:`SpanReductionPass` /
+    :class:`WorkDistributionPass`, wrapping the ``work_division.py`` passes) on
+    every compile; ``config.lx_planning`` gates only the LX placement that
+    follows. The ``@_runs`` tag names every file this stage's behavior depends
+    on -- ``scratchpad/allocator.py``, ``scratchpad/passes.py``, and
+    ``work_division.py`` -- so ``uuid()`` keys the Inductor FX cache on all of
+    them. Without it, edits confined to ``work_division.py`` would not
+    invalidate a cached compile.
     """
-    run_optimization(graph)
+    plan_core_division_and_scratchpad(graph)
 
 
 class CustomPreSchedulingPasses:

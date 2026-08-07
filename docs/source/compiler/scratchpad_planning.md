@@ -149,7 +149,7 @@ insert_post_mutation_restickify
 insert_bmm_padding
 dedup_and_promote_constants
 _maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
-run_optimization                      # ← THIS PASS (scratchpad/allocator.py)
+plan_core_division_and_scratchpad                      # ← THIS PASS (scratchpad/allocator.py)
 ```
 
 That single slot runs, inside `ScratchpadAllocator.plan_allocation`:
@@ -291,16 +291,16 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 ### Entry point
 
 ```python
-run_optimization(graph, allocator=ScratchpadAllocator())
+plan_core_division_and_scratchpad(graph, allocator=ScratchpadAllocator())
 ```
 
-`run_optimization` was named `scratchpad_planning` before core division moved
+`plan_core_division_and_scratchpad` was named `scratchpad_planning` before core division moved
 under this stage; the rename reflects that the call now plans *both* core
 division and LX placement. Passing `allocator=` explicitly bypasses
 `select_allocator()`, and with it the `core_division` pre-pass list that
 `select_allocator` attaches — a bare `ScratchpadAllocator()` runs
 placement only. Tests that want the production wiring should call
-`run_optimization(graph)` and let it select.
+`plan_core_division_and_scratchpad(graph)` and let it select.
 
 `ScratchpadAllocator` runs the following pipeline:
 
