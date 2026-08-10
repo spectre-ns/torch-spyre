@@ -22,24 +22,20 @@ share, the order they land in, and why that order is the one that works. Each
 individual optimization gets its own RFC, and each of those is an instantiation
 of this document rather than an input to it.
 
-The compiler makes a sequence of decisions about the same underlying object —
+The compiler makes a sequence of decisions about the same underlying —
 how a buffer is partitioned, shaped, laid out, placed, and when it is live — at
 different points of one pass list, each with its own cost model and each blind
 to the others. This document folds those decisions into a single model with a
 single objective, and specifies the contract that makes doing so tractable:
-
-> Every axis can be **pinned** by a hint, left **free**, or **optimized**. A
+> Every axis for each buffer is either **pinned** by a hint or **optimized**. A
 > validator proves the hint set is mutually consistent before the solve. The
-> solver determines only the free variables, so the result is valid, honours the
-> hints, and is optimal over what remains.
+> solver determines the optimized axes — a pin collapses its axis to the hinted
+> value before the model is built, and the result is optimal over what remains.
 
-The three-mode framing is load-bearing, not a footnote. **An axis that is not
-being optimized still has to be valid, and validity is cheap.** Op ordering left
-free means the existing topological order is used and merely checked for
-legality — it contributes no decision variables, no objective terms, and no
-search. That is what lets the model scale: each phase adds an axis that can be
-switched *on*, and switching it off returns to a validity-only treatment that
-reproduces today's behaviour by construction.
+The two-mode framing is load-bearing, not a footnote. **An axis that is not being
+optimized still has to be valid, and validity checks are cheap.** A pin is proved
+consistent before the solve rather than priced during it, so a hinted axis costs
+neither variables nor search.
 
 ## Motivation
 
@@ -129,6 +125,9 @@ and two matmuls reading the same operand each pay for their own; and no way to
 pad past legality, which is what would let a dimension become splittable or a
 stick dimension become admissible.
 
+In summary, padding costs memory (Both HBM and LX) and this cost is not accounted
+for inside the current padding strategy as it falls out of upstream choices.
+
 ### 4. Restickification is priced blind to what it costs
 
 The cost function is `prod(in_stl.device_size)` for a needed relayout, `0` when
@@ -177,6 +176,7 @@ a single address for a whole lifetime (`LifetimeBoundBuffer.address`,
 a plan whose aggregate free space is more than sufficient can still fail to place
 a buffer for want of one large enough hole.
 
+### 7. (Adjacent) Caching key insufficiency
 One adjacent bug is recorded here because the roadmap makes it more expensive,
 not because the roadmap fixes it. torch-spyre participates in Inductor's FX graph
 cache and extends its key to cover input `SpyreTensorLayout`s
@@ -203,8 +203,8 @@ rather than restating them.
   enumeration-time pins — is chosen for it.
 
   The heuristic placement solvers are **not** targets. Greedy, first-fit, and
-  best-fit exist as free mode and as the M9 fallback, and nothing in this
-  document optimizes them or treats their internal policies as decisions.
+  best-fit exist as the M9 fallback, and nothing in this document optimizes them
+  or treats their internal policies as decisions.
   Simulated annealing (`SimulatedAnnealingLayoutSolver`, registered in
   `_PLACEMENT_SOLVERS` at `scratchpad/allocator.py:2108-2113`) is the anticipated
   *second* backend rather than a fallback: it searches a different space — a
@@ -219,7 +219,7 @@ rather than restating them.
   (`config.py:110`), and a solver-backed default is the expected end state. This
   document assumes it: the phases are written for the configuration the compiler
   is heading toward, and the heuristics persist for fallback and for the parity
-  testing M3's free mode is built on, not as the destination.
+  testing M3's candidate invariant is built on, not as the destination.
 
 - **M2 — The objective is injected, not hardcoded.** The cost function is
   caller-supplied, so cost experiments do not require editing the solver. Today's
@@ -227,8 +227,8 @@ rather than restating them.
   replacement is a symbol namespace bound to model variables plus a lowering to
   CP-SAT expressions over an explicitly bounded grammar; a construct outside that
   grammar is a compile error naming the offending node. Silently approximating an
-  objective is worse than failing to build one. An axis in free mode contributes
-  no symbols.
+  objective is worse than failing to build one. A pinned axis contributes no
+  symbols.
 
   **The objective is a cost, and the model minimizes it.** One expression in one
   unit, not a ranking. Today's two-phase lexicographic structure — minimize spill,
@@ -248,24 +248,13 @@ rather than restating them.
   is faithful: the evaluated cost of a returned solution must equal the objective
   value the solver reports.
 
-- **M3 — Three modes per axis: pinned, free, optimized.** The central
-  tractability mechanism.
+- **M3 — Two modes per axis: pinned and optimized.** The central tractability
+  mechanism. The two differ along one dimension — what determines the value.
 
-  - *Pinned* — a hint fixes the value. The domain is collapsed at enumeration
-    time, so the axis contributes no variables and no search (H4).
-  - *Free* — any valid value is acceptable. The axis contributes no variables and
-    no objective terms; the existing heuristic or identity value is used and
-    checked only for legality.
-  - *Optimized* — the axis contributes variables and objective terms and is
-    solved.
-
-  Free is the default for every axis a phase has not enabled, and it is what
-  makes "never worse than today" structural rather than aspirational: with every
-  axis free, the pipeline is today's pipeline. Modes are per axis and, where it
-  makes sense, per scope — an operation or a subgraph — so a graph can optimize
-  tiling while leaving order free. Gating follows the existing `LX_PLANNING` /
-  `CO_OPTIMIZING_LX_PLANNING` / `LAYOUT_SOLVER` family (`config.py:22-25`,
-  `:111`): a config entry plus an environment variable, defaulting off.
+  - *Pinned* — a hint pre-selects the value. The domain is collapsed at
+    enumeration time, so the axis contributes no variables and no search (H4).
+  - *Optimized* — the objective prices the value. The axis contributes variables
+    and objective terms and is ranked.
 
 - **M4 — Enumerate-and-table encoding.** Nonlinearity — divisibility, stick
   alignment, span limits, the core budget — is absorbed by precomputing a
@@ -279,7 +268,7 @@ rather than restating them.
   if measurement demands it.
 
 - **M5 — Feasibility is evaluated on the combination, not per subsystem.** A
-  candidate is feasible if and only if it satisfies every subsystem's guard
+  candidate is feasible iff it satisfies every subsystem's guard
   jointly. Reuse `enumerate_work_division_candidates`'s `valid_split` guards
   verbatim (`work_division.py:809-823`): the core budget, at most one reduction
   dimension split, a per-core span within `MAX_SPAN_BYTES` on every tensor
@@ -297,9 +286,11 @@ rather than restating them.
 - **M6 — Predicates are reused, never reimplemented.** Every legality predicate
   the model needs already exists, in `wsr/span_overflow_hint_analysis.py`,
   `pass_utils.py`, and `work_division.py`. Reimplementing one creates a second
-  source of truth that will drift. This binds free mode too: the validity check
-  in free mode must call the *same* predicate optimized mode calls, or the two
-  modes disagree about what is legal and the fallback stops being a fallback.
+  source of truth that will drift. An optimized axis is constrained by the model
+  itself, so the obligation binds the M9 fallback path: the
+  legality check the existing heuristic applies must be the *same* predicate the
+  model constrains against, or the two disagree about what is legal and the
+  fallback stops being a fallback.
 
 - **M7 — Pure prediction, then apply.** A decision is scored against a
   *predicted* buffer set with no IR mutation, then applied. State the hazard once
@@ -329,9 +320,12 @@ rather than restating them.
   the hints that conflict. It is never silently dropped. Three failure causes,
   three outcomes:
 
-  1. *Solver unavailable, timed out, or errored.* The optimized axes drop to free
-     mode over the pinned candidate sets: the existing heuristic runs and only
-     validity is enforced, using the same predicates optimized mode uses (M6).
+  1. *Solver unavailable, timed out, or errored.* Every axis leaves the model over
+     the pinned candidate sets: the existing heuristic runs and only validity is
+     enforced, using the same predicates the model constrains against (M6). This
+     is a degraded *choice* over the same candidate sets, not a phase that stops
+     running: enumeration and legality are unaffected, and only ranking is lost.
+     M3's invariant is what makes it available — today's value is in the table.
      This generalizes the current `SolveError` fallback to the greedy allocator
      (`scratchpad/allocator.py:2193-2219`) and the ortools-missing fallback
      (`_make_cpsat_solver`, `:2116-2136`). The existing heuristic already honours
@@ -492,8 +486,9 @@ contract every phase registers against.
   paying to explore the space a hint exists to avoid would defeat the purpose of
   supplying one.
 
-  Hints are therefore a first-class tractability lever, on equal footing with
-  free mode: both are ways of not spending search on an axis. The honest claim is
+  Hints are therefore a first-class tractability lever, and with no unpriced mode
+  they are the *only* way to keep an axis out of the search once its phase is on.
+  The honest claim is
   that the solve is optimal *over what remains*, and this document makes that
   claim rather than a claim of global optimality.
 
@@ -503,18 +498,18 @@ contract every phase registers against.
   `reject_reasons` (`allocator.py:137`), `_SOLVER_CHOSE_SPILL`
   (`ilp_solver_ortools.py:113`), and `excluded()` / `record_exclusions()`
   (`plan_solver.py:221-258`). Every committed decision records whether it came
-  from a user hint, a compiler-generated hint, free mode, a fallback, or the
-  solver. Without this a plan cannot be debugged, and the three modes of M3
-  cannot be told apart after the fact: a value that free mode inherited from the
-  existing heuristic is indistinguishable in the output from one the solver
-  chose.
+  from a user hint, a compiler-generated hint, a fallback, or the solver. Without
+  this a plan cannot be debugged, and the two modes of M3 cannot be told apart
+  after the fact: a value a pin fixed is indistinguishable in the output from one
+  the solver chose, and both from one the fallback heuristic produced.
 
 ## Phases
 
 A phase that adds an axis follows the same template: the defect it closes, the
-decision variables it adds, what free mode means for that axis, the hint form it
-registers under H1, what the validator must newly check, what it depends on, and
-its exit criteria. One phase adds no axis and does not follow it — phase 5 is
+decision variables it adds, the objective terms that price them, the baseline
+candidate M3's invariant requires in its table, the hint form it registers under
+H1, what the validator must newly check, what it depends on, and its exit
+criteria. One phase adds no axis and does not follow it — phase 5 is
 enumeration mechanism — and it says so in its own first line. Padding likewise
 adds no axis, so it gets no phase: it is policy and legalization work, and it
 lands inside the phases that consume it, 1 and 2.
@@ -571,9 +566,10 @@ emitting a pad sequence per matmul (`:183`). The remaining half — padding as a
 `propagate_layouts.py:271`, `:455`, and `:1078` — lands in phase 3 with the
 layout search that consumes it.
 
-**Free mode.** Today's behaviour: the `_combo_cost`-ranked first feasible tiling,
-checked for span legality only, and padding's unconditional round-up to the next
-stick.
+**Baseline candidate.** Today's behaviour — the `_combo_cost`-ranked first
+feasible tiling, checked for span legality only, and padding's unconditional
+round-up to the next stick — must remain an enumerated candidate (M3), and is
+what the M9 fallback selects.
 
 **Hint form.** The existing `tiles` / `slices` / `num_tiles_per_dim` and
 `work_div` keys, registered under H1 and lowered to pins under H2, plus a pin on
@@ -594,7 +590,8 @@ post-transform frame — `_prepare_per_core_view` (`pass_utils.py:1467`) and
 `_per_core_view_on_buf` (`:1696`) taking a predicted frame rather than reading the
 operation's current layout. Phase 3 cannot start without that last one.
 
-**Exit.** Parity with today when the axis is free. A case where span overflow
+**Exit.** Today's tiling is in the enumerated table, asserted per operation. A
+case where span overflow
 forces tiling *and* work division splits the same dimension provably picks a
 smaller tile count than the `core_split_estimate = 1` path. The padding cost
 measurement reported either way, existing bmm tests
@@ -621,17 +618,9 @@ rectangles (`ilp_solver_ortools.py:31`, `:568`) and `_justify` (`:747`) then
 slides each unit down to the lowest free address to squeeze out gaps the search
 left. Order exists only in the heuristics — greedy walking topological order with
 irrevocable decisions, first-fit and best-fit sorting buffers up front
-(`firstfit_bestfit_solver.py:186-245`) — which is to say it exists only in free
-mode and on the M9 fallback path, where it is a property of the heuristic rather
-than a decision anyone makes. Optimizing it would be optimizing the fallback.
-
-There is one case where order returns, and it is a *representation* rather than
-an axis: `SimulatedAnnealingLayoutSolver` anneals over a buffer permutation via
-`PermutationBasedLayoutSolver`, and `SolverToPermutation`
-(`scratchpad/simulated_annealing.py:71-95`) converts any solver's layout into
-one. If M1's second backend is ever built, that machinery is what it searches
-over, and it is reused rather than reinvented (M6) — but no hint pins a
-permutation and no phase exposes one.
+(`firstfit_bestfit_solver.py:186-245`) — which is to say it exists only on the
+M9 fallback path, where it is a property of the heuristic rather than a decision
+anyone makes. Optimizing it would be optimizing the fallback.
 
 **Variables.** Relocation: a buffer's address becomes a function of time rather
 than a single value, so a live buffer can be moved and a hole closed. This is a
@@ -649,8 +638,12 @@ cores (`ilp_solver_ortools.py:446-518`) — so a plan that fits with a fragmente
 address space and one that fits compactly score identically until C1 supplies the
 term.
 
-**Free mode.** Today's placement, whichever solver `LAYOUT_SOLVER` selects, with
-no relocation: buffers keep one address for their whole lifetime.
+**Baseline candidate.** Today's placement, whichever solver `LAYOUT_SOLVER`
+selects, with no relocation: buffers keep one address for their whole lifetime.
+The no-relocation plan must stay reachable so M3's invariant holds and the M9
+fallback has something to select. The relocation cost term is a precondition for
+landing this phase, not a later refinement — without it the variable is unpriced,
+which M3 forbids.
 
 **Hint form.** Pin a buffer's residency, or pin it against relocation. Residency
 hands users a direct lever over the outcome they most often want to control,
@@ -673,7 +666,7 @@ conceals the split (consequence 4).
 **new index space** in the model, everything before it being per-buffer or
 per-adjacent-pair — and a relayout-bytes term in the M2 objective, precomputed
 per edge from the tiling-aware per-core views phase 1 delivers. The variable is
-*determined* rather than free: an edge needs a relayout, or it does not, given
+*determined* rather than chosen: an edge needs a relayout, or it does not, given
 the two endpoint candidates. What the solver gains is the ability to prefer
 candidate pairs that agree.
 
@@ -686,18 +679,8 @@ hardcoded `BEAM_WIDTH = 200` (`optimize_restickify.py:467`). 3b touches passes
 10-14 and does not depend on the solver at all, so it is independently landable
 and should not be gated behind 3a.
 
-**3c — padding as legalization.** Removing the issue #1756 restriction at
-`propagate_layouts.py:271`, `:455`, and `:1078`, so a candidate stick dimension
-whose size is not stick-divisible can be padded into admissibility instead of
-skipped (consequence 3). This is padding work, but it lands here rather than with
-the rest of it because this is the phase that consumes it: it is what makes
-`_candidate_output_stls` (`propagate_layouts.py:249-278`) emit candidates the
-layout search could not previously see, and pricing relayout over the smaller set
-would optimize against an artificial restriction. It builds on the derived-pad
-machinery phase 1 delivers.
-
-**Free mode.** Today's beam search over layouts, with placement fixed at the
-consumer.
+**Baseline candidate.** The layout today's beam search would select, with
+placement fixed at the consumer, must remain in the candidate set (M3).
 
 **Hint form.** Pin an edge to no-relayout, or pin a buffer's `SpyreTensorLayout`.
 
@@ -708,9 +691,7 @@ edge pinned to no-relayout must admit a common stick dimension
 **Exit.** A measurable reduction in relayout bytes on the two tracked benchmarks
 against the baselines recorded in `scratchpad_planning.md` — `mlp-linear-kn.t` at
 roughly 79% process-engine utilization after pointwise seeding, and `mha_4h`
-converging on `B/4·M/8` with the scores matrix pinned. For 3c, a dimension whose
-size is not stick-divisible appearing in `_candidate_output_stls` output where it
-is skipped today, which is the observable that the layout search space grew.
+converging on `B/4·M/8` with the scores matrix pinned.
 
 ### Phase 4 — Op re-ordering
 
@@ -734,16 +715,21 @@ once.
   consumer by one operation silently kills the merge. This is the chief
   regression risk in the whole roadmap, and it fails quietly.
 
-This axis is the worked example for M3's free mode. Left free, the existing
-topological order is used and only checked for dataflow legality — which is what
-happens today, and costs nothing. Optimizing it is opt-in.
+This axis is the worked example for M3's rule that an axis enters the model only
+once the objective prices it, and it is the sharpest case in the roadmap because
+the axis cannot be added tentatively. Landing it without pricing adjacency would
+be exactly the failure M3 describes: every permutation that separates a producer
+from its consumer is dataflow-legal, so an objective blind to adjacency has no
+reason not to pick one, and the merge dies quietly. With no off switch, that
+regression ships. Adjacency must be a constraint or an objective term before this
+phase lands, not after.
 
 **Variables.** Position variables constrained by the dataflow DAG, with liveness
 derived from them. Scope the optimized mode as a **bounded** reordering — a
 generalization of `reorder_unhinted_interlopers`
 (`wsr/coarse_tile_hints.py:166-283`, whose legality check `_no_dep_conflict` at
-`:110-131` is already the right predicate) over a window — rather than free
-permutation of the graph.
+`:110-131` is already the right predicate) over a window — rather than
+unrestricted permutation of the graph.
 
 Note that reordering already happens, reactively and too late (consequence 5).
 Phase 4 makes the decision proactive rather than introducing one.
@@ -753,7 +739,8 @@ Phase 4 makes the decision proactive rather than introducing one.
 **Validator.** Order pins must be acyclic and dataflow-legal.
 
 **Exit.** No in-place-merge regression, asserted directly against the exact-tick
-invariant. Free mode reproduces today's order exactly.
+invariant. Today's topological order is a candidate the model can return, and the
+M9 fallback returns it exactly.
 
 ### Phase 5 — Enumeration scaling
 
@@ -832,15 +819,19 @@ These run alongside the phases rather than between them.
   - *Budget.* Solve time does not decompose: CP-SAT couples every variable through
     propagation, so an axis can make a solve harder or easier and no per-axis
     share exists. A phase measures the *configuration* it creates — whole-model
-    solve time with its axis on and off against one wall-clock budget — and those
-    deltas do not compose, so a pair of axes is measured as a pair. Only shipping
-    configurations are measured, not the 2^n cross product.
+    solve time against one wall-clock budget — and those deltas do not compose,
+    so a pair of axes is measured as a pair. Only shipping configurations are
+    measured, not the 2^n cross product. With no off switch there is no
+    within-binary A/B: the comparison is against the commit before the phase
+    landed, so a phase that does not measure before merging cannot be measured
+    afterward without a revert.
   - *Enumeration.* The exception, and why phase 5's trigger is defined over it:
     rows come from a per-operation table built before the solver runs, so they are
     countable per phase in the way solve time is not. Report rows per operation
     and enumeration time alongside solve time.
-  - *Fallback.* A timeout is equally unattributable, so M9 case 1 drops **all**
-    optimized axes to free mode; no phase may assume its own is the one disabled.
+  - *Fallback.* A timeout is equally unattributable, so M9 case 1 degrades **all**
+    axes to their baseline candidates at once; no phase may assume its own is the
+    one that keeps its solved value.
   - *Determinism.* Conditional, not automatic.
     `torch.are_deterministic_algorithms_enabled()` forces
     `num_search_workers = 1` (`ilp_solver_ortools.py:459-463`) which, with
@@ -874,7 +865,8 @@ its own hint channel before the registry exists will have to be unwound.
 Documents 1 through 5 follow the phase order.
 
 Per document, each must state: the defect it closes, the decision variables it
-adds and their encoding under M4, what free mode falls back to, the hint keys it
+adds and their encoding under M4, the objective terms that price them, what the
+baseline candidate M3's invariant requires in its table, the hint keys it
 registers under H1, the validator rules it adds under H3, what it consumes from
 earlier phases, and testable exit criteria.
 
@@ -913,45 +905,3 @@ not because it must come last. Its trigger is a measurement — C2's reported
 enumeration cost and table size — so it is pulled forward the moment the eager
 cross product stops fitting the compile-time budget, whenever that happens.
 
-## Non-goals
-
-- **No ring transfers.** The `core_div_mismatch` hard wall stays. Dissolving it
-  requires a data ring or reduce-sum ring emitted in the SuperDSC schedule, which
-  is separate work.
-- **No new backend**, and no change to the DeepTools interface.
-- **No plan reuse and no plan serialization.** Caching compiled artifacts is
-  Inductor's FX graph cache's job, which torch-spyre already participates in;
-  this document adds no second cache and persists no decisions. The one thing it
-  does claim is that the existing key is wrong — no torch-spyre config value
-  reaches it (consequence 6) — and that fix is independent of every phase here.
-  Warm-starting the solver is likewise out of scope: it is a solve-time
-  optimization to consider once the axes work, not a mechanism the model rests
-  on.
-- **No recalibration of `_matmul_split_cost`** as part of the mechanism work.
-  Improving the numbers is C1's concern; this roadmap delivers the structure that
-  lets them be improved.
-- **No claim of global optimality.** Under H4 the solve is optimal over the free
-  variables only, and under M3 an axis left free is not optimized at all. Both
-  are deliberate.
-
-## Open questions
-
-- **Cost model contents.** The objective minimizes cost (M2); which terms and
-  what relative magnitudes make that cost track measured time is C1's work and is
-  not settled here. The structural question is closed — one cost, no
-  lexicographic phases — and the numbers inside it are open.
-- **Conflict diagnosis.** How much of hint conflict detection reaches the linear
-  pre-solve check (H3), and what residue is left for level 3. The residue is also
-  where attribution is worst: an assumption subset containing only pins reports
-  "these hints conflict" when the actionable message is often "this hint against
-  the core budget". Making the guard families retractable alongside the pins would
-  fix that, at the cost of a diagnostic model materially larger than the one that
-  failed.
-- **Enumeration growth.** Not answerable before the tables exist. The threshold at
-  which enumeration stops fitting the compile-time budget is a measurement phase 1
-  produces and phase 5 reacts to, and the shape of the fix is open in the same
-  way: whether the size-to-split quotient can be posed as a constraint that
-  propagates acceptably, or whether the table is simply the better encoding, is
-  what phase 5 has to find out. What prunes *safely* is the part that can be
-  reasoned about now — signature dedup and dominance are lossless, a cost-ranked
-  cap is not.
