@@ -28,6 +28,11 @@ different points of one pass list, each with its own cost model and each blind
 to the others. This document folds those decisions into a single model with a
 single objective, and specifies the contract that makes doing so tractable:
 
+<!-- Please evaluate the feaibility of using CP-SAT as the validator by 
+checking for UNSAT solutions then doing analysis after the failure to 
+diagnose the incompatible hints provided.
+ -->
+
 > Every axis can be **pinned** by a hint, left **free**, or **optimized**. A
 > validator proves the hint set is mutually consistent before the solve. The
 > solver determines only the free variables, so the result is valid, honours the
@@ -45,7 +50,8 @@ reproduces today's behaviour by construction.
 
 The decisions are made at different points of `CustomPreSchedulingPasses`
 (`passes.py:416-455`), by cost models that cannot see each other:
-
+<!-- Lets remove plan re-use I think this is covered in overall caching 
+strategies within inductor -->
 | Decision | Where | Cost model |
 |---|---|---|
 | Coarse tiling | `wsr/`, passes 6 and 17 | `_combo_cost` structural proxy |
@@ -91,6 +97,10 @@ are **parallel**, but both draw down the same divisibility budget on a dimension
 Today each decision spends that budget as if it were alone.
 
 ### 2. Tiling can never buy LX residency
+<!-- This isn't entirely true. The tiling does buy lx residancy but
+only by chance. The reduction in working set does help but there is no
+connection to verify that the upstream decisions actually improve LX usage
+or that the selected configuration is optimal -->
 
 Shrinking a chain's working set until it fits the LX scratchpad is the stated
 purpose of `wsr/`, yet the tiling planner cannot see LX occupancy and the LX
@@ -103,6 +113,11 @@ Consequences 1 and 2 are the same missing edge read from two directions: tiling
 cannot see what division has done, and neither can see what residency would cost.
 
 ### 3. Padding cannot influence the layouts it must satisfy
+
+<!-- Question: Does padding actually influence performance or is it
+just dependent on the desired configuration. If it has no impact 
+on performance or a reasonable cost model this should be moved out
+to the application step rather than part of the optimization. -->
 
 `insert_bmm_padding` runs at pass 15 (`passes.py:441`); `finalize_layouts`
 commits layouts at pass 11. Padding is therefore applied to a layout it had no
@@ -222,6 +237,9 @@ rather than restating them.
   dimension split, a per-core span within `MAX_SPAN_BYTES` on every tensor
   dependency, and no coordinate-masked dimension split. Evaluating them on the
   combination rather than one axis at a time is what discharges consequence 1.
+  <!-- Question: Does this mean that I will need to enumerate a table with
+  all the possible combinations of tiling and core division eagerly? Can you think about how this could be done declaratively using constraints? I expect this
+  space will be large. -->
 
 - **M6 — Predicates are reused, never reimplemented.** Every legality predicate
   the model needs already exists, in `wsr/span_overflow_hint_analysis.py`,
@@ -252,6 +270,9 @@ rather than restating them.
   (`_make_cpsat_solver`, `:2116-2136`). The graph must be unmutated when the
   solve fails, so the fallback starts from clean IR — which means the solve
   precedes the transform it decides.
+  <!-- No hints are always repsected or an error occurs indicating which 
+  hints are causing conflicts.
+   -->
 
 ## Hints, pins, and the validator
 
