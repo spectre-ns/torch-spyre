@@ -153,14 +153,21 @@ class ScratchpadAllocator:
         post-passes) is fixed, while subclasses override the ``_prepare_buffers``
         / ``_solve`` / ``_post_solve`` / ``_record_reject_reasons`` hooks to swap
         in their buffer type, solver call, and post-solve commit. The base hooks
-        implement the fixed-division, placement-only flow.
+        implement the fixed-division, placement-only flow. Every allocator runs
+        this skeleton -- the co-optimizing subclasses override hooks, never
+        ``plan_allocation`` itself -- so the passes are run from one place.
 
-        The pre-passes carry core division (:class:`SpanReductionPass`,
-        :class:`WorkDistributionPass`), so they run *before* the
-        ``config.lx_planning`` gate: codegen silently defaults a missing
+        Both pass lists are handled the same way: each goes through
+        :meth:`_run_passes` (so both are timed per pass), and both run on every
+        compile. ``config.lx_planning`` gates *placement*, which sits between
+        them, not the passes themselves. That gate exemption is mandatory for the
+        pre-passes, which carry core division (:class:`SpanReductionPass`,
+        :class:`WorkDistributionPass`): codegen silently defaults a missing
         ``op_it_space_splits`` to one core, so gating division would emit
-        single-core kernels and blow MAX_SPAN_BYTES with only a CRITICAL log.
-        LX planning owns core division whether or not placement runs.
+        single-core kernels and blow MAX_SPAN_BYTES with only a CRITICAL log. LX
+        planning owns core division whether or not placement runs. The
+        post-passes get the same treatment rather than being dropped by a flag
+        that says nothing about them.
 
         Args:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
@@ -168,14 +175,13 @@ class ScratchpadAllocator:
         """
         self.reject_reasons = {}
         self._run_passes(self.pre_optimization_passes, graph)
-        if not config.lx_planning:
-            return
-        buffers = self._prepare_buffers(graph)
-        allocation = self._solve(buffers)
-        self._post_solve(graph, allocation)
-        self._record_reject_reasons(allocation)
-        self._push_allocation(graph, allocation)
-        self._log_lx_pinning(graph)
+        if config.lx_planning:
+            buffers = self._prepare_buffers(graph)
+            allocation = self._solve(buffers)
+            self._post_solve(graph, allocation)
+            self._record_reject_reasons(allocation)
+            self._push_allocation(graph, allocation)
+            self._log_lx_pinning(graph)
         self._run_passes(self.post_optimization_passes, graph)
 
     @staticmethod
@@ -1301,16 +1307,25 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
     space, the worst case matches ScratchpadAllocator.
     """
 
-    def plan_allocation(self, graph: GraphLowering):
-        self.reject_reasons = {}
-        self._run_passes(self.pre_optimization_passes, graph)
-        # Same gate as the base template method, which this overrides wholesale:
-        # the pre-passes (core division) always run, placement is config-gated.
-        # Without this, LX_PLANNING=0 CO_OPTIMIZING_LX_PLANNING=1 would still run
-        # the full co-optimization search.
-        if not config.lx_planning:
-            return
+    def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
+        """Search the split cross-product, commit the winning splits, then build
+        the buffers on them.
 
+        This is the *only* hook this allocator overrides: the solve, the reject
+        reasons, the push, and both pass lists stay with
+        :meth:`ScratchpadAllocator.plan_allocation`, so the co-optimizing path
+        cannot drift from the base flow. Being a hook, it also inherits that
+        template's ``config.lx_planning`` gate for free -- with LX planning off
+        the search never runs, only the core-division pre-passes.
+
+        No pass is run from here. The winning splits are the last word on core
+        division: re-running the pre-passes over them would re-divide --
+        ``span_reduction`` overwrites a committed split whose span product
+        exceeds one, and ``work_distribution`` reads one as a floor and tops it
+        up -- committing splits the search never scored. This allocator used to
+        end with exactly that re-run, left from when the pre-pass list held a
+        clone-inserting pass rather than core division.
+        """
         # Enumerate options, run search, commit winners back to op_it_space_splits.
         ops = graph.operations
 
@@ -1350,32 +1365,16 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
             winner,
         )
 
-        # try insert clone again, as what was incompatible could be compatible now
-        # TODO simplify the previous pre-opt (at the beginning of this func), we will
-        # run check core-div-mismatch a few times due to clone-insertion, speed-up?
-        n_ops_before_clone = len(graph.operations)
-        self._run_passes(self.pre_optimization_passes, graph)
-
-        # Standard downstream flow on the now-fixed winning splits. Mirrors
-        # ScratchpadAllocator.plan_allocation past the pre-passes. Reuse the search's
-        # per-core-view cache + liveness only if the clone pass left the graph
-        # unchanged: a clone insertion both appends an op (shifts the
-        # position-indexed liveness) and rewrites input consumers' MemoryDep to read
-        # the clone (changes the (op, splits, dep) cache key), so on any op-count
-        # change both are stale and we rebuild from scratch (cache=lifetimes=None).
-        clone_inserted = len(graph.operations) != n_ops_before_clone
-        buffers = self._generate_buffers(
-            graph,
-            cache=None if clone_inserted else search_cache,
-            lifetimes=None if clone_inserted else search_lifetimes,
+        # Buffers for the template method's solve, on the now-fixed winning splits.
+        # The search's per-core-view cache and liveness are reused unconditionally:
+        # nothing between the search and here mutates the graph's shape (the commit
+        # loop above only rewrites op_it_space_splits), liveness is split-invariant,
+        # and the cache key carries the splits — so neither can be stale. The
+        # boundary clones are inserted later, by ``_push_allocation``, after these
+        # buffers have been consumed.
+        return self._generate_buffers(
+            graph, cache=search_cache, lifetimes=search_lifetimes
         )
-        assert self.layout_planning is not None
-        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
-        self._record_spill_reasons(allocation)
-        self._push_allocation(graph, allocation)
-        self._log_lx_pinning(graph)
-        for p in self.post_optimization_passes:
-            p.apply_pass(graph)
 
     # ------------------------------------------------------------------
     # Search
@@ -1397,9 +1396,8 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         >1 option (most return [seed]). Per-leaf cost is one full
         _generate_buffers + plan_layout pass; the `cache` param on
         _per_core_view_on_buf amortizes sympy work if it ever becomes hot. The
-        cache and liveness are returned so the final commit pass can reuse them
-        when the post-search clone pass leaves the graph unchanged (see
-        plan_allocation).
+        cache and liveness are returned so the buffer build that follows the
+        search reuses them rather than rebuilding both (see _prepare_buffers).
         """
         chosen: list[int] = [0] * len(ops)
         best_total: float = math.inf
