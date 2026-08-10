@@ -28,11 +28,6 @@ different points of one pass list, each with its own cost model and each blind
 to the others. This document folds those decisions into a single model with a
 single objective, and specifies the contract that makes doing so tractable:
 
-<!-- Please evaluate the feaibility of using CP-SAT as the validator by 
-checking for UNSAT solutions then doing analysis after the failure to 
-diagnose the incompatible hints provided.
- -->
-
 > Every axis can be **pinned** by a hint, left **free**, or **optimized**. A
 > validator proves the hint set is mutually consistent before the solve. The
 > solver determines only the free variables, so the result is valid, honours the
@@ -50,8 +45,7 @@ reproduces today's behaviour by construction.
 
 The decisions are made at different points of `CustomPreSchedulingPasses`
 (`passes.py:416-455`), by cost models that cannot see each other:
-<!-- Lets remove plan re-use I think this is covered in overall caching 
-strategies within inductor -->
+
 | Decision | Where | Cost model |
 |---|---|---|
 | Coarse tiling | `wsr/`, passes 6 and 17 | `_combo_cost` structural proxy |
@@ -60,8 +54,7 @@ strategies within inductor -->
 | Padding | `padding.py`, pass 15 | none |
 | Restickification | `optimize_restickify.py`, pass 10 | element count |
 | Op order | upstream DFS, repaired in `scheduler.py` | none |
-| LX allocation order | `scratchpad/` solvers | fixed per-solver heuristic |
-| Plan reuse | — | none |
+| LX placement | `scratchpad/` solvers | per-solver: greedy heuristic, or CP-SAT with no fragmentation term |
 
 Coarse tiling ranks split combinations by `_combo_cost` — total tile count, then
 tiled-dim count, then largest split (`wsr/span_overflow_hint_analysis.py:1181-1192`)
@@ -70,7 +63,7 @@ tiled-dim count, then largest split (`wsr/span_overflow_hint_analysis.py:1181-11
 (`_matmul_split_cost`, `work_division.py:1206`) and everything else by a
 dimension-priority heuristic (`prioritize_dimensions`, `:670`). LX residency runs
 a two-phase lexicographic CP-SAT solve — minimize spill, lock it, then maximize
-cores (`scratchpad/ilp_solver_ortools.py:446-518`). The remaining four have no
+cores (`scratchpad/ilp_solver_ortools.py:446-518`). The remaining three have no
 cost model at all.
 
 Six specific consequences follow, each verifiable in the tree.
@@ -96,28 +89,25 @@ Stated in the model's terms: tiles are **sequential** loop iterations and cores
 are **parallel**, but both draw down the same divisibility budget on a dimension.
 Today each decision spends that budget as if it were alone.
 
-### 2. Tiling can never buy LX residency
-<!-- This isn't entirely true. The tiling does buy lx residancy but
-only by chance. The reduction in working set does help but there is no
-connection to verify that the upstream decisions actually improve LX usage
-or that the selected configuration is optimal -->
+### 2. Tiling buys LX residency only by accident
 
 Shrinking a chain's working set until it fits the LX scratchpad is the stated
-purpose of `wsr/`, yet the tiling planner cannot see LX occupancy and the LX
-solver cannot choose a tiling. `docs/source/compiler/scratchpad_planning.md`
-records this among the remaining gaps under "Co-optimization is still limited",
-listing "**No coarse-tiling integration** when that pass also drives split
-decisions" alongside "**No performance model**".
+purpose of `wsr/`, and it does sometimes achieve that — but with no feedback
+edge. The tiling planner cannot see LX occupancy and the LX solver cannot choose
+a tiling, so nothing verifies that a chosen tiling improved residency, nothing
+rejects one that made it worse, and nothing establishes that the selected
+configuration is the best of the feasible ones. Residency is an uninstrumented
+side effect of a decision taken for span reasons.
+
+`docs/source/compiler/scratchpad_planning.md` records this among the remaining
+gaps under "Co-optimization is still limited", listing "**No coarse-tiling
+integration** when that pass also drives split decisions" alongside "**No
+performance model**".
 
 Consequences 1 and 2 are the same missing edge read from two directions: tiling
 cannot see what division has done, and neither can see what residency would cost.
 
 ### 3. Padding cannot influence the layouts it must satisfy
-
-<!-- Question: Does padding actually influence performance or is it
-just dependent on the desired configuration. If it has no impact 
-on performance or a reasonable cost model this should be moved out
-to the application step rather than part of the optimization. -->
 
 `insert_bmm_padding` runs at pass 15 (`passes.py:441`); `finalize_layouts`
 commits layouts at pass 11. Padding is therefore applied to a layout it had no
@@ -129,12 +119,15 @@ stick-divisible, under the same TODO referencing issue #1756 — because padding
 not available to them as a legalization tool. The layout search is smaller than
 it needs to be, and the reason is a pass-ordering artifact.
 
-Within its own scope, padding is a fixed policy rather than a decision:
-`compute_padding` (`padding.py:73-76`) rounds up to one stick, and the pass pads
-the y operand only, on the reduction dimension only, at the right end only, with
-zero fill only. It has no cost model, and no sharing — the loop at `:183` emits a
-separate four-op pad sequence per matmul, so two matmuls reading the same operand
-each pay for their own.
+Within its own scope, padding is a fixed policy: `compute_padding`
+(`padding.py:73-76`) rounds up to one stick, and the pass pads the y operand only,
+on the reduction dimension only, at the right end only, with zero fill only. For
+the amount needed to reach legality a fixed policy is the right answer — there is
+nothing to decide (phase 1). The defects are the ones the policy forecloses: no
+sharing, so the loop at `:183` emits a separate four-op pad sequence per matmul
+and two matmuls reading the same operand each pay for their own; and no way to
+pad past legality, which is what would let a dimension become splittable or a
+stick dimension become admissible.
 
 ### 4. Restickification is priced blind to what it costs
 
@@ -165,20 +158,36 @@ un-pins buffers whose per-core views stopped agreeing. Order is thus already
 being changed; it is simply being changed reactively, downstream of the decisions
 that depend on it.
 
-### 6. LX cannot compact, and nothing is reused between compiles
+### 6. LX placement cannot move a buffer that is already live
 
-The greedy solver processes operations in topological order making irrevocable
-placement decisions with no lookahead, and `_find_free_block` can locate holes
-between allocations but cannot compact them, so allocate/deallocate cycles
-fragment the address space — both recorded in `scratchpad_planning.md` under
-"Greedy single-pass, no lookahead" and "No defragmentation". First-fit and
-best-fit mitigate by sorting buffers up front
-(`scratchpad/firstfit_bestfit_solver.py:186-245`), which is itself a fixed
-heuristic over an axis that could be decided.
+The greedy solver — today's `LAYOUT_SOLVER` default, and a development artifact
+rather than a chosen one (M1) — processes operations in
+topological order making irrevocable placement decisions with no lookahead, and
+`_find_free_block` can locate holes between allocations but cannot compact them —
+both recorded in `scratchpad_planning.md` under "Greedy single-pass, no lookahead"
+and "No defragmentation". First-fit and best-fit mitigate by sorting buffers up
+front (`scratchpad/firstfit_bestfit_solver.py:186-245`), and `CpSatLayoutSolver`
+removes the ordering question altogether, placing every buffer in one global
+`AddNoOverlap2D` over time × address (`ilp_solver_ortools.py:31`, `:568`) and
+squeezing out the residual gaps in `_justify` (`:747`).
 
-Separately, no compiler decision is serialized anywhere. Compiled SDSC bundles
-are written to `uuid4()`-named temporary directories and recompiled on every run
-(`execution/async_compile.py:38-45`); the plan that produced them is discarded.
+What no solver can do is move a buffer once it is live. Every one of them assigns
+a single address for a whole lifetime (`LifetimeBoundBuffer.address`,
+`plan_solver.py:64`), so allocate/deallocate cycles fragment the address space and
+a plan whose aggregate free space is more than sufficient can still fail to place
+a buffer for want of one large enough hole.
+
+One adjacent bug is recorded here because the roadmap makes it more expensive,
+not because the roadmap fixes it. torch-spyre participates in Inductor's FX graph
+cache and extends its key to cover input `SpyreTensorLayout`s
+(`_patch_fx_graph_hash`, `torch_spyre/_monkey_patch.py:291-335`), while the pass
+pipeline separately hashes only pass **source files** (`passes.py:144-151`). No
+torch-spyre config value reaches either key, so a `SENCORES=8` run and a
+`SENCORES=32` run share an entry. That is a wrong-artifact bug today,
+independent of this document, and the fix is an extension to a hook that already
+exists; it should land immediately rather than being scheduled against any phase
+here. Every phase that follows widens the gap between two runs that share a key,
+which is the only reason it appears in this list.
 
 ## The model
 
@@ -186,11 +195,31 @@ These requirements are stated once here so that no phase re-derives them. Each
 collateral RFC satisfies the ones its axis touches and cites them by number
 rather than restating them.
 
-- **M1 — One solve, one objective.** All *optimized* axes resolve in a single
-  CP-SAT instance minimizing a single expression. The existing `LAYOUT_SOLVER`
-  plug point (`config.py:111-113`, `_PLACEMENT_SOLVERS` at
-  `scratchpad/allocator.py:2108-2113`) is the template both for selecting a
-  solver and for degrading when `ortools` is absent.
+- **M1 — One solve, one objective, and the solver is CP-SAT.** All *optimized*
+  axes resolve in a single CP-SAT instance minimizing a single expression. This
+  is the target the whole document is written against: `CpSatLayoutSolver`
+  (`ilp_solver_ortools.py:321`) is the solver the phases extend, and every
+  encoding decision here — M4's tables, M5's joint feasibility, H2's
+  enumeration-time pins — is chosen for it.
+
+  The heuristic placement solvers are **not** targets. Greedy, first-fit, and
+  best-fit exist as free mode and as the M9 fallback, and nothing in this
+  document optimizes them or treats their internal policies as decisions.
+  Simulated annealing (`SimulatedAnnealingLayoutSolver`, registered in
+  `_PLACEMENT_SOLVERS` at `scratchpad/allocator.py:2108-2113`) is the anticipated
+  *second* backend rather than a fallback: it searches a different space — a
+  buffer permutation — so it can accept work CP-SAT finds expensive. No phase
+  here delivers it, but no phase may preclude it, which is a constraint on M2 and
+  M4 rather than a deliverable. The existing `LAYOUT_SOLVER` plug point
+  (`config.py:111-113`) is the template both for selecting a solver and for
+  degrading when `ortools` is absent.
+
+  That `LAYOUT_SOLVER` currently defaults to `greedy` is a development artifact,
+  not a design position — the standing TODO already moves it to `firstfit`
+  (`config.py:110`), and a solver-backed default is the expected end state. This
+  document assumes it: the phases are written for the configuration the compiler
+  is heading toward, and the heuristics persist for fallback and for the parity
+  testing M3's free mode is built on, not as the destination.
 
 - **M2 — The objective is injected, not hardcoded.** The cost function is
   caller-supplied, so cost experiments do not require editing the solver. Today's
@@ -200,6 +229,24 @@ rather than restating them.
   grammar is a compile error naming the offending node. Silently approximating an
   objective is worse than failing to build one. An axis in free mode contributes
   no symbols.
+
+  **The objective is a cost, and the model minimizes it.** One expression in one
+  unit, not a ranking. Today's two-phase lexicographic structure — minimize spill,
+  lock that value, then maximize cores (`ilp_solver_ortools.py:446-518`) —
+  collapses into it, which is a real change and not a restatement: lexicographic
+  order makes a spill infinitely worse than any amount of lost parallelism, while
+  a cost prices the two against each other and takes the cheaper. That is the
+  intended behaviour. A trade that a correct cost model says is worth making is
+  worth making, and a trade it gets wrong is a C1 defect to be fixed in the
+  numbers rather than fenced off with a guard in the solver.
+
+  The grammar must additionally be **numerically evaluable on a fully assigned
+  candidate**, not only lowerable to CP-SAT expressions. A search-based backend
+  scores concrete states rather than building an expression tree, so an objective
+  that exists only as a lowering locks the model to CP-SAT for good. Two
+  consumers of one grammar is also the cheapest available check that the lowering
+  is faithful: the evaluated cost of a returned solution must equal the objective
+  value the solver reports.
 
 - **M3 — Three modes per axis: pinned, free, optimized.** The central
   tractability mechanism.
@@ -228,7 +275,8 @@ rather than restating them.
   extension mechanism, and later phases depend on it: **any
   `f(candidate) -> int` becomes a table entry plus one `AddElement`.** A
   nonlinear property of a candidate becomes a table lookup rather than a
-  constraint. The cost is enumeration, which M5 and C3 bound.
+  constraint. The cost is enumeration, which M5 and C2 bound and phase 5 reduces
+  if measurement demands it.
 
 - **M5 — Feasibility is evaluated on the combination, not per subsystem.** A
   candidate is feasible if and only if it satisfies every subsystem's guard
@@ -237,9 +285,14 @@ rather than restating them.
   dimension split, a per-core span within `MAX_SPAN_BYTES` on every tensor
   dependency, and no coordinate-masked dimension split. Evaluating them on the
   combination rather than one axis at a time is what discharges consequence 1.
-  <!-- Question: Does this mean that I will need to enumerate a table with
-  all the possible combinations of tiling and core division eagerly? Can you think about how this could be done declaratively using constraints? I expect this
-  space will be large. -->
+
+  The table is **per operation**. The joint (tiling, division) space is
+  enumerated eagerly for one operation at a time — which is what
+  `enumerate_work_division_candidates` already does for division alone
+  (`work_division.py:825-830`) — and the combination *across* operations is what
+  the solver decides, never what enumeration materializes. Eager is the
+  deliberate choice for current problem sizes; phase 5 owns shrinking the
+  per-operation table when measurement says it must.
 
 - **M6 — Predicates are reused, never reimplemented.** Every legality predicate
   the model needs already exists, in `wsr/span_overflow_hint_analysis.py`,
@@ -254,50 +307,91 @@ rather than restating them.
   `scratchpad/utils.py:84-103`, with `start_time` / `end_time` derived at
   `scratchpad/plan_solver.py:75-81`), so any pass that *inserts* operations shifts
   the lifetime ticks of everything downstream. That is a systematic offset, not
-  noise, so predictions are compared to realized values under rank-order
-  normalization. Each phase owes a verify mode (C2).
+  noise, so any comparison of predicted to realized values is made under
+  rank-order normalization.
+
+  Whether the predictor is faithful is settled **offline**, against recorded
+  plans, not by an assertion pass inside the compiler: no phase owes a verify
+  mode, and none adds one. What the phases owe instead is that the inputs to that
+  offline check exist — the predicted values a decision was scored against are
+  recorded alongside the decision itself (H5), so predicted and realized can be
+  compared after the fact without re-deriving either.
 
 - **M8 — Addresses come from the final solve.** Whatever the joint model
   predicts, physical placement is recomputed over the real post-transform
   buffers. A misprediction therefore degrades to a spill, never to a wrong
   address.
 
-- **M9 — Failure reverts to free mode.** On solver failure, timeout, or a missing
-  optional dependency, the affected axes drop to free mode: the existing
-  heuristic runs and only validity is enforced. This generalizes the current
-  `SolveError` fallback to the greedy allocator
-  (`scratchpad/allocator.py:2193-2219`) and the ortools-missing fallback
-  (`_make_cpsat_solver`, `:2116-2136`). The graph must be unmutated when the
-  solve fails, so the fallback starts from clean IR — which means the solve
-  precedes the transform it decides.
-  <!-- No hints are always repsected or an error occurs indicating which 
-  hints are causing conflicts.
-   -->
+- **M9 — Failure never discards a pin.** A pin is an enumeration-time domain
+  restriction (H2), not a solver-level preference, so it survives any fallback by
+  construction: the fallback runs over the *already-pinned* candidate sets. A
+  hint is therefore always respected, or the compile fails with an error naming
+  the hints that conflict. It is never silently dropped. Three failure causes,
+  three outcomes:
+
+  1. *Solver unavailable, timed out, or errored.* The optimized axes drop to free
+     mode over the pinned candidate sets: the existing heuristic runs and only
+     validity is enforced, using the same predicates optimized mode uses (M6).
+     This generalizes the current `SolveError` fallback to the greedy allocator
+     (`scratchpad/allocator.py:2193-2219`) and the ortools-missing fallback
+     (`_make_cpsat_solver`, `:2116-2136`). The existing heuristic already honours
+     hints on the one axis that has them — `work_distribution_pass` returns early
+     on a resolved hint (`work_division.py:1109-1141`) — so this is the current
+     behaviour generalized, not a new obligation.
+  2. *Infeasible with the pins, feasible without them.* A hint conflict. Hard
+     error naming the conflicting subset (H3.3). Never a fallback: falling back
+     here would silently produce a plan the user's hints forbid.
+  3. *Infeasible without the pins.* A compiler defect or a genuinely infeasible
+     graph. Error, not fallback.
+
+  Distinguishing (2) from (3) costs one extra pin-free solve, on the failure path
+  only, and it is what gives H3.3's diagnostic pass its entry condition. Note
+  that H3.2 catches most pin conflicts before any solve; M9's error path exists
+  for conflicts that are only visible across operations.
+
+  The graph must be unmutated when the solve fails, so the fallback starts from
+  clean IR — which means the solve precedes the transform it decides.
 
 ## Hints, pins, and the validator
 
 The spine. Collateral document 0 owns it in full; this section states the
 contract every phase registers against.
-
-- **H1 — A hint registry.** A declared schema per axis: key name, value shape,
-  scope kind (operation, dimension, edge, buffer, graph), and owning phase.
+- **H1 — A hint registry.** A table mapping each hint key to its value schema and
+  its scope kind (operation, dimension, edge, buffer, subgraph), consulted at
+  validation time. It is **not a new data path**: hints continue to be attached
+  and read exactly as they are today, per operation.
 
   The *transport* needs no redesign. `spyre_hint(**kwargs)`
-  (`propagate_hints.py:85-93`) already attaches an arbitrary kwargs dict to every
-  FX node in scope, keyed by hint id, and survives AOT re-tracing through
-  `collect_spyre_hints` / `recover_spyre_hints` (`:138-208`). It is already
-  axis-agnostic.
+  (`propagate_hints.py:85-93`) is a `torch.fx.traceback.annotate` context manager,
+  so every FX node traced in scope carries the hint id — `decompositions.py:447-455`
+  nests four of them — and `get_op_hints` (`:96-113`) reads them back per
+  operation off `op.origins`. AOT re-tracing is survived by `collect_spyre_hints` /
+  `recover_spyre_hints` (`:138-208`). Hint scope is therefore already
+  multi-operation and already propagated: `coarse_tile_hints.py` groups operations
+  by hint id today. That is why scope kind is a *declared* field rather than an
+  implied one — a pin has to know what it collapses.
 
-  What is missing is the registry. Consumers each pull their own key out of the
+  What is missing is the schema. Consumers each pull their own key out of the
   untyped dict — `work_div` at `work_division.py:835-843`, and
-  `tiles` / `slices` / `num_tiles_per_dim` at `propagate_named_dims.py:636-644` —
-  so an unregistered or misspelled key is silently dropped, and two hint families
-  on one operation never see each other. Registration turns an unknown key into
-  an error naming the nearest registered one.
+  `tiles` / `slices` / `num_tiles_per_dim` at
+  `wsr/propagate_named_dims.py:636-644` — so a key no consumer matches is silently
+  a no-op: `spyre_hint(tile={"A": 2})`, singular, compiles and does nothing.
+  Well-formedness is ad hoc for the same reason: the one-of-`tiles`/`slices`/
+  `num_tiles_per_dim` rule is an inline generator expression at `:636-644`, while
+  `work_div`'s shape checks live in `_apply_user_hint`
+  (`work_division.py:866-932`). Registration turns an unknown key into an error
+  naming the nearest registered one, and gives H3.1 one place to check shape and
+  scope instead of one per consumer.
+
+  What a registry does **not** buy is agreement between two hint families on the
+  same operation. That needs feasibility predicates, not a schema, and it is
+  H3.2's job.
 
 - **H2 — A hint lowers to a pin.** Each hint becomes a domain restriction applied
   at *enumeration* time: the candidate list is filtered before the model is
-  built, not overridden after a choice is made.
+  built, not overridden after a choice is made. On a hinted axis the filter leaves
+  **exactly one option**, so the solver is not choosing under a preference — it is
+  handed the value and searches only what is left.
 
   This generalizes a mechanism that already exists. `_division_map` and
   `_fixed_core_division` (`scratchpad/allocator.py:1527-1556`) already collapse an
@@ -311,27 +405,80 @@ contract every phase registers against.
   `_cost_model_divide_op` (`:1642-1644`) declines to override one. Correct
   behaviour, wrong layer.
 
-- **H3 — The validator.** Two levels run always; a third runs only on failure.
+- **H3 — The validator.** Three levels, each anchored to a point in the pipeline:
+  level 1 runs before enumeration, level 2 during enumeration, and level 3 only
+  after the solver returns `INFEASIBLE`. Levels 1 and 2 are the entire normal
+  path — a hint that is malformed, or that no candidate satisfies, is named before
+  any model is built, so the solver only ever sees pins that are individually
+  legal.
 
-  1. *Well-formedness.* The key is registered, the value's shape and type are
+  **The design target is that conflict detection is linear, not NP.** A solve is
+  exponential in the worst case and answers a question most hint conflicts do not
+  need asked: two pins that disagree, or a pin that violates a budget, are local
+  facts about the hint set. Levels 1 and 2 are therefore built to catch as much as
+  a pass over the hints and the operations they scope can catch — O(hints) plus
+  O(operations), no search — and level 3 exists only for what provably cannot be
+  decided that way. Every conflict pushed down into the linear check is both
+  faster and better attributed, since it names the rule that failed rather than a
+  subset of assumptions.
+
+  1. *Well-formedness — before enumeration, on the hint set alone.* The key is
+     registered, the value's shape and type are
      correct, and the scope resolves to a live operation, dimension, edge, or
      buffer. This subsumes the checks scattered through `_apply_user_hint`
      (`work_division.py:866-932`) and the one-of-`tiles`/`slices` rule at
      `propagate_named_dims.py:636-644`.
-  2. *Realizability.* The pinned value survives the phase's own feasibility
+  2. *Realizability — during enumeration, one operation at a time.* The pinned
+     value survives the phase's own feasibility
      predicates (M5, M6). This closes a real hole: a `work_div` hint that reduces
      splits `span_reduction` already committed proceeds today with only a warning
      — *"Applying strict user hint; this may violate the hardware span limit"*
      (`work_division.py:1110-1142`) — and `_apply_user_hint` silently skips, at
      `logger.info` level, a dimension whose split would exceed `SENCORES`. Both
      become named errors.
-  3. *Conflict diagnosis, on infeasibility only.* The normal solve carries no
-     diagnostic apparatus: pins are collapsed domains, so a satisfiable model pays
-     nothing for them. When the solve reports infeasible, a **separate diagnostic
-     pass** re-expresses the pins as retractable assumptions and reports the
-     minimal conflicting subset, so the error names the specific hints that
-     conflict instead of reporting a bare UNSAT. The cost is paid only on the
-     failure path, which is the point.
+
+     This is also where two hint families on one operation are reconciled, which
+     no consumer does today: because M5 evaluates the combination rather than one
+     axis at a time, a `tiles` pin and a `work_div` pin on the same dimension are
+     checked against the same `valid_split` guards, and a pair that is
+     individually legal but jointly infeasible is named here rather than
+     surviving to the solve. A pin that empties an operation's candidate list is
+     caught here too: enumeration returns nothing, and the error names the hint
+     and the predicate that rejected it.
+
+     All of this stays linear because the predicates are evaluated per candidate
+     row and per operation, never across the graph: the pinned combination either
+     appears in the operation's enumerated set or it does not. The collateral
+     document owns the list of conflicts reachable this way, and the pins whose
+     product is checkable against a fixed budget — `SENCORES`, `MAX_SPAN_BYTES`,
+     one reduction split — belong on it.
+  3. *Conflict diagnosis — only after the solve returns `INFEASIBLE`.* Levels 1
+     and 2 each look at one operation, so what survives them and still fails is
+     exactly one thing: a set of pins that are individually realizable but
+     jointly infeasible *across* operations. That is the whole of level 3's
+     domain, and nothing else routes to it — in particular `UNKNOWN` from the
+     wall-clock limit is not `INFEASIBLE` and goes to M9 case 1.
+
+     The normal solve carries no diagnostic apparatus: pins are collapsed
+     domains, so a satisfiable model pays nothing for them. On infeasibility a
+     **separate diagnostic pass** re-expresses the pins as retractable
+     assumptions and reports a conflicting subset, so the error names specific
+     hints instead of a bare UNSAT. The cost is paid only on the failure path,
+     which is the point.
+
+     Two properties of the underlying API, recorded so the phase that builds this
+     does not assume them away. OR-Tools returns a subset *sufficient* for
+     infeasibility, not a minimal one — with an objective attached it will happily
+     return every assumption — so the diagnostic model is built objective-free and
+     deletion-refined if a true minimal subset is wanted. And re-expressing pins
+     as assumptions means re-enumerating without pin filtering, which is the real
+     cost of the level.
+
+     **Level 3 is therefore staged behind levels 1 and 2**, which land first and
+     cover every conflict visible within one operation. It is also the only part
+     of the validator that pays solver-order cost, which is the argument for
+     keeping it small: the residue after the linear checks, not the mechanism the
+     validator is built around.
 
   One trap to record so no phase assumes it away: a predicate quantified over a
   *set* of operations does not follow from checking adjacent pairs. Where a
@@ -356,21 +503,21 @@ contract every phase registers against.
   `reject_reasons` (`allocator.py:137`), `_SOLVER_CHOSE_SPILL`
   (`ilp_solver_ortools.py:113`), and `excluded()` / `record_exclusions()`
   (`plan_solver.py:221-258`). Every committed decision records whether it came
-  from a user hint, a compiler-generated hint, a cache replay, free mode, a
-  fallback, or the solver. Without this, a plan cannot be debugged and a cache
-  replay cannot be distinguished from a fresh solve.
-
-- **H6 — A warm start is not a pin.** OR-Tools' `AddHint` is a soft search seed
-  with no semantic guarantee; a torch-spyre hint is a hard pin validated by H3.
-  They must not share vocabulary in code or in documentation, or the two will be
-  conflated in review.
+  from a user hint, a compiler-generated hint, free mode, a fallback, or the
+  solver. Without this a plan cannot be debugged, and the three modes of M3
+  cannot be told apart after the fact: a value that free mode inherited from the
+  existing heuristic is indistinguishable in the output from one the solver
+  chose.
 
 ## Phases
 
-Each phase follows the same template: the defect it closes, the decision
-variables it adds, what free mode means for that axis, the hint form it registers
-under H1, what the validator must newly check, what it depends on, and its exit
-criteria.
+A phase that adds an axis follows the same template: the defect it closes, the
+decision variables it adds, what free mode means for that axis, the hint form it
+registers under H1, what the validator must newly check, what it depends on, and
+its exit criteria. One phase adds no axis and does not follow it — phase 5 is
+enumeration mechanism — and it says so in its own first line. Padding likewise
+adds no axis, so it gets no phase: it is policy and legalization work, and it
+lands inside the phases that consume it, 1 and 2.
 
 ### Phase 1 — Coarse tiling, for sizing and temporal op splitting
 
@@ -392,17 +539,54 @@ deciding whether a loop nest breaks there. Grouping then falls out of the
 objective — a tiling group is a maximal run with no break — rather than being
 precomputed by a grouping heuristic that a wrong guess would make unrecoverable.
 
+**Padding, which is not an axis.** Padding gets no phase of its own and no index
+space; it lands here because this is the first phase that needs it, and it needs
+it for sizing. The pad required to reach legality is *derived* — `compute_padding`
+(`padding.py:73-76`) rounds up to one stick, and given the layout and tiling
+there is no freedom and therefore nothing to decide. It is a scalar on each
+candidate row, so buffer sizes are computed from padded `device_size` rather than
+from the unpadded shape. Padding *beyond* legality is the one part with a genuine
+choice — it can unlock a divisibility `valid_split` requires
+(`work_division.py:809-823`), turning an illegal core split into a legal one —
+and it enters as additional rows in the tables this phase already builds. **No
+new index space**, precisely the case M4's rule was written for.
+
+Whether those extra rows are worth having is an empirical question this document
+does not presume the answer to. Padding is not free today: `lower_pad_sequence`
+(`pass_utils.py:1191-1227`) emits a four-op sequence — allocate, fill constant,
+fill pad region, copy — per matmul, with no sharing between two matmuls reading
+the same operand (`padding.py:183`); y's buffer grows and competes for LX; and
+K→K_padded widens the SDSC iteration space at codegen
+(`_extend_matmul_k_to_padded`). Measuring that — an unaligned-K matmul against
+the same model pre-padded by hand — gates whether discretionary pad values are
+enumerated at all. If the delta is noise, the derived pad stays purely in the
+apply step and no pad row is ever added.
+
+Either way this phase lifts the fixed policies in `padding.py`, since the derived
+amount cannot be expressed without them: pad operands other than y, dimensions
+other than K, ends other than the right, and multiples other than one stick; and
+share a padded buffer between matmuls that read the same operand rather than
+emitting a pad sequence per matmul (`:183`). The remaining half — padding as a
+*layout legalization* tool, removing the issue #1756 restriction at
+`propagate_layouts.py:271`, `:455`, and `:1078` — lands in phase 3 with the
+layout search that consumes it.
+
 **Free mode.** Today's behaviour: the `_combo_cost`-ranked first feasible tiling,
-checked for span legality only.
+checked for span legality only, and padding's unconditional round-up to the next
+stick.
 
 **Hint form.** The existing `tiles` / `slices` / `num_tiles_per_dim` and
-`work_div` keys, registered under H1 and lowered to pins under H2.
+`work_div` keys, registered under H1 and lowered to pins under H2, plus a pin on
+a buffer's pad amount.
 
 **Validator.** The hinted value survives enumeration; a hint scope must not
 straddle a loop-nest break, the invariant `validate_coarse_tile_groups`
-(`wsr/coarse_tile.py:112-137`) enforces today; and group contiguity
+(`wsr/coarse_tile.py:112-137`) enforces today; group contiguity
 (`_validate_contiguous`, `:785-814`) should hold structurally, by pinning a break
-wherever an operation cannot be tiled, rather than being checked after the fact.
+wherever an operation cannot be tiled, rather than being checked after the fact;
+and stick alignment must hold jointly across pad, tile, and division, reusing
+`_post_tile_stick_alignment_error` (`span_overflow_hint_analysis.py:263`) and
+`_combined_tile_stick_alignment_error` (`:1215`).
 
 **Owed to later phases.** The M4 candidate encoding, the M2 objective namespace,
 the M7 predictor, and per-core views evaluated against a *predicted*
@@ -412,39 +596,73 @@ operation's current layout. Phase 3 cannot start without that last one.
 
 **Exit.** Parity with today when the axis is free. A case where span overflow
 forces tiling *and* work division splits the same dimension provably picks a
-smaller tile count than the `core_split_estimate = 1` path. Prediction verified
-under C2.
+smaller tile count than the `core_split_estimate = 1` path. The padding cost
+measurement reported either way, existing bmm tests
+unchanged, and `tests/inductor/test_padding.py` extended with a shared-operand
+sharing case — plus a chosen-pad case if the measurement justifies one.
 
-### Phase 2 — Padding
+### Phase 2 — LX relocation and compaction
 
-The cheapest addition, and it sharpens phase 1 retroactively: padded
-`device_size` is what buffer sizes are computed from, so phase 1 otherwise
-optimizes against numbers a fixed policy chose.
+Paired with phase 4 on the same time axis, and deliberately not adjacent to it:
+phase 4 decides *when operations run*, this phase decides *where in LX their
+buffers sit* and whether that placement may change while a buffer is live.
 
-**Variables.** A pad choice per padded dimension over a small enumerated set.
-**No new index space** — a pad choice is a per-candidate scalar folded into the
-existing tables under M4, which is precisely the case M4's rule was written for.
+It comes second because its defect is the one that is independent of every other
+axis. Fragmentation costs spills today, under a program order and a buffer set
+that no later phase has to settle first, so it can be measured and closed before
+anything else is a variable. Phase 4 later moves lifetimes, so the relocation plan
+is re-solved and phase 2's numbers re-measured rather than inherited; nothing is
+invalidated, since relocation is defined over whatever lifetimes hold.
 
-**Policy work, not solver work.** The second half of the phase lifts the fixed
-policies in `padding.py`: pad operands other than y, dimensions other than K,
-ends other than the right, and multiples other than one stick; share a padded
-buffer between matmuls that read the same operand rather than emitting a pad
-sequence per matmul (`:183`); and — the part phase 3 consumes — make padding
-available as a *layout legalization* tool, removing the issue #1756 restriction
-at `propagate_layouts.py:271`, `:455`, and `:1078`.
+**Allocation order is not the axis, and this phase does not model it as one.**
+Under a solver, addresses are not handed out in an order at all: `CpSatLayoutSolver`
+places every buffer with one global `AddNoOverlap2D` over time × address
+rectangles (`ilp_solver_ortools.py:31`, `:568`) and `_justify` (`:747`) then
+slides each unit down to the lowest free address to squeeze out gaps the search
+left. Order exists only in the heuristics — greedy walking topological order with
+irrevocable decisions, first-fit and best-fit sorting buffers up front
+(`firstfit_bestfit_solver.py:186-245`) — which is to say it exists only in free
+mode and on the M9 fallback path, where it is a property of the heuristic rather
+than a decision anyone makes. Optimizing it would be optimizing the fallback.
 
-**Free mode.** Today's unconditional round-up to the next stick.
+There is one case where order returns, and it is a *representation* rather than
+an axis: `SimulatedAnnealingLayoutSolver` anneals over a buffer permutation via
+`PermutationBasedLayoutSolver`, and `SolverToPermutation`
+(`scratchpad/simulated_annealing.py:71-95`) converts any solver's layout into
+one. If M1's second backend is ever built, that machinery is what it searches
+over, and it is reused rather than reinvented (M6) — but no hint pins a
+permutation and no phase exposes one.
 
-**Hint form.** Pin a buffer's pad amount.
+**Variables.** Relocation: a buffer's address becomes a function of time rather
+than a single value, so a live buffer can be moved and a hole closed. This is a
+genuine extension to the model even under CP-SAT, where each buffer is one
+rectangle with one address today. Two consequences the collateral document owns.
+The plan representation changes — `LifetimeBoundBuffer.address` is a single
+`Optional[int]` (`plan_solver.py:64`), and consumers after a move must bind the
+new address. And relocation is not free the way an ordering permutation would
+have been: it emits an LX→LX copy, so it needs a cost term in the M2 objective or
+the solver will relocate whenever it closes a byte.
 
-**Validator.** Joint stick alignment across pad, tile, and division, reusing
-`_post_tile_stick_alignment_error` (`span_overflow_hint_analysis.py:263`) and
-`_combined_tile_stick_alignment_error` (`:1215`).
+The second half is objective, not variables: fragmentation and peak occupancy
+have no term today — the existing solve minimizes spill, locks it, then maximizes
+cores (`ilp_solver_ortools.py:446-518`) — so a plan that fits with a fragmented
+address space and one that fits compactly score identically until C1 supplies the
+term.
 
-**Exit.** Existing bmm tests unchanged. `tests/inductor/test_padding.py` extended
-with a shared-operand sharing case and a chosen-pad case. Padded candidates
-visible to `_candidate_output_stls` (`propagate_layouts.py:249-278`), which is
-the observable that phase 3's search space grew.
+**Free mode.** Today's placement, whichever solver `LAYOUT_SOLVER` selects, with
+no relocation: buffers keep one address for their whole lifetime.
+
+**Hint form.** Pin a buffer's residency, or pin it against relocation. Residency
+hands users a direct lever over the outcome they most often want to control,
+which no current hint family reaches.
+
+**Validator.** A pinned residency must fit the packing across its lifetime; a
+buffer pinned against relocation must still admit a single-address placement.
+
+**Exit.** A fragmentation case that no current solver can pack — aggregate free
+space sufficient, no single hole large enough — is packed by relocating. No
+regression in spill count on the tracked benchmarks, and no relocation emitted
+when the fragmentation-free plan already fits.
 
 ### Phase 3 — Restickification
 
@@ -452,7 +670,7 @@ Two separable efforts, and the document says so because the existing pass name
 conceals the split (consequence 4).
 
 **3a — pricing.** A per-edge relayout variable over *dataflow* edges — the first
-**new index space** in the model, everything before phase 3 being per-buffer or
+**new index space** in the model, everything before it being per-buffer or
 per-adjacent-pair — and a relayout-bytes term in the M2 objective, precomputed
 per edge from the tiling-aware per-core views phase 1 delivers. The variable is
 *determined* rather than free: an edge needs a relayout, or it does not, given
@@ -468,6 +686,16 @@ hardcoded `BEAM_WIDTH = 200` (`optimize_restickify.py:467`). 3b touches passes
 10-14 and does not depend on the solver at all, so it is independently landable
 and should not be gated behind 3a.
 
+**3c — padding as legalization.** Removing the issue #1756 restriction at
+`propagate_layouts.py:271`, `:455`, and `:1078`, so a candidate stick dimension
+whose size is not stick-divisible can be padded into admissibility instead of
+skipped (consequence 3). This is padding work, but it lands here rather than with
+the rest of it because this is the phase that consumes it: it is what makes
+`_candidate_output_stls` (`propagate_layouts.py:249-278`) emit candidates the
+layout search could not previously see, and pricing relayout over the smaller set
+would optimize against an artificial restriction. It builds on the derived-pad
+machinery phase 1 delivers.
+
 **Free mode.** Today's beam search over layouts, with placement fixed at the
 consumer.
 
@@ -480,7 +708,9 @@ edge pinned to no-relayout must admit a common stick dimension
 **Exit.** A measurable reduction in relayout bytes on the two tracked benchmarks
 against the baselines recorded in `scratchpad_planning.md` — `mlp-linear-kn.t` at
 roughly 79% process-engine utilization after pointwise seeding, and `mha_4h`
-converging on `B/4·M/8` with the scores matrix pinned.
+converging on `B/4·M/8` with the scores matrix pinned. For 3c, a dimension whose
+size is not stick-divisible appearing in `_candidate_output_stls` output where it
+is skipped today, which is the observable that the layout search space grew.
 
 ### Phase 4 — Op re-ordering
 
@@ -493,7 +723,10 @@ once.
   model is constructed. If order is a decision, adjacency is itself variable and
   the topology cannot be baked in.
 - Liveness *is* the index into `graph.operations` (`scratchpad/utils.py:84-103`),
-  so every packing rectangle's time axis moves when an operation moves.
+  so every packing rectangle's time axis moves when an operation moves. Phase 2
+  sharpens this rather than softening it: a relocation is scheduled *at a tick*,
+  so moving an operation moves the point at which a buffer changes address, and
+  the hole the relocation was closing may not be there any more.
 - In-place merging requires **exact** tick adjacency —
   `parent.end_time == child.start_time + 1`, asserted at
   `scratchpad/plan_solver.py:169-194` and relied on at
@@ -522,97 +755,101 @@ Phase 4 makes the decision proactive rather than introducing one.
 **Exit.** No in-place-merge regression, asserted directly against the exact-tick
 invariant. Free mode reproduces today's order exactly.
 
-### Phase 5 — LX allocation re-ordering
+### Phase 5 — Enumeration scaling
 
-Sibling of phase 4 on the same time axis: phase 4 decides *when operations run*,
-phase 5 decides *in what order addresses are assigned* to the buffers they
-produce, and whether the address space can be compacted.
+Deferred by choice, and the document records it as a choice rather than an
+oversight. M4 buys model simplicity with enumeration, and until measured problem
+sizes make that trade bad, the **eager cross product stays**: the joint
+(tiling, division) table is formed per operation as the product of the two
+enumerations, extending what `enumerate_work_division_candidates` already does
+for division alone (`work_division.py:825-830`) within the caps coarse tiling
+already applies (`_MAX_AUTO_TILE_SPLIT_COUNT = 64` per dimension,
+`_MAX_TILE_COMBOS = 512` combinations, `span_overflow_hint_analysis.py:144-149`).
 
-**Variables.** Allocation order or priority over the placeable set, and — the
-harder half — relocation, permitting a buffer's address to change during its
-lifetime so holes can be closed. The permutation machinery exists as a foundation
-(`scratchpad/permutation_layout.py`, and `SolverToPermutation` in
-`scratchpad/simulated_annealing.py`) and should be reused rather than reinvented
-(M6).
+**Trigger.** Not a position in the order. C2 reports candidate rows per operation
+alongside enumeration and solve time; this phase lands when either exceeds the
+compile-time budget. Since the joint table is phase 1's, that may well be
+immediately after it and before phases 2 through 4 rather than after them.
+Nothing earlier depends on it, and no interface changes when it lands — the table
+is built differently, not consumed differently.
 
-**Free mode.** Today's solver-specific order: greedy topological, or the
-first-fit / best-fit up-front sort.
+**What it does, cheapest first.**
 
-**Hint form.** Pin a buffer's residency, or its relative allocation priority.
-This also hands users a direct lever over the outcome they most often want to
-control, which no current hint family reaches.
+1. *Table over distinct derived-scalar signatures.* M4 consumes only
+   `f(candidate) -> int`, so two candidates producing the same row — per-core
+   span, buffer bytes, tile count, cores, cost — are indistinguishable to the
+   solver. Deduplicating by signature bounds the row count by the number of
+   distinct signatures rather than by the combinatorial count.
+2. *Per-dimension tables with channeling constraints.* Keep per-dimension tile
+   and core variables whose **domain is the divisor set**, so divisibility is
+   declared rather than enumerated; express joint per-dimension legality as one
+   allowed-assignment table per dimension; and keep the cross-dimension couplings
+   as constraints — the core budget as a chained bounded product, the
+   `MAX_SPAN_BYTES` limit likewise, at most one reduction split as a reified sum.
+   This replaces a product over dimensions with a sum over dimensions.
+3. *The quotient, posed rather than tabulated.* The reason sizes are table
+   entries today is that per-core size is a **quotient** of the dimension by the
+   split, and a quotient of two variables is not linear. Restricting the split
+   variable's domain to the divisor set removes the rounding, and what is left is
+   a product: `split × per_core == dim` states the relation exactly, with
+   `per_core` a variable the objective and the span constraints can read
+   directly. Padding makes it a three-way relation over `dim_padded`, and
+   `AddMultiplicationEquality` / `AddDivisionEquality` are the constructs in
+   question. Whether that formulation propagates well enough to be worth having —
+   a table gives the solver perfect propagation, a multiplication gives it much
+   less — is the open part, and it is an experiment this phase runs rather than a
+   design it assumes.
+4. *Hybrid and lazy.* The flat combination table below a threshold, the channeled
+   encoding above it; enumerate per operation in parallel and cache, extending
+   the `_views_for_divs` prep cache (`scratchpad/allocator.py:2079`).
 
-**Validator.** A pinned residency must fit the packing across its lifetime;
-pinned priorities must form a consistent partial order.
+**The limit to record.** (2) pays only where every derived scalar is separable
+per dimension. Per-core span is a product over dimensions and separates; anything
+needing the full per-core view (`_prepare_per_core_view`, `pass_utils.py:1467`)
+does not — and that is exactly what phase 3 consumes. So (2) shrinks the
+feasibility encoding while view-dependent objective terms may still require a
+combination table, which is what makes (1) the primary lever rather than the
+fallback.
 
-**Exit.** A fragmentation case the greedy solver cannot pack today is packed. No
-regression in spill count on the tracked benchmarks.
-
-### Phase 6 — Optimization caching
-
-The closing argument for the whole spine: **a cached plan is a complete hint
-set.**
-
-Replaying it through the H3 validator means a stale entry — the graph changed,
-the config changed, enumeration changed — fails validation and falls back to a
-fresh solve instead of being silently mis-applied. Invalidation therefore needs
-no logic beyond the key. A *partially* valid entry degrades naturally: pins on
-the decisions that still validate, with the rest left free (M3) or warm-started
-(H6). This is also why caching is last — it needs the decision space closed and
-the validator total.
-
-**Requirements.** A whole-graph signature, which does not exist today.
-`provenance.py`'s `_stable_id` (`:52-80`) explicitly disclaims cross-run
-stability at `:58-63`: *"a within-compile linking key, not a cross-run
-fingerprint"*. The key must cover config values, solver identity, and the
-existing pass-source uuids (`passes.py:144-151`). Plan serialization is new.
-Enumeration caching belongs here too — candidate tables and the `_views_for_divs`
-prep cache (`scratchpad/allocator.py:2079`) — since enumeration cost grows with
-every phase (C3).
-
-**Two hard prerequisites**, both named rather than assumed:
-
-1. *Config values are absent from the cache key.* Only pass **source files** are
-   hashed (`passes.py:144-151`), so a `LAYOUT_SOLVER=cpsat` run and a
-   `LAYOUT_SOLVER=greedy` run produce the same key. This is a wrong-artifact risk
-   today, independent of this roadmap, and should be fixed early rather than
-   waiting for phase 6.
-2. *CP-SAT is not reproducible on the default path.* It runs
-   `num_search_workers = os.cpu_count()` under a 600-second wall-clock limit
-   (`ilp_solver_ortools.py:328-333`, `:456-463`); `random_seed = 0` guarantees
-   reproducibility only for a fixed worker configuration, so a
-   timeout-terminated multi-worker solve is not reproducible. The intent is
-   already recorded elsewhere in the tree —
-   `scratchpad/simulated_annealing.py:205-212` states that "compilation caching
-   depends on" deterministic layout planning.
-
-**Exit.** A warm second compile of an unchanged graph replays the plan and
-produces an identical result. A mutated graph misses cleanly. A config change
-misses cleanly.
+**Exit.** Identical solutions to the eager encoding on the tracked benchmarks,
+with a measured reduction in enumeration time and table size.
 
 ## Cross-cutting tracks
 
 These run alongside the phases rather than between them.
 
 - **C1 — Cost model.** M2 makes the objective injectable; it does not make it
-  good. Every phase contributes terms — pad bytes (2), relayout bytes (3),
-  lifetime effects (4), peak and fragmentation effects (5) — so this track owns
+  good. Every phase contributes terms — pad bytes (1), fragmentation and peak
+  effects (2), relayout bytes (3), lifetime effects (4) — so this track owns
   the per-phase term requirements and the calibration procedure against measured
   process-engine utilization and fused kernel time on the tracked benchmarks.
   Without it, every phase adds precision to a proxy, and phase-level benchmark
   results should not be read as a verdict on the approach.
 
-- **C2 — Prediction fidelity.** A per-axis predict-versus-realize verify mode
-  under an environment flag, asserting that predicted sizes, lifetimes, and
-  per-core views match the realized ones after the transform applies. A
-  mispredicted *view* is a wrong-residency bug and does not enjoy M8's
-  degrade-to-spill safety, so it gets the strictest assertion of the three.
+- **C2 — Determinism, tractability, and fallback.** Every phase enlarges one
+  model, and nothing about that model divides by axis.
 
-- **C3 — Determinism, tractability, and fallback.** Each phase enlarges the
-  model, so each owes a solve-time budget, a warm start, and the M9 fallback.
-  Enumeration time must be reported alongside solve time — M4 trades enumeration
-  for model simplicity, and the two have different mitigations. Determinism must
-  hold before phase 6 can cache anything.
+  - *Budget.* Solve time does not decompose: CP-SAT couples every variable through
+    propagation, so an axis can make a solve harder or easier and no per-axis
+    share exists. A phase measures the *configuration* it creates — whole-model
+    solve time with its axis on and off against one wall-clock budget — and those
+    deltas do not compose, so a pair of axes is measured as a pair. Only shipping
+    configurations are measured, not the 2^n cross product.
+  - *Enumeration.* The exception, and why phase 5's trigger is defined over it:
+    rows come from a per-operation table built before the solver runs, so they are
+    countable per phase in the way solve time is not. Report rows per operation
+    and enumeration time alongside solve time.
+  - *Fallback.* A timeout is equally unattributable, so M9 case 1 drops **all**
+    optimized axes to free mode; no phase may assume its own is the one disabled.
+  - *Determinism.* Conditional, not automatic.
+    `torch.are_deterministic_algorithms_enabled()` forces
+    `num_search_workers = 1` (`ilp_solver_ortools.py:459-463`) which, with
+    `random_seed = 0`, makes a *completed* solve reproducible; the multi-worker
+    default is not. Any run compared against another sets the flag — and its solve
+    time is then not the shipping configuration's, so the budget above is measured
+    on both or on neither. A solve terminated by the wall-clock limit (`:328-333`)
+    stays machine-dependent even at one worker, absent a `max_deterministic_time`
+    limit.
 
 ## Collateral documents
 
@@ -623,16 +860,18 @@ specifies only what its axis adds.
 | # | Document | Owns |
 |---|---|---|
 | 0 | Optimization and Hinting Strategy | The spine: registry, pin lowering, axis modes, validator, conflict diagnosis, explainability |
-| 1 | Coarse Tiling Optimization | Tiling for sizing and temporal op splitting, jointly with core division |
-| 2 | Padding Optimization | Pad amount, placement, sharing; padding as layout legalization |
-| 3 | Restickification Optimization | Relayout pricing; restickify placement, sharing, input-layout choice |
+| 1 | Coarse Tiling Optimization | Tiling for sizing and temporal op splitting, jointly with core division; pad amount as a candidate scalar, pad policy and sharing |
+| 2 | LX Relocation and Compaction | Time-varying addresses, defragmentation, the fragmentation objective term |
+| 3 | Restickification Optimization | Relayout pricing; restickify placement, sharing, input-layout choice; padding as layout legalization |
 | 4 | Op Re-ordering Optimization | Program order as a bounded decision |
-| 5 | LX Allocation Re-ordering | Address-assignment order, compaction, defragmentation |
-| 6 | Optimization Caching | Graph signature, plan persistence, replay-as-hints |
+| 5 | Enumeration Scaling | Signature dedup, per-dimension channeling, lazy enumeration |
+
+Padding has no row: it adds no axis, so documents 1 and 3 carry the halves each
+one consumes rather than a document owning the subject.
 
 Document 0 is drafted first: every other depends on it, and a phase that invents
 its own hint channel before the registry exists will have to be unwound.
-Documents 1 through 6 follow the phase order.
+Documents 1 through 5 follow the phase order.
 
 Per document, each must state: the defect it closes, the decision variables it
 adds and their encoding under M4, what free mode falls back to, the hint keys it
@@ -641,31 +880,38 @@ earlier phases, and testable exit criteria.
 
 ## Sequencing rationale
 
-The order is a dependency chain, not a preference.
+Phase 1 first and phase 4 last are dependency facts; the two in between are
+ordered by which defect is closable soonest, and this section says which is
+which.
 
-**1 → 2.** Tiling is the only axis that changes the *buffer set itself*;
-everything downstream is defined over the buffers it produces. Padding then adds
-no new index space (M4) and corrects the sizes phase 1 optimizes against, so it
-is both the cheapest next step and a retroactive improvement to the previous one.
+**1 → everything.** Tiling is the only axis that changes the *buffer set itself*.
+Every later phase is defined over the buffers and lifetimes it produces — the
+rectangles phase 2 packs, the per-core views phase 3 prices relayouts from, the
+positions phase 4 permutes — so nothing can precede it.
 
-**2 → 3.** Padding as a legalization tool removes the stick-divisibility
-restriction on layout candidates, enlarging the search space restickification
-works over. Pricing relayout before that restriction lifts would optimize over an
-artificially small set.
+**1 → 2.** Relocation needs only a buffer set and lifetimes, both of which phase 1
+delivers, and its defect is independent of every remaining axis: fragmentation
+costs spills today under an unchanged program order and an unchanged layout
+assignment. That independence is why it can be closed and measured early, and it
+carries one consequence rather than one caveat: phase 4 will move the lifetimes
+the relocation plan was built against, so that plan is re-solved and its numbers
+re-measured once order is a variable.
+
+**2 → 3.** No dependency runs between them; restickification depends on phase 1,
+not on phase 2. The order reflects that relayout pricing needs a C1 cost term
+before its exit criterion means anything, while fragmentation is already
+measurable in spill counts. If the relayout term lands first, the two swap
+without consequence.
 
 **3 → 4.** Every phase before 4 indexes on a static program order — per-buffer,
-per-adjacent-pair, and per-dataflow-edge variables all assume it. Making order
-variable invalidates that assumption, so it comes after the phases that rely on
-it, not before.
+per-adjacent-pair, per-dataflow-edge, and now the time axis of phase 2's
+relocation rectangles. Making order variable invalidates all of them at once, so
+it comes after the phases that rely on it, not before.
 
-**4 → 5.** Allocation order is optimized against lifetimes, so lifetimes must
-settle first. This ordering is a judgment call and is recorded as such: the
-fragmentation and lookahead defects phase 5 closes are independent of op order
-and could be pulled earlier if they hurt sooner.
-
-**5 → 6.** The cache key cannot be defined until the decision space is closed. A
-key that omits an axis added later silently returns plans made under different
-assumptions.
+**4 → 5, conditionally.** Phase 5 is placed last because nothing depends on it,
+not because it must come last. Its trigger is a measurement — C2's reported
+enumeration cost and table size — so it is pulled forward the moment the eager
+cross product stops fitting the compile-time budget, whenever that happens.
 
 ## Non-goals
 
@@ -673,6 +919,14 @@ assumptions.
   requires a data ring or reduce-sum ring emitted in the SuperDSC schedule, which
   is separate work.
 - **No new backend**, and no change to the DeepTools interface.
+- **No plan reuse and no plan serialization.** Caching compiled artifacts is
+  Inductor's FX graph cache's job, which torch-spyre already participates in;
+  this document adds no second cache and persists no decisions. The one thing it
+  does claim is that the existing key is wrong — no torch-spyre config value
+  reaches it (consequence 6) — and that fix is independent of every phase here.
+  Warm-starting the solver is likewise out of scope: it is a solve-time
+  optimization to consider once the axes work, not a mechanism the model rests
+  on.
 - **No recalibration of `_matmul_split_cost`** as part of the mechanism work.
   Improving the numbers is C1's concern; this roadmap delivers the structure that
   lets them be improved.
@@ -682,17 +936,22 @@ assumptions.
 
 ## Open questions
 
-- **Objective weighting.** The default objective reproduces today's terms.
-  Once the mechanism is trusted, what weighting and what additional terms should
-  it carry — and does the move from a two-phase lexicographic solve to a single
-  weighted one need a guard so that parallelism can never buy a spill?
-- **Where hints apply.** Hints currently apply pre-stickification, which is what
-  keeps them authoritative but also prevents the solver from *growing* a hinted
-  group with neighbours it would like to add. Moving hint application later would
-  lift that, at the cost of a contract the current ordering exists to protect.
-- **Phase 5's position.** Recorded above as a judgment call; worth revisiting
-  once phase 3 lands and the fragmentation picture is measured rather than
-  inferred.
-- **Enumeration growth.** M4 trades enumeration cost for model simplicity, and
-  each phase multiplies the candidate set. At what point does pruning become
-  mandatory rather than optional, and what prunes safely?
+- **Cost model contents.** The objective minimizes cost (M2); which terms and
+  what relative magnitudes make that cost track measured time is C1's work and is
+  not settled here. The structural question is closed — one cost, no
+  lexicographic phases — and the numbers inside it are open.
+- **Conflict diagnosis.** How much of hint conflict detection reaches the linear
+  pre-solve check (H3), and what residue is left for level 3. The residue is also
+  where attribution is worst: an assumption subset containing only pins reports
+  "these hints conflict" when the actionable message is often "this hint against
+  the core budget". Making the guard families retractable alongside the pins would
+  fix that, at the cost of a diagnostic model materially larger than the one that
+  failed.
+- **Enumeration growth.** Not answerable before the tables exist. The threshold at
+  which enumeration stops fitting the compile-time budget is a measurement phase 1
+  produces and phase 5 reacts to, and the shape of the fix is open in the same
+  way: whether the size-to-split quotient can be posed as a constraint that
+  propagates acceptably, or whether the table is simply the better encoding, is
+  what phase 5 has to find out. What prunes *safely* is the part that can be
+  reasoned about now — signature dedup and dominance are lossless, a cost-ranked
+  cap is not.
