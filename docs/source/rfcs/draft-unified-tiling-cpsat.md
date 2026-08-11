@@ -1,11 +1,12 @@
-# RFC (draft) — Unified Tiling, Work Division, and LX Residency Co-optimization
+# RFC (draft) — Coarse Tiling Optimization
 
 | Field | Value |
 |---|---|
 | Status | Draft — pending issue number |
 | Area | Compiler |
-| Target | `torch_spyre/_inductor/scratchpad`, `torch_spyre/_inductor/wsr` |
-| Depends on | RFC 1358 (Coarse Tiling), RFC 0047 (Tensors with Device-Specific Layouts) |
+| Roadmap | Compiler Optimization Roadmap — collateral document 1, Phase 1 |
+| Target | `torch_spyre/_inductor` — `wsr`, `scratchpad`, and `padding.py` |
+| Depends on | Compiler Optimization Roadmap (parent, `draft-compiler-optimization.md`); Optimization and Hinting Strategy (collateral document 0); RFC 1358 (Coarse Tiling); RFC 0047 (Tensors with Device-Specific Layouts) |
 
 > **Draft note.** RFC sources live in
 > [`torch-spyre/rfcs`](https://github.com/torch-spyre/rfcs) as
@@ -16,21 +17,87 @@
 
 ## Summary
 
-Fold coarse tiling into the CP-SAT model that already chooses core divisions and
-LX residency together, so all three partitioning decisions are made against a
-single objective. The objective becomes caller-supplied: `plan_layout` and
-`plan_layout_and_core_divisions` accept a sympy expression that is lowered to
-CP-SAT expressions over the model's own optimization variables. The solver
-enumerates every valid output-range tiling option per operation and lets tiling
-*groups* emerge from minimizing that objective rather than being pre-computed
-from hint scopes. Reduction-axis tiling stays hint-only and out of the solver's
-decision space (R9).
+This is **collateral document 1** of the
+[Compiler Optimization Roadmap](draft-compiler-optimization.md), covering the
+roadmap's **Phase 1 — coarse tiling for sizing and temporal op splitting,
+jointly with core division**. It instantiates the roadmap's shared model
+(M1–M9) and hint spine (H1–H5) for the tiling axis; per the roadmap's rule that
+a phase document may not restate the model, it cites those requirements by
+number rather than re-deriving them, and specifies only what the tiling axis
+adds.
+
+Concretely, it adds **tiling** — a *temporal split*, sequential loop iterations
+on one core — as a third axis of the single CP-SAT model (M1) that already
+chooses **core division** — a *spatial split*, parallel across cores — and LX
+residency together, so all three partitioning decisions are made against one
+injected objective (M2). Tiling and division collapse into a per-operation
+**config** enumerated and tabled with the rest of the model (M4), feasible on
+the *combination* rather than per subsystem (M5). The solver enumerates every
+valid output-range tiling option per operation and lets tiling *groups* emerge
+from minimizing that objective — a group is a maximal run of operations with no
+loop-nest break — rather than being pre-computed from hint scopes. A tiling or
+division hint is a **pin** in the roadmap's pinned/optimized sense (M3): it
+collapses its axis at enumeration time (H2) and the solver optimizes the rest of
+the graph around it.
+Reduction-axis tiling enters the optimized space **single-level only** — one
+reduction dim split once, pinned as a singleton group (R4.6); the nested
+output+reduction shapes remain a known wrong-numerics bug this RFC does not fix
+and the enumerator never emits (R1.8, R9). Padding, which the roadmap folds into
+this phase because it is the first
+that needs it for sizing (consequence 3), enters as a derived scalar on
+candidate rows and — only if measurement justifies it — as extra rows, adding no
+new decision axis (R10).
+
+## Relationship to the roadmap
+
+The roadmap states the shared model once; this document satisfies the parts the
+tiling axis touches, cites them by number, and defers the rest to the phases and
+tracks that own them.
+
+**Satisfied here (Phase 1).**
+
+| Roadmap requirement | How this document satisfies it |
+|---|---|
+| M1 — one CP-SAT solve, one objective | Tiling joins the existing joint division + residency model as a third axis (§1–§3); no separate tiling stage (*Alternatives*). |
+| M2 — injected objective | This phase **delivers** the objective namespace and sympy→CP-SAT lowering later phases consume (§4, R3); today's two-phase lexicographic solve collapses into a single minimized cost. |
+| M3 — pinned / optimized modes | A tiling or division hint pins its axis (R5); the (untiled, work-division-seed) config is the baseline candidate M3's invariant requires (R2.4). |
+| M4 — enumerate-and-table | The (tiling, division) `PartitionConfig` cross product, with derived scalars bound by `AddElement` (§1, R2). |
+| M5 — feasibility on the combination | Span and divisibility are checked on the config *pair*, discharging the `core_split_estimate = 1` guess (R2.3) — roadmap consequence 1. |
+| M6 — predicates reused, never reimplemented | Every legality predicate is reused from `wsr`/`pass_utils`/`work_division` (R1.4, R4.7). |
+| M7 — pure prediction, then apply; offline fidelity | A pure predictor maps configs to a buffer set with no IR mutation (R7); predicted values are recorded (H5) for the roadmap's *offline* fidelity check, not an in-compiler verify pass. |
+| M8 — addresses from the final solve | The placement re-solve over the real post-tiling buffers is authoritative for addresses (§5, R7.3). |
+| M9 — failure never discards a pin | Only an `INFEASIBLE` model — or a timeout with no feasible incumbent — raises `SolveError`; the pipeline then reverts to the retained span-overflow tiler plus greedy placement, over the already-pinned candidate sets (R8.3). A timeout that *has* an incumbent applies it. |
+| H1–H5 — hint spine | Tiling and pad keys register under H1, lower to pins under H2, are validated by H3, shrink the model under H4, and explain themselves under H5 (R5, R10); collateral document 0 owns the registry itself. |
+| C2 — determinism, tractability, fallback | Determinism, warm-start, and the fallback path (R8). |
+
+**Owed to later phases** (roadmap Phase 1, *"Owed to later phases"*): the M4
+config encoding, the M2 objective namespace, the M7 predictor, and **tiling-aware
+per-core views** evaluated against a *predicted* post-tiling frame (R2.6) — the
+last of which Phase 3 cannot start without.
+
+**Deferred to other phases / tracks, not solved here.**
+
+| Concern | Owner |
+|---|---|
+| Time-varying addresses, defragmentation | Phase 2 / collateral document 2 |
+| Relayout *pricing*, restickify placement and sharing, padding as layout legalization | Phase 3 / collateral document 3 (R6, R10) |
+| Op re-ordering as a decision | Phase 4 / collateral document 4 (R4.4) |
+| Enumeration scaling (signature dedup, per-dimension channeling, lazy enumeration) | Phase 5 / collateral document 5 (§6) |
+| Cost-model calibration in microseconds | Track C1 (R9) |
 
 ## Motivation
 
-torch-spyre makes three independent decisions about the same underlying
-variable — how a buffer is partitioned — using three different cost models at
-three points in the `CustomPreSchedulingPasses` pass list (`passes.py:416-456`):
+The roadmap's *Motivation* enumerates seven consequences of decisions taken at
+different points of `CustomPreSchedulingPasses` by cost models that cannot see
+each other. This document closes the two that are the tiling axis's —
+**consequence 1** (the span budget is spent twice) and **consequence 2** (tiling
+buys LX residency only by accident) — and the sizing half of **consequence 3**
+(padding cannot influence the layouts it must satisfy; the legalization half is
+Phase 3). The rest of this section is the axis-specific evidence for those,
+stated in code terms rather than re-deriving the roadmap.
+
+The three code sites this axis touches, each blind to the others, are the
+tiling-axis slice of the roadmap's decision table:
 
 | Decision | Where | Cost model | Blind to |
 |---|---|---|---|
@@ -38,9 +105,7 @@ three points in the `CustomPreSchedulingPasses` pass list (`passes.py:416-456`):
 | Core division | `work_division.py`, two pass-list entries at `passes.py:451-452` expanding to three passes (`_distribute_work` is `@_runs(cost_model_matmul_division, work_distribution)`, `:382`) | `_matmul_split_cost` (µs) for matmuls; priority heuristic otherwise | LX, tiling |
 | LX residency + placement | `scratchpad/ilp_solver_ortools.py`, `passes.py:455` | CP-SAT, two-phase lexicographic: `spill_cost()` then `sum(cores)` | tiling |
 
-Two concrete defects follow directly.
-
-**Over-tiling.** `plan_span_overflow_tile`
+**Over-tiling (consequence 1).** `plan_span_overflow_tile`
 (`wsr/span_overflow_hint_analysis.py:1479`) is handed `core_split_estimate = 1`,
 hardcoded at both `ChunkingInfo` construction sites (`:666`, `:827`), and carries
 the TODO at `:1504-1506`: *"make a common planner for Work Division and Working
@@ -50,9 +115,9 @@ division then splits the same dimensions again. The `MAX_SPAN_BYTES` constraint
 is satisfied twice over and the emitted tile counts are larger than necessary,
 costing loop overhead and, where tiling forces boundary copies, HBM traffic.
 
-**Tiling never buys LX residency.** Shrinking a chain's working set so it fits
-the 2 MB LX is the purpose of working-set reduction, yet the tiling planner
-cannot see LX occupancy and the LX solver cannot choose a tiling.
+**Tiling never buys LX residency (consequence 2).** Shrinking a chain's working
+set so it fits the 2 MB LX is the purpose of working-set reduction, yet the
+tiling planner cannot see LX occupancy and the LX solver cannot choose a tiling.
 `docs/source/compiler/scratchpad_planning.md:578` lists "**No coarse-tiling
 integration** when that pass also drives split decisions" among the remaining
 gaps under "Co-optimization is still limited" (`:555`). It is logged there against
@@ -74,12 +139,15 @@ The joint pattern is already proven for two of the three axes.
 `CpSatLayoutSolver`, which picks division and placement in one model. This RFC
 adds tiling as a third axis of that same model.
 
-A secondary motivation is that the objective is currently hardcoded. Recent work
-on the `tighten-spill-cost` branch encapsulated the per-buffer spill term into
-`_LifetimeBufferWithCpVars.spill_cost()`, which now returns a
-`cp_model.LinearExpr` already gated on `1 - in_buffer`. That makes the objective
-a single overridable hook — the natural point at which to let callers supply the
-cost function instead of editing the solver.
+Making the objective caller-supplied is not a motivation this document argues for
+on its own — it is roadmap requirement **M2**, and Phase 1 is the phase that
+*delivers* the injectable objective namespace later phases consume (§4). One
+enabling fact is worth recording because it is what makes the delivery cheap:
+recent work on the `tighten-spill-cost` branch encapsulated the per-buffer spill
+term into `_LifetimeBufferWithCpVars.spill_cost()`, which now returns a
+`cp_model.LinearExpr` already gated on `1 - in_buffer`. That makes today's
+hardcoded objective a single overridable hook — the natural point at which to
+hang M2's injection.
 
 ## Background: what exists today
 
@@ -249,7 +317,8 @@ reachable only through `spyre_hint`; the automatic planner never emits it
 "would require partial-result accumulation").
 
 Four properties of that machinery bear directly on this RFC, and together they
-are why R9 places reduction-axis tiling out of scope for phase 1:
+are why it enters scope **single-level only and as a pinned singleton** (R1.8,
+R4.6) rather than fully or as a fusible axis:
 
 - **The accumulator is loop-carried.** Tile `t` reads what tile `t-1` wrote, so
   the op cannot share a loop nest with peers that tile at the same level.
@@ -299,8 +368,10 @@ no-overlap over optional rectangles
 Objective (`_run`, `:446`) is two-phase lexicographic: minimize
 `sum(spill_cost)`, lock it with a rounded inequality
 (`model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))`, `:479`), then
-maximize `sum(cores)`. Phase 2 is skipped entirely when no buffer has a division
-to choose, which is the placement-only path.
+maximize `sum(cores)`. The second lexicographic phase is skipped entirely when no
+buffer has a division to choose, which is the placement-only path. (This
+"two-phase" is the objective's lexicographic structure, distinct from the
+roadmap's Phase N; §4 / M2 collapse it to one minimized cost.)
 
 ### Why the three cannot simply be reordered
 
@@ -309,17 +380,38 @@ to run *after* stickification. The LX solver needs the buffer set that tiling
 produces, so it wants to run *after* tiling. Work division needs stick counts
 and is constrained by the same span limit as tiling. Any purely sequential
 ordering makes one of the three guess about another — which is precisely the
-`core_split_estimate = 1` guess that exists today.
+`core_split_estimate = 1` guess that exists today. Folding them into M1's single
+solve is what removes the guess; that solve sits post-stickification (§5).
 
 ## Proposed design
 
-### 1. Config-as-unit
+Sections 1–3 instantiate the roadmap's shared-model requirements for the tiling
+axis: the config cross product is the M4 enumerate-and-table encoding (§1), its
+joint span/divisibility check is M5 feasibility-on-the-combination (§1–§2), and
+the per-adjacent-pair loop-nest-break booleans are the Phase 1 variables from
+which grouping falls out of the objective (§2–§3). Section 4 delivers the M2
+objective namespace, §5 places the solve in the pass list under M7/M8, and §6
+covers tractability under C2 and defers enumeration scaling to Phase 5.
 
-Collapse tiling and division into a single per-operation **config** index.
-Precomputing the feasible cross product absorbs every nonlinearity —
-divisibility, stick alignment, `MAX_SPAN_BYTES`, core budget — into a table
-lookup, which is exactly how `CoreDivision` is already consumed via
-`AddElement`.
+### 1. Config-as-unit (M4 encoding, M5 feasibility)
+
+Collapse tiling (temporal split) and division (spatial split) into a single
+per-operation **config** index. Precomputing the feasible cross product absorbs
+every nonlinearity — divisibility, stick alignment, `MAX_SPAN_BYTES`, core
+budget — into a table lookup, which is exactly how `CoreDivision` is already
+consumed via `AddElement`. This is M4's enumerate-and-table rule applied to a
+two-axis candidate; M5 is what makes the pair, not each axis alone, the unit of
+feasibility (R2.3).
+
+Divisibility in particular is enforced **at enumeration**, not by a runtime
+constraint: `enumerate_tile_options` draws split counts only from
+`divisors(basis)` (R2.2), so every tile size in the table already divides its
+dimension evenly. An `AddModuloEquality` alternative — let the solver pick any
+tile size, then constrain `size mod tile == 0` — is deliberately **not** used:
+modular constraints are the nonlinear encoding M4 exists to avoid, they break the
+linear-binding rule (R3.7), and they rediscover at solve time what enumeration
+already knows. Enumeration's cost is bounded by the R1.7 caps; the
+modular-constraint cost is not.
 
 `CoreDivision` (`scratchpad/plan_solver.py:94`) is generalized rather than
 forked. It carries just two stored fields — `output_splits` and
@@ -401,10 +493,22 @@ divided. Tiling both **loosens** the span guard (`get_per_core_span` is
 evaluated on the tiled space, so smaller tiles admit divisions that were
 infeasible before — the R2.3 direction) and **tightens** divisibility
 (`divisors(M/T)` is smaller than `divisors(M)`, and `adjust_it_space_for_sticks`
-shifts the stick basis too). Each tiling option therefore has its own division
-candidate set, enumerated against its own iteration space.
+shifts the stick basis too). **Each tiling option therefore has its own division
+candidate set, enumerated against its own iteration space.**
 
 ### 2. Model variables
+
+The two-axis config index is the per-operation candidate the roadmap's Phase 1
+"Variables" calls for; this section adds its second half — **one boolean per
+adjacent pair of operations deciding whether a loop nest breaks there** — and the
+per-buffer machinery that prices what a break materializes.
+
+This is an **extension**, not a rewrite: the CP-SAT solver and allocator
+interface gain config-based solving, but every existing path is preserved and the
+untiled / work-division-seed config is always in the candidate set (R1.3, R2.4).
+With the tiling gate off (R8.1) the model reproduces today's division and
+residency solve, so parity is directly checkable and regressions are structurally
+excluded.
 
 The per-buffer vars live on a new wrapper, `_TilingBufferWithCpVars`, extending
 `_CoreDivisionBufferWithCpVars` — the same subclass-and-override step that class
@@ -454,11 +558,15 @@ count, not either op's chosen division (R4.7). So the per-edge table is keyed on
 already lives, on the slicing gate (`config_matches`), which is conditional under
 `in_buffer` rather than unconditional like cut.
 
-`cut[i]` itself stays at graph level. It is indexed over *program-order
+`cut[i]` is graph-level in *indexing* but is **not** a single shared graph
+variable — it is realized as the per-buffer cut bools tied by equality that §2
+details below (`cut_parents`/`cut_children`, reconciled by `_add_cut_equalities`).
+What stays graph-level is the indexing: `cut[i]` runs over *program-order
 adjacency*, not dataflow, so the two ops it joins need not be related to any one
-buffer — and its feasible values come from the `(tile_src, tile_dst, cut)`
-triple for that op pair. A multi-output op compounds this: one edge, several
-buffers. It therefore has no per-buffer home.
+buffer — and its feasible values come from the `(tile_src, tile_dst, cut)` triple
+for that op pair. A multi-output op compounds this: one edge, several buffers. So
+it has no single per-buffer home, which is why it lives as equated per-buffer
+claims rather than one variable.
 
 What each wrapper holds is a **neighbour view**, split by direction:
 `cut_parents[b]` and `cut_children[b]`, built once in `__post_init__`. Edge `i`
@@ -546,11 +654,12 @@ whereas cut holds unconditionally.
 
 Stickification/relayout optimization — choosing configs to *avoid* a restickify,
 which would need a second per-edge `relayout[e]` variable over *dataflow*
-producer→consumer edges — is **out of scope** for this RFC (R6, R9).
+producer→consumer edges — is **the roadmap's Phase 3, not this phase** (R6, R9).
 
 Crucially, `cut[i]` is indexed over **all** adjacent pairs in `graph.operations`,
 not just tileable ones, and is **pinned to 1** at any boundary where either side
-cannot be tiled — or was tiled on a reduction axis by the hint pass (R4.6). That
+cannot be tiled — or was tiled on a reduction axis, hint- or solver-chosen
+(R4.6). That
 is what makes §3's contiguity guarantee structural rather than aspirational: an
 untileable op can never end up inside a cut-free run.
 
@@ -558,8 +667,9 @@ The reduction-axis case is pinned for a sharper reason than untileability. The
 rule governing such a group quantifies over the whole run
 (`_plan_is_loop_invariant_at_reduction_levels`), and pairwise compatibility
 provably does not compose into it, so no widening of the triple table would make
-it expressible. R4.6 carries the counterexample; R1.8 keeps reduction-axis
-options out of the enumerated space so the situation arises only from hints.
+it expressible. R4.6 carries the counterexample; the single-level reduction
+options R1.8 now admits are pinned as singletons the same way, so the case is
+handled identically whether the reduction tiling is hint- or solver-chosen.
 
 #### A cut adds a buffer, it does not evict its tiled producer
 
@@ -591,7 +701,7 @@ in-group consumer — while the read copy lives in the consuming group. The
 **model** cannot claim that ordering: it runs pre-mutation (§5), so `b`'s
 interval is derived from pre-mutation `uses`, whose last entry is still the
 outside consumer — on the model's time axis the two rectangles overlap at the
-consumer's tick. Phase 1 keeps that overlap as deliberate conservatism: `b`
+consumer's tick. This document keeps that overlap as deliberate conservatism: `b`
 retains its full pre-mutation extent whatever the cut variables say, the read
 copy is an additional optional rectangle, and no stacking is assumed. The
 error direction is safe — a cut's LX footprint is over-, never under-stated —
@@ -708,18 +818,21 @@ exactly as `eff_size[b]` and `cores[b]` are:
   happen to share a slice count from a genuine match — the conflation that has
   already produced one wrong-output bug in the co-optimizing path (R2.6).
 
-**Pricing is out of scope for this RFC.** What a cut *costs* — the HBM traffic
-through `full_buf`, the loop overhead, how the cut's two rectangles (sequential
-only in applied IR, §2) trade against the one they replace — is specified by a
-separate cost-model design. This section fixes
-only what exists and what is eligible; the objective consumes `boundary_op[b]`,
-`full_size[b]` and `boundary_view[b]` but does not define them.
+**Pricing is track C1's, not this document's.** What a cut *costs* — the HBM
+traffic through `full_buf`, the loop overhead, how the cut's two rectangles
+(sequential only in applied IR, §2) trade against the one they replace — is
+calibrated by the roadmap's cost-model track C1, not fixed here. This section
+fixes only what exists and what is eligible; the objective consumes
+`boundary_op[b]`, `full_size[b]` and `boundary_view[b]` but does not define what
+they are worth.
 
 ### 3. Tiling groups fall out of the cut variables
 
-**A tiling group is a maximal cut-free run of operations.** This is the central
-simplification, and it buys three things at once:
-
+**A tiling group is a maximal cut-free run of operations.** This realizes the
+roadmap's Phase 1 promise that "grouping then falls out of the objective — a
+tiling group is a maximal run with no break — rather than being precomputed by a
+grouping heuristic that a wrong guess would make unrecoverable." It is the
+central simplification, and it buys three things at once:
 1. `_validate_contiguous` is satisfied *structurally*. Because `cut[i]` ranges
    over adjacent pairs of `graph.operations` and is pinned to 1 wherever either
    side is untileable (§2), a maximal cut-free run is by construction a
@@ -739,13 +852,15 @@ simplification, and it buys three things at once:
    and the read copies enter the packing model as optional rectangles under the
    same literals (§2). There is deliberately no `n_groups` penalty term — the
    performance profile is read off the real outcomes (tile shape, LX pinning
-   status), not off a proxy for them.
+   status), not off a proxy for them. Whether a cut still warrants an explicit
+   signal of its own — a loop-overhead term beyond the consequences it
+   materializes — is an open point for track C1.
 
    What those consequences are *worth* — HBM traffic through `full_buf`, loop
    overhead, and how a cut's two tile-sized rectangles (sequential in applied
    IR, conservatively concurrent in the model — §2) trade against the one they
-   replace — is specified by a **separate cost-model design** and is
-   out of scope here. Note only that the consequences are producer-dependent, so
+   replace — is the roadmap's cost-model **track C1**, calibrated there rather
+   than here. Note only that the consequences are producer-dependent, so
    any price must be too: a cut between two tiled configs materializes a
    full-size HBM buffer plus a mutation copy op, while a cut whose producer is
    *untiled* materializes only a read copy in the consumer — though it can
@@ -757,9 +872,15 @@ simplification, and it buys three things at once:
 groups) becomes a constraint: `cut[i] == 0` is forced for every `i` interior to
 a hint scope.
 
-### 4. Injected sympy objective
+### 4. The M2 objective namespace (delivered by this phase)
 
-A new module `torch_spyre/_inductor/scratchpad/cost_expr.py` provides:
+Requirement M2 — that the objective be injected rather than hardcoded — is a
+shared-model requirement, but Phase 1 is where the namespace and lowering are
+*built*, because it is the first phase whose axis contributes terms and the
+roadmap lists "the M2 objective namespace" among what Phase 1 owes later phases.
+This section specifies that deliverable; it does not re-argue M2's rationale (see
+the roadmap). A new module `torch_spyre/_inductor/scratchpad/cost_expr.py`
+provides:
 
 - **A symbol namespace** the solver binds to model variables. Per-buffer:
   `size`, `read_count`, `in_lx`, `spilled`, `cores`, `tile_count`,
@@ -780,7 +901,7 @@ A new module `torch_spyre/_inductor/scratchpad/cost_expr.py` provides:
 
   Anything beyond this list must arrive as a per-config scalar, precomputed into
   the §2 table and bound by one more `AddElement`. The tile *shape* is
-  deliberately not a symbol (R3.8).
+  deliberately not a symbol (R3.7).
 - **A lowering** `lower(expr, bindings) -> cp_model.LinearExpr` over an
   explicitly bounded sympy subset (R3.3). Anything outside that subset raises
   `CostExpressionError` naming the offending node. Silently approximating an
@@ -790,13 +911,13 @@ A new module `torch_spyre/_inductor/scratchpad/cost_expr.py` provides:
 
 The objective is a **single expression minimized in one phase** — the model
 computes one total cost and minimizes it (`Minimize(expr)`), with no
-lexicographic sequence and no per-phase locking. `CostSpec` therefore wraps a
-single sympy expression; a bare expression is the normal form. This is a
-deliberate move away from today's two-phase lexicographic solve: the hard
-guarantee that parallelism can never buy a spill is no longer structural but a
-matter of relative weight — the default weights the spill term to dominate the
-core term so the practical outcome tracks today's spill-first intent (R3.2,
-R3.5).
+lexicographic sequence and no per-phase locking. This is the collapse M2
+mandates ("one expression in one unit, not a ranking"), not a decision this
+document makes on its own; `CostSpec` therefore wraps a single sympy expression,
+and a bare expression is the normal form. The hard guarantee that parallelism can
+never buy a spill is no longer structural but a matter of relative weight — the
+default weights the spill term to dominate the core term so the practical outcome
+tracks today's spill-first intent (R3.2, R3.5).
 
 **The predictor is load-bearing for what this objective *means*, not only for how
 accurate it is.** §3 prices a cut partly through residency the run's interior
@@ -811,13 +932,16 @@ question.
 
 ### 5. Pipeline placement — decide once, apply in dependency order
 
-The solve needs device layouts, so it sits post-stickification. Manual hints keep
-applying pre-stickification exactly as today, preserving the rationale spelled
-out at `passes.py:419-425` (running before stickification means `_divide_ranges`
-never calls `_resize_device_layout`, which is what dissolved the
+This section places the solve in the pass list under the roadmap's M7 (pure
+prediction, then apply) and M8 (addresses from the final solve). The solve needs
+device layouts, so it sits post-stickification. Manual hints keep applying
+pre-stickification exactly as today, preserving the rationale spelled out at
+`passes.py:419-425` (running before stickification means `_divide_ranges` never
+calls `_resize_device_layout`, which is what dissolved the
 `insert_restickify`→hint cross-phase contract, issue #3135). The solver sees
-hint-tiled ops as **pinned single-config buffers** and optimizes the rest of the
-graph around them.
+hint-tiled ops as **pinned single-config buffers** — a pin in M3's sense, lowered
+at enumeration time under H2 (R5) — and optimizes the rest of the graph around
+them.
 
 ```text
   propagate_named_dims, validate_named_dims          # 426-427
@@ -850,12 +974,26 @@ separate pass. The pass itself is retained — skipped when the solve succeeds,
 run verbatim when it raises (the R8.3 failure path) — so a graph whose
 feasibility requires tiling still compiles when the joint solve fails.
 
-The final placement solve remains **authoritative for addresses**. The joint
-model decides on a *predicted* buffer set; addresses are then computed over the
-real post-tiling buffers. A misprediction therefore degrades to a spill, never
-to a wrong address.
+The final placement solve remains **authoritative for addresses** — this is M8.
+The joint model decides on a *predicted* buffer set; addresses are then computed
+over the real post-tiling buffers.
 
-### 6. Tractability
+**The solver emits only legal, systematically-applicable plans; an illegal
+emission is a failure, not a fallback case.** This splits the seam between the
+predicted model and the applied IR cleanly in two. A *sizing or lifetime*
+misprediction is legal — the plan still applies — and merely degrades to a
+spill, never a wrong address, repriced by the placement re-solve. But a plan
+`coarse_tile` cannot apply, or one whose residency was gated on a per-core view
+the applied IR does not honour, is **illegal**: the model must make it
+infeasible **by construction** — every admitting predicate (R4.7 cut
+compatibility, R2.6 view agreement) must be *sufficient* for applicability, not
+merely necessary — and the post-apply validation that checks this is an
+assertion whose firing is a hard failure, never a silent degrade-to-greedy that
+would mask the modelling bug. This is distinct from *no* solution (INFEASIBLE,
+or a timeout with no incumbent), which is the legitimate R8.3 fallback to
+greedy.
+
+### 6. Tractability (track C2; enumeration scaling is Phase 5)
 
 - **Whole-graph model.** The solve is a single CP-SAT instance over the entire
   graph — it is **not** decomposed at matmul or any other op boundary, and makes
@@ -874,7 +1012,10 @@ to a wrong address.
   segmentation at matmul boundaries is unnecessary rather than merely unwanted.
 - **No per-op config cap.** Model size is controlled by external pruning of the
   enumerated config set rather than a fixed ceiling (see R2.4 and *Open
-  questions*).
+  questions*). The enumeration-scaling levers themselves — signature dedup,
+  per-dimension channeling, lazy enumeration — are the roadmap's **Phase 5** and
+  are deferred there; this phase ships the eager cross product, leaving those
+  levers to Phase 5.
 - **Enumeration cost, not just model size.** Two per-op costs now scale with the
   tiling-option count rather than being paid once:
   `enumerate_work_division_candidates` runs per option (R2.2), and
@@ -882,13 +1023,61 @@ to a wrong address.
   cache key gains the tile (R2.6) and it is built once per `(op, dep, buf, tile)`
   rather than once per `(op, dep, buf)`. The prep was introduced precisely to keep
   view cost proportional to ops rather than candidates; tiling reinstates a factor
-  of the option count. Solve time is already reported against the gate-off
-  baseline (testing item 10) — enumeration time must be reported alongside it,
-  since the two have different mitigations.
-- **Warm-start** via `AddHint` with the current heuristic's plan. Combined with
-  the R8.3 failure path — `SolveError` caught at the new pass slot, then the
-  existing tiling method with the greedy solver — this yields an anytime
-  property and a never-worse-than-today floor.
+  of the option count.
+- **Warm-start** via `AddHint` with the current heuristic's plan. The solve is
+  then genuinely **anytime**: a timeout keeps the best incumbent found (R8.3),
+  and because that incumbent is never worse than the warm-start plan under the
+  injected objective, early stopping does not regress below the heuristic's own
+  plan — the spill-dominant default (R3.5) keeps that tracking today's spill-first
+  intent. The harder floor is the `SolveError` path — `INFEASIBLE` or no
+  incumbent, caught at the new pass slot, then the existing tiling method with
+  the greedy solver — which is M9 ("failure never discards a pin"): the fallback
+  runs over the already-pinned candidate sets, so a hint is respected there too.
+  Determinism and fallback follow track C2.
+
+### 7. Padding (Phase 1, not an axis)
+
+The roadmap folds padding into Phase 1 because this is the first phase that needs
+it — for **sizing** (roadmap consequence 3). Padding gets no decision axis and no
+index space of its own; it lands entirely inside the config tables §1 already
+builds. Two cases, exactly as the roadmap frames them.
+
+**The pad required to reach legality is *derived*, so it is a scalar on each
+candidate row.** `compute_padding` (`padding.py:73`) rounds a dimension up to one
+stick, and given the layout and the tiling there is no freedom — nothing to
+decide. The only change is that a config's predicted buffer sizes are computed
+from the padded `device_size`, not from the unpadded shape, so the sizing every
+later phase is defined over is correct. This is precisely the case M4's "no new
+index space" rule was written for: `f(config) -> int` (here, padded bytes) is a
+table entry, not a variable.
+
+**Padding *beyond* legality is the one part with a genuine choice, and it enters
+as extra rows, not a new axis.** A discretionary pad can unlock a divisibility
+that `valid_split` requires (`work_division.py:809-823`), turning an illegal core
+split into a legal one — so it widens the feasible config set. Those extra
+configs are additional rows in the same per-op table, ranked by the same
+objective; still **no new index space**.
+
+Whether those rows are worth enumerating is an empirical question this document
+does not presume the answer to, because padding is not free today:
+`lower_pad_sequence` (`pass_utils.py:1191`) emits a four-op sequence — allocate,
+fill constant, fill the pad region, copy — per matmul, with no sharing between two
+matmuls reading the same operand (`padding.py:183`); the y operand's buffer grows
+and competes for LX; and `K → K_padded` widens the SDSC iteration space at codegen
+(`_extend_matmul_k_to_padded`, `codegen/superdsc.py:870`). The gate is a
+measurement — an unaligned-`K` matmul against the same model pre-padded by hand.
+If the delta is noise, the derived pad stays purely in the apply step and **no
+discretionary pad row is ever enumerated**; only if it is real do the extra rows
+land.
+
+Either way this phase lifts the fixed policies in `padding.py`, since the derived
+amount cannot be expressed without them: pad operands other than y, dimensions
+other than K, ends other than the right, and multiples other than one stick; and
+share a padded buffer between matmuls reading the same operand rather than
+emitting a pad sequence per matmul (`padding.py:183`). The **other** half of
+consequence 3 — padding as a *layout legalization* tool, which would remove the
+issue #1756 restriction at `propagate_layouts.py:271`, `:455`, and `:1078` — is
+**not** this phase's: it lands in Phase 3 with the layout search that consumes it.
 
 ## Requirements
 
@@ -896,14 +1085,28 @@ to a wrong address.
 
 - **R1.1** Add `enumerate_tile_options(op, *, max_dims, max_splits_per_dim,
   max_options) -> list[TileOption]`, returning **all** feasible options within
-  bounds, tiling **output ranges only** (R1.8). This is the behavioural change
+  the R1.7 caps, in the deterministic feasibility-tiered order R1.2 defines and
+  truncated to `max_options` by it, tiling output ranges or a single reduction
+  level (R1.8). This is the behavioural change
   from `_search_min_cost_tile_plan`
   (`:1269`), which returns the *first* combo in `_combo_cost` order. Both of its
   failure modes are preserved: it *raises* `Unsupported` when no combo passes
   (`:1395`, `:1399`), and returns `None` only when there are no candidate host
   dims at all (`:1303`).
-- **R1.2** `_combo_cost` is retained solely as the ranking used to truncate to
-  `max_options`, and as the deterministic tie-break.
+- **R1.2** `_combo_cost` is **dropped** — the injected objective (§4) is the only
+  ranking, applied by the solver over the enumerated set, so the enumerator does
+  not pre-rank options by a cost proxy. It instead emits every feasible option
+  within the R1.7 caps in a **deterministic, feasibility-tiered** order, and
+  truncation to `max_options` (when a cap binds) drops from that order's tail.
+  The tiers, outermost first: (1) the **mandatory keeps** — the untiled option
+  (R1.3) and the work-division-seed pair (R2.4) — never truncated; (2)
+  span-pressure-relieving options (R1.9); (3) speculative residency-driven
+  options. Within a tier the order is a canonical key over the option's
+  `(host_dim, split_count)` tuples, which doubles as the deterministic tie-break
+  R8.4 relies on. Feasibility priority, never cost, decides which options survive
+  the cap; the objective decides quality among the survivors. The
+  constraint-based encoding that lets larger problems avoid the cap altogether —
+  per-dimension channeling — is Phase 5.
 - **R1.3** The untiled option `TileOption(dims=())` is always present, so
   feasibility is never worse than today.
 - **R1.4** Validity predicates must be **reused, not reimplemented**. From
@@ -917,13 +1120,14 @@ to a wrong address.
   `pass_utils.py`: `coeff_through_floor` (`:848`, sub-stick guard) and
   `op_out_coords` (`:363`, the frame `host_dim` indexes).
 
-  `_validate_reduction_tiling` (`coarse_tile.py:1233`) and
-  `_seed_buffer_for_carry` (`:575`) are deliberately **not** in this list. They
-  guard reduction-axis tiling, which R1.8 excludes from the enumerated space, and
-  `_validate_reduction_tiling` over-approves in any case (*Background*), so it
-  could not serve as a feasibility gate even if reduction options were
-  enumerated. Both continue to run inside `coarse_tile` on the hint path,
-  unchanged.
+  `_seed_buffer_for_carry` (`:575`) **is** reused — it rejects carry-propagating
+  recurrences, which single-level reduction tiling (R1.8) must reject too.
+  `_validate_reduction_tiling` (`coarse_tile.py:1233`) is deliberately **not**: it
+  over-approves, admitting the nested known-wrong shapes (*Background*), so it
+  cannot be the feasibility gate. What gates the reduction options R1.8 does emit
+  is instead structural — a single reduction level, no nesting — backed by R1.6's
+  apply-and-compare-to-CPU test. `_validate_reduction_tiling` continues to run
+  inside `coarse_tile` on the hint path, unchanged.
 - **R1.5** Derived quantities come from the existing zero-mutation planner —
   `_planned_tile_extents_per_level` (`:309`) for the extents themselves, and
   `_tiled_dims_for_dep` (`:421`) to filter them per dep. No new extent arithmetic
@@ -939,13 +1143,20 @@ to a wrong address.
   in `wsr/span_overflow_hint_analysis.py` rather than migrating to `config.py`:
   `_MAX_TILE_DIMS = 3`, `_MAX_TILE_COMBOS = 512`, `_MAX_SPLITS_PER_DIM = 16`
   (`:143-145`), `_MAX_AUTO_TILE_SPLIT_COUNT = 64` (`:149`).
-- **R1.8** **No reduction-axis options.** `enumerate_tile_options` never emits a
-  `TileOption` that divides a `reduction_ranges` entry; every level tiles an
-  output range. This matches what the automatic planner already does
-  (`SpanOverflowTileLevel.is_reduction` is hardcoded `False`) and is the
-  enumeration-side half of the R9 non-goal. Hint-driven reduction-axis tiling is
-  unaffected — it still applies pre-stickification through
-  `_maybe_coarse_tile_hints` — but those ops enter the model pinned (R4.6, R5.6).
+- **R1.8** **Reduction-axis tiling is single-level only.** `enumerate_tile_options`
+  may emit a `TileOption` that divides a `reduction_ranges` entry, but only as a
+  **single level** — one reduction dim, split once, with no other level (output
+  or reduction) in the same option. Nested output+reduction and multi-level
+  reduction shapes are **never** emitted: they are exactly the shapes
+  `test_coarse_tile_e2e.py` marks `correctness=False` ("nested tiling + reduction
+  correctness bug") or `@pytest.mark.skip` ("inconsistent loop_count across
+  reduction fill/combine nodes"), and fixing that numerics bug is **out of
+  scope** — this RFC never emits the illegal option (§5). A single-level
+  reduction-tiled op enters the model **pinned as a singleton** (R4.6), and its
+  predicted footprint includes the accumulator/fill/combine buffers (R7.1).
+  Hint-driven reduction-axis tiling is unaffected — it still applies
+  pre-stickification through `_maybe_coarse_tile_hints` — and those ops enter the
+  model pinned the same way (R4.6, R5.6).
 - **R1.9** **Candidate dims are not span-pressure-only.** `_candidate_host_dims`
   (`:911`) takes `list[SpanOverflowCandidate]`, so it surfaces only dims already
   under span pressure — which is correct for the span-overflow planner and wrong
@@ -958,9 +1169,10 @@ to a wrong address.
   Candidate dims are instead the union of the span-pressure dims and every host
   dim passing `_host_dim_has_legal_nontrivial_split` (`:935`) — an existing
   helper, already built on `_split_candidates_for_host_dim`. Ordering stays
-  pressure-first (`_candidate_host_dims`'s own ordering, then the remainder), so
-  when `_combo_cost` truncation to `max_options` binds it discards the
-  speculative options before the pressure-relieving ones.
+  pressure-first (`_candidate_host_dims`'s own ordering, then the remainder) —
+  the R1.2 tiers put span-pressure dims ahead of speculative ones — so when the
+  `max_options` cap binds it discards the speculative options before the
+  pressure-relieving ones.
 
 ### R2 — Config construction and joint feasibility
 
@@ -1022,7 +1234,13 @@ to a wrong address.
   A tiling whose predicted frame cannot be built is excluded the same way — never
   pin on a slicing that cannot be verified.
 
-### R3 — Injected cost function
+### R3 — Injected cost function (the M2 deliverable)
+
+R3 specifies the M2 objective namespace this phase delivers. It is not a separate
+design decision from M2 — the collapse to a single minimized cost (R3.2) is M2's,
+the per-config `AddElement` binding (R3.7) is M4's, and the fact that a pinned
+axis contributes no objective terms is H4's. What R3 adds is the concrete
+signature, grammar, and scaling rules for the tiling axis.
 
 - **R3.1** Signature change. Today (`scratchpad/plan_solver.py:261`, `:298`)
   neither ABC is keyword-only, and only one takes `log_lx_usage`:
@@ -1068,7 +1286,9 @@ to a wrong address.
   buy a spill becomes a weighting choice (R3.5) — a term whose scale must
   dominate another is expressed by its coefficient, subject to the
   `COST_SCALE`/overflow rules in R3.4.
-- **R3.3** Supported sympy subset, stated exhaustively:
+- **R3.3** Supported sympy subset, stated exhaustively. Products of two model
+  variables are expensive in CP-SAT (they must be reified), so they are limited
+  now and may relax later:
   - `Add`; `Mul` with at most one non-constant factor per term (otherwise
     reified with `AddMultiplicationEquality`); `Pow` with a small non-negative
     integer exponent (expanded); `Integer` / `Rational` / `Float` coefficients.
@@ -1095,9 +1315,7 @@ to a wrong address.
   support these solvers lack. Note `LAYOUT_SOLVER` has a fifth value, `cpsat`,
   which is handled ahead of that registry (`allocator.py:2159`) and is the one
   solver for which `objective` is honoured.
-- **R3.7** `SPYRE_COST_EXPR` parses a string against the exported namespace, so
-  objectives can be explored without a code change.
-- **R3.8** **Symbol binding is bounded.** Every symbol resolves to either an
+- **R3.7** **Symbol binding is bounded.** Every symbol resolves to either an
   existing model variable or a single `AddElement` lookup over a per-config table
   computed at enumeration time. No symbol may add constraints scaling with
   anything but the buffer count and the adjacent-pair count (the edge count
@@ -1121,7 +1339,8 @@ to a wrong address.
 - **R4.3** `cut[i] == 0` is forced for every `i` interior to a hint scope,
   preserving `validate_coarse_tile_groups`'s invariant.
 - **R4.4** `reorder_unhinted_interlopers` continues to run as a pre-step. The
-  solver does not reorder operations. **Graph reordering is out of scope.**
+  solver does not reorder operations. **Graph reordering is out of scope — it is
+  the roadmap's Phase 4.**
 
   Execution order is the topological order of `graph.operations`, established at
   lowering and guaranteed by `GraphLowering` (`passes.py:404`). It is *a*
@@ -1139,8 +1358,9 @@ to a wrong address.
   tiled → tiled row requires an interloper between two ops the solver actively
   wanted to fuse.
 
-  Lifting this is harder than re-running the existing pass, which is why it is
-  not phase 2 either. Reordering sits at pipeline position 5, deliberately
+  Lifting this is harder than re-running the existing pass, which is why the
+  roadmap makes it a separate phase (Phase 4) rather than a near-term follow-on
+  here. Reordering sits at pipeline position 5, deliberately
   **before** stickification; the joint solve runs late — post-stickification
   (§5), after layouts are committed and after `optimize_restickify_locations`
   has chosen restickify sites against the current order — with the
@@ -1171,10 +1391,10 @@ to a wrong address.
   does not set them"). The apply step does the same, in the same order, and
   derives `group_idx_offset` from existing `loop_group_id[0]` values the same way.
   No new application path is introduced.
-- **R4.6** `cut[i]` is pinned to 1 on **both** boundaries of any op the hint pass
-  tiled on a reduction axis, exactly as for an untileable op (R4.2). Such an op
-  is therefore always a singleton group and never shares a loop nest with a
-  solver-chosen neighbour.
+- **R4.6** `cut[i]` is pinned to 1 on **both** boundaries of any op tiled on a
+  reduction axis — hint-driven or solver-chosen (R1.8) — exactly as for an
+  untileable op (R4.2). Such an op is therefore always a singleton group and
+  never shares a loop nest with a neighbour.
 
   This is not merely conservative — it is what keeps the pairwise cut table
   sound. The invariant governing a reduction-tiled group is
@@ -1257,35 +1477,64 @@ to a wrong address.
   `boundary_view[b]` exists so producer/consumer agreement at the boundary is
   checked on the physical per-core view (R2.6), not on a slice count two
   orthogonal divisions can share. Both are inputs the objective consumes; what
-  they are **worth** is the separate cost-model design's concern, not this one's.
+  they are **worth** is track C1's concern, not this document's.
 
-### R5 — Hints
+### R5 — Hints (registered under the H-spine)
 
-- **R5.1** Manual `spyre_hint` tiling applies pre-stickification exactly as
-  today, and remains authoritative. Hinted ops enter the model as pinned
-  single-config buffers.
-- **R5.2** The solver never re-tiles or un-tiles a hinted op.
-- **R5.3** Where no hint is present, the solver tiles automatically.
-- **R5.4** `SPYRE_INDUCTOR_IGNORE_HINTS=1` disables hints, handing those ops to
-  the solver as ordinary un-hinted ops.
-- **R5.5** *Deferred (phase 2).* Growing an existing hint group with
-  solver-chosen neighbours requires either moving hint application
-  post-stickification or emitting nested groups with a matching
-  `loop_group_id` prefix. Out of scope for phase 1; the constraint is recorded
-  here so the limitation is understood, not discovered.
+Tiling and division hints are **pins** in the roadmap's M3 sense, handled through
+the H1–H5 spine that collateral document 0 owns. This RFC does not build the
+registry or the validator — it **registers its keys and rules against them**. In
+particular, a hinted axis contributes no variables and no search (H4): pinning is
+an enumeration-time domain restriction (H2), not a post-solve override.
+
+- **R5.1** The tiling keys (`tiles` / `slices` / `num_tiles_per_dim`) and the
+  `work_div` key register under **H1** with their value schema and scope. Manual
+  `spyre_hint` tiling applies pre-stickification exactly as today and remains
+  authoritative; the affected op enters the model as a **pinned single-config
+  buffer** — the H2 lowering of a hint to a pin, leaving exactly one option in the
+  op's candidate list.
+- **R5.2** The solver never re-tiles or un-tiles a hinted op — a direct
+  consequence of the H2 pin, not a separate rule the solver enforces.
+- **R5.3** Where no hint is present, the axis is *optimized* (M3): the solver
+  tiles automatically.
+- **R5.4** `SPYRE_INDUCTOR_IGNORE_HINTS=1` corresponds to the roadmap's
+  `SPYRE_INDUCTOR_IGNORE_HINTS` behaviour — it drops the pins, handing those ops
+  to the solver as ordinary un-hinted ops.
+- **R5.5** *Deferred (a follow-on to this phase, not a roadmap phase).* Growing an
+  existing hint group with solver-chosen neighbours requires either moving hint
+  application post-stickification or emitting nested groups with a matching
+  `loop_group_id` prefix. Out of scope here; recorded so the limitation is
+  understood, not discovered.
 - **R5.6** A hint that tiles a reduction axis still applies, and
   `enable_reduction_tiling` (`config.py:82`) keeps its current default and
   meaning. The affected op enters the model as a pinned single-config buffer
   (R5.1) with both its `cut[i]` boundaries pinned to 1 (R4.6). Setting
   `SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING=0` makes such a hint raise
   `Unsupported`, unchanged by this RFC.
+- **R5.7** Validation is **H3's**, not a new mechanism: a malformed key is named
+  before enumeration (level 1), a hinted value that survives no config is named
+  during enumeration (level 2), and a set of individually-realizable pins that is
+  jointly infeasible across ops routes to the post-`INFEASIBLE` diagnostic (level
+  3). The one axis-specific obligation is that the tiling predicates (R1.4) are
+  the *same* ones the model constrains against, satisfying M6 for the fallback
+  path. Every committed tiling/division decision records its source under **H5**
+  (`decision_reason`).
+- **R5.8** A global **untiled default** needs no per-op hinting: with
+  `AUTO_COARSE_TILING` off (R8.1) every un-hinted op is pinned to the unity
+  tiling (`tile=None`), so the tiling optimization can be turned off while manual
+  tiling hints still apply and the solver still co-optimizes division and
+  residency. This hints-honoured / rest-defaulted mode is distinct from
+  `SPYRE_INDUCTOR_IGNORE_HINTS` (R5.4), which instead *drops* the pins.
 
-### R6 — Stickification / relayout: out of scope
+### R6 — Stickification / relayout: Phase 3, not here
 
 Choosing configs to *avoid* a restickify — a "stickification optimization" that
 models each producer→consumer edge's relayout cost and lets the objective trade
-it off — is **out of scope for this RFC** (R9). The `relayout[e]` variable, its
-per-edge triple table, and the `relayout_bytes` objective term are all deferred.
+it off — is the roadmap's **Phase 3** (collateral document 3), not this phase
+(R9). The `relayout[e]` variable, its per-edge triple table, and the
+`relayout_bytes` objective term are all deferred there. The exception, called out
+in R6.3, is the tiling-aware per-core views this phase *must* deliver because
+Phase 3 depends on them.
 
 - **R6.1** The compiler keeps inserting restickifies wherever configs force one,
   exactly as today (`insert_restickify`, `passes.py:438`). The solver neither
@@ -1302,42 +1551,61 @@ per-edge triple table, and the `relayout_bytes` objective term are all deferred.
 - **R6.3** Lifting this is follow-on work, but only the *pricing* half is
   deferred. The two halves must not be bundled:
 
-  - **Lands in this RFC (R2.6):** tiling-aware physical per-core views —
+  - **Lands in this phase (R2.6)** — this is exactly the "tiling-aware per-core
+    views" the roadmap lists under Phase 1's *"Owed to later phases"*:
     `_prepare_per_core_view` (`pass_utils.py:1467`) and `_per_core_view_on_buf`
     (`:1696`) evaluated against a predicted post-tiling frame. `config_matches`
     depends on this to gate residency, so it is not optional and cannot wait for
-    the relayout work.
-  - **Deferred:** `relayout[e]` as a *determined*, cost-only edge variable,
-    precomputed once per edge at enumeration time from those same views, plus a
-    `relayout_bytes = SumOverEdges(relayout[e] * bytes[e])` term in the objective
-    namespace, inside R3.8's linear-binding rule.
+    Phase 3.
+  - **Deferred to Phase 3:** `relayout[e]` as a *determined*, cost-only edge
+    variable, precomputed once per edge at enumeration time from those same views,
+    plus a `relayout_bytes = SumOverEdges(relayout[e] * bytes[e])` term in the
+    objective namespace, inside R3.7's linear-binding rule.
 
   An earlier draft filed the view extension under the deferred half. That would
   have left the non-deferred `config_matches` path depending on a mechanism this
-  RFC never builds; the follow-on work is a variable and a cost term over views
+  phase never builds; Phase 3's work is then a variable and a cost term over views
   that already exist by then.
 
-### R7 — Prediction fidelity and application
+### R7 — Prediction fidelity and application (M7, M8)
+
+R7 instantiates M7 (pure prediction, then apply) and M8 (addresses from the final
+solve) for the tiling axis. One alignment point matters: per M7 the predictor's
+fidelity is settled **offline against recorded plans**, not by an assertion pass
+inside the compiler — "no phase owes a verify mode, and none adds one." So what
+this phase owes is that the *inputs* to that offline check exist (R7.2), recorded
+under H5; it does not add an in-compiler verify flag. This concerns **fidelity**
+— the *accuracy* of predicted sizes, lifetimes, and views — not **legality**:
+that an applied plan is well-formed is guaranteed by construction and backstopped
+by §5's post-apply assertion, whose firing is a hard failure (§5). What M7 defers
+offline is the accuracy check, never the legality guard.
 
 - **R7.1** A pure predictor maps a candidate config set to the predicted buffer
   set (sizes, lifetimes, boundary copies) with **no IR mutation**. R1.8 bounds
   what it has to model: output-range tiling materializes only the boundary copies
-  of `_allocate_full_buffer`/`_insert_copy_op`/`_insert_read_copy_ops`. The
-  accumulator, identity fill, and combine op that reduction-axis tiling would add
-  are never predicted — hints apply pre-stickification (`passes.py:430`), so by
-  the time the solve runs those buffers are already real IR the model simply
-  sees.
+  of `_allocate_full_buffer`/`_insert_copy_op`/`_insert_read_copy_ops`, and
+  **single-level** reduction-axis tiling adds exactly the accumulator, identity
+  fill, and combine op of `_propagate_tiled_reduction_op` — no nested second
+  accumulator, since R1.8 emits no nested option. The predictor models those three
+  for a solver-chosen reduction option, or the objective would read reduction
+  tiling as free LX relief (*Background* property 3). Hint-driven reduction tiling
+  applies pre-stickification (`passes.py:430`), so by the time the solve runs its
+  buffers are already real IR the model simply sees.
 
   The predictor's second output is the **post-tiling frame** — divided ranges
   plus the resized device layout — that R2.6 evaluates per-core views against.
   One predictor serves both; they must not drift apart.
-- **R7.2** `SPYRE_VERIFY_TILE_PREDICTION=1` applies the plan and asserts
-  predicted per-buffer sizes and lifetimes match the realized ones, **and** that
-  each predicted per-core view equals the one recomputed from the post-tiling IR
-  (R2.6). The view check is the more important of the two: a mispredicted size
-  degrades to a spill under R7.4, whereas a mispredicted view means residency was
-  gated on a slicing agreement that does not hold, which is a wrong-data bug. This
-  is the highest-risk area in the design and gets its own test suite.
+- **R7.2** Each decision **records** the predicted values it was scored against —
+  per-buffer size and lifetime, and the predicted per-core view (R2.6) — alongside
+  the decision itself under H5. The roadmap's offline fidelity check reads those
+  records and compares them to the realized post-tiling IR after the fact, under
+  the rank-order normalization M7 mandates (R7.5); this phase adds no
+  in-compiler verify pass. The **view** record is the load-bearing one: a
+  mispredicted size degrades to a spill under R7.4, whereas a mispredicted view
+  means residency was gated on a slicing agreement that does not hold — a
+  wrong-data bug, and the highest-risk area in the design. The offline check
+  therefore treats the view comparison as its primary assertion and gets its own
+  recorded-plan fixtures.
 - **R7.3** Application order is: decide → `coarse_tile` → commit divisions →
   placement-only re-solve. Addresses always come from the final solve over real
   buffers.
@@ -1368,7 +1636,15 @@ per-edge triple table, and the `relayout_bytes` objective term are all deferred.
   buffers it fails to see are exactly the ones tiling exists to make pinnable —
   so this is not a wash that averages out across a graph.
 
-### R8 — Robustness, gating, determinism
+### R8 — Robustness, gating, determinism (track C2; fallback is M9)
+
+R8 is this axis's instance of track C2 (determinism, tractability, fallback) and
+of M9 (failure never discards a pin). The fallback path (R8.3) is M9 case 1 — a
+timed-out or unavailable solver degrades to the pinned candidate sets — and the
+determinism rules (R8.4) are C2's `num_search_workers = 1` /
+`random_seed = 0` regime. Per C2, a timeout is unattributable across axes, so the
+fallback degrades *all* axes at once; this phase does not assume its own is the
+one that keeps its solved value.
 
 - **R8.1** New gate `UNIFIED_TILING` / `config.unified_tiling`, **default off**.
   The bare `UPPER_SNAKE` form matches the LX-planning family this gate composes
@@ -1378,26 +1654,51 @@ per-edge triple table, and the `relayout_bytes` objective term are all deferred.
   accidental. Requires `LAYOUT_SOLVER=cpsat` and `CO_OPTIMIZING_LX_PLANNING=1`,
   the latter itself default-off today (`config.py:23-25`); warn and no-op
   otherwise.
+
+  A second gate `AUTO_COARSE_TILING` / `config.auto_coarse_tiling`, **default
+  off**, governs whether the solver introduces tiling on **un-hinted** ops — the
+  R1.9 residency-driven candidates and R5.3's optimized axis. With
+  `UNIFIED_TILING` on but `AUTO_COARSE_TILING` off, the joint model still
+  co-optimizes core division and residency and still honours tiling hints (R5.1),
+  but every un-hinted op stays `tile=None`; this is the safe-rollout state, whose
+  plans differ from today only in the M2 objective collapse, not in any new
+  tiling. Turning it on admits the enumerator's non-span-pressure options (R1.9).
+  Span-forced tiling a graph *requires* for feasibility is not gated by it — that
+  path remains the retained span-overflow tiler (§5, R8.3).
 - **R8.2** Warm-start the model via `AddHint` with the current heuristic's plan,
-  so hitting the time limit yields today's answer rather than a worse one.
-- **R8.3** Time limit → `SolveError` (`plan_solver.py:27`), caught by a **new
-  handler at the `unified_partition_solve` slot** — the existing try/except at
+  so a timed-out solve keeps an incumbent no worse than today's answer rather
+  than dropping to the fallback (R8.3).
+- **R8.3** The solve has three outcomes, not two. **A feasible solution —
+  `OPTIMAL`, or a `FEASIBLE` incumbent when the deterministic time budget (R8.4)
+  is spent — is applied as-is.** The model only ever emits legal plans (§5), so
+  an incumbent needs no further vetting; a timeout is a *quality* limit, not a
+  failure. **Only `INFEASIBLE`, or a timeout with no incumbent, raises
+  `SolveError`** (`plan_solver.py:27`), caught by a **new handler at the
+  `unified_partition_solve` slot** — the existing try/except at
   `allocator.py:2211` wraps only `_maybe_scratchpad_planning` (pass 455) and
-  never sees this pass. On failure the joint plan is discarded whole and the
+  never sees this pass. On that raise the joint plan is discarded whole and the
   pipeline reverts to the existing tiling method with the greedy solver:
   `_maybe_coarse_tile_span_overflow` runs exactly as today (retained, §5), the
   heuristic division passes at 451-452 proceed unchanged, and placement at
   pass 455 drops straight to placement-only greedy — `allocator.py:2211`'s
-  fallback path, entered directly rather than after a second `SolveError`,
-  since a joint solve that just timed out makes another CP-SAT attempt a poor
-  bet. The graph is unmutated when the solve raises — the solve precedes
-  `coarse_tile` — so the fallback starts from clean IR. This is what makes the
-  floor hold on the failure path: the graphs span-forced tiling exists to
-  rescue still compile.
-- **R8.4** Determinism: keep `num_search_workers = 1` under
-  `torch.are_deterministic_algorithms_enabled()` and `random_seed = 0`. Tiling
-  adds symmetry, so add symmetry-breaking over equal-cost configs and document
-  the tie-break, so plans are reproducible across runs.
+  fallback path, entered directly rather than after a second `SolveError`, since
+  a solve that could not even find a feasible point makes another CP-SAT attempt
+  a poor bet. The graph is unmutated until a plan is applied — the solve and its
+  outcome check precede `coarse_tile` — so the raise starts the fallback from
+  clean IR, and the span-forced tiler still rescues the graphs that need it. An
+  *illegal* emission is a separate matter entirely: a hard failure, not a
+  fallback (§5).
+- **R8.4** Determinism means **a given model yields an identical plan across
+  runs**, not that similar graphs yield similar plans. Keep
+  `num_search_workers = 1` under `torch.are_deterministic_algorithms_enabled()`,
+  `random_seed = 0`, and a fixed signature-defined enumeration order so
+  equal-cost ties resolve the same way every run. **Plan stability under input
+  perturbation is an explicit non-goal** — by construction a changed graph is not
+  expected to produce a similar plan — so no symmetry-breaking beyond seed and
+  enumeration order is added. One caveat: a solve that stops early and keeps a
+  feasible solution (R8.3) is reproducible only under a **deterministic** stop
+  criterion (`max_deterministic_time`, not wall-clock); otherwise the accepted
+  solution varies across machines.
 - **R8.5** `ortools` remains the optional extra named `cpsat`
   (`pyproject.toml:36-38`, `ortools>=9.0`); the import stays guarded
   (`ilp_solver_ortools.py:86-93`) and `_make_cpsat_solver` (`allocator.py:2116`)
@@ -1407,37 +1708,84 @@ per-edge triple table, and the `relayout_bytes` objective term are all deferred.
 
 ### R9 — Non-goals
 
+Most of these are not "never" — they are *other phases and tracks* of the
+roadmap. They are listed as non-goals of **this** document so the scope boundary
+is explicit, with the owner named.
+
 - **No ring transfers.** The `core_div_mismatch` hard wall stays. Dissolving it
   needs a data ring or reduce-sum ring emitted in the SuperDSC schedule, which
-  is separate work.
-- **No new performance model in microseconds.** The objective is caller-supplied;
-  supplying a *good* one is follow-on work. This RFC delivers the mechanism.
-- **No operation reordering** beyond the existing
-  `reorder_unhinted_interlopers`.
+  is separate work outside the roadmap.
+- **No cost-model calibration in microseconds.** This phase delivers the M2
+  *mechanism* (§4); tuning the objective to measured µs is the roadmap's **track
+  C1**, not this document.
+- **No operation reordering** beyond the existing `reorder_unhinted_interlopers`.
+  Order as a decision is the roadmap's **Phase 4** (R4.4).
+- **No time-varying addresses / defragmentation.** LX relocation and compaction
+  are the roadmap's **Phase 2**; this phase keeps today's single-address
+  placement and co-optimizes residency against it.
 - **No change** to `_matmul_split_cost` in `work_division.py`.
 - **No stickification / relayout optimization.** The solver does not model or
-  minimize restickify cost (R6); configs are chosen blind to relayout, which can
-  be pessimistic on relayout-driven HBM traffic. Deferred to follow-on work.
-- **No reduction-axis tiling.** The solver never chooses to tile a reduction
-  range (R1.8), and hint-driven reduction-axis tiling is pinned out of the
-  grouping decision (R4.6, R5.6). Three reasons, in descending order of how hard
-  they are to work around: the group invariant is not pairwise so the cut model
-  cannot express it (R4.6); only *single-level* reduction-axis tiling is
-  numerically validated today, while `_validate_reduction_tiling` also admits the
-  known-wrong nested shapes (*Background*); and it is not a pure working-set
-  reduction, so pricing it needs the accumulator and fill buffers in the cost
-  model rather than the tiled op's footprint alone. The capability itself is
-  untouched — `enable_reduction_tiling` keeps its default and hints keep working.
-  Follow-on work is described under *Open questions*.
+  minimize restickify cost; that is the roadmap's **Phase 3** (R6). Configs are
+  chosen blind to relayout, which can be pessimistic on relayout-driven HBM
+  traffic — the tiling-aware per-core views Phase 3 needs are the one piece that
+  lands here (R2.6).
+- **No padding as layout legalization.** The sizing half of padding lands here
+  (R10); using padding to remove the issue #1756 layout-search restriction is
+  **Phase 3**.
+- **No *nested* or *fused* reduction-axis tiling.** The solver may choose
+  single-level reduction tiling (R1.8), but never a nested output+reduction or
+  multi-level shape, and a reduction-tiled op is always a pinned singleton, never
+  fused into a group (R4.6). Two boundaries stay out of scope here: the nested
+  wrong-numerics bug this RFC does not fix (so those options are never emitted);
+  and fusing a reduction-tiled op with neighbours, which the pairwise cut model
+  cannot express (R4.6) and which needs per-run/per-level literals. The capability
+  itself is untouched — `enable_reduction_tiling` keeps its default and hints keep
+  working. Follow-on work is described under *Open questions*.
+
+### R10 — Padding (not an axis, §7)
+
+Padding lands in this phase for **sizing** (roadmap consequence 3) and adds no
+decision axis. It is entirely per-config table content (M4).
+
+- **R10.1** The legality pad is **derived**, not decided: `compute_padding`
+  (`padding.py:73`) rounds a dimension to one stick, so given a config's layout
+  and tiling there is exactly one value. It is a scalar on the candidate row, and
+  a config's predicted buffer sizes are computed from the padded `device_size`.
+  **No new index space** — the M4 `f(config) -> int` case.
+- **R10.2** Padding *beyond* legality enters as **additional config rows**, never
+  a new variable. A discretionary pad can satisfy a divisibility `valid_split`
+  requires (`work_division.py:809-823`), turning an illegal core split into a
+  legal one and so widening the feasible config set; the extra configs are ranked
+  by the same objective.
+- **R10.3** Whether R10.2's discretionary rows are enumerated at all is **gated on
+  a measurement** — an unaligned-`K` matmul against the same model pre-padded by
+  hand, accounting for `lower_pad_sequence`'s four-op cost (`pass_utils.py:1191`),
+  the y-operand buffer growth, and the `K → K_padded` iteration-space widening
+  (`_extend_matmul_k_to_padded`, `codegen/superdsc.py:870`). If the delta is
+  noise, the derived pad (R10.1) stays purely in the apply step and no pad row is
+  added.
+- **R10.4** This phase lifts `padding.py`'s fixed policies, since the derived
+  amount cannot be expressed without them: pad operands other than y, dimensions
+  other than K, ends other than the right, and multiples other than one stick;
+  and share one padded buffer between matmuls that read the same operand rather
+  than emitting a pad sequence per matmul (`padding.py:183`).
+- **R10.5** A pad-amount pin registers as a hint key under **H1**, lowers to a pin
+  under **H2** (it collapses the pad scalar / selects among R10.2 rows), and is
+  validated by **H3** exactly as the tiling keys are (R5.7). A pad pin that makes
+  an op's config set empty is named at H3 level 2.
+- **R10.6** Padding as a **layout-legalization** tool — removing the issue #1756
+  restriction at `propagate_layouts.py:271`, `:455`, `:1078` — is **not** in this
+  phase; it is Phase 3, with the layout search that consumes it (R9).
 
 ## Files
 
 **New**
 
-- `torch_spyre/_inductor/scratchpad/cost_expr.py` — symbol namespace,
-  `CostSpec`, sympy→CP-SAT lowering, `CostExpressionError`.
+- `torch_spyre/_inductor/scratchpad/cost_expr.py` — the **M2 objective namespace**
+  this phase delivers: symbol namespace, `CostSpec`, sympy→CP-SAT lowering,
+  `CostExpressionError`.
 - `torch_spyre/_inductor/wsr/enumerate_tilings.py` — `enumerate_tile_options`,
-  built on the R1.4 predicates; output ranges only (R1.8).
+  built on the R1.4 predicates; output ranges plus single-level reduction (R1.8).
 
 **Modified**
 
@@ -1460,12 +1808,22 @@ per-edge triple table, and the `relayout_bytes` objective term are all deferred.
   `dim_hint_assignments` for `coarse_tile` (R4.5).
 - `pass_utils.py` — `_prepare_per_core_view` (`:1467`) and `_per_core_view_on_buf`
   (`:1696`) accept a predicted post-tiling frame instead of reading the op's
-  current ranges and device layout (R2.6).
+  current ranges and device layout (R2.6); `lower_pad_sequence` (`:1191`) gains
+  shared-operand emission so two matmuls reading the same operand share one padded
+  buffer (R10.4).
+- `padding.py` — `compute_padding` (`:73`) exposed as the per-config derived-pad
+  scalar (R10.1); the fixed policies in `insert_bmm_padding` (`:163`) lifted so pad
+  operand/dimension/end/multiple follow the chosen config (R10.4). The
+  layout-legalization half (#1756) is **not** touched here — that is Phase 3
+  (R10.6).
 - `passes.py` — insert `unified_partition_solve` (with its R8.3 `SolveError`
   handler) and the apply step; skip `_maybe_coarse_tile_span_overflow` when
   the solve succeeds — retained verbatim as the R8.3 fallback tiler, not
   deleted.
-- `config.py` — `unified_tiling`, `cost_expr`, `verify_tile_prediction`.
+- `config.py` — `unified_tiling`, `auto_coarse_tiling` (R8.1) (and
+  `enable_discretionary_pad`, gated by the R10.3 measurement). No `verify_tile_prediction` flag: per M7 the
+  fidelity check is offline, so the phase records predicted values (R7.2, under
+  H5) rather than adding an in-compiler verify pass.
 - `wsr/span_overflow_hint_analysis.py` — expose the predicates as reusable
   helpers; `_search_min_cost_tile_plan` becomes a thin ranked wrapper over the
   enumerator.
@@ -1493,7 +1851,7 @@ integration" gap), `docs/source/compiler/coarse_tiling_loops.md`, and
    `PartitionConfig` migration.
 3. **Cost lowering.** Unit tests for the R3.3 accept/reject table and R3.4
    scaling (single-phase `Minimize` of one total expression; no per-phase
-   locking), with a `CostExpressionError` case per rejected construct. Plus R3.8:
+   locking), with a `CostExpressionError` case per rejected construct. Plus R3.7:
    every namespace symbol adds at most one `AddElement` (or the single
    `AddMaxEquality` for `peak_lx_bytes`), and model size grows linearly in buffer
    count and adjacent-pair count as the graph scales. Also assert `SumOverEdges`
@@ -1503,8 +1861,8 @@ integration" gap), `docs/source/compiler/coarse_tiling_loops.md`, and
 4. **Cut tables and structural contiguity.** The `cut[i]` triple table is total —
    every `(tile_src, tile_dst)` pair appears exactly once — and `cut[i]` is
    pinned to 1 at every untileable boundary and on **both** boundaries of every
-   hint-driven reduction-axis-tiled op (R4.6), so such an op is always a
-   singleton group. Then the property that
+   reduction-axis-tiled op, hint- or solver-chosen (R4.6), so such an op is always
+   a singleton group. Then the property that
    §3 rests on: for any solution, every maximal cut-free run is a contiguous
    slice of `graph.operations` (R4.2), asserted directly rather than argued.
 
@@ -1520,12 +1878,14 @@ integration" gap), `docs/source/compiler/coarse_tiling_loops.md`, and
    calling `coarse_tile` reproduces exactly the grouping the solver chose, with
    no `loop_group_id` collision against hint-pass groups.
 5. **Enumerator completeness and scope.** Brute-force reference on small shapes;
-   the enumerator's set must equal the reference's. No returned option divides a
-   `reduction_ranges` entry (R1.8) — asserted over the reduction ops in
-   `test_coarse_tile_e2e.py`'s Group 4 and Group 5 shapes, which are the ones
-   that would otherwise produce reduction-axis candidates. Every option applies
+   the enumerator's set must equal the reference's. Every reduction option is
+   **single-level** — one reduction dim, no other level — and **no** nested
+   output+reduction or multi-level reduction option is emitted (R1.8), asserted
+   over `test_coarse_tile_e2e.py`'s Group 4 and Group 5 shapes, whose nested
+   variants are the `correctness=False` / skipped ones. Every option applies
    **and** matches CPU numerically (R1.6), not merely applies without
-   `Unsupported`.
+   `Unsupported` — this is what keeps the admitted single-level reduction options
+   legal.
 
    The R1.9 guard needs its own case, because it is the one that fails silently:
    for an op under **no** span pressure but with a legally splittable host dim,
@@ -1533,8 +1893,13 @@ integration" gap), `docs/source/compiler/coarse_tiling_loops.md`, and
    `_candidate_host_dims` alone this returns a single option and the solver simply
    never tiles that op — no error, no warning, and the LX-residency motivation
    quietly does nothing.
-6. **Prediction fidelity.** Run the coarse-tiling and scratchpad suites under
-   `SPYRE_VERIFY_TILE_PREDICTION=1`.
+6. **Prediction fidelity (offline, M7).** The coarse-tiling and scratchpad suites
+   emit the prediction records R7.2 requires (predicted per-buffer sizes,
+   lifetimes, and per-core views, recorded under H5). An **offline** check —
+   against recorded plans, not an in-compiler verify flag — compares each record
+   to the realized post-tiling IR under the rank-order normalization of §2's
+   interstitial coordinates. Per M7 no verify mode ships in the compiler; the test
+   asserts the records exist and the offline comparison holds.
 7. **Boundary buffer LX status.** For a graph tiled into two groups, assert the
    `full_buf` that `_allocate_full_buffer` produces has a non-`None`
    `residency_reason` (`"mutation target"` or `"tiled (advancing)"`), that the
@@ -1583,37 +1948,44 @@ integration" gap), `docs/source/compiler/coarse_tiling_loops.md`, and
 9. **Over-tiling fix.** A case where span overflow forces tiling *and* work
    division splits the same dim: assert the joint model picks a strictly smaller
    tile count than the `core_split_estimate = 1` path.
-10. **End-to-end performance.** `mlp-linear-kn.t` and `mha_4h` at `SENCORES=32`,
-    the two benchmarks already tracked in `scratchpad_planning.md`, measured
-    against the baselines recorded there: `mlp-linear-kn.t` at ~79%
-    process-engine utilization after pointwise seeding, ~17% below its
-    pre-seeding fused kernel time (`:519`); `mha_4h` converging on `B/4·M/8`
-    with the scores matrix pinned (`:508`), but with the reduction option
-    pushing search into tens of seconds (`:566`). Report PE utilization, fused
-    kernel time, *and* solve time against the gate-off baseline — the last
-    matters because tiling enlarges the model.
-11. **Determinism.** Identical plans across two runs under
+10. **Determinism.** Identical plans across two runs under
     `torch.use_deterministic_algorithms(True)`.
-12. **Fallback.** With the gate on and the solver forced to fail (an epsilon
-    time limit or an injected `SolveError` — a zero limit is skipped by the
+11. **Fallback and incumbent** — the two non-optimal outcomes (R8.3). *Failure:*
+    with the gate on and the solver forced to `INFEASIBLE` or an injected
+    `SolveError` (an epsilon time limit no longer forces this — it now yields a
+    feasible incumbent that is applied; a zero limit is skipped by the
     `if self._time_limit_seconds` guard, `ilp_solver_ortools.py:457`), a graph
-    that requires span-forced tiling compiles through the
-    retained span-overflow path and matches today's plan; assert the failed
-    solve left no trace in the IR (the solve precedes `coarse_tile`, R8.3).
+    that requires span-forced tiling compiles through the retained span-overflow
+    path and matches today's plan, and the failed solve leaves no trace in the IR
+    (it precedes `coarse_tile`, R8.3) — M9 case 1: the pinned candidate sets
+    survive, so a hint is still respected. *Incumbent:* with an epsilon
+    deterministic budget on a solvable graph, assert the timed-out solve applies
+    its feasible incumbent — the graph is tiled per that plan, not dropped to the
+    greedy fallback — and that the incumbent is no worse than the warm-start plan
+    under the objective.
+12. **Padding (R10).** Assert the derived legality pad reaches buffer sizing —
+    predicted sizes are computed from the padded `device_size`, not the unpadded
+    shape (R10.1). Extend `tests/inductor/test_padding.py` with a **shared-operand**
+    case: two matmuls reading the same operand emit one padded buffer, not two
+    (R10.4). Report the R10.3 padding-cost measurement (unaligned-`K` matmul vs.
+    hand-pre-padded) either way, and — only if it justifies discretionary pad —
+    add a **chosen-pad** case where a pad row unlocks a core split that
+    divisibility would otherwise block (R10.2).
 
 ## Alternatives considered
 
 **A separate CP-SAT tiling stage ahead of layout planning.** Cleaner to land and
 test, but it reproduces the current defect in a new place: a tiling chosen
 without seeing LX occupancy or the core division still has to guess. Rejected in
-favour of one joint model.
+favour of one joint model — which is the roadmap's M1, not a choice re-opened
+here.
 
 **Keeping the hardcoded objective and adding tiling terms to it.**
 Requires editing the solver for every cost experiment, and the interesting
 question — how to trade HBM traffic against parallelism against loop overhead —
-is exactly the one that needs iteration. Rejected in favour of injection. (Today's
-objective is two-phase lexicographic; §4 replaces it with a single-phase weighted
-one independently of the injection question — see R3.2.)
+is exactly the one that needs iteration. Rejected in favour of injection, which
+is M2. (Today's objective is two-phase lexicographic; §4 replaces it with a
+single-phase weighted one — the collapse M2 mandates, see R3.2.)
 
 **Pre-computing tiling groups from producer/consumer connectivity, then having
 CP-SAT pick one tiling per group.** A smaller model, but the grouping heuristic
@@ -1628,38 +2000,48 @@ enumeration, which is bounded by the caps in R1.7.
 
 ## Resolved design decisions
 
-These four were raised as open questions and have been resolved for phase 1:
+These four were raised as open questions and have been resolved for phase 1;
+each aligns with a roadmap requirement rather than standing alone:
 
 - **Segmentation granularity — resolved: whole-graph.** The solve is a single
   CP-SAT instance over the entire graph, not decomposed at matmul or any other op
-  boundary (§6). No op-specific break is assumed; matmul cuts fall out of
-  untileability, not a segmentation rule.
+  boundary (§6) — this is M1 ("one CP-SAT solve"). No op-specific break is
+  assumed; matmul cuts fall out of untileability, not a segmentation rule.
 - **How cuts should be priced — resolved: loops are free.** A cut is priced only
   through the consequences it materializes; no `n_groups` or per-cut term (§3). A
   cut that materializes no boundary copy costs nothing. This is a working
-  assumption and can be revised with a loop-overhead term if a later cost model
-  justifies it.
+  assumption for track C1 and can be revised with a loop-overhead term if a later
+  cost model justifies it.
 - **Config cap per op — resolved: no cap.** The model does not cap configs per op;
-  model size is controlled by external pruning of the enumerated set (§6, R2.4).
+  model size is controlled by external pruning of the enumerated set (§6, R2.4),
+  and shrinking the table is the roadmap's Phase 5.
 - **Default objective — resolved: keep today's terms, single-phase.** The default
   stays today's spill and core terms, now combined into one single-phase weighted
-  objective rather than the two-phase lexicographic solve (§4, R3.2, R3.5).
+  objective rather than the two-phase lexicographic solve (§4, R3.2, R3.5) — the
+  M2 collapse.
 
 ## Open questions
 
-- **Objective tuning.** The single-phase default reproduces today's terms with
-  the spill term weighted to dominate. What weighting, and what additional terms
-  (tile count / loop overhead, `peak_lx_bytes`), should the default carry once the
-  mechanism is trusted?
-- **Stickification.** Relayout cost is unmodelled (R6), which can be pessimistic
-  on relayout-driven HBM traffic. When is the follow-on `relayout[e]` work worth
-  landing, and does tiling make that pessimism large enough to reprioritize it?
-- **Reduction-axis tiling.** Excluded for phase 1 (R9). Bringing it in scope has
-  three prerequisites, and the first two are independent of this RFC: fix the
-  nested output+reduction wrong-numerics so `_validate_reduction_tiling`'s stated
-  contract matches reality; extend the per-config cost tables to include the
-  accumulator and fill buffers, so the solver does not read reduction tiling as
-  free LX relief. Only the third is a modelling question here — expressing the
-  group invariant needs per-run, per-level literals rather than pairwise cut
-  tables (R4.6), which is a real increase in model size. Is that worth paying for,
-  or is reduction-axis tiling better left permanently hint-only?
+Most of these are owned by a roadmap track or a later phase; they are listed here
+because tiling is where the question first bites.
+
+- **Objective tuning (track C1).** The single-phase default reproduces today's
+  terms with the spill term weighted to dominate. What weighting, and what
+  additional terms (tile count / loop overhead, `peak_lx_bytes`), should the
+  default carry once the mechanism is trusted? Calibration is C1's, but the tiling
+  terms are what it first has to weigh.
+- **Discretionary padding (R10.3).** Does the padding-cost measurement justify
+  enumerating pad-beyond-legality rows, or does the derived pad stay purely in the
+  apply step? Open until the benchmark runs.
+- **Stickification (Phase 3).** Relayout cost is unmodelled (R6), which can be
+  pessimistic on relayout-driven HBM traffic. When is Phase 3's `relayout[e]` work
+  worth landing, and does tiling make that pessimism large enough to reprioritize
+  it?
+- **Nested and fused reduction-axis tiling.** Single-level reduction tiling is in
+  scope (R1.8); two extensions are not. *Nested* output+reduction needs the
+  wrong-numerics bug fixed first so `_validate_reduction_tiling`'s stated contract
+  matches reality — deliberately out of scope, as this RFC does not take on
+  library fixes elsewhere. *Fused* reduction tiling — letting a reduction-tiled op
+  share a loop nest rather than stay a singleton — is the modelling question:
+  the group invariant needs per-run, per-level literals rather than pairwise cut
+  tables (R4.6), a real increase in model size. Is either worth paying for?
