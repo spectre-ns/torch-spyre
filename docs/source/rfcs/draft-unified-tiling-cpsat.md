@@ -1115,10 +1115,19 @@ issue #1756 restriction at `propagate_layouts.py:271`, `:455`, and `:1078` — i
   `_cap_split_candidates` (`:979`), `_input_stick_alignment_error` (`:1042`),
   `_split_candidates_for_host_dim` (`:1100`), `_iter_split_combos` (`:1195`),
   `_combined_tile_stick_alignment_error` (`:1215`),
-  `_host_dim_has_legal_nontrivial_split` (`:935`, the R1.9 candidate source), and
+  `_remaining_span_candidates_after_tile` (`:1236`),
+  `_host_dim_has_legal_nontrivial_split` (`:936`, the R1.9 candidate source), and
   `can_conform_pointwise_tile` (`:1421`, the R4.7 adoption predicate). From
   `pass_utils.py`: `coeff_through_floor` (`:848`, sub-stick guard) and
   `op_out_coords` (`:363`, the frame `host_dim` indexes).
+
+  `_remaining_span_candidates_after_tile` carries more weight than its position
+  in that list suggests: it is the span-*sufficiency* check — does any overflow
+  survive this tiling — and both public entry points compose it
+  (`_search_min_cost_tile_plan` at `:1344`, `can_conform_pointwise_tile` at
+  `:1471`). R2.3's joint per-core, per-tile span feasibility is that same
+  question asked of a config pair, so it is the predicate to extend rather than
+  restate.
 
   `_seed_buffer_for_carry` (`:575`) **is** reused — it rejects carry-propagating
   recurrences, which single-level reduction tiling (R1.8) must reject too.
@@ -1167,7 +1176,7 @@ issue #1756 restriction at `propagate_layouts.py:271`, `:455`, and `:1078` — i
   silently nullifying the second defect in *Motivation*.
 
   Candidate dims are instead the union of the span-pressure dims and every host
-  dim passing `_host_dim_has_legal_nontrivial_split` (`:935`) — an existing
+  dim passing `_host_dim_has_legal_nontrivial_split` (`:936`) — an existing
   helper, already built on `_split_candidates_for_host_dim`. Ordering stays
   pressure-first (`_candidate_host_dims`'s own ordering, then the remainder) —
   the R1.2 tiers put span-pressure dims ahead of speculative ones — so when the
@@ -1383,6 +1392,18 @@ signature, grammar, and scaling rules for the tiling axis.
   - `dim_hint_assignments` — `(op, list[DimHint])` pairs built by
     `_dims_to_hints` (`coarse_tile_span_overflow.py:152`) from each op's
     `TileOption.dims` and the hint ids minted for its run.
+
+  **Two namespaces have to stay disjoint, not one.** `group_idx_offset` handles
+  `loop_group_id`; `hint_id` needs the same treatment separately, and does not
+  get it for free. The span-overflow path mints from a reserved base —
+  `_SPAN_OVERFLOW_HINT_ID = 10000` (`coarse_tile_span_overflow.py:45`),
+  incremented one block per closed group — precisely so its ids cannot collide
+  with the user `spyre_hint` ids `assign_dim_hints` stamps. The solver is a
+  **third** source and needs its own reserved base above both. Without one,
+  `validate_coarse_tile_groups` (`coarse_tile.py:112`) sees a single `hint_id`
+  in two groups and raises — and it raises during apply, after the solve has
+  succeeded, so the failure surfaces as an illegal emission (§5) rather than as
+  anything the model could have ruled out.
 
   `op.dim_hints` is an **input** to `plan_coarse_tile_groups`, not an output of
   it: the hint lookups that build `hint_id_to_ranges_pos` read it. The
@@ -1841,9 +1862,11 @@ integration" gap), `docs/source/compiler/coarse_tiling_loops.md`, and
    coverage lives in `JointDivisionSolverTests:776` and
    `TestCpSatPlacementOnly:1121`), `test_scratchpad_use.py`, `test_coarse_tiling.py`,
    `test_coarse_tile_e2e.py`, `test_span_overflow_hint_analysis.py` all pass
-   unchanged. Note `test_coarse_tiling.py` has no CI config yaml under
-   `tests/configs/torch_spyre_tests/inductor/`, unlike its siblings, so it must be
-   run explicitly rather than assumed covered.
+   unchanged. All five carry a CI config yaml under
+   `tests/configs/torch_spyre_tests/inductor/` with
+   `unlisted_test_mode: mandatory_success`, so a test added to any of them must
+   be green to land — an expected failure satisfies that, an unexpected pass
+   does not.
 2. **Parity, gate on with tiling disabled.** Spill outcomes must match today's
    CP-SAT output and core counts must not regress at equal spill. Exact
    bit-identity is **not** required, because the objective is now single-phase
