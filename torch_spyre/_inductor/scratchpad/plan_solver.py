@@ -87,6 +87,17 @@ class LifetimeBoundBuffer:
         """Smallest LX footprint the buffer can take, for the capacity check"""
         return self.size
 
+    @property
+    def sym_is_lx(self) -> sympy.Symbol:
+        """Objective-namespace symbol for "this buffer is LX-resident" (0 or 1).
+
+        Every buffer has a residency decision, so this lives on the base; a
+        solver that accepts an injected cost expression binds it to its own
+        residency variable (``CpSatLayoutSolver`` does, in
+        ``_LifetimeBufferWithCpVars.cost_symbols``).
+        """
+        return sympy.Symbol(f"is_lx_{self.name}")
+
     def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
         """Returns true iff self and other overlap in time."""
         return self.start_time < other.end_time and other.start_time < self.end_time
@@ -168,11 +179,35 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         )
 
     @property
-    def sym_is_lx(self) -> sympy.Symbol:
-        return sympy.Symbol(f"is_lx_{self.name}")
+    def sym_cores(self) -> sympy.Symbol:
+        """Objective-namespace symbol for the core count, ``cores_used``, of the
+        division this buffer's op runs on -- the full parallelism, so a
+        reduction-split division counts its reduction cores too.
+
+        The plain count stands next to :attr:`sym_inv_cores`' reciprocal because
+        the two answer different questions: a cost model divides work by cores
+        and needs the reciprocal, while an objective that simply prefers more
+        parallelism -- the solver's own default one does -- needs the count.
+        Both read the same division decision, and a solver binds whichever of
+        them the objective actually names.
+        """
+        return sympy.Symbol(f"cores_{self.name}")
 
     @property
     def sym_inv_cores(self) -> sympy.Symbol:
+        """Objective-namespace symbol for the *reciprocal* core count,
+        ``1 / cores_used``, of the division this buffer's op runs on.
+
+        The reciprocal rather than the count itself because that is the form the
+        cost model needs (work / cores), and dividing by a decision variable is
+        outside the lowerable grammar while multiplying by one is not.
+
+        Its value is the exact rational ``1 / cores_used``. No integer solver
+        variable can hold that, so a solver binds it to a fixed-point stand-in
+        and folds the scale back into the coefficients of the objective (see
+        ``ilp_solver_ortools._INV_CORES_SCALE``); writers of cost expressions
+        work with the exact reciprocal and never see the scale.
+        """
         return sympy.Symbol(f"inv_cores_{self.name}")
 
     @property
@@ -214,8 +249,9 @@ class LifetimeBoundBufferWithSolverVars:
     offset: int = field(init=False)
     # solver var for per core size
     eff_size: int = field(init=False)
-    # solver var for number of cores
-    cores: int = field(init=False)
+    # No standing core-count var: the chosen division's core count is read only
+    # by an objective, so a solver binds it when the objective names it
+    # (``sym_cores``) rather than carrying one per buffer for every solve.
     # dictionary of solver vars for merging inplace
     # with parents
     merge_vars: dict[str, bool] = field(init=False)

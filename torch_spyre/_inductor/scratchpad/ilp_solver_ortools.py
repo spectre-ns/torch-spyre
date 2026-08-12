@@ -37,21 +37,40 @@ constraint model over :class:`CoreDivisionBuffer`s:
   (``_assert_in_place_relationships``) makes this exact. The parent keeps its
   full lifetime, so the footprint above a smaller child stays protected on the
   handoff tick (``_add_no_overlap_2d``).
-* **Objective** (two-phase lexicographic, in ``_run``). *Residency is the hard
-  priority.* Phase 1 minimizes total **HBM transfer traffic** via
-  ``spill_cost(b) * (1 - in_buffer)`` -- the *differential* traffic a spill adds
-  over residency (resident buffers contribute 0). An intermediate costs
-  ``(num_consumers + 1) * size`` (the producer's HBM write, which residency turns
-  into a free LX write, plus one re-read per consumer); a graph input drops the
-  producer write it never had and the clone-in read residency cannot avoid
+* **Objective** (``_objective``). Always a sympy expression written in the
+  buffers' own symbols (``sym_is_lx``, ``sym_cores``, ``sym_inv_cores``), lowered
+  onto the model and minimized in a **single phase**. This module's share of that
+  is one step, ``_bind_symbols``: tie each symbol to the variable that decides it
+  (``cost_symbols``). The conversion itself belongs to
+  :func:`~torch_spyre._inductor.scratchpad.cost_expr_ortools.lower`, which takes
+  only a model, an expression and that binding -- so the objective is data this
+  solver supplies variables for, not a shape built into it. Anything the lowering
+  does not understand raises ``CostExpressionError`` rather than being
+  approximated.
+
+  The caller may supply that expression as ``plan_layout_and_core_divisions``'
+  ``cost_expr`` -- typically the latency the cost model predicts for the graph --
+  and it is then the *whole* objective; nothing else is optimized alongside it.
+  With no ``cost_expr`` the default (``default_cost_expr``) is built the same
+  way from the same symbols, so the injected and default paths are one path and
+  the default is simply the expression on it.
+
+  That default is ``weight * sum_b spill_cost(b) * (1 - is_lx_b) - sum_b cores_b``.
+  The first sum is total **HBM transfer traffic**: the *differential* traffic a
+  spill adds over residency, so resident buffers contribute 0. An intermediate
+  costs ``(num_consumers + 1) * size`` (the producer's HBM write, which residency
+  turns into a free LX write, plus one re-read per consumer); a graph input drops
+  the producer write it never had and the clone-in read residency cannot avoid
   (``(num_consumers - 1) * size``); a graph output drops its unavoidable
-  write-out (``num_consumers * size``). Phase 1 puts as much in LX as possible
-  and chooses whatever division serves that (even no split, if that is what lets
-  a buffer match its consumers and reside). Phase 2 then *holds that residency
-  optimum* and maximizes total core usage (``sum_b cores_b``) so every buffer --
-  resident or spilled, the latter free of the slicing gate -- takes its most
-  parallel division, which the allocator commits. Parallelism never costs a
-  spill.
+  write-out (``num_consumers * size``). The second sum is total core usage, so
+  every buffer -- resident or spilled, the latter free of the slicing gate --
+  takes its most parallel division, which the allocator commits. ``weight``
+  exceeds the whole range of the core sum, which makes the collapse of the
+  earlier two-phase lexicographic solve exact rather than approximate:
+  *residency stays the hard priority*, since no amount of parallelism can pay for
+  the smallest traffic increase. So the default still puts as much in LX as
+  possible, choosing whatever division serves that (even no split, if that is
+  what lets a buffer match its consumers and reside), and only then parallelises.
 
 After the solve, ``_justify`` slides each in-place-merged placement unit down to
 the lowest free address, squeezing out float gaps the search leaves. It coarsens
@@ -63,7 +82,7 @@ The same model also serves plain :class:`LifetimeBoundBuffer`s via
 ``plan_layout`` (the ``MemoryPlanSolver`` contract the placement-only allocator
 calls). Those buffers carry no candidate divisions, so the division-dependent
 pieces -- per-core sizing, the slicing-match gate, the merge division gate and
-the phase-2 parallelism objective -- simply drop out: the footprint is the
+the default objective's parallelism term -- simply drop out: the footprint is the
 buffer's ``size`` and the solve reduces to minimising HBM traffic under the 2D
 no-overlap with in-place reuse. Residency is then gated only by capacity and by
 the allocator's own ``residency_reason`` bars (which both paths honour, since
@@ -79,19 +98,28 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Optional, TypeVar, cast
 import sympy
 import torch
+from torch.utils._sympy.value_ranges import ValueRanges
 
 
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model
+
+    from torch_spyre._inductor.scratchpad.cost_expr_ortools import Val, lower
 else:
     try:
         from ortools.sat.python import cp_model
 
+        # Sibling module, but it imports ortools unguarded, so it belongs in the
+        # same try: without ortools this module must still import (the friendly
+        # error is raised from ``CpSatLayoutSolver.__init__``, not here).
+        from torch_spyre._inductor.scratchpad.cost_expr_ortools import Val, lower
+
     except ImportError:  # pragma: no cover - exercised only when ortools is absent
         cp_model = None
+        Val = lower = None
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -114,6 +142,16 @@ logger = logging.getLogger(__name__)
 # log and the reasons surfaced to the allocator agree.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 
+# Fixed-point scale for ``sym_inv_cores``. That symbol means the exact rational
+# ``1 / cores_used``, which an integer variable cannot hold, so the variable
+# carries ``_INV_CORES_SCALE // cores_used`` and every objective coefficient on
+# the symbol is divided by the same scale on the way in (``_bind_symbols``), which
+# leaves the product -- the only thing the objective reads -- unchanged. A power
+# of two above the 32-core maximum: exact on the powers of two a work division
+# actually produces, and under 0.2% quantisation error on the rest (worst case
+# 1024/31 -> 33).
+_INV_CORES_SCALE = 1024
+
 # Buffer type the wrapper carries: the base placement wrapper holds any
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
 _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
@@ -129,6 +167,116 @@ class _PlacementUnit:
     end_time: int
     original_offset: int  # offset the solver chose, before bottom-justify
     justified_offset: int = 0  # final justified offset
+
+
+def default_cost_expr(tensors: dict[str, _LifetimeBufferWithCpVars]) -> sympy.Expr:
+    """The objective for a solve the caller gave no ``cost_expr``, written
+    in the same symbols an injected one is -- so there is a single objective
+    path and the default is simply the expression on it.
+
+    It is the two-phase lexicographic solve this replaces (minimize HBM
+    traffic; then, holding that optimum, maximize core usage) collapsed into
+    one weighted expression, and the collapse is *exact* rather than a
+    reweighting: traffic is integer-valued, so a weight above the whole span
+    the core sum can swing across makes the smallest traffic increase cost
+    more than every core gain available put together. Minimizing the sum
+    therefore has precisely the lexicographic solve's optimum set --
+    parallelism still can never buy a spill -- and each buffer's span comes
+    from its own candidate divisions (``parallelism_term``), so a solve with
+    nothing to parallelise weights the traffic by 1 and a solve with more to
+    trade weights it by more.
+    """
+    parallelism = [sb.parallelism_term() for sb in tensors.values()]
+    weight = sum(span for _, span in parallelism) + 1
+    traffic = sympy.Add(*(sb.spill_term() for sb in tensors.values()))
+    return weight * traffic + sympy.Add(*(term for term, _ in parallelism))
+
+
+def _bind_symbols(
+    tensors: dict[str, _LifetimeBufferWithCpVars],
+    cost_expr: sympy.Expr,
+) -> tuple[sympy.Expr, dict[sympy.Symbol, "Val"]]:
+    """Build the symbol environment a cost expression is lowered against, and
+    put the expression in the units that environment measures in.
+
+    This is the whole of what the objective needs from *this* solver: which
+    variable decides which symbol. Each buffer contributes the symbols for the
+    decisions it exposes (``cost_symbols``), and only those, so an expression
+    naming anything else is rejected by name rather than quietly interpreted.
+
+    The one unit conversion is ``sym_inv_cores``: the symbol is the exact
+    rational ``1 / cores_used`` but its variable holds
+    ``_INV_CORES_SCALE // cores_used``, so substituting
+    ``sym_inv_cores -> sym_inv_cores / _INV_CORES_SCALE`` moves the scale onto
+    the coefficient standing next to it, where the integer rescale inside
+    ``lower`` absorbs it. Doing it here rather than at the binding is what lets a
+    cost model write ``work * sym_inv_cores`` and mean it: the fixed point is
+    this solver's representation choice, not part of the objective's language.
+    """
+    wanted = cost_expr.free_symbols
+    env: dict[sympy.Symbol, "Val"] = {}
+    for sb in tensors.values():
+        env.update(sb.cost_symbols(wanted))
+
+    inv_scale = {
+        sym: sym / _INV_CORES_SCALE for sym in env if sym.name.startswith("inv_cores_")
+    }
+    return cost_expr.xreplace(inv_scale), env
+
+
+def _objective(
+    model: "cp_model.CpModel",
+    tensors: dict[str, _LifetimeBufferWithCpVars],
+    cost_expr: sympy.Expr | None,
+) -> tuple[object, str]:
+    """The expression this solve minimizes, lowered onto ``model``, plus its
+    name for the DEBUG summary.
+
+    The caller's ``cost_expr`` when there is one, :func:`default_cost_expr`
+    otherwise; from there the two are the same code, which is what makes the
+    default an injected objective rather than a second mechanism beside one.
+    Two steps: bind the model's decisions to the symbols the expression is
+    written in (:func:`_bind_symbols`, the only solver-aware part), then hand
+    expression and environment to :func:`~cost_expr_ortools.lower`, which owns
+    the conversion itself and raises ``CostExpressionError`` on anything it
+    cannot convert.
+
+    An injected expression with no free symbols is the one case that falls back
+    rather than raising: it is a constant, so minimizing it would leave the
+    residency and division variables entirely unconstrained by any objective,
+    and the solver would return the first feasible plan it found -- typically
+    the all-spilled one. That is a cost model that failed to see any decision
+    (every op's features came back concrete), not a request to pack arbitrarily,
+    so the default objective takes over and the caller gets a warning. (The
+    default itself may legitimately be constant -- no buffer with any traffic to
+    save or division to choose -- and is then minimized as one, leaving the
+    solve to return any feasible packing, which is all such a model can
+    distinguish anyway.)
+    """
+    name = "injected_cost"
+    if cost_expr is not None:
+        cost_expr = sympy.sympify(cost_expr)
+        if not cost_expr.free_symbols:
+            logger.warning(
+                "[CP-SAT layout solver] injected cost expression %s names no "
+                "solver decision; falling back to the default objective",
+                cost_expr,
+            )
+            cost_expr = None
+    if cost_expr is None:
+        name = "default_cost"
+        cost_expr = default_cost_expr(tensors)
+
+    cost_expr, env = _bind_symbols(tensors, cost_expr)
+    root, analysis = lower(model, cost_expr, env)
+    logger.debug(
+        "[CP-SAT layout solver] %s objective: %d symbols, %d aux vars, scale=%d",
+        name,
+        len(env),
+        len(analysis.aux),
+        analysis.scale,
+    )
+    return root.e, name
 
 
 def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
@@ -185,9 +333,6 @@ class _LifetimeBufferWithCpVars(LifetimeBoundBufferWithSolverVars):
         # Fixed footprint -- no division to pick, so a constant stands in for
         # the joint solver's eff_size var.
         self.eff_size = b.size
-        # Nothing to parallelise without candidate divisions; ``_run`` skips
-        # phase 2 when no buffer offers a core-usage term.
-        self.cores = None
         self.merge_vars = {
             parent: m.new_bool_var(f"merge_{parent}_{b.name}")
             for parent in b.in_place_parents
@@ -228,6 +373,42 @@ class _LifetimeBufferWithCpVars(LifetimeBoundBufferWithSolverVars):
         is fixed: ``_assert_in_place_relationships`` already checks the child
         fits in the parent's slot."""
 
+    # ------------------------------ objective ------------------------------
+    def cost_symbols(self, wanted: set[sympy.Symbol]) -> dict[sympy.Symbol, "Val"]:
+        """This buffer's slice of the objective's symbol environment: each
+        symbol a cost expression may mention, bound to the solver variable that
+        decides it and the range that variable lives in.
+
+        Residency is the one decision every buffer exposes, so it is all the
+        placement-only wrapper binds; the joint wrapper adds its division-derived
+        scalars. A cost expression naming anything else is rejected by ``lower``
+        against this environment, which is the point of building it per buffer:
+        the objective can only speak about decisions the model actually makes.
+
+        ``wanted`` is the set of symbols the expression actually names, for
+        bindings that have to *build* something to offer (the joint wrapper's
+        per-division scalars). Residency needs no such filter -- the variable
+        already exists -- and binding it either way keeps every buffer's name in
+        the "bound:" list an unbound-symbol error prints."""
+        return {self.buffer.sym_is_lx: Val(self.in_buffer, ValueRanges(0, 1))}
+
+    def spill_term(self) -> sympy.Expr:
+        """This buffer's share of the default objective's traffic sum: the HBM
+        traffic a spill adds over residency, charged only when it is spilled."""
+        return self.spill_cost() * (1 - self.buffer.sym_is_lx)
+
+    def parallelism_term(self) -> tuple[sympy.Expr, int]:
+        """This buffer's share of the default objective's parallelism sum, and
+        how much that share can vary between plans.
+
+        There is nothing to parallelise without candidate divisions, so the
+        placement-only wrapper contributes neither a term nor any span for the
+        traffic weight to have to dominate. That is the explicit skip standing in
+        for the ``sb.cores is None`` test the old phase 2 used: the wrapper that
+        has no division to choose says so, rather than the solver inferring it
+        from a null variable."""
+        return sympy.Integer(0), 0
+
     # ------------------------------- extract -------------------------------
     def footprint(self, solver: "cp_model.CpSolver") -> int:
         return self.buffer.size
@@ -240,9 +421,10 @@ class _LifetimeBufferWithCpVars(LifetimeBoundBufferWithSolverVars):
 @dataclass
 class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
     """The joint-model wrapper: a :class:`CoreDivisionBuffer` plus the vars for
-    its chosen core division (``division``), the per-core footprint that
-    division implies (``eff_size``) and its total core usage (``cores`` =
-    ``cores_used``, including any reduction-axis split).
+    its chosen core division (``division``) and the per-core footprint that
+    division implies (``eff_size``). Its core usage is division-derived too, but
+    only an objective reads it, so it is bound on demand in
+    :meth:`cost_symbols` rather than created up front.
 
     On top of the base placement vars it supplies the division-aware pieces of
     the model: the slicing-match residency gate, the division gate on an
@@ -255,19 +437,13 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
         m = self.model
 
         per_core = [ceil_div(b.size, cd.output_partition) for cd in b.core_divisions]
-        # Total cores the op runs on under each division -- includes any
-        # reduction-axis split, so a reduction-parallel division counts its full
-        # parallelism (``output_partition`` alone would score it as 1 core).
-        inv_cores_used = [32 // cd.cores_used for cd in b.core_divisions]
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
-        # total cores this op uses under the chosen div
-        self.inv_cores = m.new_int_var(0, max(inv_cores_used), f"inv_cores_{b.name}")
 
-        # tie per-core footprint (output split only) and total core usage to the
-        # chosen division index
+        # tie the per-core footprint (output split only) to the chosen division
+        # index. Core usage is division-derived too, but only an objective reads
+        # it, so it is bound on demand in ``cost_symbols`` rather than here.
         m.add_element(self.division, per_core, self.eff_size)
-        m.add_element(self.division, inv_cores_used, self.inv_cores)
 
     @property
     def parents(self) -> list[str]:
@@ -291,6 +467,51 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars):
             _gate_divisions(
                 model, compatible, self.division, bufs[child].division, self.in_buffer
             )
+
+    def _cores_table(self) -> list[int]:
+        """Total cores the op runs on under each candidate division -- includes
+        any reduction-axis split, so a reduction-parallel division counts its
+        full parallelism (``output_partition`` alone would score it as 1 core)."""
+        return [cd.cores_used for cd in self.buffer.core_divisions]
+
+    def cost_symbols(self, wanted: set[sympy.Symbol]) -> dict[sympy.Symbol, "Val"]:
+        """Residency, plus the core count the chosen division implies and the
+        reciprocal of that count.
+
+        Each is one ``AddElement`` over the same per-division table the rest of
+        the model is indexed by, which is what keeps a symbol's cost to a single
+        lookup (R3.7). ``sym_cores`` is the count itself; ``sym_inv_cores`` means
+        the exact rational ``1 / cores_used``, so its table holds the fixed-point
+        ``_INV_CORES_SCALE // cores_used`` and the scale comes back out of the
+        objective's coefficients in :func:`_bind_symbols`.
+
+        Built here, and only for the symbols the objective actually names, rather
+        than in ``__post_init__``: they exist to be read by an objective, and a
+        solve whose objective does not price parallelism should not carry a
+        variable and an element constraint per buffer for nothing."""
+        env = super().cost_symbols(wanted)
+        b = self.buffer
+        cores = self._cores_table()
+        tables = {
+            b.sym_cores: cores,
+            b.sym_inv_cores: [_INV_CORES_SCALE // c for c in cores],
+        }
+        for sym, table in tables.items():
+            if sym not in wanted:
+                continue
+            lo, hi = min(table), max(table)
+            var = self.model.new_int_var(lo, hi, sym.name)
+            self.model.add_element(self.division, table, var)
+            env[sym] = Val(var, ValueRanges(lo, hi))
+        return env
+
+    def parallelism_term(self) -> tuple[sympy.Expr, int]:
+        """Minus the core count of the chosen division -- the default objective
+        minimizes, and more cores is better -- and the span between this
+        buffer's least and most parallel candidate division, which is all its
+        term can contribute to the swing the traffic weight has to outrank."""
+        cores = self._cores_table()
+        return -self.buffer.sym_cores, max(cores) - min(cores)
 
     def constrain_merge(self, model, parent, edge) -> None:
         """An active merge means the child reuses the parent's exact per-core
@@ -319,7 +540,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
     model (joint division, slicing-match residency gate, 2D no-overlap with
-    in-place lifetime shortening) and the HBM-traffic objective.
+    in-place lifetime shortening) and for the single-phase objective, injected
+    by the caller or defaulted to traffic-over-parallelism.
     """
 
     def __init__(
@@ -468,164 +690,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 
-        status = cp_model.INFEASIBLE
-
-        if cost_expr is not None:
-
-            def affine_bounds(expr):
-                if isinstance(expr, cp_model.IntVar):
-                    return expr.domain.min(), expr.domain.max()
-                if isinstance(expr, (int, float)):
-                    return expr, expr
-                if (
-                    hasattr(expr, "coefficient")
-                    and hasattr(expr, "offset")
-                    and hasattr(expr, "expression")
-                ):
-                    lb, ub = affine_bounds(expr.expression)
-                    c, o = expr.coefficient, expr.offset
-                    return (
-                        (c * lb + o, c * ub + o) if c >= 0 else (c * ub + o, c * lb + o)
-                    )
-                if hasattr(expr, "num_exprs"):
-                    # SumArray (e.g. from ``a + b + c`` or ``sum(...)``): flatten to
-                    # a single offset + per-var coefficients and bound each term.
-                    flat = cp_model.FlatIntExpr(expr)
-                    lb = ub = flat.offset
-                    for var, c in zip(flat.vars, flat.coeffs):
-                        vlb, vub = affine_bounds(var)
-                        if c >= 0:
-                            lb, ub = lb + c * vlb, ub + c * vub
-                        else:
-                            lb, ub = lb + c * vub, ub + c * vlb
-                    return lb, ub
-                raise TypeError(f"unsupported expr type: {type(expr)}")
-
-            print("Cost Expr", cost_expr)
-
-            def is_mul_constant(expr, func):
-                # check if an expression is of the form c*func() where c is positive
-                return (
-                    isinstance(expr, sympy.Mul)
-                    and len(expr.args) == 2
-                    and expr.args[-1].func == func
-                    and expr.args[0] > 0
-                )
-
-            def unnest_min(expr):
-                # rewrites Min(4, 5*Min(x, y)) as Min(4, 5*x, 5*y)
-                result = []
-                func = expr.func
-                for arg in expr.args:
-                    if is_mul_constant(arg, func):
-                        result.extend([a * arg.args[0] for a in arg.args[-1].args])
-                    elif isinstance(arg, sympy.Add):
-                        for i, a in enumerate(arg.args):
-                            if is_mul_constant(a, func):
-                                rest = sympy.Add(*(arg.args[:i] + arg.args[(i + 1) :]))
-                                result.extend(
-                                    [b * a.args[0] + rest for b in a.args[-1].args]
-                                )
-                                break
-                        else:
-                            result.append(arg)
-                return func(*result)
-
-            def truncate_floats_min(expr):
-                # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
-                m = 10000
-                return (
-                    expr.func(
-                        *[(arg * m).n().nsimplify(tolerance=1) for arg in expr.args]
-                    )
-                    / m
-                )
-
-            cost_expr = cost_expr.replace(
-                lambda e: e.func in [sympy.Min, sympy.Max], lambda e: unnest_min(e)
-            )
-            print("simplify 1", cost_expr)
-            cost_expr = cost_expr.replace(
-                lambda e: e.func in [sympy.Min, sympy.Max],
-                lambda e: truncate_floats_min(e),
-            )
-            count = 0
-            print("simplify 2", cost_expr)
-
-            def my_max(*args):
-                nonlocal count
-                lb = min(affine_bounds(arg)[0] for arg in args)
-                ub = max(affine_bounds(arg)[1] for arg in args)
-                max_var = model.NewIntVar(lb, ub, f"max_var_{count}")
-                # max_var = model.NewIntVar(int(math.ceil(lb)), int(math.floor(ub)), f"max_var_{count}")
-                model.AddMaxEquality(max_var, args)
-                count += 1
-                return max_var
-
-            def my_min(*args):
-                nonlocal count
-                lb = min(affine_bounds(arg)[0] for arg in args)
-                ub = max(affine_bounds(arg)[1] for arg in args)
-                if isinstance(lb, float) or isinstance(ub, float):
-                    import math
-
-                    min_var = model.NewIntVar(
-                        int(math.floor(lb * 1000)),
-                        int(math.ceil(ub * 1000)),
-                        f"min_var_{count}",
-                    )
-                    model.AddMinEquality(min_var, args)
-                    count += 1
-                    return min_var * 1e-3
-                else:
-                    min_var = model.NewIntVar(lb, ub, f"min_var_{count}")
-                    model.AddMinEquality(min_var, args)
-                    count += 1
-                    return min_var
-
-            custom = {"max": my_max, "min": my_min}
-
-            sym_map = {}
-            for t in tensors.values():
-                sym_map[t.buffer.sym_is_lx] = t.in_buffer
-                sym_map[t.buffer.sym_inv_cores] = t.inv_cores
-
-            cp_cost = sympy.lambdify(
-                list(sym_map.keys()), cost_expr, modules=[custom, "math"]
-            )(*sym_map.values())
-            logger.debug("[CP-SAT layout solver] cost model expr: %s", cp_cost)
-            model.minimize(cp_cost)
-            status = solver.Solve(model)
-            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise SolveError("CP-SAT memory planner found no feasible plan")
-        else:
-            hbm_terms = [
-                sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
-            ]
-            if hbm_terms:
-                model.minimize(sum(hbm_terms))
-                status = solver.Solve(model)
-                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
-                # Lock in the residency optimum (the traffic value, not just the
-                # count) so phase 2 can never trade a spill for parallelism.
-
-                # Rounding avoids loss of precision as the objective function is
-                # the sum and multiplication of integers.
-                model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
-
-            # Phase 2 -- parallelism: holding the residency optimum, maximize total
-            # core usage so every buffer (resident or spilled) takes its most
-            # parallel division. Placement-only buffers have no division to choose
-            # and so contribute no term; with none at all there is nothing to
-            # maximize, so we skip the re-solve and the extract below reads the
-            # phase-1 assignment still held by ``solver``.
-            core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
-            if core_terms:
-                model.maximize(sum(core_terms))
-                status = solver.Solve(model)
-                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+        # R3.2: one objective, minimized in one phase -- no lexicographic
+        # sequence and no per-phase locking. The caller's expression when there
+        # is one, the solver's own default otherwise; both are lowered the same
+        # way, so this is the single place a plan's objective is decided.
+        objective, objective_name = _objective(model, tensors, cost_expr)
+        model.minimize(objective)
+        status = solver.Solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise SolveError("CP-SAT memory planner found no feasible plan")
 
         final_tensors = self._extract(solver, tensors)
 
@@ -636,7 +709,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "status=%s walltime=%.2f ms",
                 len(tensors),
                 len(tensors) - len(spilled),
-                "occupancy" if core_terms else "hbm_traffic",
+                objective_name,
                 round(solver.ObjectiveValue()),
                 solver.StatusName(status),
                 solver.WallTime() * 1e3,

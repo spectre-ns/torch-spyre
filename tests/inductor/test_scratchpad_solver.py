@@ -20,7 +20,13 @@ import subprocess
 import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest import TestCase
+from itertools import product
+from unittest import mock, TestCase
+
+import sympy
+from torch.utils._sympy.interp import sympy_interp
+from torch.utils._sympy.numbers import int_oo
+from torch.utils._sympy.value_ranges import ValueRanges
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
@@ -38,6 +44,15 @@ try:
 
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
         CpSatLayoutSolver,
+        default_cost_expr,
+    )
+    from torch_spyre._inductor.scratchpad.cost_expr_ortools import (
+        CostExpressionError,
+        CpSatAnalysis,
+        Val,
+        bind,
+        interp,
+        lower,
     )
 
     _HAS_ORTOOLS = True
@@ -112,6 +127,12 @@ def _divs():
         CoreDivision(output_splits={256: 4}),
         CoreDivision(),
     ]
+
+
+# A four-way split of the output stride-256 axis: per-core footprint = total / 4
+# and cores_used = 4. Paired with a bare ``CoreDivision()`` (whole, 1 core) it is
+# the smallest candidate list in which the division choice is a real decision.
+_FOUR_WAY = CoreDivision(output_splits={256: 4})
 
 
 def _whole():
@@ -1283,6 +1304,303 @@ class TestCpSatUnallocatedReads(TestCase):
         self.assertNotIn("b0", pinned)
 
 
+_OBJECTIVE_CASE_SIZE = 4096
+
+
+def _objective_case_buffers(matches, size=_OBJECTIVE_CASE_SIZE):
+    """The smallest graph in which residency and division are one decision.
+
+    A is the buffer an objective talks about: whole (1 core) or split four ways.
+    C is its consumer, and ``matches`` -- the (A div, C div) pairs that slice the
+    shared buffer the same way -- decides which of A's divisions may reside. With
+    both pairs A may reside either way and the division is free; with only
+    ``(0, 0)`` A resides *only while whole*, so parallelism and residency are in
+    direct conflict and the objective has to choose.
+    """
+    return [
+        CoreDivisionBuffer(
+            "A", size, [0, 1], core_divisions=[CoreDivision(), _FOUR_WAY]
+        ),
+        CoreDivisionBuffer(
+            "C",
+            size,
+            [1, 2],
+            core_divisions=[CoreDivision(), _FOUR_WAY],
+            parents=["A"],
+            cd_parent_matches={"A": matches},
+        ),
+    ]
+
+
+def _objective_case(matches, expr, capacity=1 << 20, size=_OBJECTIVE_CASE_SIZE):
+    """Plan :func:`_objective_case_buffers` under ``expr`` and report what the
+    objective did to it: ``(A is resident, A's chosen division)``."""
+    out = {
+        b.name: b
+        for b in CpSatLayoutSolver(
+            capacity, alignment=128
+        ).plan_layout_and_core_divisions(_objective_case_buffers(matches, size), expr)
+    }
+    return out["A"].address is not None, out["A"].chosen_division
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat layout solver needs ortools")
+class TestCpSatInjectedObjective(TestCase):
+    """The injected cost expression, end to end through the joint solver.
+
+    ``TestCostExprSolverShaped`` checks the lowering against a hand-built model
+    of the shape ``_run`` produces; these drive the real thing -- the caller
+    hands ``plan_layout_and_core_divisions`` an expression written in the
+    buffers' own ``sym_is_lx`` / ``sym_cores`` / ``sym_inv_cores``, and the plan
+    that comes back has to be the one that expression asked for.
+
+    Every case is device-free and small enough to state the arithmetic in the
+    test, so a failure says which term the solver mis-weighted.
+    """
+
+    SIZE = _OBJECTIVE_CASE_SIZE
+
+    def _solve(self, expr, matches, capacity=1 << 20):
+        return _objective_case(matches, expr, capacity)
+
+    def test_residency_follows_the_injected_weight(self):
+        """The injected expression is the whole objective, so residency goes
+        where *it* says -- including against the default objective's answer.
+
+        The default two-phase solve keeps A resident whenever it fits (residency
+        is its hard priority, and here capacity is not even close to binding).
+        An expression that instead *charges* for residency has to win."""
+        is_lx = sympy.Symbol("is_lx_A")
+        pairs = [(0, 0), (1, 1)]
+
+        for weight, expected in ((-1000, True), (1000, False)):
+            with self.subTest(weight=weight):
+                resident, _div = self._solve(weight * is_lx, pairs)
+                self.assertEqual(resident, expected)
+
+    def test_division_follows_the_injected_weight(self):
+        """``sym_inv_cores`` is 1/cores, so a positive coefficient on it prefers
+        *more* cores (a smaller reciprocal) and a negative one prefers fewer.
+        Division 0 is whole (1 core, inv = 1), division 1 splits four ways
+        (inv = 1/4)."""
+        inv = sympy.Symbol("inv_cores_A")
+        pairs = [(0, 0), (1, 1)]
+
+        for weight, expected_div in ((4096, 1), (-4096, 0)):
+            with self.subTest(weight=weight):
+                _resident, div = self._solve(weight * inv, pairs)
+                self.assertEqual(div, expected_div)
+
+    def test_core_count_symbol_follows_the_injected_weight(self):
+        """``sym_cores`` is the plain count beside ``sym_inv_cores``' reciprocal,
+        so a *negative* coefficient is the one that prefers more cores. The
+        solver's own default objective is written in it, and an injected
+        expression reaches the same binding -- one ``AddElement`` over the same
+        per-division table -- so it is checked from the caller's side here."""
+        cores = sympy.Symbol("cores_A")
+        pairs = [(0, 0), (1, 1)]
+
+        for weight, expected_div in ((-4096, 1), (4096, 0)):
+            with self.subTest(weight=weight):
+                _resident, div = self._solve(weight * cores, pairs)
+                self.assertEqual(div, expected_div)
+
+    def test_reciprocal_cores_are_weighed_against_traffic_at_true_scale(self):
+        """The load-bearing case: a spill term and a reciprocal-core term
+        traded off against each other.
+
+        ``sym_inv_cores`` is an exact rational the model can only hold as a
+        fixed point, so its variable is scaled (``_INV_CORES_SCALE``) and the
+        scale is divided back out of the coefficient standing next to it. Within
+        a single term that scale cancels and any value would do; it is only when
+        an ``inv_cores`` term is weighed against one that has no ``inv_cores`` in
+        it that getting it wrong changes the answer -- so that is what this
+        checks, in both directions across the tipping point.
+
+        A's only compatible pair is ``(0, 0)``, so A resides only while whole:
+        splitting it to four cores costs its residency. With the split saving
+        ``100 - 100/4 = 75`` of compute, a spill charge of 50 is worth paying and
+        a charge of 90 is not. Under a scale left in the coefficient the saving
+        reads as 75 * 1024 and both cases split, which is the failure this pins.
+        """
+        cost = 100 * sympy.Symbol("inv_cores_A")
+
+        for spill_weight, expect_resident, expect_div in (
+            (50, False, 1),
+            (90, True, 0),
+        ):
+            with self.subTest(spill_weight=spill_weight):
+                expr = cost + spill_weight * (1 - sympy.Symbol("is_lx_A"))
+                resident, div = self._solve(expr, [(0, 0)])
+
+                self.assertEqual(resident, expect_resident)
+                self.assertEqual(div, expect_div)
+
+    def test_float_coefficients_survive_the_rescale(self):
+        """The cost model speaks in ns and GB/s, so its coefficients are floats
+        orders of magnitude apart -- a ``0.0061705`` ns/byte rate next to a
+        ``235`` ns fixed cost. CP-SAT is integer-only, so the objective is scaled
+        up before lowering, and the scale has to leave the small coefficient
+        still able to decide what it decides.
+
+        The expression is ``predict_ops``' own shape, per-byte rate on a ``Min``
+        of the bundle's read and write bytes, which puts that coefficient
+        *inside* the reified node -- the scale has to reach it there, not just at
+        the root. Residency drops the term from ``0.0061705 * 8192 = 50.5`` ns to
+        ``0.0061705 * 4096 = 25.3`` ns, worth the flat 12 ns it is charged here.
+        At a scale too coarse to represent the rate it rounds to zero, the whole
+        traffic term disappears, and the 12 ns charge alone flips the answer."""
+        is_lx = sympy.Symbol("is_lx_A")
+        expr = 235.0 + 0.0061705 * sympy.Max(8192 * (1 - is_lx), 4096) + 12.0 * is_lx
+
+        resident, _div = self._solve(expr, [(0, 0), (1, 1)])
+        self.assertTrue(resident)
+
+    def test_constant_expression_falls_back_to_the_default_objective(self):
+        """A cost expression naming no decision cannot be minimized into a plan.
+        Minimizing a constant leaves residency and division unconstrained and
+        the solver returns whatever it finds first, so the default objective
+        takes over instead and the caller is warned."""
+        with self.assertLogs(
+            "torch_spyre._inductor.scratchpad.ilp_solver_ortools", level="WARNING"
+        ) as logs:
+            resident, _div = self._solve(sympy.Float(17.5), [(0, 0), (1, 1)])
+
+        self.assertTrue(resident, "default objective keeps A resident")
+        self.assertIn("names no solver decision", "\n".join(logs.output))
+
+    def test_debug_summary_names_the_injected_objective(self):
+        """The DEBUG summary reports which objective produced the plan. It is
+        also the one line that reads solve-wide state on every path, so it is
+        checked on the injected path rather than only on the default one."""
+        with self.assertLogs(
+            "torch_spyre._inductor.scratchpad.ilp_solver_ortools", level="DEBUG"
+        ) as logs:
+            self._solve(-1000 * sympy.Symbol("is_lx_A"), [(0, 0), (1, 1)])
+
+        self.assertIn("injected_cost=", "\n".join(logs.output))
+
+    def test_unbound_symbol_is_named(self):
+        """A symbol that is not one of the model's decisions is an error, not a
+        free variable -- and the error says which."""
+        with self.assertRaises(CostExpressionError) as cm:
+            self._solve(sympy.Symbol("is_lx_nonesuch"), [(0, 0), (1, 1)])
+
+        self.assertIn("is_lx_nonesuch", str(cm.exception))
+
+    def test_unsupported_node_is_rejected_not_approximated(self):
+        """Anything outside the lowerable grammar has to reach the caller as a
+        ``CostExpressionError``. Silently dropping or approximating a term the
+        cost model asked for would produce a plan optimised for an objective
+        nobody wrote."""
+        with self.assertRaises(CostExpressionError):
+            self._solve(sympy.log(1 + sympy.Symbol("inv_cores_A")), [(0, 0), (1, 1)])
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat layout solver needs ortools")
+class TestCpSatDefaultObjective(TestCase):
+    """The objective a solve gets when the caller supplies none.
+
+    It is built the same way an injected one is -- a sympy expression in the
+    buffers' own symbols, lowered onto the model and minimized once -- so what
+    these pin is that being on that path did not cost it the guarantee it used
+    to get structurally, from being the first of two lexicographic phases:
+    *parallelism can never buy a spill*. The collapse keeps it by weight, and
+    the weight is derived rather than tuned, so a wrong derivation shows up as a
+    spilled buffer here rather than as a slow model in production.
+
+    The buffers are deliberately one alignment unit each, which is the regime
+    where the weight is the *only* thing holding residency up: a realistically
+    sized buffer's traffic term dwarfs any core count on its own, and the test
+    would pass with no weight at all.
+    """
+
+    # One alignment unit, so spilling A costs 2 units of traffic (its one read
+    # plus the producer write residency would have absorbed) against a 6-core
+    # swing -- 3 on A, 3 on C -- for taking the four-way split instead. Only the
+    # weight, 1 + those same spans = 7, ranks 2 units of traffic above 6 cores.
+    SIZE = 128
+
+    def _solve(self, matches, capacity=1 << 20):
+        return _objective_case(matches, None, capacity, size=self.SIZE)
+
+    def test_parallelism_never_buys_a_spill(self):
+        """A resides only while whole (its one match pair is ``(0, 0)``), so the
+        four-way split is available to both buffers at the price of A's
+        residency -- and at this size it is the cheaper trade by raw magnitude.
+        The weight is what forbids it, and it forbids it by construction rather
+        than by margin: it exceeds the summed span of every buffer's candidate
+        divisions, so no core gain available anywhere can reach one unit of
+        traffic."""
+        resident, div = self._solve([(0, 0)])
+
+        self.assertTrue(resident)
+        self.assertEqual(div, 0)
+
+    def test_parallelism_is_taken_when_residency_is_not_at_stake(self):
+        """The other side of the same weighting: with both divisions able to
+        reside, no traffic term separates them and the core term decides, so the
+        default takes the most parallel division."""
+        resident, div = self._solve([(0, 0), (1, 1)])
+
+        self.assertTrue(resident)
+        self.assertEqual(div, 1)
+
+    def test_expression_ranks_traffic_above_every_core_gain(self):
+        """The same guarantee stated as arithmetic rather than as a plan.
+
+        The behavioural cases above can only observe the weight where it happens
+        to be binding, and an objective that had merely *swamped* the core term
+        with a large constant would satisfy them too. What makes the collapse
+        exact is the specific weight, so read it off the expression: each buffer
+        offers 4 - 1 = 3 cores, so the weight is 3 + 3 + 1 = 7, and each buffer's
+        residency is worth 7 * spill_cost = 7 * 2 = 14 -- above the 6 cores that
+        are the most any plan can gain.
+        """
+        solver = CpSatLayoutSolver(1 << 20, alignment=128)
+        model = cp_model.CpModel()
+        buffers = _objective_case_buffers([(0, 0)], size=self.SIZE)
+        expr = default_cost_expr({b.name: solver._wrap(model, b) for b in buffers})
+
+        for name in ("A", "C"):
+            with self.subTest(buffer=name):
+                # More cores is better, and the objective is minimized.
+                self.assertEqual(expr.coeff(sympy.Symbol(f"cores_{name}")), -1)
+                # spill_cost = (1 read + the producer write residency absorbs)
+                # * 1 alignment unit = 2, charged while *not* resident.
+                self.assertEqual(expr.coeff(sympy.Symbol(f"is_lx_{name}")), -14)
+
+    def test_solved_in_a_single_phase(self):
+        """R3.2: one objective, one solve. The two-phase lexicographic form this
+        replaces needed a second ``Solve`` with the first phase's optimum locked
+        in by an added inequality; counting the solves pins both away, since the
+        lock only ever existed between two of them."""
+        solves = []
+        original = cp_model.CpSolver.Solve
+
+        def counting(solver_self, model, *args, **kwargs):
+            solves.append(model)
+            return original(solver_self, model, *args, **kwargs)
+
+        with mock.patch.object(cp_model.CpSolver, "Solve", counting):
+            self._solve([(0, 0), (1, 1)])
+
+        self.assertEqual(len(solves), 1)
+        # ...and that one solve carries a real objective, rather than the count
+        # passing because the default silently minimized nothing.
+        self.assertTrue(list(solves[0].proto.objective.vars))
+
+    def test_debug_summary_names_the_default_objective(self):
+        """The DEBUG summary distinguishes the plan's objective, so a surprising
+        plan can be read back to the expression that asked for it."""
+        with self.assertLogs(
+            "torch_spyre._inductor.scratchpad.ilp_solver_ortools", level="DEBUG"
+        ) as logs:
+            self._solve([(0, 0), (1, 1)])
+
+        self.assertIn("default_cost=", "\n".join(logs.output))
+
+
 class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
     solver_class = GreedyLayoutSolver
 
@@ -1361,6 +1679,402 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Cost expression lowering (scratchpad/cost_expr_ortools.py)
+#
+# Device-free: these build CP-SAT models directly and never touch the Spyre
+# device, so they need no hardware. The load-bearing test is
+# TestCostExprLowering, which enumerates every assignment over small domains and
+# checks CP-SAT's optimum against sympy's own evaluation. Everything else is a
+# faster, more specific version of that check.
+#
+# Test corpus: (name, expression, {symbol: (lo, hi)})
+# ---------------------------------------------------------------------------
+
+_x, _y, _z, _w = sympy.symbols("x y z w")
+
+_COST_EXPR_CASES = [
+    ("affine", 3 * _x + 5 * _y - 2, {_x: (0, 4), _y: (0, 4)}),
+    ("min_max", sympy.Min(_x, _y) + sympy.Max(_x, 2 * _y), {_x: (0, 4), _y: (0, 4)}),
+    (
+        "nested_scaled_min",  # the shape unnest_min exists for
+        sympy.Min(8, 5 * sympy.Min(_x, _y)),
+        {_x: (0, 4), _y: (0, 4)},
+    ),
+    (
+        "bool_gated_product",  # var * var -> reified
+        3 * _z * (1 - _w),
+        {_z: (0, 4), _w: (0, 1)},
+    ),
+    (
+        "cost_model_shaped",
+        sympy.Min(8, 5 * sympy.Min(_x, _y)) + 3 * _z * (1 - _w) + sympy.Max(_x, 2 * _y),
+        {_x: (0, 4), _y: (0, 4), _z: (0, 4), _w: (0, 1)},
+    ),
+    (
+        "negative_coeffs",
+        4 * _x - 7 * _y + sympy.Max(_x - _y, 0),
+        {_x: (0, 4), _y: (0, 4)},
+    ),
+    ("power", _x**2 - 3 * _x, {_x: (0, 4)}),
+]
+
+
+def _brute_force(expr, domains):
+    """Every assignment over the (small) domains -> (min, max) of expr."""
+    syms = sorted(domains, key=str)
+    best_lo, best_hi = None, None
+    for combo in product(*(range(domains[s][0], domains[s][1] + 1) for s in syms)):
+        val = int(expr.subs(dict(zip(syms, combo))))
+        best_lo = val if best_lo is None else min(best_lo, val)
+        best_hi = val if best_hi is None else max(best_hi, val)
+    return best_lo, best_hi
+
+
+def _cost_solve(model, objective, maximize: bool):
+    """Solve deterministically so a failure reproduces."""
+    if maximize:
+        model.maximize(objective)
+    else:
+        model.minimize(objective)
+
+    s = cp_model.CpSolver()
+    s.parameters.num_search_workers = 1
+    s.parameters.random_seed = 0
+    s.parameters.max_time_in_seconds = 30.0
+    status = s.solve(model)
+
+    return s, status
+
+
+class _CostExprBase(TestCase):
+    def build(self, domains):
+        m = cp_model.CpModel()
+        env = {s: bind(m, str(s), lo, hi) for s, (lo, hi) in domains.items()}
+        return m, env
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cost expression lowering needs ortools")
+class TestCostExprLowering(_CostExprBase):
+    """The load-bearing check (R3.3): CP-SAT's optimum must equal the true
+    optimum over an exhaustively enumerated domain, in both directions."""
+
+    def test_optima_match_enumeration(self):
+        for name, expr, domains in _COST_EXPR_CASES:
+            true_lo, true_hi = _brute_force(expr, domains)
+
+            for maximize, truth in ((False, true_lo), (True, true_hi)):
+                with self.subTest(case=name, maximize=maximize):
+                    m, env = self.build(domains)
+                    root, _analysis = lower(m, expr, env)
+                    s, status = _cost_solve(m, root.e, maximize)
+
+                    self.assertIn(
+                        status,
+                        (cp_model.OPTIMAL, cp_model.FEASIBLE),
+                        f"{name}: {s.status_name(status)}",
+                    )
+
+                    sol = {sym: s.value(v.e) for sym, v in env.items()}
+
+                    # The solver's objective, the model's own expression, and
+                    # sympy must all agree -- disagreement between the first
+                    # two is the wide-domain failure mode.
+                    self.assertEqual(round(s.objective_value), s.value(root.e), name)
+                    self.assertEqual(s.value(root.e), int(expr.subs(sol)), name)
+                    self.assertEqual(round(s.objective_value), truth, f"{name} {sol}")
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cost expression lowering needs ortools")
+class TestCostExprBoundsAreSound(_CostExprBase):
+    """Every aux domain must contain the value the solve gives it, and the
+    root range must contain the true optimum."""
+
+    def test_aux_domains_contain_solution(self):
+        for name, expr, domains in _COST_EXPR_CASES:
+            with self.subTest(case=name):
+                m, env = self.build(domains)
+                root, analysis = lower(m, expr, env)
+                s, status = _cost_solve(m, root.e, maximize=True)
+
+                self.assertIn(status, (cp_model.OPTIMAL, cp_model.FEASIBLE))
+
+                for v in analysis.aux:
+                    val = s.value(v)
+                    lo, hi = v.domain.min(), v.domain.max()
+                    self.assertTrue(
+                        lo <= val <= hi, f"{name}: {v.name}={val} not in [{lo},{hi}]"
+                    )
+
+    def test_root_range_contains_true_optima(self):
+        for name, expr, domains in _COST_EXPR_CASES:
+            with self.subTest(case=name):
+                m, env = self.build(domains)
+                root, _ = lower(m, expr, env)
+                true_lo, true_hi = _brute_force(expr, domains)
+
+                self.assertLessEqual(int(root.vr.lower), true_lo, name)
+                self.assertGreaterEqual(int(root.vr.upper), true_hi, name)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cost expression lowering needs ortools")
+class TestCostExprWideDomainsAreUnsafe(TestCase):
+    """Why Val carries a range at all.
+
+    A blanket-wide aux domain is legal by CP-SAT's own validator but produces a
+    wrong answer: OPTIMAL, objective 80, on a solution actually worth 77, when
+    the true optimum is 81 (ortools 9.15.6755). Kept as a test so the day it
+    starts passing we can simplify.
+    """
+
+    EXPR = (
+        sympy.Min(40, 5 * sympy.Min(_x, _y)) + 3 * _z * (1 - _w) + sympy.Max(_x, 2 * _y)
+    )
+
+    DOMAINS = {_x: (0, 10), _y: (0, 10), _z: (0, 7), _w: (0, 1)}
+
+    def _solve_with_aux_width(self, width):
+        class Wide(CpSatAnalysis):
+            def _reify(self, vr, tag):  # noqa: ARG002 - width, not range
+                v = self.m.new_int_var(-width, width, f"{tag}{len(self.aux)}")
+                self.aux.append(v)
+                return v
+
+        m = cp_model.CpModel()
+        env = {s: bind(m, str(s), lo, hi) for s, (lo, hi) in self.DOMAINS.items()}
+        root = sympy_interp(Wide(m), env, self.EXPR)
+
+        self.assertEqual(m.validate(), "", "model itself is valid")
+
+        s, _status = _cost_solve(m, root.e, maximize=True)
+        sol = {sym: s.value(v.e) for sym, v in env.items()}
+
+        return round(s.objective_value), s.value(root.e), int(self.EXPR.subs(sol))
+
+    def test_derived_bounds_are_correct(self):
+        m = cp_model.CpModel()
+        env = {s: bind(m, str(s), lo, hi) for s, (lo, hi) in self.DOMAINS.items()}
+        root, _ = lower(m, self.EXPR, env)
+        s, _status = _cost_solve(m, root.e, maximize=True)
+
+        self.assertEqual(round(s.objective_value), 81)
+        self.assertEqual(s.value(root.e), 81)
+
+    def test_wide_domain_reports_an_objective_it_cannot_produce(self):
+        reported, actual, truth = self._solve_with_aux_width(2**55)
+
+        self.assertNotEqual(
+            reported,
+            actual,
+            "ortools now agrees with itself at 2**55 — re-check whether the "
+            "range tracking can be simplified",
+        )
+
+        self.assertEqual((reported, actual, truth), (80, 77, 77))
+
+    def test_moderate_widths_are_still_correct(self):
+        for width in (2**40, 2**31, 2**20):
+            with self.subTest(width=width):
+                reported, actual, truth = self._solve_with_aux_width(width)
+                self.assertEqual((reported, actual, truth), (81, 81, 81))
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cost expression lowering needs ortools")
+class TestCostExprModelSize(_CostExprBase):
+    """R3.7: one reified var per Min/Max/var-times-var node, and nothing for
+    the affine part."""
+
+    def test_aux_count(self):
+        expected = {
+            "affine": 0,
+            "min_max": 2,
+            "nested_scaled_min": 2,
+            "bool_gated_product": 1,
+            "cost_model_shaped": 4,
+            "negative_coeffs": 1,
+            "power": 1,
+        }
+
+        for name, expr, domains in _COST_EXPR_CASES:
+            with self.subTest(case=name):
+                m, env = self.build(domains)
+                _root, analysis = lower(m, expr, env)
+                self.assertEqual(len(analysis.aux), expected[name], name)
+
+    def test_nary_min_costs_k_minus_1_vars(self):
+        """An n-ary Min costs k-1 reified vars, not 1.
+
+        sympy flattens ``Min(4, Min(x, y))`` to a 3-ary ``Min(4, x, y)``
+        itself, but ``_run_sympy_handler`` folds associative ops pairwise, so
+        we get two ``add_min_equality`` calls where CP-SAT would accept one
+        over three operands. That is an optimisation left on the table -- the
+        *answer* is right either way, which is the point: unlike the rewrite
+        this replaces, nothing here can silently drop an operand.
+        """
+
+        flat = sympy.Min(4, sympy.Min(_x, _y))
+        self.assertEqual(len(flat.args), 3, "sympy flattens nested Min itself")
+
+        for expr in (flat, sympy.Min(4, _x, _y)):
+            with self.subTest(expr=str(expr)):
+                m, env = self.build({_x: (0, 9), _y: (0, 9)})
+                root, analysis = lower(m, expr, env)
+                s, _ = _cost_solve(m, root.e, maximize=True)
+
+                self.assertEqual(len(analysis.aux), len(expr.args) - 1)
+                self.assertEqual(s.value(root.e), 4)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cost expression lowering needs ortools")
+class TestCostExprRejections(_CostExprBase):
+    """R3.3: every unsupported construct must surface as CostExpressionError
+    naming what it was -- never as a TypeError from inside ortools."""
+
+    def test_rejected(self):
+        cases = [
+            ("transcendental", sympy.log(_x), "unsupported operation"),
+            ("division by var", _x / _y, "division by a variable"),
+        ]
+
+        for name, expr, fragment in cases:
+            with self.subTest(case=name):
+                m, env = self.build({_x: (1, 4), _y: (1, 4)})
+
+                with self.assertRaises(CostExpressionError) as cm:
+                    lower(m, expr, env)
+
+                self.assertIn(fragment, str(cm.exception), f"{name}: {cm.exception}")
+
+    def test_non_integer_constants_are_rejected_by_the_grammar(self):
+        """``interp`` is integer-only, and says so rather than truncating.
+
+        Non-integer coefficients do reach ``lower`` -- rescaling them is the
+        first thing it does -- so this is the invariant the rescale exists to
+        uphold, checked where it is actually load-bearing: whatever comes out of
+        ``_rescale_to_integers`` must be integral, and a bug there has to fail
+        the compile rather than silently drop a fractional part.
+        """
+        for name, expr in (("rational", _x / 2), ("float", 0.5 * _x)):
+            with self.subTest(case=name):
+                m, env = self.build({_x: (1, 4)})
+
+                with self.assertRaises(CostExpressionError) as cm:
+                    interp(m, expr, env)
+
+                self.assertIn("non-integer constant", str(cm.exception))
+
+    def test_unbound_symbol_names_itself_and_the_bound_set(self):
+        m, env = self.build({_x: (0, 4)})
+
+        with self.assertRaises(CostExpressionError) as cm:
+            lower(m, _x + sympy.Symbol("is_lx_buf7"), env)
+
+        self.assertIn("is_lx_buf7", str(cm.exception))
+        self.assertIn("bound: x", str(cm.exception))
+
+    def test_unbounded_leaf_is_rejected(self):
+        """Caught at the boundary: an infinite range detonates inside the
+        range arithmetic long before a domain could be derived from it."""
+
+        m = cp_model.CpModel()
+        env = {_x: Val(m.new_int_var(0, 10, "x"), ValueRanges(0, int_oo))}
+
+        with self.assertRaises(CostExpressionError) as cm:
+            lower(m, sympy.Max(_x, 3), env)
+
+        self.assertIn("unbounded leaf symbol", str(cm.exception))
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cost expression lowering needs ortools")
+class TestCostExprDeterminism(_CostExprBase):
+    """R8.4: the same expression must lower to the same model, twice."""
+
+    def test_identical_protos(self):
+        _name, expr, domains = _COST_EXPR_CASES[4]
+        protos = []
+
+        for _ in range(2):
+            m, env = self.build(domains)
+            root, _ = lower(m, expr, env)
+            m.minimize(root.e)
+            protos.append(str(m.proto))
+
+        self.assertEqual(protos[0], protos[1])
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cost expression lowering needs ortools")
+class TestCostExprSolverShaped(TestCase):
+    """A miniature of the real integration: per-buffer residency bools and an
+    inv_cores table selected by AddElement, exactly as the joint solver builds
+    them, with the cost expression written in the buffers' own symbols.
+
+    This is the one to step through -- it is the shape ``_run`` will have.
+    """
+
+    SCALE = 240  # divisible by every candidate core count, so 1/cores is exact
+
+    def _model(self, buffers, capacity):
+        m = cp_model.CpModel()
+        env, is_lx, sizes = {}, {}, {}
+
+        for name, size, cands in buffers:
+            lx = m.new_bool_var(f"in_buffer_{name}")
+            inv_table = [self.SCALE // c for c in cands]
+            div = m.new_int_var(0, len(cands) - 1, f"div_{name}")
+            inv = m.new_int_var(min(inv_table), max(inv_table), f"inv_cores_{name}")
+            m.add_element(div, inv_table, inv)
+
+            # symbols the producer would have minted off the buffer
+            env[sympy.Symbol(f"is_lx_{name}")] = Val(lx, ValueRanges(0, 1))
+            env[sympy.Symbol(f"inv_cores_{name}")] = Val(
+                inv, ValueRanges(min(inv_table), max(inv_table))
+            )
+
+            is_lx[name] = lx
+            sizes[name] = size
+
+        m.add(sum(sizes[n] * is_lx[n] for n in is_lx) <= capacity)
+
+        return m, env, is_lx
+
+    def test_traffic_plus_time(self):
+        buffers = [  # (name, size, candidate core counts)
+            ("buf0", 60, [1, 2, 4]),
+            ("buf1", 40, [1, 2]),
+            ("buf2", 90, [1, 3, 6]),
+        ]
+
+        # cost = HBM traffic paid when spilled + compute time (~ work/cores)
+        terms = []
+
+        for name, size, _cands in buffers:
+            spilled = 1 - sympy.Symbol(f"is_lx_{name}")
+            terms.append(2 * size * spilled)
+            terms.append(size * sympy.Symbol(f"inv_cores_{name}"))
+
+        # Add(*terms), never sum(terms): incremental sympy accumulation is
+        # superlinear (0.34 s at 500 terms, 37.7 s at 1500, vs 0.09 s here).
+        expr = sympy.Add(*terms)
+
+        m, env, is_lx = self._model(buffers, capacity=100)
+        root, analysis = lower(m, expr, env)
+        s, status = _cost_solve(m, root.e, maximize=False)
+
+        self.assertIn(status, (cp_model.OPTIMAL, cp_model.FEASIBLE))
+
+        sol = {sym: s.value(v.e) for sym, v in env.items()}
+        self.assertEqual(round(s.objective_value), int(expr.subs(sol)))
+
+        # capacity forces a spill; the model should keep the buffer whose
+        # residency saves the most traffic per byte held.
+        resident = {n for n, v in is_lx.items() if s.value(v)}
+        self.assertLessEqual(sum(sz for n, sz, _ in buffers if n in resident), 100)
+        self.assertTrue(resident, "expected at least one resident buffer")
+
+        # affine in the decision vars -> nothing to reify
+        self.assertEqual(len(analysis.aux), 0)
 
 
 if __name__ == "__main__":
