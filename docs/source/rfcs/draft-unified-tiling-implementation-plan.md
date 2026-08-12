@@ -124,8 +124,9 @@ together, and either one alone emptying is a bug.
 | `TileOption`, `PartitionConfig` dataclasses with derived properties | `scratchpad/plan_solver.py` (beside `CoreDivision`, `:93`) | R2.1 |
 | `enumerate_tile_options` signature; body raises `NotImplementedError("unified-tiling: ...")` | new `wsr/enumerate_tilings.py` | R1.1 |
 | `PredictedFrame` / `PredictedBufferSet` types real, builders raise (§3b) | new `wsr/tile_prediction.py` | R7.1 |
-| `CostSpec`, `CostExpressionError`, symbol namespace; `lower()` raises | new `scratchpad/cost_expr.py` | R3.3 |
-| `objective` keyword-only param on both ABCs and all four concrete overrides | `plan_solver.py:260,297`; `ilp_solver_ortools.py:348`, `greedy_solver.py:134`, `firstfit_bestfit_solver.py:186`, `simulated_annealing.py:122` | R3.1 |
+| `CostSpec`, `CostExpressionError`; `validate()` and `lower()` raise | new `scratchpad/cost_expr.py` | R3.3 |
+| `sym_is_lx`, `sym_inv_cores` symbol properties, real (§3a) | `plan_solver.py:137` (`CoreDivisionBuffer`) | R3.7 |
+| `objective` keyword-only param, typed `CostSpec` / `sympy.Expr` / `None`, on both ABCs and all four concrete overrides | `plan_solver.py:260,297`; `ilp_solver_ortools.py:348`, `greedy_solver.py:134`, `firstfit_bestfit_solver.py:186`, `simulated_annealing.py:122` | R3.1 |
 | Placement solvers ignore a non-`None` objective, warn once | the four solvers above | R3.6 |
 | `_UNIFIED_TILING_HINT_ID = 20000`, a reserved `hint_id` base (§4) | `wsr/enumerate_tilings.py` | R4.5 |
 | CI config yamls for the two new test files | `tests/configs/torch_spyre_tests/inductor/` | — |
@@ -207,7 +208,7 @@ contract runs against the tiling path unchanged. Then the axis-specific classes:
 
 | Class | Covers | RFC test item |
 |---|---|---|
-| `TestCostExprLowering` | R3.3 accept/reject table (one `CostExpressionError` case per rejected construct), R3.4 scaling and overflow, R3.7 binding bounds, `SumOverEdges`/`relayout_bytes` **absent** | 3 |
+| `TestCostExprLowering` | R3.3 accept/reject table (one `CostExpressionError` case per rejected construct, raised by `validate` **before** any ortools error can surface), unbound-symbol containment, `Min`/`Max` flattening preserves the arg set, R3.4 one scale for the whole expression + overflow, R3.7 binding bounds, `SumOverEdges`/`relayout_bytes` **absent** | 3 |
 | `TestSinglePhaseObjective` | R3.2 — one `Minimize`, no lock inequality, no second solve | 3 |
 | `TestCutTables` | R4.1 totality, R4.2 untileable pins + structural contiguity, R4.7 directionality and fail-closed, claim orientation after the equality sweep | 4 |
 | `TestCutConsequences` | R4.8 (no `boundary_op ⟹ ¬in_buffer` constraint; row-3 eviction only), R4.9 optional rectangles, R4.10 `full_size`/`boundary_view` | 7 |
@@ -248,18 +249,117 @@ reweighting break this?" on the one suite that catches either.
 
 Land and prove it before any tiling variable exists.
 
-1. `scratchpad/cost_expr.py`: symbol namespace (`size`, `read_count`, `in_lx`,
-   `spilled`, `cores`, `tile_count`, `is_intermediate`, `SumOverBuffers`,
-   `total_hbm_bytes`, `peak_lx_bytes`, `idle_cores`), `CostSpec`,
-   `lower(expr, bindings) -> cp_model.LinearExpr`, `CostExpressionError`.
-   `peak_lx_bytes` is one `AddMaxEquality` over the existing `top[b]` vars
-   (`_add_no_overlap_2d`, `:568`) — never a time-indexed sum (R3.7).
-2. Replace `_run`'s two-phase block (`:467-492`) with a single `Minimize`,
-   default objective `SumOverBuffers(spill_cost) - SumOverBuffers(cores)` with
-   the spill term weighted to dominate (R3.5). Phase 2 is currently skipped by
-   testing `sb.cores is None`, which only the placement-only wrapper sets
-   (`:193`); collapsing to one phase removes that flag's meaning, so the
-   placement-only path needs an explicit skip in its place.
+#### How the cost function is injected
+
+`isuruf/torch-spyre@cost` is a working end-to-end injection and is the reference
+for this step. It threads a cost function through four layers:
+
+| Layer | On the reference branch | Adopt as |
+|---|---|---|
+| Producer | `_inductor/cost_model.py::predict_ops(op_features) -> sympy.Expr`, fed per op by `allocator._extract_op_features` (`:2068` there) | **not this phase** — see *Producer* below |
+| Symbol namespace | `sym_is_lx` / `sym_inv_cores` / `sym_core_divs` properties on `CoreDivisionBuffer`, minting `sympy.Symbol(f"is_lx_{self.name}")` | adopt; §3b adds the tiling symbols |
+| Transport | `plan_layout_and_core_divisions(buffers, cost_expr)` → `_plan_layout_generic` → `_run` | adopt, renamed to R3.1's keyword-only `objective` |
+| Lowering | sympy rewrite → `lambdify(syms, expr, modules=[{"min", "max"}, "math"])` applied to the CP-SAT vars → one `model.minimize` | adopt, with a validator in front |
+
+Three of its decisions are worth taking as-is.
+
+1. **Symbols live on the buffer, not in a table passed alongside it.** Producer
+   and solver agree through the buffer name alone, so nothing has to carry a
+   `symbol -> var` map across the allocator/solver boundary and the solver's
+   binding step is a five-line loop over `tensors.values()`. It also keeps the
+   namespace open: §3b's tiling symbols are new properties, not a new parameter.
+2. **`lambdify` replaces a hand-written lowerer.** The tree walk this plan
+   previously specified (`lower(expr, bindings) -> cp_model.LinearExpr`) is what
+   `lambdify` already does — it prints the expression to Python source and
+   evaluates it against the CP-SAT vars, so `Add` and constant `Mul` lower
+   through the vars' own operator overloads and only the nodes with no operator
+   form (`Min`, `Max`) need entries in the custom module. `cost_expr.py` stays,
+   owning validation and scaling rather than tree-walking.
+3. **Non-linearity in the division axis is a lookup table, not a constraint.**
+   The cost model wants time, which goes as `1/cores`; a reciprocal of a decision
+   variable is not expressible, so the branch precomputes
+   `[32 // cd.cores_used for cd in b.core_divisions]` and ties it to the division
+   index with one `AddElement` — the same shape `eff_size` already uses. Any
+   per-candidate scalar, however non-linear in the choice, therefore costs
+   exactly what R3.7 budgets. This is the pattern §3b's `tile_count` and
+   `full_size` follow.
+
+The branch's `if cost_expr is not None: ... else: <two-phase>` split is
+transitional and does **not** come across: R3.2 replaces the two-phase block
+rather than sitting beside it, and `TestSinglePhaseObjective` pins one
+`Minimize` and one `Solve` on the default path too.
+
+#### What must change on adoption
+
+Nine items, found by reading the branch against this tree. Items 1–5 and 7 are
+defects on the branch as it stands, not porting friction; 6, 8 and 9 are gaps to
+close on the way in.
+
+| # | On the branch | Consequence | Fix |
+|---|---|---|---|
+| 1 | `unnest_min` appends nothing for an arg that is neither `c*Min(...)` nor `Add` | It is silently dropped. Verified: `Min(4, 5*Min(x, y))` — the function's own docstring example — rewrites to `Min(5x, 5y)`, losing the constant bound. Wrong cost, no error | add the missing `else: result.append(arg)`; pin with a rewrite test asserting the flattened arg set, not just the node count |
+| 2 | `sym_map` binds `t.buffer.sym_inv_cores -> t.inv_cores` for **every** wrapper | `_LifetimeBufferWithCpVars` has no `inv_cores` and plain `LifetimeBoundBuffer` has no `sym_inv_cores` (it is a `CoreDivisionBuffer` property) → `AttributeError` on any `plan_layout` solve | bind through a `bind_symbols()` wrapper hook, empty on the placement-only wrapper — the same hooks-on-the-wrapper shape §3b relies on |
+| 3 | `core_terms` is read by the DEBUG log block but bound only in the `else` branch | `UnboundLocalError` whenever an injected objective runs under DEBUG logging | branch the log line with the objective |
+| 4 | the joint wrapper renames `cores` → `inv_cores` and never sets `self.cores` | `core_terms` is then always empty, so the legacy path's phase 2 silently stops running and every no-objective plan loses its parallelism phase | moot once R3.2 lands; until then keep both attributes |
+| 5 | two ad-hoc float scales: `truncate_floats_min` (×10⁴, then `/m` back out) and `my_min` (×10³, returning `min_var * 1e-3`) | Verified: CP-SAT accepts float coefficients in `minimize` but **rejects** them in `AddMinEquality` (`ValueError: Failed to convert integer linear expression`). A float-scaled `Min` nested in another `Min`/`Max` raises | one documented `COST_SCALE` applied once to the whole expression (R3.4); never a per-node scale |
+| 6 | `modules=[custom, "math"]` — an unsupported node falls through to `math` or to the vars' own operators | the failure surfaces from inside ortools naming neither the sympy node nor the buffer. Verified: `sqrt`/`log` → `TypeError: must be real number`; `x*y` → `TypeError: __mul__(): incompatible function arguments`; `x**2`, `x/y`, `Piecewise` → `NotImplementedError` from `cp_model` | validate before lowering (R3.3), so every rejection carries its own message |
+| 7 | nothing checks `cost_expr.free_symbols` against what the solver binds | an unbound symbol reaches `lambdify` as a free variable → `NameError` at call time. Live today: `sym_core_divs` is minted and written to `op.op_it_space_splits` but never bound | assert containment in `validate`; raise `CostExpressionError` naming the unbound symbols in sorted order (`free_symbols` is a `set` — R8.4) |
+| 8 | `32 // cd.cores_used` | hardcodes 32 cores rather than reading `SENCORES`, and floor division is lossy: `32 // 7 = 4` against a true 4.57, a 12% error that can mis-rank two divisions | scale the reciprocal table (`SCALE // cores_used`, `SCALE` large) and take the core count from `get_ncores` |
+| 9 | three `print()` calls, a commented-out `NewIntVar`, a function-local `import math` | debug residue | delete |
+
+**Producer, and what this step owes it.** `predict_ops` and its
+`dump_cost_model` feature extractors live only on the reference branch — neither
+exists in this tree. That is not a blocker: R3.5 has `objective=None` select a
+default objective built from today's terms, so M2 lands, is testable, and is
+useful with no producer at all, and `TestCostExprLowering` authors its
+expressions directly, which is what keeps it device-free. Porting the analytic
+cost model is separate work. What this step owes it is a surface it can bind to
+unchanged — which is why the namespace is extensible (`_extract_op_features`
+wants symbols for splits as well as for residency and cores) rather than a
+closed set of scalars.
+
+**Expression build cost, measured.** `lambdify` is not the bottleneck (0.77 s to
+lower a 3000-symbol sum). Building the sympy expression is: accumulating terms
+with `sum()` or `+=` is superlinear — 0.34 s at 500 terms, **37.7 s at 1500** —
+against 0.09 s for `sympy.Add(*terms)` at 1500. Any producer, and the default
+objective here, must assemble with `Add(*terms)`. Worth an explicit line in
+`cost_expr.py`, since the natural way to write it is the slow way.
+
+**Needs folding back into R3.7.** R3.7 bounds binding at one `AddElement` per
+symbol and says nothing about the aux vars `Min`/`Max` reification creates — one
+`IntVar` plus one `AddMinEquality`/`AddMaxEquality` per surviving node, which is
+exactly what `unnest_min`'s flattening exists to keep down. The bound wanted is
+"one `AddElement` per symbol **and** one reified var per `Min`/`Max` node
+surviving flattening"; `TestCostExprLowering` pins the second half.
+
+#### Work items
+
+1. `scratchpad/cost_expr.py`: `CostSpec`; `CostExpressionError`;
+   `validate(expr, bound)` — the R3.3 accept/reject walk plus item 7's
+   containment check, raising with the offending node named; `COST_SCALE`
+   derivation and the int64 overflow check (R3.4); `lower(expr, bindings)` =
+   validate, flatten nested `Min`/`Max`, scale once, then `lambdify` against the
+   `{"min", "max"}` module. Model-level symbols with no buffer to hang from stay
+   in this module's namespace — `peak_lx_bytes` is one `AddMaxEquality` over the
+   existing `top[b]` vars (`_add_no_overlap_2d`, `:568`), never a time-indexed
+   sum (R3.7).
+2. `plan_solver.py`: `sym_is_lx` and `sym_inv_cores` on `CoreDivisionBuffer`
+   (`:137`), scaffolded at §0.3 so step-2 tests can construct them.
+3. `ilp_solver_ortools.py`: `bind_symbols()` on both wrappers (item 2); the
+   scaled reciprocal-cores table (item 8); and replace `_run`'s two-phase block
+   (`:467-492`) with a single `Minimize`, default objective
+   `SumOverBuffers(spill_cost) - SumOverBuffers(cores)` with the spill term
+   weighted to dominate (R3.5). Phase 2 is currently skipped by testing
+   `sb.cores is None`, which only the placement-only wrapper sets (`:193`);
+   collapsing to one phase removes that flag's meaning, so the placement-only
+   path needs an explicit skip in its place.
+
+Adopt the injection mechanism only. The branch also carries an unrelated
+divergence in this file — its `_add_no_overlap_2d` shortens the **parent's**
+lifetime on an in-place merge where this tree shortens the **child's**, and its
+`_justify` drops the capacity check — and it subclasses a
+`LifetimeBoundBufferWithSolverVars` base that does not exist here. None of that
+is part of the cost function; leave this tree's versions alone.
 
 **Gate to proceed:** RFC testing item 2 green — spill-parity against today's
 CP-SAT output, no core regression at equal spill, on
@@ -346,7 +446,7 @@ Two boundaries hold this together:
 | `_enumerate_core_divisions` → config enumeration, once per tiling option | `allocator.py:1558` | R2.2, R2.3, R2.4, R2.5 |
 | `_cd_parent_matches` → `_config_matches` on tiling-aware views; `_views_for_divs` `prep_cache` key gains the tile | `allocator.py:1973`, `:2078` (key at `:2092`, coeff at `:2095`) | R2.6, R6.3 |
 | `_prepare_per_core_view` / `_per_core_view_on_buf` accept a predicted frame | `pass_utils.py:1467`, `:1696` | R2.6 |
-| `_TilingBufferWithCpVars` extending `_CoreDivisionBufferWithCpVars` (`:243`): two-level `tile`/`div`, `AddAllowedAssignments` for the flat pair, `AddElement` for `eff_size`/`cores`/`tile_count` | `ilp_solver_ortools.py` | R4.8 |
+| `_TilingBufferWithCpVars` extending `_CoreDivisionBufferWithCpVars` (`:243`): two-level `tile`/`div`, `AddAllowedAssignments` for the flat pair, `AddElement` for `eff_size`/`cores`/`tile_count` (per-candidate tables — §3a, "non-linearity is a lookup table"), `bind_symbols()` extended with the tiling symbols | `ilp_solver_ortools.py` | R4.8 |
 | `_wrap` dispatch to the new wrapper | `ilp_solver_ortools.py:379` | — |
 | Direction-indexed `cut_parents`/`cut_children` claim dicts; `_add_cut_equalities` sweep in `_run` | `ilp_solver_ortools.py` | R4.1, R4.2, R4.7 |
 | Read copies as optional rectangles; row-3 eviction implication | `_add_no_overlap_2d`, `:568` | R4.9, R4.8 |
@@ -450,13 +550,13 @@ ENU (`test_enumerate_tilings.py`), BENCH (measurement, not a test).
 | R2.4 | 3b | SOL | seed pair always retained; signature dedup; no cap |
 | R2.5 | 3b | SOL | empty config set raises `Unsupported` at today's point |
 | R2.6 | 3b | SOL+E2E | `prep_cache` key includes tile; negative cache-sharing test; predicted view == recomputed post-`coarse_tile` |
-| R3.1 | 0 | SOL | `objective` keyword-only on all five solvers |
-| R3.2 | 3a | SOL | one `Minimize`; no lock inequality; no second `Solve` |
-| R3.3 | 3a | SOL | accept case per node; `CostExpressionError` per rejected construct |
-| R3.4 | 3a | SOL | rational scaling; overflow raises |
+| R3.1 | 0 | SOL | `objective` keyword-only on all five solvers; accepts a `sympy.Expr` |
+| R3.2 | 3a | SOL | one `Minimize`; no lock inequality; no second `Solve`; no cost-expr/legacy fork |
+| R3.3 | 3a | SOL | accept case per node; `CostExpressionError` per rejected construct, raised by `validate` before lowering and naming the node; unbound symbols rejected |
+| R3.4 | 3a | SOL | one `COST_SCALE` for the whole expression; overflow raises; no float coefficient reaches `AddMinEquality` |
 | R3.5 | 3a | E2E | spill-parity, no core regression at equal spill |
 | R3.6 | 0 | SOL | four placement solvers ignore objective, warn once |
-| R3.7 | 3a | SOL | ≤ 1 `AddElement` per symbol; model size linear; `SumOverEdges`/`relayout_bytes` absent |
+| R3.7 | 3a | SOL | ≤ 1 `AddElement` per symbol **and** ≤ 1 reified var per `Min`/`Max` surviving flattening; model size linear; `SumOverEdges`/`relayout_bytes` absent |
 | R4.1 | 3b | SOL | triple table total; `cut` determined not merely constrained |
 | R4.2 | 3b | SOL | untileable boundary pinned; every cut-free run is a contiguous slice |
 | R4.3 | 4 | SOL+E2E | hint scope never split |
@@ -519,7 +619,14 @@ answer decides whether R10.2/R10.5 are in scope at all.
    tiling off. Isolated as step 3a so its blast radius is measurable.
 3. **R4.6 in step 3.** Omitting the hint-driven pin produces plans
    `coarse_tile` will reject at apply — an illegal emission, not a fallback.
-4. **Enumeration cost.** `enumerate_work_division_candidates` runs per tiling
+4. **Name-keyed symbol binding (§3a).** Producer and solver agree only through
+   the buffer name, and every failure mode of that agreement is quiet: an
+   unbound symbol is a `NameError` from generated code, a dropped `Min` arg is a
+   wrong cost with no error at all (both live on the reference branch today).
+   Nothing downstream can detect it — the plan is legal, just worse. `validate`'s
+   containment check and the flattening test are the only guards, which is why
+   both are step-2 obligations rather than step-3 ones.
+5. **Enumeration cost.** `enumerate_work_division_candidates` runs per tiling
    option (R2.2) and `_views_for_divs`' sympy prep is no longer
    candidate-invariant (R2.6). Both were built assuming they are paid once per
    op. Measure compile time at step 3b, not at step 5.
@@ -535,6 +642,11 @@ Found while grounding this plan against the tree, and folded back into
 | R1.4, R1.9 | `_host_dim_has_legal_nontrivial_split` cited at `:935`; it is at `:936`. |
 | R1.4 | Reuse list omitted `_remaining_span_candidates_after_tile` (`:1236`) — the span-*sufficiency* check both public entry points compose (`:1344`, `:1471`), and the one R2.3's joint span feasibility should extend rather than restate. Added with that rationale. |
 | R4.5 | Handled `loop_group_id` collision via `group_idx_offset` but not `hint_id`. Added the second namespace: span-overflow mints from `_SPAN_OVERFLOW_HINT_ID = 10000`, so the solver needs its own reserved base or `validate_coarse_tile_groups` raises during apply — an illegal emission, not something the model could rule out. |
+
+**One pending fold-back, not yet applied.** R3.7 bounds symbol binding at one
+`AddElement` per symbol but is silent on the aux vars `Min`/`Max` reification
+creates (§3a). The plan carries the tighter bound and pins it; R3.7 should gain
+the second clause.
 
 **Two earlier flags retracted.** Both came from a misreading of the RFC, not
 from the RFC:
