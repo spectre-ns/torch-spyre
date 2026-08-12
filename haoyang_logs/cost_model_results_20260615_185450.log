@@ -1,0 +1,849 @@
+================ cost-model calibration run ================
+date:    Mon Jun 15 18:54:50 UTC 2026
+examples/run_cost_model_plan.sh: line 42: hostname: command not found
+host:    
+git:     bc9130d dev1
+python:  3.12.13 torch 2.11.0+cpu
+runs=100 warmup=20  SENCORES=default(32)
+log:     haoyang_logs/cost_model_results_20260615_185450.log
+===========================================================
+
+########################################################################
+## RUNG1 size sweep: gelu[512x512]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=512 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=262144 cores=32 hbm=1048576B lx=0B
+      output hbm 262144 elems
+      input  hbm 262144 elems
+  => T = 20000ns(fill) + 1048576/111.0  (lx 0B: ~free) = 29.45 us
+
+gelu[512x512]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     29.860     34.584     36.178
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG1 size sweep: gelu[512x1024]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     41.444     43.298     46.833
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG1 size sweep: gelu[512x2048]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=2048 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=1048576 cores=32 hbm=4194304B lx=0B
+      output hbm 1048576 elems
+      input  hbm 1048576 elems
+  => T = 20000ns(fill) + 4194304/111.0  (lx 0B: ~free) = 57.79 us
+
+gelu[512x2048]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     59.610     62.630     68.738
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG1 size sweep: gelu[512x4096]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=2097152 cores=32 hbm=8388608B lx=0B
+      output hbm 2097152 elems
+      input  hbm 2097152 elems
+  => T = 20000ns(fill) + 8388608/111.0  (lx 0B: ~free) = 95.57 us
+
+gelu[512x4096]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     94.059    124.387   2457.576
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG1 size sweep: gelu[512x8192]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=8192 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=4194304 cores=32 hbm=16777216B lx=0B
+      output hbm 4194304 elems
+      input  hbm 4194304 elems
+  => T = 20000ns(fill) + 16777216/111.0  (lx 0B: ~free) = 171.15 us
+
+gelu[512x8192]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100    169.866    177.905    198.838
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG2 arithmetic: relu[512x1024]
+## + env BENCH_OP=relu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  relu         out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+relu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_relu_0                           100     39.332     43.048     46.977
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG2 arithmetic: gelu[512x1024]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     40.910     43.952     47.425
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG2 arithmetic: sigmoid[512x1024]
+## + env BENCH_OP=sigmoid BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  sigmoid      out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+sigmoid[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_sigmoid_0                        100     40.381     45.175     51.276
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG2 arithmetic: exp[512x1024]
+## + env BENCH_OP=exp BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  exp          out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+exp[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_exp_0                            100     39.468     44.520     48.114
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3 traffic: gelu[512x1024]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     39.195     43.890     51.480
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3 traffic: mul[512x1024]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=524288 cores=32 hbm=3145728B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 3145728/111.0  (lx 0B: ~free) = 48.34 us
+
+mul[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100     57.991     60.169     63.352
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3 traffic: add[512x1024]
+## + env BENCH_OP=add BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=524288 cores=32 hbm=3145728B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 3145728/111.0  (lx 0B: ~free) = 48.34 us
+
+add[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     56.842     60.985    131.425
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b mul size: mul[512x512]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=512 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=262144 cores=32 hbm=1572864B lx=0B
+      output hbm 262144 elems
+      input  hbm 262144 elems
+      input  hbm 262144 elems
+  => T = 20000ns(fill) + 1572864/111.0  (lx 0B: ~free) = 34.17 us
+
+mul[512x512]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100     39.063     42.056     49.402
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b mul size: mul[512x1024]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=524288 cores=32 hbm=3145728B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 3145728/111.0  (lx 0B: ~free) = 48.34 us
+
+mul[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100     55.589     62.104     66.110
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b mul size: mul[512x2048]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=2048 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=1048576 cores=32 hbm=6291456B lx=0B
+      output hbm 1048576 elems
+      input  hbm 1048576 elems
+      input  hbm 1048576 elems
+  => T = 20000ns(fill) + 6291456/111.0  (lx 0B: ~free) = 76.68 us
+
+mul[512x2048]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100     90.437    100.125    214.387
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b mul size: mul[512x4096]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=2097152 cores=32 hbm=12582912B lx=0B
+      output hbm 2097152 elems
+      input  hbm 2097152 elems
+      input  hbm 2097152 elems
+  => T = 20000ns(fill) + 12582912/111.0  (lx 0B: ~free) = 133.36 us
+
+mul[512x4096]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100    162.433    176.978    288.002
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b mul size: mul[512x8192]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=8192 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=4194304 cores=32 hbm=25165824B lx=0B
+      output hbm 4194304 elems
+      input  hbm 4194304 elems
+      input  hbm 4194304 elems
+  => T = 20000ns(fill) + 25165824/111.0  (lx 0B: ~free) = 246.72 us
+
+mul[512x8192]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100    314.969    330.662    346.804
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b equal-bytes 3MB / 3-stream: mul[512x1024]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=524288 cores=32 hbm=3145728B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 3145728/111.0  (lx 0B: ~free) = 48.34 us
+
+mul[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100     56.072     61.153     65.160
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b equal-bytes 3MB / 2-stream: gelu[512x1536]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1536 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=786432 cores=32 hbm=3145728B lx=0B
+      output hbm 786432 elems
+      input  hbm 786432 elems
+  => T = 20000ns(fill) + 3145728/111.0  (lx 0B: ~free) = 48.34 us
+
+gelu[512x1536]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     49.856     52.846     58.078
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b equal-bytes 6MB / 3-stream: mul[512x2048]
+## + env BENCH_OP=mul BENCH_ROWS=512 BENCH_COLS=2048 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mul          out=1048576 cores=32 hbm=6291456B lx=0B
+      output hbm 1048576 elems
+      input  hbm 1048576 elems
+      input  hbm 1048576 elems
+  => T = 20000ns(fill) + 6291456/111.0  (lx 0B: ~free) = 76.68 us
+
+mul[512x2048]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_mul_0                            100     94.227     97.626    102.720
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG3b equal-bytes 6MB / 2-stream: gelu[512x3072]
+## + env BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=3072 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=1572864 cores=32 hbm=6291456B lx=0B
+      output hbm 1572864 elems
+      input  hbm 1572864 elems
+  => T = 20000ns(fill) + 6291456/111.0  (lx 0B: ~free) = 76.68 us
+
+gelu[512x3072]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     79.646     82.977     92.961
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+## RUNG4 LX-placement check (depth=4): expect 'lx' allocations on intermediates
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+gelu[512x1024] depth=4  runs=100  LX_PLANNING=True  ALL_LX=True
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     35.535     40.403     57.523
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+-- intermediate allocations in the depth-4 chain IR --
+15
+(count of lx allocations above)
+  allocation={'lx': 0}
+  allocation={'lx': 32768}
+  allocation={'lx': 0}
+  allocation={'lx': 0}
+  allocation={'lx': 32768}
+  allocation={'lx': 0}
+  allocation={'lx': 0}
+  allocation={'lx': 32768}
+  allocation={'lx': 0}
+  allocation={'lx': 0}
+  allocation={'lx': 32768}
+  allocation={'lx': 0}
+  allocation={'lx': 0}
+  allocation={'lx': 32768}
+  allocation={'lx': 0}
+
+########################################################################
+## RUNG4 LX chain: gelu depth=1 (all-LX)
+## + env BENCH_OP=gelu BENCH_LX_ALL=1 BENCH_DEPTH=1 BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=True
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     37.878     43.826     46.239
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG4 LX chain: gelu depth=2 (all-LX)
+## + env BENCH_OP=gelu BENCH_LX_ALL=1 BENCH_DEPTH=2 BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=1048576B lx=1048576B
+      output lx  524288 elems
+      input  hbm 524288 elems
+  gelu_1       out=524288 cores=32 hbm=1048576B lx=1048576B
+      output hbm 524288 elems
+      input  lx  524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 2097152B: ~free) = 38.89 us
+
+gelu[512x1024] depth=2  runs=100  LX_PLANNING=True  ALL_LX=True
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     34.011     38.975     44.182
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG4 LX chain: gelu depth=4 (all-LX)
+## + env BENCH_OP=gelu BENCH_LX_ALL=1 BENCH_DEPTH=4 BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=1048576B lx=1048576B
+      output lx  524288 elems
+      input  hbm 524288 elems
+  gelu_1       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_2       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_3       out=524288 cores=32 hbm=1048576B lx=1048576B
+      output hbm 524288 elems
+      input  lx  524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 6291456B: ~free) = 38.89 us
+
+gelu[512x1024] depth=4  runs=100  LX_PLANNING=True  ALL_LX=True
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     35.806     40.961     45.338
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG4 LX chain: gelu depth=8 (all-LX)
+## + env BENCH_OP=gelu BENCH_LX_ALL=1 BENCH_DEPTH=8 BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=1048576B lx=1048576B
+      output lx  524288 elems
+      input  hbm 524288 elems
+  gelu_1       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_2       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_3       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_4       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_5       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_6       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_7       out=524288 cores=32 hbm=1048576B lx=1048576B
+      output hbm 524288 elems
+      input  lx  524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 14680064B: ~free) = 38.89 us
+
+gelu[512x1024] depth=8  runs=100  LX_PLANNING=True  ALL_LX=True
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     36.698     41.830     48.835
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG4 LX chain: gelu depth=16 (all-LX)
+## + env BENCH_OP=gelu BENCH_LX_ALL=1 BENCH_DEPTH=16 BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=1048576B lx=1048576B
+      output lx  524288 elems
+      input  hbm 524288 elems
+  gelu_1       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_2       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_3       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_4       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_5       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_6       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_7       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_8       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_9       out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_10      out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_11      out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_12      out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_13      out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_14      out=524288 cores=32 hbm=0B lx=2097152B
+      output lx  524288 elems
+      input  lx  524288 elems
+  gelu_15      out=524288 cores=32 hbm=1048576B lx=1048576B
+      output hbm 524288 elems
+      input  lx  524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 31457280B: ~free) = 38.89 us
+
+gelu[512x1024] depth=16  runs=100  LX_PLANNING=True  ALL_LX=True
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     47.308     49.192     52.207
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG5 SENCORES=1: gelu[512x1024]
+## + env SENCORES=1 BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=1 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     59.392     62.969     67.743
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG5 SENCORES=2: gelu[512x1024]
+## + env SENCORES=2 BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=2 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     43.089     46.058     50.693
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG5 SENCORES=4: gelu[512x1024]
+## + env SENCORES=4 BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=4 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     45.260     48.000     50.162
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG5 SENCORES=8: gelu[512x1024]
+## + env SENCORES=8 BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=8 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     37.866     45.787     48.537
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG5 SENCORES=16: gelu[512x1024]
+## + env SENCORES=16 BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=16 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     41.921     44.751     48.601
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG5 SENCORES=32: gelu[512x1024]
+## + env SENCORES=32 BENCH_OP=gelu BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  gelu         out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+gelu[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_gelu_0                           100     40.656     44.267     53.768
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG6 broadcast: bcast[512x1024] (b is [1x1024])
+## + env BENCH_OP=bcast BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=524288 cores=32 hbm=3145728B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+      input  hbm 524288 elems broadcast
+  => T = 20000ns(fill) + 3145728/111.0  (lx 0B: ~free) = 48.34 us
+
+bcast[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     37.272     39.895     47.355
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG6 full ref:  add[512x1024]
+## + env BENCH_OP=add BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=524288 cores=32 hbm=3145728B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 3145728/111.0  (lx 0B: ~free) = 48.34 us
+
+add[512x1024]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     56.643     61.191    139.076
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG6 broadcast: bcast[512x4096] (b is [1x4096])
+## + env BENCH_OP=bcast BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=2097152 cores=32 hbm=12582912B lx=0B
+      output hbm 2097152 elems
+      input  hbm 2097152 elems
+      input  hbm 2097152 elems broadcast
+  => T = 20000ns(fill) + 12582912/111.0  (lx 0B: ~free) = 133.36 us
+
+bcast[512x4096]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     97.326    104.788    113.302
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+########################################################################
+## RUNG6 full ref:  add[512x4096]
+## + env BENCH_OP=add BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_ops.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=2097152 cores=32 hbm=12582912B lx=0B
+      output hbm 2097152 elems
+      input  hbm 2097152 elems
+      input  hbm 2097152 elems
+  => T = 20000ns(fill) + 12582912/111.0  (lx 0B: ~free) = 133.36 us
+
+add[512x4096]  runs=100  LX_PLANNING=True  ALL_LX=False
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    162.010    175.947    265.161
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+
+================ DONE. forward this file: haoyang_logs/cost_model_results_20260615_185450.log ================

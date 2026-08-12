@@ -43,6 +43,7 @@ from torch_spyre._inductor.pass_utils import (
     _prepare_per_core_view,
     _per_core_view_from_prep,
 )
+from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures
 from torch_spyre._inductor.work_division import enumerate_work_division_candidates
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -160,7 +161,7 @@ class ScratchpadAllocator:
         self.reject_reasons = {}
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph)
-        allocation = self._solve(buffers)
+        allocation = self._solve(buffers, graph)
         self._post_solve(graph, allocation)
         self._record_reject_reasons(allocation)
         self._push_allocation(graph, allocation)
@@ -178,7 +179,7 @@ class ScratchpadAllocator:
         """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
         return self._generate_buffers(graph)
 
-    def _solve(self, buffers: Sequence[Any]) -> Sequence[Any]:
+    def _solve(self, buffers: Sequence[Any], graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         assert self.layout_planning is not None
         return self.layout_planning.plan_layout(buffers, log_lx_usage=True)
@@ -1502,15 +1503,27 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self.layout_planning: Optional[CoreDivisionLayoutSolver] = layout_planning
 
     def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
+        # Stashed for `_solve`, which the base `plan_allocation` template calls
+        # with only `buffers` -- it needs the graph to re-derive op features.
         in_place = self._determine_in_place_division_invariant(graph)
         buffers = self._build_cd_bound_buffers(
             graph, in_place, self._division_map(graph)
         )
         return buffers
 
-    def _solve(self, buffers: Sequence[Any]) -> Sequence[Any]:
+    def _solve(self, buffers: Sequence[Any], graph: GraphLowering) -> Sequence[Any]:
         assert self.layout_planning is not None
-        return self.layout_planning.plan_layout_and_core_divisions(buffers)
+        bufmap = {buf.name: buf for buf in buffers}
+
+        op_features = []
+        mem_usage = mem_usage_by_buf(graph)
+        for output_name, info in mem_usage.items():
+            op_features.append(self._extract_op_features(graph, output_name, bufmap))
+
+        from torch_spyre._inductor.cost_model import predict_ops
+
+        cost_expr = predict_ops(op_features)
+        return self.layout_planning.plan_layout_and_core_divisions(buffers, cost_expr)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
@@ -2103,6 +2116,193 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
             out.append(_per_core_view_from_prep(prep_cache[key], coeff))
         return out
+
+    def _extract_op_features(self, graph, output_name, buffers):
+        """Build OpFeatures for one ComputedBuffer op (best-effort)."""
+        from torch_spyre._inductor.dump_cost_model import (
+            _loop_features,
+            _int,
+            _matmul_features,
+            _row_split,
+            _input_traffic,
+            _hbm_pattern,
+            _device_dims,
+            _prod_ints,
+            BATCH_MATMUL_OP,
+        )
+
+        op = graph.get_buffer(output_name)
+        data = getattr(op, "data", None)
+
+        buf = buffers[output_name]
+
+        op.op_it_space_splits = buf.sym_core_divs
+
+        is_reduction = getattr(data, "reduction_type", None) is not None
+        # TODO: make this symbolic when wsr works
+        loop_trip, tiles_red_dim, tiles_out_dim = _loop_features(op)
+        # An arg ADVANCES (factor 1, walks the full tensor once across tiles) when this op
+        # tiles a dim the arg traverses: an OUTPUT (pointwise) dim -> all args advance; a
+        # REDUCTION dim -> only the reduced input advances. An arg is FIXED (factor L,
+        # re-accessed each iteration) when this op tiles neither but shares the loop -- a
+        # combine's accumulator / a per-tile partial. (fill/combine: loop_tiled_dims and
+        # loop_tiled_reduction_dims are both empty, so out/red are False -> factor L.)
+        is_tiled_red = is_reduction and tiles_red_dim
+        dtype_bytes = _int(getattr(op.get_dtype(), "itemsize", 2), 2)
+        out_size = list(op.get_size())
+        # TRUE I/O sizes come from the committed DEVICE layout (sticks), not the torch
+        # logical shape -- a row of N fp16 rounds up to ceil(N/64)*64, and reduction/
+        # broadcast operands carry their own device size.
+        out_dims = _device_dims(op.get_layout()) or out_size
+        out_elems = _prod_ints(out_dims)
+
+        cores = 1 / buf.sym_inv_cores
+
+        def max(*args):
+            return sympy.Max(*args)
+
+        # Cross-core ring combine: work division splits OUTPUT dims first, then the reduced
+        # axis with leftover cores -> the reduced axis is split only when out_elems < cores.
+        # Approx k as the cores not absorbed by the output (refine if rung 11 needs it).
+        reduction_cores = 1
+        if is_reduction:
+            reduction_cores = max(1, cores // max(1, out_elems))
+
+        is_lx = buf.sym_is_lx
+
+        # Matmul (batchmatmul reduction): compute-bound -> extra additive compute term. Pull
+        # MACs (M*N*K), the per-core M tile (pt_eff), and the K-split k (-> reduction_cores,
+        # so the existing combine term becomes the PSUM ring). Non-matmul ops keep is_matmul
+        # False and the generic reduction_cores above.
+        is_matmul = getattr(data, "reduction_type", None) == BATCH_MATMUL_OP
+        matmul_macs, matmul_rows_per_core, matmul_cols_per_core = 0, 0.0, 0.0
+        matmul_a_bytes = matmul_b_bytes = 0
+        if is_matmul:
+            # TODO: make symbolic
+            (
+                matmul_macs,
+                matmul_rows_per_core,
+                matmul_cols_per_core,
+                matmul_a_bytes,
+                matmul_b_bytes,
+                k_split,
+            ) = _matmul_features(op, out_elems, dtype_bytes)
+            reduction_cores = k_split
+
+        # Per-core per-tile pass-row height for the UNDERFILL derate -- only for OUTPUT-dim
+        # (pointwise) tiling (a reduction's tiny output has no pass-row height). The "rows"
+        # is the partition device dim (out_dims[-2]); an HBM full-buffer output reports the
+        # UNTILED height, so divide by loop_trip to recover the per-tile slice, whereas an
+        # LX intermediate is already allocated per-tile. Then divide by the ROW-dim core
+        # split -- NOT total cores: at extreme tiling the planner may split COLUMNS instead
+        # (rows/tile < col-sticks), leaving each core a full row tile (no underfill). 0.0 =
+        # N/A -> no derate.
+        tile_rows_per_core = 0.0
+        if tiles_out_dim and loop_trip > 1 and len(out_dims) >= 2:
+            rows = out_dims[-2]
+            # full-buffer alloc: per-tile slice is rows / loop_trip
+            rows = rows / loop_trip * (1 - is_lx) + rows * is_lx
+            # TODO: make symbolic
+            tile_rows_per_core = rows / _row_split(op, cores)
+
+        # Output advances (factor 1) when this op tiles an output dim (pointwise tiling
+        # writes the result tile by tile); fixed (factor L) for a reduction's per-tile
+        # partial or a combine's accumulator (re-written at one address each iteration).
+        out_factor = 1 if tiles_out_dim else loop_trip
+        # Inputs advance (factor 1) when the op tiles an output dim (all pointwise inputs)
+        # or a reduction dim (the reduced input); else fixed accumulators (factor L).
+        in_factor = 1 if (tiles_out_dim or is_tiled_red) else loop_trip
+
+        args: list = []
+        # Output arg (device-sized).
+        args.append(
+            ArgTraffic(
+                name=op.get_operation_name(),
+                role="output",
+                is_lx=is_lx,
+                elems=out_elems,
+                dims=list(out_dims),
+                logical=out_size,
+                loop_factor=out_factor,
+            )
+        )
+        # Input args, from the op's reads. Each read is sized by ITS OWN buffer's device
+        # layout -- so a reduction's reduced input is naturally full-sized (no separate
+        # reduction scaling), and a broadcast operand carries its real (one-row) size.
+        try:
+            reads = op.get_read_writes().reads
+        except Exception:  # noqa: BLE001
+            reads = []
+        n_out_vars = len(out_size)
+        for dep in reads:
+            name = getattr(dep, "name", "?")
+            index = getattr(dep, "index", None)
+            # Broadcast heuristic: the read index references fewer loop variables than
+            # the output rank -> it is loaded ONCE and reused across the broadcast dim, so
+            # it is counted at its own (small) device size, not the output size. This
+            # INCLUDES scalars/constants (0 loop vars, e.g. the `1.0` in `x + 1.0`): a
+            # scalar is the maximally-broadcast input -- its one-load size is ~1 stick, so
+            # it costs ~nothing, but it is no longer forced to exactly zero.
+            try:
+                n_index_vars = len(getattr(index, "free_symbols", []) or [])
+                broadcast = n_index_vars < n_out_vars
+            except Exception:  # noqa: BLE001
+                broadcast = False
+                raise
+            _, dims, in_elems, in_logical = _input_traffic(name)
+            if in_elems is None:  # unresolved buffer -> fallback
+                # A broadcast operand with no resolvable buffer (e.g. a scalar constant)
+                # is loaded once and is at most ~1 element -- do NOT inflate it to the
+                # output size. Only a NON-broadcast unresolved read is conservatively
+                # sized at the full output.
+                if broadcast:
+                    dims, in_elems, in_logical = [1], 1, [1]
+                else:
+                    dims, in_elems, in_logical = (
+                        list(out_dims),
+                        out_elems,
+                        [],
+                    )
+                inp_is_lx = False
+            else:
+                # A resolved buffer not in `buffers` (e.g. a graph input never
+                # cloned at the boundary) isn't managed by the LX planner, so
+                # it can never be resident.
+                buf = buffers.get(name)
+                inp_is_lx = buf.sym_is_lx if buf is not None else False
+
+            args.append(
+                ArgTraffic(
+                    name=name,
+                    role="input",
+                    is_lx=inp_is_lx,
+                    elems=in_elems,
+                    broadcast=broadcast,
+                    dims=list(dims),
+                    logical=in_logical if in_logical else [],
+                    loop_factor=in_factor,  # 1 if advancing, L if a fixed accumulator
+                )
+            )
+
+        return OpFeatures(
+            name=self._get_op_name(op),
+            is_reduction=is_reduction,
+            out_elems=out_elems,
+            cores=cores,
+            dtype_bytes=dtype_bytes,
+            args=args,
+            reduction_cores=reduction_cores,
+            loop_trip=loop_trip,
+            tiles_output_dim=tiles_out_dim,
+            tile_rows_per_core=tile_rows_per_core,
+            is_matmul=is_matmul,
+            matmul_macs=matmul_macs,
+            matmul_rows_per_core=matmul_rows_per_core,
+            matmul_cols_per_core=matmul_cols_per_core,
+            matmul_a_bytes=matmul_a_bytes,
+            matmul_b_bytes=matmul_b_bytes,
+            hbm_pattern="" if is_matmul else _hbm_pattern(op, is_reduction, out_dims),
+        )
 
 
 _PLACEMENT_SOLVERS: dict[str, type[MemoryPlanSolver]] = {

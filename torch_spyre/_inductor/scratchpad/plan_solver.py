@@ -17,7 +17,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 from abc import ABC, abstractmethod
+import itertools
 import math
+import sympy
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from enum import Enum
 
@@ -165,6 +167,71 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             ceil_div(self.size, cd.output_partition) for cd in self.core_divisions
         )
 
+    @property
+    def sym_is_lx(self) -> sympy.Symbol:
+        return sympy.Symbol(f"is_lx_{self.name}")
+
+    @property
+    def sym_inv_cores(self) -> sympy.Symbol:
+        return sympy.Symbol(f"inv_cores_{self.name}")
+
+    @property
+    def sym_core_divs(self) -> tuple[dict, dict]:
+        """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
+        stride coefficient seen across this buffer's candidate divisions, so the
+        cost model can carry an undecided split as an unknown rather than a
+        concrete value."""
+        core_divs = self.core_divisions
+
+        def unique(args):
+            d = {arg: None for arg in args}
+            return list(d)
+
+        output_keys = unique(
+            itertools.chain.from_iterable(cd.output_splits for cd in core_divs)
+        )
+        sym_output_splits = {
+            key: sympy.Symbol(f"output_split_{self.name}_{key}") for key in output_keys
+        }
+
+        reduction_keys = unique(
+            itertools.chain.from_iterable(cd.reduction_splits for cd in core_divs)
+        )
+        sym_reduction_splits = {
+            key: sympy.Symbol(f"reduction_split_{self.name}_{key}")
+            for key in reduction_keys
+        }
+        return (sym_output_splits, sym_reduction_splits)
+
+
+@dataclass
+class LifetimeBoundBufferWithSolverVars:
+    buffer: LifetimeBoundBuffer
+    capacity_units: int
+    # solver var for checking if buffer in lx
+    in_buffer: bool = field(init=False)
+    # solver var for lx address
+    offset: int = field(init=False)
+    # solver var for per core size
+    eff_size: int = field(init=False)
+    # solver var for number of cores
+    cores: int = field(init=False)
+    # dictionary of solver vars for merging inplace
+    # with parents
+    merge_vars: dict[str, bool] = field(init=False)
+
+    @property
+    def name(self):
+        return self.buffer.name
+
+    @property
+    def start_time(self):
+        return self.buffer.start_time
+
+    @property
+    def end_time(self):
+        return self.buffer.end_time
+
 
 def _assert_in_place_relationships(
     buffers: Sequence["LifetimeBoundBuffer"],
@@ -296,7 +363,7 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
 
     @abstractmethod
     def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
+        self, buffers: Sequence[CoreDivisionBuffer], cost_expr: sympy.Expr | None = None
     ) -> list[CoreDivisionBuffer]:
         """Choose each buffer's core division and its LX placement together.
 

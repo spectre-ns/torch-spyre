@@ -1,0 +1,1468 @@
+==== softmax term sweep Wed Jul  8 20:56:29 UTC 2026 ====
+git: 98739fe  sections: GR VAR SP
+## GR softmax COLS=2048: ROWS{2048,4096,8192,16384} x TILES{4,8,16,32}
+-- softmax [2048,2048] tiles=4 (ROWS/tile=512)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   op sub
+IO     output op1                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf0                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [2048, 2048] -> device [2048, 2048] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 25165824 B  (lx 10747904 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=8388608 B (write)   loop_trip L=4
+MODEL   base = (R+W)/150 = 167.77 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 215.92 us
+SUMMARY op=softmax_row_tiling rows=2048 cols=2048 cores=32 tiles=4 lx=1 io_hbm_bytes=25165824 kernel_us=172.133 pred_us=215.923 err_pct=+25.4 bw_gbps=146.2 memset_us=237.438 other_dev_us=283.698 total_dev_us=693.269
+-- softmax [2048,2048] tiles=8 (ROWS/tile=256)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   op sub
+IO     output op1                    torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf0                   torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [2048, 2048] -> device [2048, 2048] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf2                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 25165824 B  (lx 5373952 B, ~free)
+MODEL -- estimate (turnaround): T = [(R+W)/BW_PEAK + a*min(R,W)] / eff_underfill --
+MODEL   R=16777216 B (read)   W=8388608 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 167.77 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   eff_underfill = min(1,(8.0/16)**0.35) = 0.785 -> (base+turn)/eff = 275.21 us
+MODEL   => T_model = 275.21 us
+SUMMARY op=softmax_row_tiling rows=2048 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=25165824 kernel_us=202.229 pred_us=275.207 err_pct=+36.1 bw_gbps=124.4 memset_us=236.898 other_dev_us=358.817 total_dev_us=797.944
+-- softmax [2048,2048] tiles=16 (ROWS/tile=128)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   op sub
+IO     output op1                    torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf0                   torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [2048, 2048] -> device [2048, 2048] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf2                   torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 25165824 B  (lx 2686976 B, ~free)
+MODEL -- estimate (turnaround): T = [(R+W)/BW_PEAK + a*min(R,W)] / eff_underfill --
+MODEL   R=16777216 B (read)   W=8388608 B (write)   loop_trip L=16
+MODEL   base = (R+W)/150 = 167.77 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   eff_underfill = min(1,(4.0/16)**0.35) = 0.616 -> (base+turn)/eff = 350.77 us
+MODEL   => T_model = 350.77 us
+SUMMARY op=softmax_row_tiling rows=2048 cols=2048 cores=32 tiles=16 lx=1 io_hbm_bytes=25165824 kernel_us=325.684 pred_us=350.768 err_pct=+7.7 bw_gbps=77.3 memset_us=235.883 other_dev_us=435.698 total_dev_us=997.265
+-- softmax [2048,2048] tiles=32 (ROWS/tile=64)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [64, 1] -> device [1, 64, 64] in LX = 4096 elems x 2B = 8192 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   op sub
+IO     output op1                    torch [64, 2048] -> device [32, 64, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf0                   torch [64, 1] -> device [1, 64, 64] in LX = 4096 elems x 2B = 8192 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [64, 2048] -> device [32, 64, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [64, 2048] -> device [32, 64, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [64, 1] -> device [1, 64, 64] in LX = 4096 elems x 2B = 8192 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [64, 2048] -> device [32, 64, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [2048, 2048] -> device [2048, 2048] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf2                   torch [64, 2048] -> device [32, 64, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [64, 1] -> device [1, 64, 64] in LX = 4096 elems x 2B = 8192 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 25165824 B  (lx 1343488 B, ~free)
+MODEL -- estimate (turnaround): T = [(R+W)/BW_PEAK + a*min(R,W)] / eff_underfill --
+MODEL   R=16777216 B (read)   W=8388608 B (write)   loop_trip L=32
+MODEL   base = (R+W)/150 = 167.77 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   eff_underfill = min(1,(2.0/16)**0.35) = 0.483 -> (base+turn)/eff = 447.07 us
+MODEL   => T_model = 447.07 us
+SUMMARY op=softmax_row_tiling rows=2048 cols=2048 cores=32 tiles=32 lx=1 io_hbm_bytes=25165824 kernel_us=527.730 pred_us=447.075 err_pct=-15.3 bw_gbps=47.7 memset_us=313.706 other_dev_us=447.123 total_dev_us=1288.559
+-- softmax [4096,2048] tiles=4 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [4096, 2048] -> device [4096, 2048] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 50331648 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=33554432 B (read)   W=16777216 B (write)   loop_trip L=4
+MODEL   base = (R+W)/150 = 335.54 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 431.85 us
+SUMMARY op=softmax_row_tiling rows=4096 cols=2048 cores=32 tiles=4 lx=1 io_hbm_bytes=50331648 kernel_us=354.588 pred_us=431.846 err_pct=+21.8 bw_gbps=141.9 memset_us=308.898 other_dev_us=750.235 total_dev_us=1413.721
+-- softmax [4096,2048] tiles=8 (ROWS/tile=512)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op sub
+IO     output op1                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf0                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [4096, 2048] -> device [4096, 2048] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 50331648 B  (lx 10747904 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=33554432 B (read)   W=16777216 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 335.54 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 431.85 us
+SUMMARY op=softmax_row_tiling rows=4096 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=50331648 kernel_us=359.051 pred_us=431.846 err_pct=+20.3 bw_gbps=140.2 memset_us=272.174 other_dev_us=819.218 total_dev_us=1450.443
+-- softmax [4096,2048] tiles=16 (ROWS/tile=256)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op sub
+IO     output op1                    torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf0                   torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [4096, 2048] -> device [4096, 2048] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf2                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 50331648 B  (lx 5373952 B, ~free)
+MODEL -- estimate (turnaround): T = [(R+W)/BW_PEAK + a*min(R,W)] / eff_underfill --
+MODEL   R=33554432 B (read)   W=16777216 B (write)   loop_trip L=16
+MODEL   base = (R+W)/150 = 335.54 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   eff_underfill = min(1,(8.0/16)**0.35) = 0.785 -> (base+turn)/eff = 550.41 us
+MODEL   => T_model = 550.41 us
+SUMMARY op=softmax_row_tiling rows=4096 cols=2048 cores=32 tiles=16 lx=1 io_hbm_bytes=50331648 kernel_us=404.894 pred_us=550.413 err_pct=+35.9 bw_gbps=124.3 memset_us=334.598 other_dev_us=904.428 total_dev_us=1643.920
+-- softmax [4096,2048] tiles=32 (ROWS/tile=128)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op sub
+IO     output op1                    torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [4096, 2048] -> device [32, 4096, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf0                   torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [4096, 2048] -> device [4096, 2048] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf2                   torch [128, 2048] -> device [32, 128, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [128, 1] -> device [1, 128, 64] in LX = 8192 elems x 2B = 16384 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 50331648 B  (lx 2686976 B, ~free)
+MODEL -- estimate (turnaround): T = [(R+W)/BW_PEAK + a*min(R,W)] / eff_underfill --
+MODEL   R=33554432 B (read)   W=16777216 B (write)   loop_trip L=32
+MODEL   base = (R+W)/150 = 335.54 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   eff_underfill = min(1,(4.0/16)**0.35) = 0.616 -> (base+turn)/eff = 701.54 us
+MODEL   => T_model = 701.54 us
+SUMMARY op=softmax_row_tiling rows=4096 cols=2048 cores=32 tiles=32 lx=1 io_hbm_bytes=50331648 kernel_us=650.181 pred_us=701.535 err_pct=+7.9 bw_gbps=77.4 memset_us=828.999 other_dev_us=628.767 total_dev_us=2107.947
+-- softmax [8192,2048] tiles=4 (ROWS/tile=2048)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 42991616 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=4
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=4 lx=1 io_hbm_bytes=100663296 kernel_us=729.682 pred_us=863.691 err_pct=+18.4 bw_gbps=138.0 memset_us=495.943 other_dev_us=2323.006 total_dev_us=3548.631
+-- softmax [8192,2048] tiles=8 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=100663296 kernel_us=666.589 pred_us=863.691 err_pct=+29.6 bw_gbps=151.0 memset_us=476.650 other_dev_us=2296.858 total_dev_us=3440.097
+-- softmax [8192,2048] tiles=16 (ROWS/tile=512)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 10747904 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=16
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=16 lx=1 io_hbm_bytes=100663296 kernel_us=677.346 pred_us=863.691 err_pct=+27.5 bw_gbps=148.6 memset_us=530.696 other_dev_us=2263.442 total_dev_us=3471.484
+-- softmax [8192,2048] tiles=32 (ROWS/tile=256)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [256, 2048] -> device [32, 256, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [256, 1] -> device [1, 256, 64] in LX = 16384 elems x 2B = 32768 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 5373952 B, ~free)
+MODEL -- estimate (turnaround): T = [(R+W)/BW_PEAK + a*min(R,W)] / eff_underfill --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=32
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   eff_underfill = min(1,(8.0/16)**0.35) = 0.785 -> (base+turn)/eff = 1100.83 us
+MODEL   => T_model = 1100.83 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=32 lx=1 io_hbm_bytes=100663296 kernel_us=857.937 pred_us=1100.827 err_pct=+28.3 bw_gbps=117.3 memset_us=489.733 other_dev_us=2343.050 total_dev_us=3690.720
+-- softmax [16384,2048] tiles=4 (ROWS/tile=4096)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   op sub
+IO     output op1                    torch [4096, 2048] -> device [32, 4096, 64] in LX = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf0                   torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [4096, 2048] -> device [32, 4096, 64] in LX = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [4096, 2048] -> device [32, 4096, 64] in LX = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [4096, 2048] -> device [32, 4096, 64] in LX = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [16384, 2048] -> device [16384, 2048] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf2                   torch [4096, 2048] -> device [32, 4096, 64] in LX = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 201326592 B  (lx 85983232 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=134217728 B (read)   W=67108864 B (write)   loop_trip L=4
+MODEL   base = (R+W)/150 = 1342.18 us
+MODEL   turn = a*min(R,W) = 0.00574*67108864 = 385.20 us
+MODEL   => T_model = 1727.38 us
+SUMMARY op=softmax_row_tiling rows=16384 cols=2048 cores=32 tiles=4 lx=1 io_hbm_bytes=201326592 kernel_us=1552.316 pred_us=1727.382 err_pct=+11.3 bw_gbps=129.7 memset_us=1513.672 other_dev_us=2756.503 total_dev_us=5822.491
+-- softmax [16384,2048] tiles=8 (ROWS/tile=2048)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   op sub
+IO     output op1                    torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf0                   torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [16384, 2048] -> device [16384, 2048] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf2                   torch [2048, 2048] -> device [32, 2048, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [2048, 1] -> device [1, 2048, 64] in LX = 131072 elems x 2B = 262144 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 201326592 B  (lx 42991616 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=134217728 B (read)   W=67108864 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 1342.18 us
+MODEL   turn = a*min(R,W) = 0.00574*67108864 = 385.20 us
+MODEL   => T_model = 1727.38 us
+SUMMARY op=softmax_row_tiling rows=16384 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=201326592 kernel_us=1453.520 pred_us=1727.382 err_pct=+18.8 bw_gbps=138.5 memset_us=1125.392 other_dev_us=5941.255 total_dev_us=8520.167
+-- softmax [16384,2048] tiles=16 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [16384, 2048] -> device [16384, 2048] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 201326592 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=134217728 B (read)   W=67108864 B (write)   loop_trip L=16
+MODEL   base = (R+W)/150 = 1342.18 us
+MODEL   turn = a*min(R,W) = 0.00574*67108864 = 385.20 us
+MODEL   => T_model = 1727.38 us
+SUMMARY op=softmax_row_tiling rows=16384 cols=2048 cores=32 tiles=16 lx=1 io_hbm_bytes=201326592 kernel_us=1337.595 pred_us=1727.382 err_pct=+29.1 bw_gbps=150.5 memset_us=1151.812 other_dev_us=6064.572 total_dev_us=8553.979
+-- softmax [16384,2048] tiles=32 (ROWS/tile=512)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   op sub
+IO     output op1                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 2048] -> device [32, 16384, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf0                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [16384, 2048] -> device [16384, 2048] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf2                   torch [512, 2048] -> device [32, 512, 64] in LX = 1048576 elems x 2B = 2097152 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [512, 1] -> device [1, 512, 64] in LX = 32768 elems x 2B = 65536 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 201326592 B  (lx 10747904 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=134217728 B (read)   W=67108864 B (write)   loop_trip L=32
+MODEL   base = (R+W)/150 = 1342.18 us
+MODEL   turn = a*min(R,W) = 0.00574*67108864 = 385.20 us
+MODEL   => T_model = 1727.38 us
+SUMMARY op=softmax_row_tiling rows=16384 cols=2048 cores=32 tiles=32 lx=1 io_hbm_bytes=201326592 kernel_us=1383.608 pred_us=1727.382 err_pct=+24.8 bw_gbps=145.5 memset_us=1169.436 other_dev_us=6085.924 total_dev_us=8638.968
+## VAR softmax [8192,2048] tiles=8 x5 (variance)
+-- softmax [8192,2048] tiles=8 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=100663296 kernel_us=666.667 pred_us=863.691 err_pct=+29.6 bw_gbps=151.0 memset_us=577.030 other_dev_us=2049.918 total_dev_us=3293.615
+-- softmax [8192,2048] tiles=8 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=100663296 kernel_us=666.813 pred_us=863.691 err_pct=+29.5 bw_gbps=151.0 memset_us=548.446 other_dev_us=2370.882 total_dev_us=3586.141
+-- softmax [8192,2048] tiles=8 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=100663296 kernel_us=667.900 pred_us=863.691 err_pct=+29.3 bw_gbps=150.7 memset_us=465.963 other_dev_us=2230.694 total_dev_us=3364.557
+-- softmax [8192,2048] tiles=8 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=100663296 kernel_us=668.644 pred_us=863.691 err_pct=+29.2 bw_gbps=150.5 memset_us=500.404 other_dev_us=2333.478 total_dev_us=3502.526
+-- softmax [8192,2048] tiles=8 (ROWS/tile=1024)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   op sub
+IO     output op1                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 2048] -> device [32, 8192, 64] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf0                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 2048] -> device [8192, 2048] in HBM = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  buf2                   torch [1024, 2048] -> device [32, 1024, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [1024, 1] -> device [1, 1024, 64] in LX = 65536 elems x 2B = 131072 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 100663296 B  (lx 21495808 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=33554432 B (write)   loop_trip L=8
+MODEL   base = (R+W)/150 = 671.09 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 863.69 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=2048 cores=32 tiles=8 lx=1 io_hbm_bytes=100663296 kernel_us=667.284 pred_us=863.691 err_pct=+29.4 bw_gbps=150.9 memset_us=487.727 other_dev_us=2330.641 total_dev_us=3485.652
+## SP softmax COLS=4096 tiles=2: ROWS{6144,8192,10240,12288,16384}
+-- softmax [6144,4096] tiles=2 (ROWS/tile=3072)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [3072, 1] -> device [1, 3072, 64] in LX = 196608 elems x 2B = 393216 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [6144, 4096] -> device [64, 6144, 64] in HBM = 25165824 elems x 2B = 50331648 B  (hbm counted: 50331648 B)
+IO   op sub
+IO     output op1                    torch [3072, 4096] -> device [64, 3072, 64] in LX = 12582912 elems x 2B = 25165824 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [6144, 4096] -> device [64, 6144, 64] in HBM = 25165824 elems x 2B = 50331648 B  (hbm counted: 50331648 B)
+IO     input  buf0                   torch [3072, 1] -> device [1, 3072, 64] in LX = 196608 elems x 2B = 393216 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [3072, 4096] -> device [64, 3072, 64] in LX = 12582912 elems x 2B = 25165824 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [3072, 4096] -> device [64, 3072, 64] in LX = 12582912 elems x 2B = 25165824 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [3072, 1] -> device [1, 3072, 64] in LX = 196608 elems x 2B = 393216 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [3072, 4096] -> device [64, 3072, 64] in LX = 12582912 elems x 2B = 25165824 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [6144, 4096] -> device [6144, 4096] in HBM = 25165824 elems x 2B = 50331648 B  (hbm counted: 50331648 B)
+IO     input  buf2                   torch [3072, 4096] -> device [64, 3072, 64] in LX = 12582912 elems x 2B = 25165824 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [3072, 1] -> device [1, 3072, 64] in LX = 196608 elems x 2B = 393216 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 150994944 B  (lx 127401984 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=100663296 B (read)   W=50331648 B (write)   loop_trip L=2
+MODEL   base = (R+W)/150 = 1006.63 us
+MODEL   turn = a*min(R,W) = 0.00574*50331648 = 288.90 us
+MODEL   => T_model = 1295.54 us
+SUMMARY op=softmax_row_tiling rows=6144 cols=4096 cores=32 tiles=2 lx=1 io_hbm_bytes=150994944 kernel_us=1144.332 pred_us=1295.537 err_pct=+13.2 bw_gbps=132.0 memset_us=787.301 other_dev_us=3854.853 total_dev_us=5786.486
+-- softmax [8192,4096] tiles=2 (ROWS/tile=4096)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 4096] -> device [64, 8192, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   op sub
+IO     output op1                    torch [4096, 4096] -> device [64, 4096, 64] in LX = 16777216 elems x 2B = 33554432 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [8192, 4096] -> device [64, 8192, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf0                   torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [4096, 4096] -> device [64, 4096, 64] in LX = 16777216 elems x 2B = 33554432 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [4096, 4096] -> device [64, 4096, 64] in LX = 16777216 elems x 2B = 33554432 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [4096, 4096] -> device [64, 4096, 64] in LX = 16777216 elems x 2B = 33554432 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [8192, 4096] -> device [8192, 4096] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf2                   torch [4096, 4096] -> device [64, 4096, 64] in LX = 16777216 elems x 2B = 33554432 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [4096, 1] -> device [1, 4096, 64] in LX = 262144 elems x 2B = 524288 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 201326592 B  (lx 169869312 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=134217728 B (read)   W=67108864 B (write)   loop_trip L=2
+MODEL   base = (R+W)/150 = 1342.18 us
+MODEL   turn = a*min(R,W) = 0.00574*67108864 = 385.20 us
+MODEL   => T_model = 1727.38 us
+SUMMARY op=softmax_row_tiling rows=8192 cols=4096 cores=32 tiles=2 lx=1 io_hbm_bytes=201326592 kernel_us=1563.827 pred_us=1727.382 err_pct=+10.5 bw_gbps=128.7 memset_us=1180.978 other_dev_us=5290.352 total_dev_us=8035.157
+-- softmax [10240,4096] tiles=2 (ROWS/tile=5120)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [5120, 1] -> device [1, 5120, 64] in LX = 327680 elems x 2B = 655360 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [10240, 4096] -> device [64, 10240, 64] in HBM = 41943040 elems x 2B = 83886080 B  (hbm counted: 83886080 B)
+IO   op sub
+IO     output op1                    torch [5120, 4096] -> device [64, 5120, 64] in LX = 20971520 elems x 2B = 41943040 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [10240, 4096] -> device [64, 10240, 64] in HBM = 41943040 elems x 2B = 83886080 B  (hbm counted: 83886080 B)
+IO     input  buf0                   torch [5120, 1] -> device [1, 5120, 64] in LX = 327680 elems x 2B = 655360 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [5120, 4096] -> device [64, 5120, 64] in LX = 20971520 elems x 2B = 41943040 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [5120, 4096] -> device [64, 5120, 64] in LX = 20971520 elems x 2B = 41943040 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [5120, 1] -> device [1, 5120, 64] in LX = 327680 elems x 2B = 655360 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [5120, 4096] -> device [64, 5120, 64] in LX = 20971520 elems x 2B = 41943040 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [10240, 4096] -> device [10240, 4096] in HBM = 41943040 elems x 2B = 83886080 B  (hbm counted: 83886080 B)
+IO     input  buf2                   torch [5120, 4096] -> device [64, 5120, 64] in LX = 20971520 elems x 2B = 41943040 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [5120, 1] -> device [1, 5120, 64] in LX = 327680 elems x 2B = 655360 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 251658240 B  (lx 212336640 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=167772160 B (read)   W=83886080 B (write)   loop_trip L=2
+MODEL   base = (R+W)/150 = 1677.72 us
+MODEL   turn = a*min(R,W) = 0.00574*83886080 = 481.51 us
+MODEL   => T_model = 2159.23 us
+SUMMARY op=softmax_row_tiling rows=10240 cols=4096 cores=32 tiles=2 lx=1 io_hbm_bytes=251658240 kernel_us=2046.386 pred_us=2159.228 err_pct=+5.5 bw_gbps=123.0 memset_us=1493.058 other_dev_us=7903.417 total_dev_us=11442.861
+-- softmax [12288,4096] tiles=2 (ROWS/tile=6144)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [6144, 1] -> device [1, 6144, 64] in LX = 393216 elems x 2B = 786432 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [12288, 4096] -> device [64, 12288, 64] in HBM = 50331648 elems x 2B = 100663296 B  (hbm counted: 100663296 B)
+IO   op sub
+IO     output op1                    torch [6144, 4096] -> device [64, 6144, 64] in LX = 25165824 elems x 2B = 50331648 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [12288, 4096] -> device [64, 12288, 64] in HBM = 50331648 elems x 2B = 100663296 B  (hbm counted: 100663296 B)
+IO     input  buf0                   torch [6144, 1] -> device [1, 6144, 64] in LX = 393216 elems x 2B = 786432 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [6144, 4096] -> device [64, 6144, 64] in LX = 25165824 elems x 2B = 50331648 B  (hbm counted: 0 B)
+IO     input  buf1                   torch [6144, 4096] -> device [64, 6144, 64] in LX = 25165824 elems x 2B = 50331648 B  (hbm counted: 0 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [6144, 1] -> device [1, 6144, 64] in LX = 393216 elems x 2B = 786432 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [6144, 4096] -> device [64, 6144, 64] in LX = 25165824 elems x 2B = 50331648 B  (hbm counted: 0 B)
+IO   op div
+IO     output op4                    torch [12288, 4096] -> device [12288, 4096] in HBM = 50331648 elems x 2B = 100663296 B  (hbm counted: 100663296 B)
+IO     input  buf2                   torch [6144, 4096] -> device [64, 6144, 64] in LX = 25165824 elems x 2B = 50331648 B  (hbm counted: 0 B)
+IO     input  buf3                   torch [6144, 1] -> device [1, 6144, 64] in LX = 393216 elems x 2B = 786432 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 301989888 B  (lx 254803968 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=201326592 B (read)   W=100663296 B (write)   loop_trip L=2
+MODEL   base = (R+W)/150 = 2013.27 us
+MODEL   turn = a*min(R,W) = 0.00574*100663296 = 577.81 us
+MODEL   => T_model = 2591.07 us
+SUMMARY op=softmax_row_tiling rows=12288 cols=4096 cores=32 tiles=2 lx=1 io_hbm_bytes=301989888 kernel_us=2469.111 pred_us=2591.073 err_pct=+4.9 bw_gbps=122.3 memset_us=1733.773 other_dev_us=10980.525 total_dev_us=15183.409
+-- softmax [16384,4096] tiles=2 (ROWS/tile=8192)
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output op0                    torch [8192, 1] -> device [1, 8192, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [16384, 4096] -> device [64, 16384, 64] in HBM = 67108864 elems x 2B = 134217728 B  (hbm counted: 134217728 B)
+IO   op sub
+IO     output op1                    torch [8192, 4096] -> device [64, 8192, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  arg0_1                 torch [16384, 4096] -> device [64, 16384, 64] in HBM = 67108864 elems x 2B = 134217728 B  (hbm counted: 134217728 B)
+IO     input  buf0                   torch [8192, 1] -> device [1, 8192, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   op exp
+IO     output op2                    torch [8192, 4096] -> device [64, 8192, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf1                   torch [8192, 4096] -> device [64, 8192, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   op sum_1 [reduction]
+IO     output op3                    torch [8192, 1] -> device [1, 8192, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  buf2                   torch [8192, 4096] -> device [64, 8192, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   op div
+IO     output op4                    torch [16384, 4096] -> device [16384, 4096] in HBM = 67108864 elems x 2B = 134217728 B  (hbm counted: 134217728 B)
+IO     input  buf2                   torch [8192, 4096] -> device [64, 8192, 64] in HBM = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  buf3                   torch [8192, 1] -> device [1, 8192, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B) broadcast (loaded once)
+IO   => HBM I/O total = 738197504 B  (lx 4194304 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=469762048 B (read)   W=268435456 B (write)   loop_trip L=2
+MODEL   base = (R+W)/150 = 4921.32 us
+MODEL   turn = a*min(R,W) = 0.00574*268435456 = 1540.82 us
+MODEL   => T_model = 6462.14 us
+SUMMARY op=softmax_row_tiling rows=16384 cols=4096 cores=32 tiles=2 lx=1 io_hbm_bytes=738197504 kernel_us=9767.298 pred_us=6462.136 err_pct=-33.8 bw_gbps=75.6 memset_us=2394.492 other_dev_us=17264.898 total_dev_us=29426.688
+==== DONE -> forward haoyang_logs/softmax_terms_20260708_205629.log ====

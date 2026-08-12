@@ -1,0 +1,131 @@
+$ SPYRE_DUMP_COST=1 BENCH_OP=matmul_row_tiling BENCH_COLS=2048 BENCH_ROWS=2048 BENCH_N=2048 BENCH_TILES=4 python docs/source/user_guide/examples/profile_ops.py 
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mm           read=16777216B write=8388608B lx=0B loop_trip=4 [reduction: combine 0ns (k=1)]
+      output op0                    torch [2048, 2048] -> device [2048, 2048] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg1_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+  -- prediction (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+     R=16777216B (read)   W=8388608B (write)
+     compute = MACs/cores/(mac_peak*pt_eff) = 8589934592/32/(1536*1.000) = 174.76 us  (M/m=64, pt_eff=1.000)
+     base = R/143 + W/156 = 171.10 us
+     turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+     => T_model = 394.01 us
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mm           read=16777216B write=8388608B lx=0B loop_trip=4 [reduction: combine 0ns (k=1)]
+      output op0                    torch [2048, 2048] -> device [2048, 2048] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg1_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+  -- prediction (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+     R=16777216B (read)   W=8388608B (write)
+     compute = MACs/cores/(mac_peak*pt_eff) = 8589934592/32/(1536*1.000) = 174.76 us  (M/m=64, pt_eff=1.000)
+     base = R/143 + W/156 = 171.10 us
+     turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+     => T_model = 394.01 us
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mm           read=16777216B write=8388608B lx=0B loop_trip=4 [reduction: combine 0ns (k=1)]
+      output op0                    torch [2048, 2048] -> device [2048, 2048] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg1_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+  -- prediction (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+     R=16777216B (read)   W=8388608B (write)
+     compute = MACs/cores/(mac_peak*pt_eff) = 8589934592/32/(1536*1.000) = 174.76 us  (M/m=64, pt_eff=1.000)
+     base = R/143 + W/156 = 171.10 us
+     turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+     => T_model = 394.01 us
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mm           read=16777216B write=8388608B lx=0B loop_trip=4 [reduction: combine 0ns (k=1)]
+      output op0                    torch [2048, 2048] -> device [2048, 2048] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg1_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+  -- prediction (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+     R=16777216B (read)   W=8388608B (write)
+     compute = MACs/cores/(mac_peak*pt_eff) = 8589934592/32/(1536*1.000) = 174.76 us  (M/m=64, pt_eff=1.000)
+     base = R/143 + W/156 = 171.10 us
+     turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+     => T_model = 394.01 us
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mm           read=16777216B write=8388608B lx=0B loop_trip=4 [reduction: combine 0ns (k=1)]
+      output op0                    torch [2048, 2048] -> device [2048, 2048] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg1_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+  -- prediction (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+     R=16777216B (read)   W=8388608B (write)
+     compute = MACs/cores/(mac_peak*pt_eff) = 8589934592/32/(1536*1.000) = 174.76 us  (M/m=64, pt_eff=1.000)
+     base = R/143 + W/156 = 171.10 us
+     turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+     => T_model = 394.01 us
+
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  mm           read=16777216B write=8388608B lx=0B loop_trip=4 [reduction: combine 0ns (k=1)]
+      output op0                    torch [2048, 2048] -> device [2048, 2048] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+      input  arg1_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM  | 4194304 elems x 2B = 8388608 B (hbm counted: 8388608 B)
+  -- prediction (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+     R=16777216B (read)   W=8388608B (write)
+     compute = MACs/cores/(mac_peak*pt_eff) = 8589934592/32/(1536*1.000) = 174.76 us  (M/m=64, pt_eff=1.000)
+     base = R/143 + W/156 = 171.10 us
+     turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+     => T_model = 394.01 us
+
+[W701 21:28:39.340021710 collection.cpp:1077] Warning: Detected an event which was likely passed to kineto by the PyTorch profiler, but is not present in the set of known events: [memory] This most likely means that Kineto has not maintained address stability for this event. Please report this to the PyTorch team. (function operator())
+== matmul_row_tiling[2048x2048] -- profiler kernel time vs cost-model I/O ==
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    Self SPYRE  Self SPYRE %   SPYRE total  SPYRE time avg       CPU Mem  Self CPU Mem     SPYRE Mem  Self SPYRE Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                                0.00%       0.000us         0.00%       0.000us       0.000us     437.342us        42.42%     437.342us     218.671us           0 B           0 B           0 B           0 B             2  
+                                          Memcpy (DtoH)         0.00%       0.000us         0.00%       0.000us       0.000us     269.671us        26.16%     269.671us     134.836us           0 B           0 B           0 B           0 B             2  
+                                          Memcpy (HtoD)         0.00%       0.000us         0.00%       0.000us       0.000us     162.849us        15.80%     162.849us      81.425us           0 B           0 B           0 B           0 B             2  
+                                        Memset (Device)         0.00%       0.000us         0.00%       0.000us       0.000us     161.142us        15.63%     161.142us      40.285us           0 B           0 B           0 B           0 B             4  
+                               TorchDynamo Cache Lookup         0.00%      92.271us         0.00%      92.271us      18.454us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             5  
+                             Torch-Compiled Region: 0/0         0.00%      12.706us        99.71%        5.461s        5.461s       0.000us         0.00%       0.000us       0.000us           0 B           0 B       8.08 MB           0 B             1  
+                             Torch-Compiled Region: 1/0         0.00%      14.622us         0.00%      14.622us       7.311us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+                             Torch-Compiled Region: 3/0         0.01%     480.441us        99.71%        5.461s        5.461s       0.000us         0.00%       0.000us       0.000us           0 B           0 B       8.08 MB           0 B             1  
+                                                 dynamo         0.03%       1.727ms        99.69%        5.460s        5.460s       0.000us         0.00%       0.000us       0.000us           0 B           0 B      77.00 KB           0 B             1  
+                            dynamo_data: compile_id=4/5         0.00%      29.535us         0.00%      29.535us      29.535us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                                   entire_frame_compile         0.00%      28.234us        99.66%        5.459s        5.459s       0.000us         0.00%       0.000us       0.000us           0 B           0 B      77.00 KB           0 B             1  
+entire_frame_compile_data: fn_name=_compile.compile_...         0.00%       6.622us         0.00%       6.622us       6.622us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                  _compile.compile_inner (dynamo_timed)         0.01%     630.783us        99.66%        5.459s        5.459s       0.000us         0.00%       0.000us       0.000us           0 B           0 B      77.00 KB           0 B             1  
+                                      compile_attempt_0         0.00%      22.283us        99.43%        5.446s        5.446s       0.000us         0.00%       0.000us       0.000us       8.00 MB           0 B      77.00 KB           0 B             1  
+                 compile_attempt_0_data: compile_id=4/5         0.00%       7.515us         0.00%       7.515us       7.515us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                       compile_attempt_0 (dynamo_timed)         0.05%       2.652ms        99.43%        5.446s        5.446s       0.000us         0.00%       0.000us       0.000us       8.00 MB           0 B      77.00 KB           0 B             1  
+                                       bytecode_tracing         0.00%      28.749us         0.07%       3.881ms       3.881ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                  bytecode_tracing_data: compile_id=4/5         0.00%      10.706us         0.00%      10.706us      10.706us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                        bytecode_tracing (dynamo_timed)         0.07%       3.563ms         0.07%       3.841ms       3.841ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                                    aten::empty_strided         0.00%     236.470us         0.01%     382.965us       8.906us       0.000us         0.00%       0.000us       0.000us       8.01 MB       8.01 MB           0 B           0 B            43  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 5.477s
+Self SPYRE time total: 1.031ms
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mm [reduction]
+IO     output op0                    torch [2048, 2048] -> device [2048, 2048] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   => HBM I/O total = 25165824 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=8388608 B (write)   loop_trip L=4
+MODEL   compute = MACs/cores/(mac_peak*pt_eff) = 8589934592/32/(1536*1.000) = 174.76 us  (M/m=64, pt_eff=1.000)
+MODEL   base = R/143+W/156 = 171.10 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 394.01 us
+SUMMARY op=matmul_row_tiling rows=2048 cols=2048 cores=32 tiles=4 lx=1 io_hbm_bytes=25165824 kernel_us=437.342 pred_us=394.010 err_pct=-9.9 bw_gbps=57.5 memset_us=161.142 other_dev_us=432.520 total_dev_us=1031.004

@@ -1,0 +1,16 @@
+==== golden profiler re-sweep Thu Jun 18 18:08:41 UTC 2026 ====
+git: 225b70e  sections: A
+## A size-sweep fit (neg, gelu)
+SUMMARY op=neg rows=512 cols=512 elems=262144 kernel_us=8.576 memset_us=26.792 other_dev_us=0.000 total_dev_us=35.368
+SUMMARY op=gelu rows=512 cols=512 elems=262144 kernel_us=8.509 memset_us=36.799 other_dev_us=0.000 total_dev_us=45.308
+SUMMARY op=neg rows=512 cols=1024 elems=524288 kernel_us=17.534 memset_us=26.478 other_dev_us=0.000 total_dev_us=44.012
+SUMMARY op=gelu rows=512 cols=1024 elems=524288 kernel_us=17.116 memset_us=25.079 other_dev_us=0.000 total_dev_us=42.195
+SUMMARY op=neg rows=512 cols=2048 elems=1048576 kernel_us=37.372 memset_us=41.461 other_dev_us=0.000 total_dev_us=78.833
+SUMMARY op=gelu rows=512 cols=2048 elems=1048576 kernel_us=37.729 memset_us=38.935 other_dev_us=0.000 total_dev_us=76.664
+SUMMARY op=neg rows=512 cols=4096 elems=2097152 kernel_us=80.166 memset_us=55.837 other_dev_us=0.000 total_dev_us=136.003
+SUMMARY op=gelu rows=512 cols=4096 elems=2097152 kernel_us=80.539 memset_us=93.784 other_dev_us=0.000 total_dev_us=174.323
+SUMMARY op=neg rows=512 cols=8192 elems=4194304 kernel_us=154.785 memset_us=128.455 other_dev_us=0.000 total_dev_us=283.240
+SUMMARY op=gelu rows=512 cols=8192 elems=4194304 kernel_us=165.534 memset_us=141.489 other_dev_us=0.000 total_dev_us=307.023
+SUMMARY op=neg rows=512 cols=16384 elems=8388608 kernel_us=320.568 memset_us=244.559 other_dev_us=0.000 total_dev_us=565.127
+SUMMARY op=gelu rows=512 cols=16384 elems=8388608 kernel_us=333.630 memset_us=221.655 other_dev_us=0.000 total_dev_us=555.285
+==== DONE -> forward haoyang_logs/profile_sweep_20260618_180841.log ====

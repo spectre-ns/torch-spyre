@@ -1,0 +1,432 @@
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] Output code: 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] # AOT ID: ['0_inference']
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from ctypes import c_void_p, c_long, c_int
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] import torch
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] import math
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] import random
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] import os
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] import tempfile
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from math import inf, nan
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from cmath import nanj
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch._inductor.hooks import run_intermediate_hooks
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch._inductor.utils import maybe_profile
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch._inductor.codegen.memory_planning import _align as align
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch import device, empty_strided
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch._inductor.async_compile import AsyncCompile
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch._inductor.select_algorithm import extern_kernels
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from sympy import sympify
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch_spyre.execution.async_compile import SpyreAsyncCompile
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] import subprocess
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] aten = torch.ops.aten
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] inductor_ops = torch.ops.inductor
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] _quantized = torch.ops._quantized
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] assert_alignment = torch._C._dynamo.guards.assert_alignment
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] empty_strided_cpu_pinned = torch._C._dynamo.guards._empty_strided_cpu_pinned
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] empty_strided_mtia = torch._C._dynamo.guards._empty_strided_mtia
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] alloc_from_pool = torch.ops.inductor._alloc_from_pool
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] async_compile = AsyncCompile()
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch_spyre._C import reinterpret_tensor as reinterpret_tensor
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] from torch_spyre._C import reinterpret_tensor_with_layout
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] del async_compile
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] async_compile = SpyreAsyncCompile()
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] # Topologically Sorted Source Nodes: [_softmax_default], Original ATen: [aten._softmax]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] # Source node to ATen node mapping:
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   _softmax_default => amax, div, exp, sub, sum_1
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] # Graph fragment:
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %arg0_1 : Tensor "f16[512, 1024][1024, 1]spyre:0" = PlaceHolder[target=arg0_1]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %amax : Tensor "f16[1, 1024][1024, 1]spyre:0" = PlaceHolder[target=amax]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %sub : Tensor "f16[512, 1024][1024, 1]spyre:0" = PlaceHolder[target=sub]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %exp : Tensor "f16[512, 1024][1024, 1]spyre:0" = PlaceHolder[target=exp]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %sum_1 : Tensor "f16[1, 1024][1024, 1]spyre:0" = PlaceHolder[target=sum_1]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %amax : Tensor "f16[1, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.amax.default](args = (%arg0_1, [0], True), kwargs = {})
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %sub : Tensor "f16[512, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.sub.Tensor](args = (%arg0_1, %amax), kwargs = {})
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %exp : Tensor "f16[512, 1024][1024, 1]spyre:0"[num_users=2] = call_function[target=torch.ops.aten.exp.default](args = (%sub,), kwargs = {})
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %sum_1 : Tensor "f16[1, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.sum.dim_IntList](args = (%exp, [0], True), kwargs = {})
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   %div : Tensor "f16[512, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.div.Tensor](args = (%exp, %sum_1), kwargs = {})
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] #   return %amax,%sub,%exp,%sum_1,%div
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] sdsc_fused__softmax_0 = async_compile.sdsc('sdsc_fused__softmax_0',
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]     [
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         OpSpec(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op='max',
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             is_reduction=True,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             iteration_space={sympify('c0'): (sympify('1024'), 16), sympify('c1'): (sympify('512'), 2)},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op_info={},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             args=[
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=True, arg_index=0, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(c0/64)'), sympify('c1'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'hbm': 17179869184},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(c0/64)'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             ]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         OpSpec(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op='sub',
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             is_reduction=False,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             iteration_space={sympify('d0'): (sympify('512'), 32), sympify('d1'): (sympify('1024'), 1)},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op_info={},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             args=[
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=True, arg_index=0, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'hbm': 17179869184},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(d1/64)'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'lx': 0},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             ]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         OpSpec(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op='exp',
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             is_reduction=False,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             iteration_space={sympify('d0'): (sympify('512'), 32), sympify('d1'): (sympify('1024'), 1)},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op_info={},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             args=[
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'lx': 0},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'pool': 2048},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             ]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         OpSpec(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op='sum',
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             is_reduction=True,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             iteration_space={sympify('c0'): (sympify('1024'), 16), sympify('c1'): (sympify('512'), 2)},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op_info={},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             args=[
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(c0/64)'), sympify('c1'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'pool': 2048},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(c0/64)'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             ]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         OpSpec(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op='realdiv',
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             is_reduction=False,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             iteration_space={sympify('d0'): (sympify('1024'), 1), sympify('d1'): (sympify('512'), 32)},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             op_info={},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             args=[
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(d0/64)'), sympify('d1'), sympify('Mod(d0, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'pool': 2048},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(d0/64)'), sympify('Mod(d0, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 TensorArg(
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     is_input=False, arg_index=1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     device_coordinates=[sympify('floor(d0/64)'), sympify('d1'), sympify('Mod(d0, 64)')],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     allocation={'hbm': 34359738368},
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]                 ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             ]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         ),
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]     ]
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] )
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] async_compile.wait(globals())
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] del async_compile
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] class Runner:
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]     def __init__(self, partitions):
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         self.partitions = partitions
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]     def recursively_apply_fns(self, fns):
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         new_callables = []
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         for fn, c in zip(fns, self.partitions):
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]             new_callables.append(fn(c))
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         self.partitions = new_callables
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]     def call(self, args):
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         arg0_1, = args
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         args.clear()
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         assert_size_stride(arg0_1, (512, 1024), (1024, 1))
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         buf4 = spyre_empty_with_layout((512, 1024), (1024, 1), torch.float16, SpyreTensorLayout(device_size=[16, 512, 64], stride_map =[64, 1024, 1], device_dtype=DataFormats.SEN169_FP16))
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         _pool = spyre_empty_with_layout((8208,), (1,), torch.uint8, SpyreTensorLayout(device_size=[8208, 1, 1], stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         sdsc_fused__softmax_0.run(_pool, arg0_1, buf4)
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         del arg0_1
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         del _pool
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code]         return (buf4, )
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] runner = Runner(partitions=[])
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] call = runner.call
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] recursively_apply_fns = runner.recursively_apply_fns
+V0602 20:06:33.195000 18436 torch/_inductor/codecache.py:1347] [0/0] [__output_code] 
+V0602 20:06:33.196000 18436 torch/_inductor/codecache.py:1348] [0/0] [__output_code] Output code written to: /tmp/torchinductor_haoyang/xq/cxqwjxea2fin6lzaw6ft36pd2ysn2dp2w43ekaco3p7v7m7bhctu.py
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] Output code: 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] # AOT ID: ['0_inference']
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from ctypes import c_void_p, c_long, c_int
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] import torch
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] import math
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] import random
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] import os
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] import tempfile
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from math import inf, nan
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from cmath import nanj
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch._inductor.hooks import run_intermediate_hooks
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch._inductor.utils import maybe_profile
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch._inductor.codegen.memory_planning import _align as align
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch import device, empty_strided
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch._inductor.async_compile import AsyncCompile
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch._inductor.select_algorithm import extern_kernels
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from sympy import sympify
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch_spyre.execution.async_compile import SpyreAsyncCompile
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] import subprocess
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] aten = torch.ops.aten
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] inductor_ops = torch.ops.inductor
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] _quantized = torch.ops._quantized
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] assert_alignment = torch._C._dynamo.guards.assert_alignment
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] empty_strided_cpu_pinned = torch._C._dynamo.guards._empty_strided_cpu_pinned
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] empty_strided_xpu = torch._C._dynamo.guards._empty_strided_xpu
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] empty_strided_mtia = torch._C._dynamo.guards._empty_strided_mtia
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] reinterpret_tensor = torch._C._dynamo.guards._reinterpret_tensor
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] alloc_from_pool = torch.ops.inductor._alloc_from_pool
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] async_compile = AsyncCompile()
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] empty_strided_p2p = torch._C._distributed_c10d._SymmetricMemory.empty_strided_p2p
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch_spyre._C import reinterpret_tensor as reinterpret_tensor
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] from torch_spyre._C import reinterpret_tensor_with_layout
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] del async_compile
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] async_compile = SpyreAsyncCompile()
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] # Topologically Sorted Source Nodes: [_softmax_default], Original ATen: [aten._softmax]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] # Source node to ATen node mapping:
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   _softmax_default => amax, div, exp, sub, sum_1
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] # Graph fragment:
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %arg0_1 : Tensor "f16[512, 1024][1024, 1]spyre:0" = PlaceHolder[target=arg0_1]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %amax : Tensor "f16[1, 1024][1024, 1]spyre:0" = PlaceHolder[target=amax]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %sub : Tensor "f16[512, 1024][1024, 1]spyre:0" = PlaceHolder[target=sub]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %exp : Tensor "f16[512, 1024][1024, 1]spyre:0" = PlaceHolder[target=exp]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %sum_1 : Tensor "f16[1, 1024][1024, 1]spyre:0" = PlaceHolder[target=sum_1]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %amax : Tensor "f16[1, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.amax.default](args = (%arg0_1, [0], True), kwargs = {})
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %sub : Tensor "f16[512, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.sub.Tensor](args = (%arg0_1, %amax), kwargs = {})
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %exp : Tensor "f16[512, 1024][1024, 1]spyre:0"[num_users=2] = call_function[target=torch.ops.aten.exp.default](args = (%sub,), kwargs = {})
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %sum_1 : Tensor "f16[1, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.sum.dim_IntList](args = (%exp, [0], True), kwargs = {})
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   %div : Tensor "f16[512, 1024][1024, 1]spyre:0"[num_users=1] = call_function[target=torch.ops.aten.div.Tensor](args = (%exp, %sum_1), kwargs = {})
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] #   return %amax,%sub,%exp,%sum_1,%div
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] sdsc_fused__softmax_0 = async_compile.sdsc('sdsc_fused__softmax_0',
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]     [
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         OpSpec(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op='max',
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             is_reduction=True,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             iteration_space={sympify('c0'): (sympify('1024'), 16), sympify('c1'): (sympify('512'), 2)},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op_info={},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             args=[
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=True, arg_index=0, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(c0/64)'), sympify('c1'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'hbm': 17179869184},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(c0/64)'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             ]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         OpSpec(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op='sub',
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             is_reduction=False,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             iteration_space={sympify('d0'): (sympify('512'), 32), sympify('d1'): (sympify('1024'), 1)},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op_info={},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             args=[
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=True, arg_index=0, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'hbm': 17179869184},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(d1/64)'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'lx': 0},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             ]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         OpSpec(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op='exp',
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             is_reduction=False,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             iteration_space={sympify('d0'): (sympify('512'), 32), sympify('d1'): (sympify('1024'), 1)},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op_info={},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             args=[
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'lx': 0},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'pool': 2048},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             ]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         OpSpec(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op='sum',
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             is_reduction=True,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             iteration_space={sympify('c0'): (sympify('1024'), 16), sympify('c1'): (sympify('512'), 2)},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op_info={},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             args=[
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(c0/64)'), sympify('c1'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'pool': 2048},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(c0/64)'), sympify('Mod(c0, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             ]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         OpSpec(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op='realdiv',
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             is_reduction=False,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             iteration_space={sympify('d0'): (sympify('1024'), 1), sympify('d1'): (sympify('512'), 32)},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             op_info={},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             args=[
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(d0/64)'), sympify('d1'), sympify('Mod(d0, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'pool': 2048},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[1, 16, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('0'), sympify('floor(d0/64)'), sympify('Mod(d0, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'pool': 0},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, -1, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 TensorArg(
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     is_input=False, arg_index=1, device_dtype=DataFormats.SEN169_FP16,
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_size=[16, 512, 64],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     device_coordinates=[sympify('floor(d0/64)'), sympify('d1'), sympify('Mod(d0, 64)')],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     allocation={'hbm': 34359738368},
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                     stride_map=[64, 1024, 1],
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]                 ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             ]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         ),
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]     ]
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] )
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] async_compile.wait(globals())
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] del async_compile
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] class Runner:
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]     def __init__(self, partitions):
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         self.partitions = partitions
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]     def recursively_apply_fns(self, fns):
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         new_callables = []
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         for fn, c in zip(fns, self.partitions):
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]             new_callables.append(fn(c))
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         self.partitions = new_callables
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]     def call(self, args):
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         arg0_1, = args
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         args.clear()
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         assert_size_stride(arg0_1, (512, 1024), (1024, 1))
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         buf4 = spyre_empty_with_layout((512, 1024), (1024, 1), torch.float16, SpyreTensorLayout(device_size=[16, 512, 64], stride_map =[64, 1024, 1], device_dtype=DataFormats.SEN169_FP16))
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         _pool = spyre_empty_with_layout((8208,), (1,), torch.uint8, SpyreTensorLayout(device_size=[8208, 1, 1], stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         sdsc_fused__softmax_0.run(_pool, arg0_1, buf4)
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         del arg0_1
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         del _pool
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code]         return (buf4, )
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] runner = Runner(partitions=[])
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] call = runner.call
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] recursively_apply_fns = runner.recursively_apply_fns
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1347] [1/0] [__output_code] 
+V0602 20:06:33.877000 18436 torch/_inductor/codecache.py:1348] [1/0] [__output_code] Output code written to: /tmp/torchinductor_haoyang/xq/cxqwjxea2fin6lzaw6ft36pd2ysn2dp2w43ekaco3p7v7m7bhctu.py

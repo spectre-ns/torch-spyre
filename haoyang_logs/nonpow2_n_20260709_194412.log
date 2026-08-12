@@ -1,0 +1,58 @@
+==== nonpow2-N sweep Thu Jul  9 19:44:12 UTC 2026 ====
+git: 2faf53c  sections: NP
+## NP M=2048 K=2048 4x8x1, N{4096..4608 step 64} (per-core tile 512..576)
+-- mmwd M=2048 K=2048 N=4096 m=4 n=8 k=1 (N/n=512,  tile_stick_pad=0)
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mm [reduction]
+IO     output op0                    torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 41943040 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=25165824 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   compute = MACs/cores/(mac_peak*pt_eff) = 17179869184/32/(1140*1.000) = 470.94 us  (M/m=512, pt_eff=1.000)
+MODEL   base = R/143+W/156 = 283.53 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 696.19 us
+SUMMARY op=mmwd rows=2048 cols=2048 cores=32 tiles=0 lx=1 io_hbm_bytes=41943040 kernel_us=775.424 pred_us=696.187 err_pct=-10.2 bw_gbps=54.1 memset_us=251.713 other_dev_us=958.822 total_dev_us=1985.959
+-- mmwd M=2048 K=2048 N=4160 m=4 n=8 k=1 (N/n=520,  tile_stick_pad=56)
+SUMMARY op=mmwd rows=2048 cols=2048 tiles=0 lx=1 FAILED reason=InductorError: Unsupported: Spyre backend does not support: work_division_hint: buf0 dim d1 size=65 is not evenly divisible by split=8.
+-- mmwd M=2048 K=2048 N=4224 m=4 n=8 k=1 (N/n=528,  tile_stick_pad=48)
+SUMMARY op=mmwd rows=2048 cols=2048 tiles=0 lx=1 FAILED reason=InductorError: Unsupported: Spyre backend does not support: work_division_hint: buf0 dim d1 size=66 is not evenly divisible by split=8.
+-- mmwd M=2048 K=2048 N=4288 m=4 n=8 k=1 (N/n=536,  tile_stick_pad=40)
+SUMMARY op=mmwd rows=2048 cols=2048 tiles=0 lx=1 FAILED reason=InductorError: Unsupported: Spyre backend does not support: work_division_hint: buf0 dim d1 size=67 is not evenly divisible by split=8.
+-- mmwd M=2048 K=2048 N=4352 m=4 n=8 k=1 (N/n=544,  tile_stick_pad=32)
+SUMMARY op=mmwd rows=2048 cols=2048 tiles=0 lx=1 FAILED reason=InductorError: Unsupported: Spyre backend does not support: work_division_hint: buf0 dim d1 size=68 is not evenly divisible by split=8.
+-- mmwd M=2048 K=2048 N=4416 m=4 n=8 k=1 (N/n=552,  tile_stick_pad=24)
+SUMMARY op=mmwd rows=2048 cols=2048 tiles=0 lx=1 FAILED reason=InductorError: Unsupported: Spyre backend does not support: work_division_hint: buf0 dim d1 size=69 is not evenly divisible by split=8.
+-- mmwd M=2048 K=2048 N=4480 m=4 n=8 k=1 (N/n=560,  tile_stick_pad=16)
+SUMMARY op=mmwd rows=2048 cols=2048 tiles=0 lx=1 FAILED reason=InductorError: Unsupported: Spyre backend does not support: work_division_hint: buf0 dim d1 size=70 is not evenly divisible by split=8.
+-- mmwd M=2048 K=2048 N=4544 m=4 n=8 k=1 (N/n=568,  tile_stick_pad=8)
+SUMMARY op=mmwd rows=2048 cols=2048 tiles=0 lx=1 FAILED reason=InductorError: Unsupported: Spyre backend does not support: work_division_hint: buf0 dim d1 size=71 is not evenly divisible by split=8.
+-- mmwd M=2048 K=2048 N=4608 m=4 n=8 k=1 (N/n=576,  tile_stick_pad=0)
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+  op_it_space_splits={d0: 4, d1: 8, d2: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mm [reduction]
+IO     output op0                    torch [2048, 4608] -> device [72, 2048, 64] in HBM = 9437184 elems x 2B = 18874368 B  (hbm counted: 18874368 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [2048, 4608] -> device [72, 2048, 64] in HBM = 9437184 elems x 2B = 18874368 B  (hbm counted: 18874368 B)
+IO   => HBM I/O total = 46137344 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = compute + (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=27262976 B (read)   W=18874368 B (write)   loop_trip L=1
+MODEL   compute = MACs/cores/(mac_peak*pt_eff) = 19327352832/32/(1140*1.000) = 529.81 us  (M/m=512, pt_eff=1.000)
+MODEL   base = R/143+W/156 = 311.64 us
+MODEL   turn = a*min(R,W) = 0.00574*18874368 = 108.34 us
+MODEL   => T_model = 791.73 us
+SUMMARY op=mmwd rows=2048 cols=2048 cores=32 tiles=0 lx=1 io_hbm_bytes=46137344 kernel_us=956.008 pred_us=791.734 err_pct=-17.2 bw_gbps=48.3 memset_us=350.501 other_dev_us=1127.261 total_dev_us=2433.770
+==== DONE -> forward haoyang_logs/nonpow2_n_20260709_194412.log ====

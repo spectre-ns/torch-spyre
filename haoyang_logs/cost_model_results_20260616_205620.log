@@ -1,0 +1,671 @@
+================ cost-model calibration run ================
+date:    Tue Jun 16 20:56:20 UTC 2026
+examples/run_cost_model_plan.sh: line 42: hostname: command not found
+host:    
+git:     7991c09 dev1
+python:  3.12.13 torch 2.11.0+cpu
+runs=100 warmup=20  SENCORES=default(32)
+log:     haoyang_logs/cost_model_results_20260616_205620.log
+===========================================================
+
+########################################################################
+## RUNG8 bandwidth: neg[512x1024]
+## + env BENCH_BW_OP=neg BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  neg          out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+bandwidth probe: op=neg shape=[512x1024] elems=524288 passes=2 bytes=2097152  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_neg_0                            100     38.521     42.725     52.011
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   54.4 GB/s  (2097152 B / 38.52 us, 1 kernel(s))  = 27% of 204.8 peak
+  BW excl. fill:  113.2 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: neg[512x4096]
+## + env BENCH_BW_OP=neg BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  neg          out=2097152 cores=32 hbm=8388608B lx=0B
+      output hbm 2097152 elems
+      input  hbm 2097152 elems
+  => T = 20000ns(fill) + 8388608/111.0  (lx 0B: ~free) = 95.57 us
+
+bandwidth probe: op=neg shape=[512x4096] elems=2097152 passes=2 bytes=8388608  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_neg_0                            100     96.350    100.823    112.103
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   87.1 GB/s  (8388608 B / 96.35 us, 1 kernel(s))  = 43% of 204.8 peak
+  BW excl. fill:  109.9 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: neg[512x16384]
+## + env BENCH_BW_OP=neg BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  neg          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=neg shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_neg_0                            100    310.224    330.521    345.183
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  108.2 GB/s  (33554432 B / 310.22 us, 1 kernel(s))  = 53% of 204.8 peak
+  BW excl. fill:  115.6 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: neg[512x65536]
+## + env BENCH_BW_OP=neg BENCH_ROWS=512 BENCH_COLS=65536 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  neg          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+  => T = 20000ns(fill) + 134217728/111.0  (lx 0B: ~free) = 1229.17 us
+
+bandwidth probe: op=neg shape=[512x65536] elems=33554432 passes=2 bytes=134217728  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_neg_0                            100   1346.585   1354.257   1363.998
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   99.7 GB/s  (134217728 B / 1346.59 us, 1 kernel(s))  = 49% of 204.8 peak
+  BW excl. fill:  101.2 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: copy[512x1024]
+## + env BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=524288 cores=32 hbm=2097152B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems
+      input  hbm 524288 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 2097152/111.0  (lx 0B: ~free) = 38.89 us
+
+bandwidth probe: op=copy shape=[512x1024] elems=524288 passes=2 bytes=2097152  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     36.617     41.297     47.700
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   57.3 GB/s  (2097152 B / 36.62 us, 1 kernel(s))  = 28% of 204.8 peak
+  BW excl. fill:  126.2 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: copy[512x4096]
+## + env BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=2097152 cores=32 hbm=8388608B lx=0B
+      output hbm 2097152 elems
+      input  hbm 2097152 elems
+      input  hbm 2097152 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 8388608/111.0  (lx 0B: ~free) = 95.57 us
+
+bandwidth probe: op=copy shape=[512x4096] elems=2097152 passes=2 bytes=8388608  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     96.132    103.817    114.935
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   87.3 GB/s  (8388608 B / 96.13 us, 1 kernel(s))  = 43% of 204.8 peak
+  BW excl. fill:  110.2 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: copy[512x16384]
+## + env BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    335.908    349.377    363.523
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   99.9 GB/s  (33554432 B / 335.91 us, 1 kernel(s))  = 49% of 204.8 peak
+  BW excl. fill:  106.2 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: copy[512x65536]
+## + env BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=65536 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 134217728/111.0  (lx 0B: ~free) = 1229.17 us
+
+bandwidth probe: op=copy shape=[512x65536] elems=33554432 passes=2 bytes=134217728  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100   1369.472   1385.423   1400.014
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   98.0 GB/s  (134217728 B / 1369.47 us, 1 kernel(s))  = 48% of 204.8 peak
+  BW excl. fill:   99.5 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: read[512x1024]
+## + env BENCH_BW_OP=read BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  sum_1        out=512 cores=32 hbm=2048B lx=0B [reduction: NOT modeled]
+      output hbm 512 elems
+      input  hbm 512 elems
+  => T = 20000ns(fill) + 2048/111.0  (lx 0B: ~free) = 20.02 us
+
+bandwidth probe: op=read shape=[512x1024] elems=524288 passes=1 bytes=1048576  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_sum_0                            100     27.231     33.260     46.639
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   38.5 GB/s  (1048576 B / 27.23 us, 1 kernel(s))  = 19% of 204.8 peak
+  BW excl. fill:  145.0 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: read[512x4096]
+## + env BENCH_BW_OP=read BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  sum_1        out=512 cores=32 hbm=2048B lx=0B [reduction: NOT modeled]
+      output hbm 512 elems
+      input  hbm 512 elems
+  => T = 20000ns(fill) + 2048/111.0  (lx 0B: ~free) = 20.02 us
+
+bandwidth probe: op=read shape=[512x4096] elems=2097152 passes=1 bytes=4194304  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_sum_0                            100     47.960     50.962     57.973
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   87.5 GB/s  (4194304 B / 47.96 us, 1 kernel(s))  = 43% of 204.8 peak
+  BW excl. fill:  150.0 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: read[512x16384]
+## + env BENCH_BW_OP=read BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  sum_1        out=512 cores=32 hbm=2048B lx=0B [reduction: NOT modeled]
+      output hbm 512 elems
+      input  hbm 512 elems
+  => T = 20000ns(fill) + 2048/111.0  (lx 0B: ~free) = 20.02 us
+
+bandwidth probe: op=read shape=[512x16384] elems=8388608 passes=1 bytes=16777216  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_sum_0                            100    117.794    122.892    133.848
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  142.4 GB/s  (16777216 B / 117.79 us, 1 kernel(s))  = 70% of 204.8 peak
+  BW excl. fill:  171.6 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: read[512x65536]
+## + env BENCH_BW_OP=read BENCH_ROWS=512 BENCH_COLS=65536 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  sum_1        out=512 cores=32 hbm=2048B lx=0B [reduction: NOT modeled]
+      output hbm 512 elems
+      input  hbm 512 elems
+  => T = 20000ns(fill) + 2048/111.0  (lx 0B: ~free) = 20.02 us
+
+bandwidth probe: op=read shape=[512x65536] elems=33554432 passes=1 bytes=67108864  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_sum_0                            100    404.225    411.103    421.302
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  166.0 GB/s  (67108864 B / 404.23 us, 1 kernel(s))  = 81% of 204.8 peak
+  BW excl. fill:  174.7 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: write[512x1024]
+## + env BENCH_BW_OP=write BENCH_ROWS=512 BENCH_COLS=1024 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=524288 cores=32 hbm=1048576B lx=0B
+      output hbm 524288 elems
+      input  hbm 524288 elems broadcast (cached: ~free)
+      input  hbm 524288 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 1048576/111.0  (lx 0B: ~free) = 29.45 us
+
+bandwidth probe: op=write shape=[512x1024] elems=524288 passes=1 bytes=1048576  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     27.255     32.791     37.182
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   38.5 GB/s  (1048576 B / 27.25 us, 1 kernel(s))  = 19% of 204.8 peak
+  BW excl. fill:  144.5 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: write[512x4096]
+## + env BENCH_BW_OP=write BENCH_ROWS=512 BENCH_COLS=4096 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=2097152 cores=32 hbm=4194304B lx=0B
+      output hbm 2097152 elems
+      input  hbm 2097152 elems broadcast (cached: ~free)
+      input  hbm 2097152 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 4194304/111.0  (lx 0B: ~free) = 57.79 us
+
+bandwidth probe: op=write shape=[512x4096] elems=2097152 passes=1 bytes=4194304  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100     53.573     57.047     61.221
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   78.3 GB/s  (4194304 B / 53.57 us, 1 kernel(s))  = 38% of 204.8 peak
+  BW excl. fill:  124.9 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: write[512x16384]
+## + env BENCH_BW_OP=write BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=32 hbm=16777216B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 16777216/111.0  (lx 0B: ~free) = 171.15 us
+
+bandwidth probe: op=write shape=[512x16384] elems=8388608 passes=1 bytes=16777216  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    180.016    190.854    299.251
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   93.2 GB/s  (16777216 B / 180.02 us, 1 kernel(s))  = 46% of 204.8 peak
+  BW excl. fill:  104.8 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG8 bandwidth: write[512x65536]
+## + env BENCH_BW_OP=write BENCH_ROWS=512 BENCH_COLS=65536 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=33554432 cores=32 hbm=67108864B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 67108864/111.0  (lx 0B: ~free) = 624.58 us
+
+bandwidth probe: op=write shape=[512x65536] elems=33554432 passes=1 bytes=67108864  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    523.726    530.472    541.222
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  128.1 GB/s  (67108864 B / 523.73 us, 1 kernel(s))  = 63% of 204.8 peak
+  BW excl. fill:  133.2 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG9 tile-size: copy[512x16384] SENCORES=1
+## + env SENCORES=1 BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=1 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=1
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    817.021    821.631    827.232
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   41.1 GB/s  (33554432 B / 817.02 us, 1 kernel(s))  = 20% of 204.8 peak
+  BW excl. fill:   42.1 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG9 tile-size: copy[512x16384] SENCORES=2
+## + env SENCORES=2 BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=2 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=2
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    445.206    449.870    455.482
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   75.4 GB/s  (33554432 B / 445.21 us, 1 kernel(s))  = 37% of 204.8 peak
+  BW excl. fill:   78.9 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG9 tile-size: copy[512x16384] SENCORES=4
+## + env SENCORES=4 BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=4 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=4
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    302.061    312.792    421.207
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  111.1 GB/s  (33554432 B / 302.06 us, 1 kernel(s))  = 54% of 204.8 peak
+  BW excl. fill:  119.0 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG9 tile-size: copy[512x16384] SENCORES=8
+## + env SENCORES=8 BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=8 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=8
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    328.521    349.961    446.703
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  102.1 GB/s  (33554432 B / 328.52 us, 1 kernel(s))  = 50% of 204.8 peak
+  BW excl. fill:  108.8 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG9 tile-size: copy[512x16384] SENCORES=16
+## + env SENCORES=16 BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=16 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=16
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    328.148    346.956    369.220
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  102.3 GB/s  (33554432 B / 328.15 us, 1 kernel(s))  = 50% of 204.8 peak
+  BW excl. fill:  108.9 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG9 tile-size: copy[512x16384] SENCORES=32
+## + env SENCORES=32 BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=32
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    335.054    348.580    359.501
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:  100.1 GB/s  (33554432 B / 335.05 us, 1 kernel(s))  = 49% of 204.8 peak
+  BW excl. fill:  106.5 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG10 write-frac: copy[512x16384]
+## + env BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 33554432/111.0  (lx 0B: ~free) = 322.29 us
+
+bandwidth probe: op=copy shape=[512x16384] elems=8388608 passes=2 bytes=33554432  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100    336.354    350.688    368.926
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   99.8 GB/s  (33554432 B / 336.35 us, 1 kernel(s))  = 49% of 204.8 peak
+  BW excl. fill:  106.1 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG10 write-frac: copy[512x65536]
+## + env BENCH_BW_OP=copy BENCH_ROWS=512 BENCH_COLS=65536 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 134217728/111.0  (lx 0B: ~free) = 1229.17 us
+
+bandwidth probe: op=copy shape=[512x65536] elems=33554432 passes=2 bytes=134217728  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_0                            100   1365.767   1385.195   1398.074
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   98.3 GB/s  (134217728 B / 1365.77 us, 1 kernel(s))  = 48% of 204.8 peak
+  BW excl. fill:   99.7 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG10 write-frac: w2[512x16384]
+## + env BENCH_BW_OP=w2 BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  sub          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 67108864/111.0  (lx 0B: ~free) = 624.58 us
+
+bandwidth probe: op=w2 shape=[512x16384] elems=8388608 passes=3 bytes=50331648  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_sub_0                        100    659.892    699.050    721.208
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   76.3 GB/s  (50331648 B / 659.89 us, 1 kernel(s))  = 37% of 204.8 peak
+  BW excl. fill:   78.7 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG10 write-frac: w2[512x65536]
+## + env BENCH_BW_OP=w2 BENCH_ROWS=512 BENCH_COLS=65536 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  sub          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 268435456/111.0  (lx 0B: ~free) = 2438.34 us
+
+bandwidth probe: op=w2 shape=[512x65536] elems=33554432 passes=3 bytes=201326592  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_sub_0                        100   2624.850   2656.294   2688.508
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   76.7 GB/s  (201326592 B / 2624.85 us, 1 kernel(s))  = 37% of 204.8 peak
+  BW excl. fill:   77.3 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG10 write-frac: w3[512x16384]
+## + env BENCH_BW_OP=w3 BENCH_ROWS=512 BENCH_COLS=16384 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  sub          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  mul          out=8388608 cores=32 hbm=33554432B lx=0B
+      output hbm 8388608 elems
+      input  hbm 8388608 elems
+      input  hbm 8388608 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 100663296/111.0  (lx 0B: ~free) = 926.88 us
+
+bandwidth probe: op=w3 shape=[512x16384] elems=8388608 passes=4 bytes=67108864  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_mul_sub_0                    100    931.074   1016.711   1083.996
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   72.1 GB/s  (67108864 B / 931.07 us, 1 kernel(s))  = 35% of 204.8 peak
+  BW excl. fill:   73.7 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+########################################################################
+## RUNG10 write-frac: w3[512x65536]
+## + env BENCH_BW_OP=w3 BENCH_ROWS=512 BENCH_COLS=65536 python examples/bench_bandwidth.py
+########################################################################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  add          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  sub          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  mul          out=33554432 cores=32 hbm=134217728B lx=0B
+      output hbm 33554432 elems
+      input  hbm 33554432 elems
+      input  hbm 33554432 elems broadcast (cached: ~free)
+  => T = 20000ns(fill) + 402653184/111.0  (lx 0B: ~free) = 3647.51 us
+
+bandwidth probe: op=w3 shape=[512x65536] elems=33554432 passes=4 bytes=268435456  SENCORES=default(32)
+==== SPYRE_PROFILE: per-kernel host launch timing (min strips host jitter) ====
+kernel                                    count     min_us    mean_us     max_us
+sdsc_fused_add_mul_sub_0                    100   3688.436   3706.027   3730.949
+[note] SPYRE_PROFILE_SYNC on: times are per-kernel DEVICE latency (serialized); trust the min.
+  effective BW:   72.8 GB/s  (268435456 B / 3688.44 us, 1 kernel(s))  = 36% of 204.8 peak
+  BW excl. fill:   73.2 GB/s (minus 20us x 1; true asymptote = sweep slope)
+
+================ DONE. forward this file: haoyang_logs/cost_model_results_20260616_205620.log ================

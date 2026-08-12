@@ -1,0 +1,55 @@
+==== grand 5h sweep Fri Jun 26 15:56:45 UTC 2026 ====
+git: bec2601  rows: 2048  sections: P3
+## P3 chain c_loop K-sweep ([2048,4096], LX on; have K=1,8)
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [1024, 4096] -> device [64, 1024, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg1_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op mul
+IO     output op1                    torch [2048, 4096] -> device [2048, 4096] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf0                   torch [1024, 4096] -> device [64, 1024, 64] in LX = 4194304 elems x 2B = 8388608 B  (hbm counted: 0 B)
+IO     input  arg2_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 67108864 B  (lx 16777216 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) + c_loop*L --
+MODEL   R=50331648 B (read)   W=16777216 B (write)   loop_trip L=2
+MODEL   base = (R+W)/BW_PEAK = (50331648+16777216)/150 = 447.39 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   loop = c_loop*L = 860.0*2 = 1.72 us
+MODEL   => T_model = 545.41 us
+SUMMARY op=chain rows=2048 cols=4096 cores=- tiles=2 lx=1 io_hbm_bytes=67108864 kernel_us=576.497 pred_us=545.414 err_pct=-5.4 bw_gbps=116.4 memset_us=219.417 other_dev_us=1080.724 total_dev_us=1876.638
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [512, 4096] -> device [64, 512, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg1_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op mul
+IO     output op1                    torch [2048, 4096] -> device [2048, 4096] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf0                   torch [512, 4096] -> device [64, 512, 64] in LX = 2097152 elems x 2B = 4194304 B  (hbm counted: 0 B)
+IO     input  arg2_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 67108864 B  (lx 8388608 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) + c_loop*L --
+MODEL   R=50331648 B (read)   W=16777216 B (write)   loop_trip L=4
+MODEL   base = (R+W)/BW_PEAK = (50331648+16777216)/150 = 447.39 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   loop = c_loop*L = 860.0*4 = 3.44 us
+MODEL   => T_model = 547.13 us
+SUMMARY op=chain rows=2048 cols=4096 cores=- tiles=4 lx=1 io_hbm_bytes=67108864 kernel_us=596.683 pred_us=547.134 err_pct=-8.3 bw_gbps=112.5 memset_us=297.831 other_dev_us=975.240 total_dev_us=1869.754
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [128, 4096] -> device [64, 128, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  arg0_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg1_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op mul
+IO     output op1                    torch [2048, 4096] -> device [2048, 4096] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf0                   torch [128, 4096] -> device [64, 128, 64] in LX = 524288 elems x 2B = 1048576 B  (hbm counted: 0 B)
+IO     input  arg2_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 67108864 B  (lx 2097152 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) + c_loop*L --
+MODEL   R=50331648 B (read)   W=16777216 B (write)   loop_trip L=16
+MODEL   base = (R+W)/BW_PEAK = (50331648+16777216)/150 = 447.39 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   loop = c_loop*L = 860.0*16 = 13.76 us
+MODEL   => T_model = 557.45 us
+SUMMARY op=chain rows=2048 cols=4096 cores=- tiles=16 lx=1 io_hbm_bytes=67108864 kernel_us=895.854 pred_us=557.454 err_pct=-37.8 bw_gbps=74.9 memset_us=311.478 other_dev_us=1012.605 total_dev_us=2219.937
+==== DONE -> forward haoyang_logs/grand_sweep_20260626_155645.log ====

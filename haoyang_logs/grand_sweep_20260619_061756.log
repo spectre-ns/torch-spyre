@@ -1,0 +1,377 @@
+==== grand 5h sweep Fri Jun 19 06:17:56 UTC 2026 ====
+git: 3966ebf  rows: 2048  sections: P1a P1b P1c P1d P2a P2b P2c P2d
+## P1a broadcast one-time-load (FIG1; cores=32, vary ROWS, C=16384)
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 64, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [256, 64, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [256, 1, 64] in hbm = 16384 elems x 2B = 32768 B  (hbm counted: 32768 B) broadcast (loaded once)
+IO   => HBM I/O total = 4227072 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2129920 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (2129920+2097152)/150 = 28.18 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 40.22 us
+SUMMARY op=bcast rows=64 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=4227072 kernel_us=31.268 pred_us=40.218 err_pct=+28.6 bw_gbps=135.2 memset_us=56.660 other_dev_us=304.319 total_dev_us=392.247
+
+
+
+
+
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 64, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [256, 64, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [1, 64, 64] in hbm = 4096 elems x 2B = 8192 B  (hbm counted: 8192 B) broadcast (loaded once)
+IO   => HBM I/O total = 4202496 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2105344 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (2105344+2097152)/150 = 28.02 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 40.05 us
+SUMMARY op=bcastcol rows=64 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=4202496 kernel_us=33.020 pred_us=40.054 err_pct=+21.3 bw_gbps=127.3 memset_us=35.678 other_dev_us=288.208 total_dev_us=356.906
+
+
+
+
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 64, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [256, 64, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [256, 64, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO   => HBM I/O total = 6291456 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4194304 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (4194304+2097152)/150 = 41.94 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 53.98 us
+SUMMARY op=add rows=64 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=6291456 kernel_us=51.316 pred_us=53.981 err_pct=+5.2 bw_gbps=122.6 memset_us=54.938 other_dev_us=248.666 total_dev_us=354.920
+
+
+
+
+
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 128, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [256, 128, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [256, 1, 64] in hbm = 16384 elems x 2B = 32768 B  (hbm counted: 32768 B) broadcast (loaded once)
+IO   => HBM I/O total = 8421376 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4227072 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (4227072+4194304)/150 = 56.14 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 80.22 us
+SUMMARY op=bcast rows=128 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=8421376 kernel_us=66.349 pred_us=80.218 err_pct=+20.9 bw_gbps=126.9 memset_us=62.330 other_dev_us=377.441 total_dev_us=506.120
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 128, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [256, 128, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [1, 128, 64] in hbm = 8192 elems x 2B = 16384 B  (hbm counted: 16384 B) broadcast (loaded once)
+IO   => HBM I/O total = 8404992 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4210688 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (4210688+4194304)/150 = 56.03 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 80.11 us
+SUMMARY op=bcastcol rows=128 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=8404992 kernel_us=79.320 pred_us=80.109 err_pct=+1.0 bw_gbps=106.0 memset_us=78.439 other_dev_us=370.815 total_dev_us=528.574
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 128, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [256, 128, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [256, 128, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO   => HBM I/O total = 12582912 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8388608 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (8388608+4194304)/150 = 83.89 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 107.96 us
+SUMMARY op=add rows=128 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=12582912 kernel_us=106.532 pred_us=107.961 err_pct=+1.3 bw_gbps=118.1 memset_us=80.339 other_dev_us=332.608 total_dev_us=519.479
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 256, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [256, 256, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [256, 1, 64] in hbm = 16384 elems x 2B = 32768 B  (hbm counted: 32768 B) broadcast (loaded once)
+IO   => HBM I/O total = 16809984 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8421376 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (8421376+8388608)/150 = 112.07 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 160.22 us
+SUMMARY op=bcast rows=256 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=16809984 kernel_us=188.082 pred_us=160.217 err_pct=-14.8 bw_gbps=89.4 memset_us=130.582 other_dev_us=459.431 total_dev_us=778.095
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 256, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [256, 256, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [1, 256, 64] in hbm = 16384 elems x 2B = 32768 B  (hbm counted: 32768 B) broadcast (loaded once)
+IO   => HBM I/O total = 16809984 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8421376 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (8421376+8388608)/150 = 112.07 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 160.22 us
+SUMMARY op=bcastcol rows=256 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=16809984 kernel_us=148.768 pred_us=160.217 err_pct=+7.7 bw_gbps=113.0 memset_us=137.673 other_dev_us=461.104 total_dev_us=747.545
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [256, 256, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [256, 256, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [256, 256, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   => HBM I/O total = 25165824 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (16777216+8388608)/150 = 167.77 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 215.92 us
+SUMMARY op=add rows=256 cols=16384 cores=32 tiles=0 lx=1 io_hbm_bytes=25165824 kernel_us=271.704 pred_us=215.923 err_pct=-20.5 bw_gbps=92.6 memset_us=133.439 other_dev_us=472.626 total_dev_us=877.769
+## P1b BW size-sweep (FIG2 anchor; neg, rows=2048)
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [16, 2048, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [16, 2048, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO   => HBM I/O total = 8388608 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4194304 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (4194304+4194304)/150 = 55.92 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 80.00 us
+SUMMARY op=neg rows=2048 cols=1024 cores=- tiles=0 lx=1 io_hbm_bytes=8388608 kernel_us=78.164 pred_us=79.999 err_pct=+2.3 bw_gbps=107.3 memset_us=78.756 other_dev_us=358.221 total_dev_us=515.141
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [32, 2048, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [32, 2048, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   => HBM I/O total = 16777216 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8388608 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (8388608+8388608)/150 = 111.85 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 160.00 us
+SUMMARY op=neg rows=2048 cols=2048 cores=- tiles=0 lx=1 io_hbm_bytes=16777216 kernel_us=158.084 pred_us=159.999 err_pct=+1.2 bw_gbps=106.1 memset_us=129.347 other_dev_us=492.855 total_dev_us=780.286
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 33554432 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (16777216+16777216)/150 = 223.70 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 320.00 us
+SUMMARY op=neg rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=33554432 kernel_us=319.658 pred_us=319.997 err_pct=+0.1 bw_gbps=105.0 memset_us=240.446 other_dev_us=884.648 total_dev_us=1444.752
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   => HBM I/O total = 67108864 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=33554432 B (read)   W=33554432 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (33554432+33554432)/150 = 447.39 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 639.99 us
+SUMMARY op=neg rows=2048 cols=8192 cores=- tiles=0 lx=1 io_hbm_bytes=67108864 kernel_us=647.659 pred_us=639.995 err_pct=-1.2 bw_gbps=103.6 memset_us=416.902 other_dev_us=2147.197 total_dev_us=3211.758
+## P1c read/write V-shape (FIG2; turnaround)
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op sum_1 [reduction]
+IO     output [1, 2048, 64] in hbm = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 17039360 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=262144 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (16777216+262144)/150 = 113.60 us
+MODEL   turn = a*min(R,W) = 0.00574*262144 = 1.50 us
+MODEL   => T_model = 115.10 us
+SUMMARY op=read rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=17039360 kernel_us=110.931 pred_us=115.100 err_pct=+3.8 bw_gbps=153.6 memset_us=22.283 other_dev_us=16.099 total_dev_us=149.313
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 33554432 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (16777216+16777216)/150 = 223.70 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 320.00 us
+SUMMARY op=neg rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=33554432 kernel_us=317.640 pred_us=319.997 err_pct=+0.7 bw_gbps=105.6 memset_us=253.841 other_dev_us=837.527 total_dev_us=1409.008
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 50331648 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=33554432 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (33554432+16777216)/150 = 335.54 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 431.85 us
+SUMMARY op=mul rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=50331648 kernel_us=436.902 pred_us=431.846 err_pct=-1.2 bw_gbps=115.2 memset_us=257.578 other_dev_us=847.288 total_dev_us=1541.768
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [64, 2048, 64] in lx = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op add_1
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in lx = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 67108864 B  (lx 33554432 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=50331648 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (50331648+16777216)/150 = 447.39 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 543.69 us
+SUMMARY op=add3 rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=67108864 kernel_us=587.457 pred_us=543.694 err_pct=-7.4 bw_gbps=114.2 memset_us=255.600 other_dev_us=841.752 total_dev_us=1684.809
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [64, 2048, 64] in lx = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op add_1
+IO     output [64, 2048, 64] in lx = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  [64, 2048, 64] in lx = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   op add_2
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in lx = 8388608 elems x 2B = 16777216 B  (hbm counted: 0 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 83886080 B  (lx 67108864 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=67108864 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (67108864+16777216)/150 = 559.24 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 655.54 us
+SUMMARY op=add4 rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=83886080 kernel_us=686.612 pred_us=655.542 err_pct=-4.5 bw_gbps=122.2 memset_us=299.286 other_dev_us=773.561 total_dev_us=1759.459
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 1, 64] in hbm = 4096 elems x 2B = 8192 B  (hbm counted: 8192 B) broadcast (loaded once)
+IO     input  [1, 2048, 64] in hbm = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B) broadcast (loaded once)
+IO   => HBM I/O total = 17047552 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=270336 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (270336+16777216)/150 = 113.65 us
+MODEL   turn = a*min(R,W) = 0.00574*270336 = 1.55 us
+MODEL   => T_model = 115.20 us
+SUMMARY op=write rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=17047552 kernel_us=152.865 pred_us=115.202 err_pct=-24.6 bw_gbps=111.5 memset_us=253.467 other_dev_us=837.401 total_dev_us=1243.733
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op sum_1 [reduction]
+IO     output [1, 2048, 64] in hbm = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B)
+IO     input  [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   => HBM I/O total = 33816576 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=33554432 B (read)   W=262144 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (33554432+262144)/150 = 225.44 us
+MODEL   turn = a*min(R,W) = 0.00574*262144 = 1.50 us
+MODEL   => T_model = 226.95 us
+SUMMARY op=read rows=2048 cols=8192 cores=- tiles=0 lx=1 io_hbm_bytes=33816576 kernel_us=218.556 pred_us=226.949 err_pct=+3.8 bw_gbps=154.7 memset_us=20.918 other_dev_us=14.990 total_dev_us=254.464
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   => HBM I/O total = 67108864 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=33554432 B (read)   W=33554432 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (33554432+33554432)/150 = 447.39 us
+MODEL   turn = a*min(R,W) = 0.00574*33554432 = 192.60 us
+MODEL   => T_model = 639.99 us
+SUMMARY op=neg rows=2048 cols=8192 cores=- tiles=0 lx=1 io_hbm_bytes=67108864 kernel_us=648.750 pred_us=639.995 err_pct=-1.3 bw_gbps=103.4 memset_us=419.654 other_dev_us=2148.685 total_dev_us=3217.089
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  [128, 1, 64] in hbm = 8192 elems x 2B = 16384 B  (hbm counted: 16384 B) broadcast (loaded once)
+IO     input  [1, 2048, 64] in hbm = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B) broadcast (loaded once)
+IO   => HBM I/O total = 33832960 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=278528 B (read)   W=33554432 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (278528+33554432)/150 = 225.55 us
+MODEL   turn = a*min(R,W) = 0.00574*278528 = 1.60 us
+MODEL   => T_model = 227.15 us
+SUMMARY op=write rows=2048 cols=8192 cores=- tiles=0 lx=1 io_hbm_bytes=33832960 kernel_us=497.957 pred_us=227.152 err_pct=-54.4 bw_gbps=67.9 memset_us=416.638 other_dev_us=2128.474 total_dev_us=3043.069
+## P1d reductions (FIG2 read-only + sumcol)
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op sum_1 [reduction]
+IO     output [1, 2048, 64] in hbm = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 17039360 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=262144 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (16777216+262144)/150 = 113.60 us
+MODEL   turn = a*min(R,W) = 0.00574*262144 = 1.50 us
+MODEL   => T_model = 115.10 us
+SUMMARY op=sumrow rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=17039360 kernel_us=110.791 pred_us=115.100 err_pct=+3.9 bw_gbps=153.8 memset_us=20.965 other_dev_us=15.015 total_dev_us=146.771
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op sum_1 [reduction]
+IO     output [64, 64] in hbm = 4096 elems x 2B = 8192 B  (hbm counted: 8192 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 16785408 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=8192 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (16777216+8192)/150 = 111.90 us
+MODEL   turn = a*min(R,W) = 0.00574*8192 = 0.05 us
+MODEL   => T_model = 111.95 us
+SUMMARY op=sumcol rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=16785408 kernel_us=145.173 pred_us=111.950 err_pct=-22.9 bw_gbps=115.6 memset_us=10.224 other_dev_us=8.276 total_dev_us=163.673
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output [1, 2048, 64] in hbm = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 17039360 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777216 B (read)   W=262144 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (16777216+262144)/150 = 113.60 us
+MODEL   turn = a*min(R,W) = 0.00574*262144 = 1.50 us
+MODEL   => T_model = 115.10 us
+SUMMARY op=amax rows=2048 cols=4096 cores=- tiles=0 lx=1 io_hbm_bytes=17039360 kernel_us=111.390 pred_us=115.100 err_pct=+3.3 bw_gbps=153.0 memset_us=25.621 other_dev_us=14.990 total_dev_us=152.001
+## P2a coarse-tile K-sweep (ctsum, B=2048 D=512; LX off+on)
+SUMMARY op=ctsum tiles=2 lx=0 B=2048 D=512 FAILED
+SUMMARY op=ctsum tiles=2 lx=1 B=2048 D=512 FAILED
+SUMMARY op=ctsum tiles=4 lx=0 B=2048 D=512 FAILED
+SUMMARY op=ctsum tiles=4 lx=1 B=2048 D=512 FAILED
+SUMMARY op=ctsum tiles=8 lx=0 B=2048 D=512 FAILED
+SUMMARY op=ctsum tiles=8 lx=1 B=2048 D=512 FAILED
+SUMMARY op=ctsum tiles=16 lx=0 B=2048 D=512 FAILED
+SUMMARY op=ctsum tiles=16 lx=1 B=2048 D=512 FAILED
+## P2b coarse-tile op coverage (ctamax, ctamin; K=8)
+SUMMARY op=ctamax tiles=8 lx=0 B=2048 D=512 FAILED
+SUMMARY op=ctamax tiles=8 lx=1 B=2048 D=512 FAILED
+SUMMARY op=ctamin tiles=8 lx=0 B=2048 D=512 FAILED
+SUMMARY op=ctamin tiles=8 lx=1 B=2048 D=512 FAILED
+## P2c coarse-tile D-sweep (ctsum K=8, LX off, B=2048)
+SUMMARY op=ctsum tiles=8 lx=0 B=2048 D=64 FAILED
+SUMMARY op=ctsum tiles=8 lx=0 B=2048 D=256 FAILED
+SUMMARY op=ctsum tiles=8 lx=0 B=2048 D=1024 FAILED
+## P2d untiled reduction baselines (B=2048 D=512)
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op sum_1 [reduction]
+IO     output [8, 64] in hbm = 512 elems x 2B = 1024 B  (hbm counted: 1024 B)
+IO     input  [8, 2048, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO   => HBM I/O total = 2098176 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2097152 B (read)   W=1024 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (2097152+1024)/150 = 13.99 us
+MODEL   turn = a*min(R,W) = 0.00574*1024 = 0.01 us
+MODEL   => T_model = 13.99 us
+SUMMARY op=ctsum rows=2048 cols=512 cores=- tiles=1 lx=0 io_hbm_bytes=2098176 kernel_us=16.455 pred_us=13.994 err_pct=-15.0 bw_gbps=127.5 memset_us=11.249 other_dev_us=6.539 total_dev_us=34.243
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amax [reduction]
+IO     output [8, 64] in hbm = 512 elems x 2B = 1024 B  (hbm counted: 1024 B)
+IO     input  [8, 2048, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO   => HBM I/O total = 2098176 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2097152 B (read)   W=1024 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (2097152+1024)/150 = 13.99 us
+MODEL   turn = a*min(R,W) = 0.00574*1024 = 0.01 us
+MODEL   => T_model = 13.99 us
+SUMMARY op=ctamax rows=2048 cols=512 cores=- tiles=1 lx=0 io_hbm_bytes=2098176 kernel_us=16.326 pred_us=13.994 err_pct=-14.3 bw_gbps=128.5 memset_us=10.376 other_dev_us=8.279 total_dev_us=34.981
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op amin [reduction]
+IO     output [8, 64] in hbm = 512 elems x 2B = 1024 B  (hbm counted: 1024 B)
+IO     input  [8, 2048, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO   => HBM I/O total = 2098176 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2097152 B (read)   W=1024 B (write)   loop_trip L=1
+MODEL   base = (R+W)/BW_PEAK = (2097152+1024)/150 = 13.99 us
+MODEL   turn = a*min(R,W) = 0.00574*1024 = 0.01 us
+MODEL   => T_model = 13.99 us
+SUMMARY op=ctamin rows=2048 cols=512 cores=- tiles=1 lx=0 io_hbm_bytes=2098176 kernel_us=17.042 pred_us=13.994 err_pct=-17.9 bw_gbps=123.1 memset_us=11.354 other_dev_us=6.540 total_dev_us=34.936
+==== DONE -> forward haoyang_logs/grand_sweep_20260619_061756.log ====

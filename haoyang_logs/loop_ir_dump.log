@@ -1,0 +1,200 @@
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=2] = placeholder[target=arg0_1]    # torch.float16 (512, 1024) spyre:0
+%amax : [num_users=1] = call_function[target=torch.ops.aten.amax.default](args = (%arg0_1, [0], True), kwargs = {})    # torch.float16 (1, 1024) spyre:0
+%sub : [num_users=1] = call_function[target=torch.ops.aten.sub.Tensor](args = (%arg0_1, %amax), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+%exp : [num_users=2] = call_function[target=torch.ops.aten.exp.default](args = (%sub,), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+%sum_1 : [num_users=1] = call_function[target=torch.ops.aten.sum.dim_IntList](args = (%exp, [0], True), kwargs = {})    # torch.float16 (1, 1024) spyre:0
+%div : [num_users=1] = call_function[target=torch.ops.aten.div.Tensor](args = (%exp, %sum_1), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+return (div,)
+[7 nodes]
+
+==============================================================================
+==== LoopLevel IR - BEFORE pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[1, 1024], stride=[1024, 1])
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      _, i1 = index
+      r0_0 = rindex
+      tmp0 = ops.load(arg0_1, i1 + 1024 * r0_0)
+      return tmp0
+  ,
+  ranges=[1, 1024],
+  reduction_ranges=[512],
+  reduction_type=max,
+  origin_node=amax,
+  origins=OrderedSet([amax])
+)
+
+op1: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(arg0_1, i1 + 1024 * i0)
+      tmp1 = ops.load(buf0, i1)
+      tmp2 = tmp0 - tmp1
+      return tmp2
+  ,
+  ranges=[512, 1024],
+  origin_node=sub,
+  origins=OrderedSet([sub])
+)
+
+op2: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(buf1, i1 + 1024 * i0)
+      tmp1 = ops.exp(tmp0)
+      return tmp1
+  ,
+  ranges=[512, 1024],
+  origin_node=exp,
+  origins=OrderedSet([exp])
+)
+
+op3: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[1, 1024], stride=[1024, 1])
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      _, i1 = index
+      r0_0 = rindex
+      tmp0 = ops.load(buf2, i1 + 1024 * r0_0)
+      return tmp0
+  ,
+  ranges=[1, 1024],
+  reduction_ranges=[512],
+  reduction_type=sum,
+  origin_node=sum_1,
+  origins=OrderedSet([sum_1])
+)
+
+op4: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(buf2, i1 + 1024 * i0)
+      tmp1 = ops.load(buf3, i1)
+      tmp2 = tmp0 / tmp1
+      return tmp2
+  ,
+  ranges=[512, 1024],
+  origin_node=div,
+  origins=OrderedSet([div])
+)
+
+[5 ops]
+
+==============================================================================
+==== LoopLevel IR - AFTER pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[1, 1024], stride=[1024, 1], device_layout=SpyreTensorLayout(device_size=[16, 1, 64], stride_map =[64, -1, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 16, d1: 2}
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      _, i1 = index
+      r0_0 = rindex
+      tmp0 = ops.load(arg0_1, i1 + 1024 * r0_0)
+      return tmp0
+  ,
+  ranges=[1, 1024],
+  reduction_ranges=[512],
+  reduction_type=max,
+  origin_node=amax,
+  origins=OrderedSet([amax])
+)
+
+op1: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1], device_layout=SpyreTensorLayout(device_size=[16, 512, 64], stride_map =[64, 1024, 1], device_dtype=DataFormats.SEN169_FP16))
+  allocation={'lx': 0}
+  op_it_space_splits={d0: 32, d1: 1}
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(arg0_1, i1 + 1024 * i0)
+      tmp1 = ops.load(buf0, i1)
+      tmp2 = tmp0 - tmp1
+      return tmp2
+  ,
+  ranges=[512, 1024],
+  origin_node=sub,
+  origins=OrderedSet([sub])
+)
+
+op2: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1], device_layout=SpyreTensorLayout(device_size=[16, 512, 64], stride_map =[64, 1024, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 32, d1: 1}
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(buf1, i1 + 1024 * i0)
+      tmp1 = ops.exp(tmp0)
+      return tmp1
+  ,
+  ranges=[512, 1024],
+  origin_node=exp,
+  origins=OrderedSet([exp])
+)
+
+op3: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[1, 1024], stride=[1024, 1], device_layout=SpyreTensorLayout(device_size=[16, 1, 64], stride_map =[64, -1, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 16, d1: 2}
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      _, i1 = index
+      r0_0 = rindex
+      tmp0 = ops.load(buf2, i1 + 1024 * r0_0)
+      return tmp0
+  ,
+  ranges=[1, 1024],
+  reduction_ranges=[512],
+  reduction_type=sum,
+  origin_node=sum_1,
+  origins=OrderedSet([sum_1])
+)
+
+op4: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1], device_layout=SpyreTensorLayout(device_size=[16, 512, 64], stride_map =[64, 1024, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 32, d1: 1}
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(buf2, i1 + 1024 * i0)
+      tmp1 = ops.load(buf3, i1)
+      tmp2 = tmp0 / tmp1
+      return tmp2
+  ,
+  ranges=[512, 1024],
+  origin_node=div,
+  origins=OrderedSet([div])
+)
+
+[5 ops]
+

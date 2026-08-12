@@ -1,0 +1,106 @@
+[31m ERRR 19.06.2026 04:53:54.657315 [            runtime_stream.cpp: 226] RuntimeStream::synchronize() still waiting after 60000ms: in_flight_=1 device=0 — possible lost completion[0m
+[31m ERRR 19.06.2026 04:53:54.657639 [            runtime_stream.cpp: 235] RuntimeStream::synchronize() device=0 completed after 60000ms (1 timeout warning(s))[0m
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=1] = placeholder[target=arg0_1]    # torch.float16 (512, 64) spyre:0
+%sum_1 : [num_users=1] = call_function[target=torch.ops.aten.sum.dim_IntList](args = (%arg0_1, [0]), kwargs = {})    # torch.float16 (64,) spyre:0
+return (sum_1,)
+[3 nodes]
+
+==============================================================================
+==== LoopLevel IR - BEFORE pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[64], stride=[1])
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      i0 = index
+      r0_0 = rindex
+      tmp0 = ops.load(arg0_1, i0 + 64 * r0_0)
+      return tmp0
+  ,
+  ranges=[64],
+  reduction_ranges=[512],
+  reduction_type=sum,
+  origin_node=sum_1,
+  origins=OrderedSet([sum_1]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/coarse_tile/run_sum_dim0_tiled.py", line 49, in torch_dynamo_resume_in_fn_at_47,
+      return x.sum(dim=0),
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== LoopLevel IR - AFTER pre-scheduling passes
+==============================================================================
+op1: SpyreEmptyFallback
+
+op2: SpyreConstantFallback
+
+coarse_tile_fill_buf0: ComputedBuffer
+  layout=MutationLayoutSHOULDREMOVE('spyre:0', torch.float16, size=[64], stride=[1])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0 = index
+      tmp0 = ops.load(buf2, 0)
+      return tmp0
+  ,
+  ranges=[64],
+  origin_node=None,
+  origins=OrderedSet([])
+)
+
+op0: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[64], stride=[1], device_layout=SpyreTensorLayout(device_size=[1, 64], stride_map =[64, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 1, d1: 32}
+  dim_hints=[DimHint(dim_names=['B'], split_count=4, loop_var=d1, is_reduction=True, hint_id=2)]
+  loop_info=CoarseTileInfo(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[]], loop_tiled_reduction_dims=[[0]])
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      i0 = index
+      r0_0 = rindex
+      tmp0 = ops.load(arg0_1, i0 + 64 * r0_0)
+      return tmp0
+  ,
+  ranges=[64],
+  reduction_ranges=[128],
+  reduction_type=sum,
+  origin_node=sum_1,
+  origins=OrderedSet([sum_1]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/coarse_tile/run_sum_dim0_tiled.py", line 49, in torch_dynamo_resume_in_fn_at_47,
+      return x.sum(dim=0),
+  ,
+  }
+)
+
+coarse_tile_combine_buf0: ComputedBuffer
+  layout=MutationLayoutSHOULDREMOVE('spyre:0', torch.float16, size=[64], stride=[1])
+  loop_info=CoarseTileInfo(loop_group_id=(0,), loop_count=[4], loop_tiled_dims=[[]], loop_tiled_reduction_dims=[[0]])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0 = index
+      tmp0 = ops.load(buf0, i0)
+      tmp1 = ops.load(buf1, i0)
+      tmp2 = tmp1 + tmp0
+      return tmp2
+  ,
+  ranges=[64],
+  origin_node=None,
+  origins=OrderedSet([])
+)
+
+[5 ops]
+

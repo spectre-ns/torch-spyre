@@ -1,0 +1,69 @@
+==== golden profiler re-sweep Thu Jun 18 19:20:32 UTC 2026 ====
+git: 3d8e197  rows: 2048  sections: A E F
+## A size-sweep fit (neg, gelu)
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [8, 2048, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [8, 2048, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO   => HBM I/O total = 4194304 B  (lx 0 B, ~free)
+SUMMARY op=neg rows=2048 cols=512 io_hbm_bytes=4194304 kernel_us=35.966 bw_gbps=116.6 memset_us=41.017 other_dev_us=0.000 total_dev_us=76.983
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op gelu
+IO     output [8, 2048, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  [8, 2048, 64] in hbm = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO   => HBM I/O total = 4194304 B  (lx 0 B, ~free)
+SUMMARY op=gelu rows=2048 cols=512 io_hbm_bytes=4194304 kernel_us=36.216 bw_gbps=115.8 memset_us=41.719 other_dev_us=0.000 total_dev_us=77.935
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [16, 2048, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [16, 2048, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO   => HBM I/O total = 8388608 B  (lx 0 B, ~free)
+SUMMARY op=neg rows=2048 cols=1024 io_hbm_bytes=8388608 kernel_us=76.714 bw_gbps=109.3 memset_us=65.367 other_dev_us=0.000 total_dev_us=142.081
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op gelu
+IO     output [16, 2048, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  [16, 2048, 64] in hbm = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO   => HBM I/O total = 8388608 B  (lx 0 B, ~free)
+SUMMARY op=gelu rows=2048 cols=1024 io_hbm_bytes=8388608 kernel_us=77.343 bw_gbps=108.5 memset_us=73.088 other_dev_us=0.000 total_dev_us=150.431
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [32, 2048, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [32, 2048, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   => HBM I/O total = 16777216 B  (lx 0 B, ~free)
+SUMMARY op=neg rows=2048 cols=2048 io_hbm_bytes=16777216 kernel_us=159.091 bw_gbps=105.5 memset_us=115.928 other_dev_us=0.000 total_dev_us=275.019
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op gelu
+IO     output [32, 2048, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  [32, 2048, 64] in hbm = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO   => HBM I/O total = 16777216 B  (lx 0 B, ~free)
+SUMMARY op=gelu rows=2048 cols=2048 io_hbm_bytes=16777216 kernel_us=160.920 bw_gbps=104.3 memset_us=109.562 other_dev_us=0.000 total_dev_us=270.482
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 33554432 B  (lx 0 B, ~free)
+SUMMARY op=neg rows=2048 cols=4096 io_hbm_bytes=33554432 kernel_us=320.912 bw_gbps=104.6 memset_us=209.709 other_dev_us=0.000 total_dev_us=530.621
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op gelu
+IO     output [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  [64, 2048, 64] in hbm = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO   => HBM I/O total = 33554432 B  (lx 0 B, ~free)
+SUMMARY op=gelu rows=2048 cols=4096 io_hbm_bytes=33554432 kernel_us=319.188 bw_gbps=105.1 memset_us=218.880 other_dev_us=0.000 total_dev_us=538.068
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   => HBM I/O total = 67108864 B  (lx 0 B, ~free)
+SUMMARY op=neg rows=2048 cols=8192 io_hbm_bytes=67108864 kernel_us=645.689 bw_gbps=103.9 memset_us=409.659 other_dev_us=0.000 total_dev_us=1055.348
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op gelu
+IO     output [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO     input  [128, 2048, 64] in hbm = 16777216 elems x 2B = 33554432 B  (hbm counted: 33554432 B)
+IO   => HBM I/O total = 67108864 B  (lx 0 B, ~free)
+SUMMARY op=gelu rows=2048 cols=8192 io_hbm_bytes=67108864 kernel_us=650.849 bw_gbps=103.1 memset_us=423.131 other_dev_us=0.000 total_dev_us=1073.980
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op neg
+IO     output [256, 2048, 64] in hbm = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO     input  [256, 2048, 64] in hbm = 33554432 elems x 2B = 67108864 B  (hbm counted: 67108864 B)
+IO   => HBM I/O total = 134217728 B  (lx 0 B, ~free)
+SUMMARY op=neg rows=2048 cols=16384 io_hbm_bytes=134217728 kernel_us=1307.111 bw_gbps=102.7 memset_us=1050.744 other_dev_us=0.000 total_dev_us=2357.855

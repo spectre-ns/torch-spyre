@@ -1,0 +1,57 @@
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+error: operand #6 does not dominate this use
+error: Unable to lower successfully the module for sdsc: 1_add
+terminate called after throwing an instance of 'DtException'
+  what():  DtException: DCC causes the compilation failure, file /project_src/deeptools/dcc/src/Driver/dcc.cpp line 563
+W0630 23:48:31.283000 7922 torch/_inductor/utils.py:1403] [4/0] on error, temporary cache dir kept at /tmp/torchinductor_haoyang/tmpb9xaibjf
+Traceback (most recent call last):
+  File "/home/haoyang/torch-spyre/coarse_tile/run_matmul_k_tiled.py", line 61, in <module>
+    main()
+  File "/home/haoyang/torch-spyre/coarse_tile/run_matmul_k_tiled.py", line 55, in main
+    compare_with_cpu(fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
+  File "/home/haoyang/torch-spyre/coarse_tile/utils.py", line 140, in compare_with_cpu
+    else _compile_and_run(
+         ^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/coarse_tile/utils.py", line 68, in _compile_and_run
+    result = comp_func(*device_args, **device_kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1038, in compile_wrapper
+    raise e.remove_dynamo_frames() from None  # see TORCHDYNAMO_VERBOSE=1
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/compile_fx.py", line 1026, in _compile_fx_inner
+    raise InductorError(e, currentframe()).with_traceback(
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/compile_fx.py", line 1022, in _compile_fx_inner
+    mb_compiled_graph = fx_codegen_and_compile(
+                        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/compile_fx.py", line 1798, in fx_codegen_and_compile
+    return scheme.codegen_and_compile(gm, example_inputs, inputs_to_check, graph_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/compile_fx.py", line 1570, in codegen_and_compile
+    compiled_module = graph.compile_to_module()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/graph.py", line 2499, in compile_to_module
+    return self._compile_to_module()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/graph.py", line 2509, in _compile_to_module
+    mod = self._compile_to_module_lines(wrapper_code)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/graph.py", line 2584, in _compile_to_module_lines
+    mod = PyCodeCache.load_by_key_path(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/codecache.py", line 3764, in load_by_key_path
+    mod = _reload_python_module(key, path, set_sys_modules=in_toplevel)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_inductor/runtime/compile_tasks.py", line 35, in _reload_python_module
+    exec(code, mod.__dict__, mod.__dict__)
+  File "/tmp/torchinductor_haoyang/tmpb9xaibjf/bi/cbiq7w6esdif3gjayor5askbj5442mmax75h3rgfttnwqa36sbvk.py", line 86, in <module>
+    sdsc_fused_mm_1 = async_compile.sdsc('sdsc_fused_mm_1',
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/haoyang/torch-spyre/torch_spyre/execution/async_compile.py", line 63, in sdsc
+    subprocess.run(["dxp_standalone", "--bundle", "-d", output_dir], check=True)
+  File "/usr/lib64/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+torch._inductor.exc.InductorError: CalledProcessError: Command '['dxp_standalone', '--bundle', '-d', '/tmp/torchinductor_haoyang/tmpb9xaibjf/inductor-spyre/sdsc_fused_mm_1_dqiie7zv']' died with <Signals.SIGABRT: 6>.
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+

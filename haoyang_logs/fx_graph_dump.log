@@ -1,0 +1,26 @@
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=2] = placeholder[target=arg0_1]    # torch.float16 (512, 1024) spyre:0
+%amax : [num_users=1] = call_function[target=torch.ops.aten.amax.default](args = (%arg0_1, [0], True), kwargs = {})    # torch.float16 (1, 1024) spyre:0
+%sub : [num_users=1] = call_function[target=torch.ops.aten.sub.Tensor](args = (%arg0_1, %amax), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+%exp : [num_users=2] = call_function[target=torch.ops.aten.exp.default](args = (%sub,), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+%sum_1 : [num_users=1] = call_function[target=torch.ops.aten.sum.dim_IntList](args = (%exp, [0], True), kwargs = {})    # torch.float16 (1, 1024) spyre:0
+%div : [num_users=1] = call_function[target=torch.ops.aten.div.Tensor](args = (%exp, %sum_1), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+return (div,)
+[7 nodes]
+
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=2] = placeholder[target=arg0_1]    # torch.float16 (512, 1024) spyre:0
+%amax : [num_users=1] = call_function[target=torch.ops.aten.amax.default](args = (%arg0_1, [0], True), kwargs = {})    # torch.float16 (1, 1024) spyre:0
+%sub : [num_users=1] = call_function[target=torch.ops.aten.sub.Tensor](args = (%arg0_1, %amax), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+%exp : [num_users=2] = call_function[target=torch.ops.aten.exp.default](args = (%sub,), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+%sum_1 : [num_users=1] = call_function[target=torch.ops.aten.sum.dim_IntList](args = (%exp, [0], True), kwargs = {})    # torch.float16 (1, 1024) spyre:0
+%div : [num_users=1] = call_function[target=torch.ops.aten.div.Tensor](args = (%exp, %sum_1), kwargs = {})    # torch.float16 (512, 1024) spyre:0
+return (div,)
+[7 nodes]
+

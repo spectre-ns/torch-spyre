@@ -1,0 +1,469 @@
+############################## BENCH_OP=transpose ##############################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=1] = placeholder[target=arg0_1]    # torch.float16 (512, 1024) spyre:0
+%permute : [num_users=1] = call_function[target=torch.ops.aten.permute.default](args = (%arg0_1, [1, 0]), kwargs = {})    # torch.float16 (1024, 512) spyre:0
+%clone : [num_users=1] = call_function[target=torch.ops.aten.clone.default](args = (%permute,), kwargs = {memory_format: torch.contiguous_format})    # torch.float16 (1024, 512) spyre:0
+return (clone,)
+[4 nodes]
+
+==============================================================================
+==== LoopLevel IR - BEFORE pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[1024, 512], stride=[512, 1])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(arg0_1, i0 + 1024 * i1)
+      return tmp0
+  ,
+  ranges=[1024, 512],
+  origin_node=clone,
+  origins=OrderedSet([clone, permute]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 111, in <lambda>,
+      "transpose": lambda x: x.transpose(0, 1).contiguous(),  # [R,C]->[C,R]: stick C->R,
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== LoopLevel IR - AFTER pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[1024, 512], stride=[512, 1], device_layout=SpyreTensorLayout(device_size=[8, 1024, 64], stride_map =[64, 512, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 16, d1: 2}
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1 = index
+      tmp0 = ops.load(arg0_1, i0 + 1024 * i1)
+      return tmp0
+  ,
+  ranges=[1024, 512],
+  origin_node=clone,
+  origins=OrderedSet([clone, permute]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 111, in <lambda>,
+      "transpose": lambda x: x.transpose(0, 1).contiguous(),  # [R,C]->[C,R]: stick C->R,
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  clone        read=1048576B write=1048576B lx=0B
+      output op0                    torch [1024, 512] -> device [8, 1024, 64] in HBM  | 524288 elems x 2B = 1048576 B (hbm counted: 1048576 B)
+      input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM  | 524288 elems x 2B = 1048576 B (hbm counted: 1048576 B)
+  -- prediction (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+     R=1048576B (read)   W=1048576B (write)
+     base = (R+W)/150 = 13.98 us
+     turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+     => T_model = 20.00 us
+
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W702 12:56:07.446109877 collection.cpp:1077] Warning: Detected an event which was likely passed to kineto by the PyTorch profiler, but is not present in the set of known events: [memory] This most likely means that Kineto has not maintained address stability for this event. Please report this to the PyTorch team. (function operator())
+== transpose[512x1024] -- profiler kernel time vs cost-model I/O ==
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    Self SPYRE  Self SPYRE %   SPYRE total  SPYRE time avg       CPU Mem  Self CPU Mem     SPYRE Mem  Self SPYRE Mem    # of Calls  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                             Memcpy (DtoH)         0.00%       0.000us         0.00%       0.000us       0.000us     159.041us        69.58%     159.041us     159.041us           0 B           0 B           0 B           0 B             1  
+                           Memset (Device)         0.00%       0.000us         0.00%       0.000us       0.000us      42.501us        18.59%      42.501us      21.251us           0 B           0 B           0 B           0 B             2  
+                                                   0.00%       0.000us         0.00%       0.000us       0.000us      17.951us         7.85%      17.951us       8.975us           0 B           0 B           0 B           0 B             2  
+                             Memcpy (HtoD)         0.00%       0.000us         0.00%       0.000us       0.000us       9.070us         3.97%       9.070us       9.070us           0 B           0 B           0 B           0 B             1  
+                  TorchDynamo Cache Lookup         1.19%      26.087us         1.19%      26.087us      26.087us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                Torch-Compiled Region: 0/0         2.07%      45.284us        12.59%     275.414us     275.414us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       1.00 MB           0 B             1  
+                         Pregraph bytecode         0.14%       3.061us         0.14%       3.061us       3.061us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+    AOTDispatcher Runtime Wrapper Prologue         0.27%       5.896us         0.27%       5.896us       5.896us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+           ## Call CompiledFxGraph None ##         9.95%     217.635us        10.11%     221.173us     221.173us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       1.00 MB       1.00 MB             1  
+                 aiuLaunchDMIControlBlocks         0.07%       1.558us         0.07%       1.558us       1.558us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                    aiuLaunchControlBlocks         0.09%       1.980us         0.09%       1.980us       0.990us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+                                  aten::to         0.12%       2.700us        86.22%       1.886ms       1.886ms       0.000us         0.00%       0.000us       0.000us       1.00 MB           0 B           0 B           0 B             1  
+                            aten::_to_copy         0.58%      12.579us        86.09%       1.883ms       1.883ms       0.000us         0.00%       0.000us       0.000us       1.00 MB           0 B           0 B           0 B             1  
+                       aten::empty_strided         0.48%      10.450us         0.48%      10.450us      10.450us       0.000us         0.00%       0.000us       0.000us       1.00 MB       1.00 MB           0 B           0 B             1  
+                               aten::copy_         0.26%       5.654us        85.04%       1.860ms       1.860ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                          aten::_copy_from        84.72%       1.853ms        84.78%       1.854ms       1.854ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                 aiuLaunchDMOControlBlocks         0.06%       1.263us         0.06%       1.263us       1.263us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                                  [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us      -1.00 MB      -1.00 MB      -1.00 MB      -1.00 MB             2  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 2.187ms
+Self SPYRE time total: 228.563us
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op clone
+IO     output op0                    torch [1024, 512] -> device [8, 1024, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO   => HBM I/O total = 2097152 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1048576 B (read)   W=1048576 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 13.98 us
+MODEL   turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+MODEL   => T_model = 20.00 us
+SUMMARY op=transpose rows=512 cols=1024 cores=32 tiles=0 lx=1 io_hbm_bytes=2097152 kernel_us=17.951 pred_us=20.000 err_pct=+11.4 bw_gbps=116.8 memset_us=42.501 other_dev_us=168.111 total_dev_us=228.563
+############################## BENCH_OP=cat0 ##############################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=1] = placeholder[target=arg0_1]    # torch.float16 (512, 1024) spyre:0
+%unsqueeze : [num_users=1] = call_function[target=torch.ops.aten.unsqueeze.default](args = (%arg0_1, 0), kwargs = {})    # torch.float16 (1, 512, 1024) spyre:0
+%expand : [num_users=1] = call_function[target=torch.ops.aten.expand.default](args = (%unsqueeze, [2, 512, 1024]), kwargs = {})    # torch.float16 (2, 512, 1024) spyre:0
+%clone : [num_users=1] = call_function[target=torch.ops.aten.clone.default](args = (%expand,), kwargs = {memory_format: torch.contiguous_format})    # torch.float16 (2, 512, 1024) spyre:0
+%view : [num_users=1] = call_function[target=torch.ops.aten.reshape.default](args = (%clone, [1024, 1024]), kwargs = {})    # torch.float16 (1024, 1024) spyre:0
+return (view,)
+[6 nodes]
+
+==============================================================================
+==== LoopLevel IR - BEFORE pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[2, 512, 1024], stride=[524288, 1024, 1])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1, i2 = index
+      tmp0 = ops.load(arg0_1, i2 + 1024 * i1)
+      return tmp0
+  ,
+  ranges=[2, 512, 1024],
+  origin_node=clone,
+  origins=OrderedSet([clone, expand, unsqueeze]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 112, in <lambda>,
+      "cat0": lambda x: torch.cat([x, x], dim=0),  # append rows (non-stick dim),
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== LoopLevel IR - AFTER pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[2, 512, 1024], stride=[524288, 1024, 1], device_layout=SpyreTensorLayout(device_size=[512, 16, 2, 64], stride_map =[1024, 64, 524288, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 1, d1: 32, d2: 1}
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1, i2 = index
+      tmp0 = ops.load(arg0_1, i2 + 1024 * i1)
+      return tmp0
+  ,
+  ranges=[2, 512, 1024],
+  origin_node=clone,
+  origins=OrderedSet([clone, expand, unsqueeze]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 112, in <lambda>,
+      "cat0": lambda x: torch.cat([x, x], dim=0),  # append rows (non-stick dim),
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  clone        read=1048576B write=2097152B lx=0B
+      output op0                    torch [2, 512, 1024] -> device [512, 16, 2, 64] in HBM  | 1048576 elems x 2B = 2097152 B (hbm counted: 2097152 B)
+      input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM  | 524288 elems x 2B = 1048576 B (hbm counted: 1048576 B) broadcast (loaded once)
+  -- prediction (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+     R=1048576B (read)   W=2097152B (write)
+     base = (R+W)/150 = 20.97 us
+     turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+     => T_model = 26.99 us
+
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W702 12:56:32.736113246 collection.cpp:1077] Warning: Detected an event which was likely passed to kineto by the PyTorch profiler, but is not present in the set of known events: [memory] This most likely means that Kineto has not maintained address stability for this event. Please report this to the PyTorch team. (function operator())
+== cat0[512x1024] -- profiler kernel time vs cost-model I/O ==
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    Self SPYRE  Self SPYRE %   SPYRE total  SPYRE time avg       CPU Mem  Self CPU Mem     SPYRE Mem  Self SPYRE Mem    # of Calls  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                             Memcpy (DtoH)         0.00%       0.000us         0.00%       0.000us       0.000us     250.767us        69.12%     250.767us     250.767us           0 B           0 B           0 B           0 B             1  
+                           Memset (Device)         0.00%       0.000us         0.00%       0.000us       0.000us      66.280us        18.27%      66.280us      33.140us           0 B           0 B           0 B           0 B             2  
+                                                   0.00%       0.000us         0.00%       0.000us       0.000us      32.760us         9.03%      32.760us      16.380us           0 B           0 B           0 B           0 B             2  
+                             Memcpy (HtoD)         0.00%       0.000us         0.00%       0.000us       0.000us      12.974us         3.58%      12.974us      12.974us           0 B           0 B           0 B           0 B             1  
+                  TorchDynamo Cache Lookup         0.72%      23.989us         0.72%      23.989us      23.989us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                Torch-Compiled Region: 0/0         1.38%      46.216us         8.51%     285.438us     285.438us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       2.00 MB           0 B             1  
+                         Pregraph bytecode         0.09%       2.932us         0.09%       2.932us       2.932us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+    AOTDispatcher Runtime Wrapper Prologue         0.19%       6.370us         0.19%       6.370us       6.370us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+           ## Call CompiledFxGraph None ##         6.75%     226.408us         6.85%     229.920us     229.920us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       2.00 MB       2.00 MB             1  
+                 aiuLaunchDMIControlBlocks         0.05%       1.683us         0.05%       1.683us       1.683us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                    aiuLaunchControlBlocks         0.05%       1.829us         0.05%       1.829us       0.915us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+                                  aten::to         0.09%       2.928us        90.78%       3.045ms       3.045ms       0.000us         0.00%       0.000us       0.000us       2.00 MB           0 B           0 B           0 B             1  
+                            aten::_to_copy         0.37%      12.486us        90.69%       3.042ms       3.042ms       0.000us         0.00%       0.000us       0.000us       2.00 MB           0 B           0 B           0 B             1  
+                       aten::empty_strided         0.16%       5.507us         0.16%       5.507us       5.507us       0.000us         0.00%       0.000us       0.000us       2.00 MB       2.00 MB           0 B           0 B             1  
+                               aten::copy_         0.18%       6.150us        90.15%       3.024ms       3.024ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                          aten::_copy_from        89.92%       3.016ms        89.97%       3.018ms       3.018ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                 aiuLaunchDMOControlBlocks         0.05%       1.788us         0.05%       1.788us       1.788us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                                  [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us      -2.00 MB      -2.00 MB      -2.00 MB      -2.00 MB             2  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 3.355ms
+Self SPYRE time total: 362.781us
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op clone
+IO     output op0                    torch [2, 512, 1024] -> device [512, 16, 2, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B) broadcast (loaded once)
+IO   => HBM I/O total = 3145728 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1048576 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 20.97 us
+MODEL   turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+MODEL   => T_model = 26.99 us
+SUMMARY op=cat0 rows=512 cols=1024 cores=32 tiles=0 lx=1 io_hbm_bytes=3145728 kernel_us=32.760 pred_us=26.990 err_pct=-17.6 bw_gbps=96.0 memset_us=66.280 other_dev_us=263.741 total_dev_us=362.781
+############################## BENCH_OP=cat1 ##############################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=1] = placeholder[target=arg0_1]    # torch.float16 (512, 1024) spyre:0
+%unsqueeze : [num_users=1] = call_function[target=torch.ops.aten.unsqueeze.default](args = (%arg0_1, 1), kwargs = {})    # torch.float16 (512, 1, 1024) spyre:0
+%expand : [num_users=1] = call_function[target=torch.ops.aten.expand.default](args = (%unsqueeze, [512, 2, 1024]), kwargs = {})    # torch.float16 (512, 2, 1024) spyre:0
+%clone : [num_users=1] = call_function[target=torch.ops.aten.clone.default](args = (%expand,), kwargs = {memory_format: torch.contiguous_format})    # torch.float16 (512, 2, 1024) spyre:0
+%view : [num_users=1] = call_function[target=torch.ops.aten.reshape.default](args = (%clone, [512, 2048]), kwargs = {})    # torch.float16 (512, 2048) spyre:0
+return (view,)
+[6 nodes]
+
+==============================================================================
+==== LoopLevel IR - BEFORE pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[512, 2, 1024], stride=[2048, 1024, 1])
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1, i2 = index
+      tmp0 = ops.load(arg0_1, i2 + 1024 * i0)
+      return tmp0
+  ,
+  ranges=[512, 2, 1024],
+  origin_node=clone,
+  origins=OrderedSet([clone, expand, unsqueeze]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 113, in <lambda>,
+      "cat1": lambda x: torch.cat([x, x], dim=1),  # append cols (stick dim -> interleave),
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== LoopLevel IR - AFTER pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[512, 2, 1024], stride=[2048, 1024, 1], device_layout=SpyreTensorLayout(device_size=[2, 16, 512, 64], stride_map =[1024, 64, 2048, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 32, d1: 1, d2: 1}
+  Pointwise(
+  'spyre',
+  torch.float16,
+  def inner_fn(index):
+      i0, i1, i2 = index
+      tmp0 = ops.load(arg0_1, i2 + 1024 * i0)
+      return tmp0
+  ,
+  ranges=[512, 2, 1024],
+  origin_node=clone,
+  origins=OrderedSet([clone, expand, unsqueeze]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 113, in <lambda>,
+      "cat1": lambda x: torch.cat([x, x], dim=1),  # append cols (stick dim -> interleave),
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  clone        read=1048576B write=2097152B lx=0B
+      output op0                    torch [512, 2, 1024] -> device [2, 16, 512, 64] in HBM  | 1048576 elems x 2B = 2097152 B (hbm counted: 2097152 B)
+      input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM  | 524288 elems x 2B = 1048576 B (hbm counted: 1048576 B) broadcast (loaded once)
+  -- prediction (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+     R=1048576B (read)   W=2097152B (write)
+     base = (R+W)/150 = 20.97 us
+     turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+     => T_model = 26.99 us
+
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W702 12:56:53.551909624 collection.cpp:1077] Warning: Detected an event which was likely passed to kineto by the PyTorch profiler, but is not present in the set of known events: [memory] This most likely means that Kineto has not maintained address stability for this event. Please report this to the PyTorch team. (function operator())
+== cat1[512x1024] -- profiler kernel time vs cost-model I/O ==
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    Self SPYRE  Self SPYRE %   SPYRE total  SPYRE time avg       CPU Mem  Self CPU Mem     SPYRE Mem  Self SPYRE Mem    # of Calls  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                             Memcpy (DtoH)         0.00%       0.000us         0.00%       0.000us       0.000us     242.169us        69.57%     242.169us     242.169us           0 B           0 B           0 B           0 B             1  
+                           Memset (Device)         0.00%       0.000us         0.00%       0.000us       0.000us      69.177us        19.87%      69.177us      34.589us           0 B           0 B           0 B           0 B             2  
+                                                   0.00%       0.000us         0.00%       0.000us       0.000us      28.100us         8.07%      28.100us      14.050us           0 B           0 B           0 B           0 B             2  
+                             Memcpy (HtoD)         0.00%       0.000us         0.00%       0.000us       0.000us       8.639us         2.48%       8.639us       8.639us           0 B           0 B           0 B           0 B             1  
+                  TorchDynamo Cache Lookup         0.69%      23.437us         0.69%      23.437us      23.437us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                Torch-Compiled Region: 0/0         1.43%      48.601us         8.53%     289.295us     289.295us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       2.00 MB           0 B             1  
+                         Pregraph bytecode         0.09%       2.983us         0.09%       2.983us       2.983us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+    AOTDispatcher Runtime Wrapper Prologue         0.18%       6.122us         0.18%       6.122us       6.122us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+           ## Call CompiledFxGraph None ##         6.73%     228.084us         6.83%     231.589us     231.589us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       2.00 MB       2.00 MB             1  
+                 aiuLaunchDMIControlBlocks         0.04%       1.520us         0.04%       1.520us       1.520us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                    aiuLaunchControlBlocks         0.06%       1.985us         0.06%       1.985us       0.993us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+                                  aten::to         0.08%       2.648us        90.78%       3.078ms       3.078ms       0.000us         0.00%       0.000us       0.000us       2.00 MB           0 B           0 B           0 B             1  
+                            aten::_to_copy         0.38%      12.755us        90.70%       3.075ms       3.075ms       0.000us         0.00%       0.000us       0.000us       2.00 MB           0 B           0 B           0 B             1  
+                       aten::empty_strided         0.16%       5.382us         0.16%       5.382us       5.382us       0.000us         0.00%       0.000us       0.000us       2.00 MB       2.00 MB           0 B           0 B             1  
+                               aten::copy_         0.23%       7.663us        90.16%       3.057ms       3.057ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                          aten::_copy_from        89.90%       3.048ms        89.94%       3.049ms       3.049ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                 aiuLaunchDMOControlBlocks         0.04%       1.417us         0.04%       1.417us       1.417us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                                  [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us      -2.00 MB      -2.00 MB      -2.00 MB      -2.00 MB             2  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 3.390ms
+Self SPYRE time total: 348.085us
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op clone
+IO     output op0                    torch [512, 2, 1024] -> device [2, 16, 512, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B) broadcast (loaded once)
+IO   => HBM I/O total = 3145728 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1048576 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 20.97 us
+MODEL   turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+MODEL   => T_model = 26.99 us
+SUMMARY op=cat1 rows=512 cols=1024 cores=32 tiles=0 lx=1 io_hbm_bytes=3145728 kernel_us=28.100 pred_us=26.990 err_pct=-3.9 bw_gbps=111.9 memset_us=69.177 other_dev_us=250.808 total_dev_us=348.085
+############################## BENCH_OP=sumcol ##############################
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/_dynamo/pgo.py:538: UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
+  warn_once(
+==============================================================================
+==== ATen FX graph (post-grad, pre-lowering)
+==============================================================================
+%arg0_1 : [num_users=1] = placeholder[target=arg0_1]    # torch.float16 (512, 1024) spyre:0
+%sum_1 : [num_users=1] = call_function[target=torch.ops.aten.sum.dim_IntList](args = (%arg0_1, [0]), kwargs = {})    # torch.float16 (1024,) spyre:0
+return (sum_1,)
+[3 nodes]
+
+==============================================================================
+==== LoopLevel IR - BEFORE pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedLayout('spyre:0', torch.float16, size=[1024], stride=[1])
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      i0 = index
+      r0_0 = rindex
+      tmp0 = ops.load(arg0_1, i0 + 1024 * r0_0)
+      return tmp0
+  ,
+  ranges=[1024],
+  reduction_ranges=[512],
+  reduction_type=sum,
+  origin_node=sum_1,
+  origins=OrderedSet([sum_1]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 98, in <lambda>,
+      "sumcol": lambda x: x.sum(dim=0),  # reduce ROWS -> [COLS] (the other axis),
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== LoopLevel IR - AFTER pre-scheduling passes
+==============================================================================
+op0: ComputedBuffer
+  layout=FixedTiledLayout('spyre:0', torch.float16, size=[1024], stride=[1], device_layout=SpyreTensorLayout(device_size=[16, 64], stride_map =[64, 1], device_dtype=DataFormats.SEN169_FP16))
+  op_it_space_splits={d0: 16, d1: 2}
+  Reduction(
+  'spyre',
+  torch.float16,
+  def inner_fn(index, rindex):
+      i0 = index
+      r0_0 = rindex
+      tmp0 = ops.load(arg0_1, i0 + 1024 * r0_0)
+      return tmp0
+  ,
+  ranges=[1024],
+  reduction_ranges=[512],
+  reduction_type=sum,
+  origin_node=sum_1,
+  origins=OrderedSet([sum_1]),
+  stack_traces = {,
+    File "/home/haoyang/torch-spyre/docs/source/user_guide/examples/profile_ops.py", line 98, in <lambda>,
+      "sumcol": lambda x: x.sum(dim=0),  # reduce ROWS -> [COLS] (the other axis),
+  ,
+  }
+)
+
+[1 ops]
+
+==============================================================================
+==== Cost model features + prediction (after pre-scheduling)
+==============================================================================
+  sum_1        read=1048576B write=2048B lx=0B [reduction: combine 0ns (k=1)]
+      output op0                    torch [1024] -> device [16, 64] in HBM  | 1024 elems x 2B = 2048 B (hbm counted: 2048 B)
+      input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM  | 524288 elems x 2B = 1048576 B (hbm counted: 1048576 B)
+  -- prediction (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+     R=1048576B (read)   W=2048B (write)
+     base = (R+W)/150 = 7.00 us
+     turn = a*min(R,W) = 0.00574*2048 = 0.01 us
+     => T_model = 7.02 us
+
+/home/haoyang/torch-spyre/.venv/lib64/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W702 12:57:12.252059443 collection.cpp:1077] Warning: Detected an event which was likely passed to kineto by the PyTorch profiler, but is not present in the set of known events: [memory] This most likely means that Kineto has not maintained address stability for this event. Please report this to the PyTorch team. (function operator())
+== sumcol[512x1024] -- profiler kernel time vs cost-model I/O ==
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    Self SPYRE  Self SPYRE %   SPYRE total  SPYRE time avg       CPU Mem  Self CPU Mem     SPYRE Mem  Self SPYRE Mem    # of Calls  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                           Memset (Device)         0.00%       0.000us         0.00%       0.000us       0.000us      17.547us        42.83%      17.547us       8.774us           0 B           0 B           0 B           0 B             2  
+                                                   0.00%       0.000us         0.00%       0.000us       0.000us       9.303us        22.71%       9.303us       4.651us           0 B           0 B           0 B           0 B             2  
+                             Memcpy (HtoD)         0.00%       0.000us         0.00%       0.000us       0.000us       7.722us        18.85%       7.722us       7.722us           0 B           0 B           0 B           0 B             1  
+                             Memcpy (DtoH)         0.00%       0.000us         0.00%       0.000us       0.000us       6.397us        15.61%       6.397us       6.397us           0 B           0 B           0 B           0 B             1  
+                  TorchDynamo Cache Lookup         5.38%      21.023us         5.38%      21.023us      21.023us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                Torch-Compiled Region: 0/0        11.66%      45.523us        72.19%     281.869us     281.869us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       2.00 KB           0 B             1  
+                         Pregraph bytecode         0.75%       2.909us         0.75%       2.909us       2.909us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+    AOTDispatcher Runtime Wrapper Prologue         3.09%      12.074us         3.09%      12.074us      12.074us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+           ## Call CompiledFxGraph None ##        55.83%     217.968us        56.69%     221.363us     221.363us       0.000us         0.00%       0.000us       0.000us           0 B           0 B       2.00 KB       2.00 KB             1  
+                 aiuLaunchDMIControlBlocks         0.37%       1.452us         0.37%       1.452us       1.452us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                    aiuLaunchControlBlocks         0.50%       1.943us         0.50%       1.943us       0.971us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+                                  aten::to         0.69%       2.676us        22.42%      87.554us      87.554us       0.000us         0.00%       0.000us       0.000us       2.00 KB           0 B           0 B           0 B             1  
+                            aten::_to_copy         3.03%      11.835us        21.74%      84.878us      84.878us       0.000us         0.00%       0.000us       0.000us       2.00 KB           0 B           0 B           0 B             1  
+                       aten::empty_strided         1.12%       4.369us         1.12%       4.369us       4.369us       0.000us         0.00%       0.000us       0.000us       2.00 KB       2.00 KB           0 B           0 B             1  
+                               aten::copy_         1.31%       5.115us        17.59%      68.674us      68.674us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                          aten::_copy_from        15.99%      62.442us        16.28%      63.559us      63.559us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                 aiuLaunchDMOControlBlocks         0.29%       1.117us         0.29%       1.117us       1.117us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             1  
+                                  [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us      -2.00 KB      -2.00 KB      -2.00 KB      -2.00 KB             2  
+------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 390.446us
+Self SPYRE time total: 40.969us
+
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op sum_1 [reduction]
+IO     output op0                    torch [1024] -> device [16, 64] in HBM = 1024 elems x 2B = 2048 B  (hbm counted: 2048 B)
+IO     input  arg0_1                 torch [512, 1024] -> device [16, 512, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO   => HBM I/O total = 1050624 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1048576 B (read)   W=2048 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 7.00 us
+MODEL   turn = a*min(R,W) = 0.00574*2048 = 0.01 us
+MODEL   => T_model = 7.02 us
+SUMMARY op=sumcol rows=512 cols=1024 cores=32 tiles=0 lx=1 io_hbm_bytes=1050624 kernel_us=9.303 pred_us=7.016 err_pct=-24.6 bw_gbps=112.9 memset_us=17.547 other_dev_us=14.119 total_dev_us=40.969

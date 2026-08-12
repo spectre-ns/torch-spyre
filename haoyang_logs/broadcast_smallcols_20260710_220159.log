@@ -1,0 +1,395 @@
+==== broadcast small-cols sweep Fri Jul 10 22:01:59 UTC 2026 ====
+git: f7bfa10  sections: SC1 SC2
+## SC1 broadcast small-COLS: {copy,bcast,bcastcol,mulbcast} x COLS{256..4096} @ ROWS=2048
+-- copy [2048,256]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg0_1                 torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  buf1                   device [1, 64] in HBM = 64 elems x 2B = 128 B  (hbm counted: 128 B) broadcast (loaded once)
+IO   => HBM I/O total = 2097280 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1048704 B (read)   W=1048576 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 13.98 us
+MODEL   turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+MODEL   => T_model = 17.77 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":524288,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"buf1","role":"input","mem":"hbm","elems":64,"broadcast":true,"dims":[1,64],"logical":[],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=copy rows=2048 cols=256 cores=32 tiles=0 lx=0 io_hbm_bytes=2097280 kernel_us=16.216 pred_us=17.774 err_pct=+9.6 bw_gbps=129.3 memset_us=57.087 other_dev_us=179.424 total_dev_us=252.727
+-- bcast [2048,256]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg0_1                 torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg1_1                 torch [1, 256] -> device [4, 1, 64] in HBM = 256 elems x 2B = 512 B  (hbm counted: 512 B) broadcast (loaded once)
+IO   => HBM I/O total = 2097664 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1049088 B (read)   W=1048576 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 13.98 us
+MODEL   turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+MODEL   => T_model = 17.78 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":524288,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":256,"broadcast":true,"dims":[4,1,64],"logical":[1,256],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=2048 cols=256 cores=32 tiles=0 lx=0 io_hbm_bytes=2097664 kernel_us=16.434 pred_us=17.777 err_pct=+8.2 bw_gbps=127.6 memset_us=42.262 other_dev_us=169.174 total_dev_us=227.870
+-- bcastcol [2048,256]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg0_1                 torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg1_1                 torch [2048, 1] -> device [1, 2048, 64] in HBM = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B) broadcast (loaded once)
+IO   => HBM I/O total = 2359296 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1310720 B (read)   W=1048576 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 15.73 us
+MODEL   turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+MODEL   => T_model = 19.99 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":524288,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":131072,"broadcast":true,"dims":[1,2048,64],"logical":[2048,1],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcastcol rows=2048 cols=256 cores=32 tiles=0 lx=0 io_hbm_bytes=2359296 kernel_us=18.727 pred_us=19.994 err_pct=+6.8 bw_gbps=126.0 memset_us=42.552 other_dev_us=178.842 total_dev_us=240.121
+-- mulbcast [2048,256]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg0_1                 torch [2048, 256] -> device [4, 2048, 64] in HBM = 524288 elems x 2B = 1048576 B  (hbm counted: 1048576 B)
+IO     input  arg1_1                 torch [1, 256] -> device [4, 1, 64] in HBM = 256 elems x 2B = 512 B  (hbm counted: 512 B) broadcast (loaded once)
+IO   => HBM I/O total = 2097664 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=1049088 B (read)   W=1048576 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 13.98 us
+MODEL   turn = a*min(R,W) = 0.00574*1048576 = 6.02 us
+MODEL   => T_model = 17.78 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":524288,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":524288,"broadcast":false,"dims":[4,2048,64],"logical":[2048,256],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":256,"broadcast":true,"dims":[4,1,64],"logical":[1,256],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=2048 cols=256 cores=32 tiles=0 lx=0 io_hbm_bytes=2097664 kernel_us=15.956 pred_us=17.777 err_pct=+11.4 bw_gbps=131.5 memset_us=50.650 other_dev_us=186.216 total_dev_us=252.822
+-- copy [2048,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  buf1                   device [1, 64] in HBM = 64 elems x 2B = 128 B  (hbm counted: 128 B) broadcast (loaded once)
+IO   => HBM I/O total = 4194432 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2097280 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 27.96 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 35.55 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":1048576,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"buf1","role":"input","mem":"hbm","elems":64,"broadcast":true,"dims":[1,64],"logical":[],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=copy rows=2048 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=4194432 kernel_us=32.908 pred_us=35.546 err_pct=+8.0 bw_gbps=127.5 memset_us=68.990 other_dev_us=271.473 total_dev_us=373.371
+-- bcast [2048,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 4195328 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2098176 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 27.97 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 35.55 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":1048576,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=2048 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=4195328 kernel_us=32.201 pred_us=35.554 err_pct=+10.4 bw_gbps=130.3 memset_us=82.987 other_dev_us=302.277 total_dev_us=417.465
+-- bcastcol [2048,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg1_1                 torch [2048, 1] -> device [1, 2048, 64] in HBM = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B) broadcast (loaded once)
+IO   => HBM I/O total = 4456448 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2359296 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 29.71 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 37.77 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":1048576,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":131072,"broadcast":true,"dims":[1,2048,64],"logical":[2048,1],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcastcol rows=2048 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=4456448 kernel_us=37.743 pred_us=37.767 err_pct=+0.1 bw_gbps=118.1 memset_us=94.249 other_dev_us=315.074 total_dev_us=447.066
+-- mulbcast [2048,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 4195328 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2098176 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 27.97 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 35.55 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":1048576,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=2048 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=4195328 kernel_us=32.601 pred_us=35.554 err_pct=+9.1 bw_gbps=128.7 memset_us=94.276 other_dev_us=314.247 total_dev_us=441.124
+-- copy [2048,1024]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  arg0_1                 torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  buf1                   device [1, 64] in HBM = 64 elems x 2B = 128 B  (hbm counted: 128 B) broadcast (loaded once)
+IO   => HBM I/O total = 8388736 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4194432 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 55.92 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 71.09 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":2097152,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"buf1","role":"input","mem":"hbm","elems":64,"broadcast":true,"dims":[1,64],"logical":[],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=copy rows=2048 cols=1024 cores=32 tiles=0 lx=0 io_hbm_bytes=8388736 kernel_us=68.016 pred_us=71.091 err_pct=+4.5 bw_gbps=123.3 memset_us=101.117 other_dev_us=416.792 total_dev_us=585.925
+-- bcast [2048,1024]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  arg0_1                 torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  arg1_1                 torch [1, 1024] -> device [16, 1, 64] in HBM = 1024 elems x 2B = 2048 B  (hbm counted: 2048 B) broadcast (loaded once)
+IO   => HBM I/O total = 8390656 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4196352 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 55.94 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 71.11 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":2097152,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":1024,"broadcast":true,"dims":[16,1,64],"logical":[1,1024],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=2048 cols=1024 cores=32 tiles=0 lx=0 io_hbm_bytes=8390656 kernel_us=64.122 pred_us=71.107 err_pct=+10.9 bw_gbps=130.9 memset_us=123.554 other_dev_us=392.750 total_dev_us=580.426
+-- bcastcol [2048,1024]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  arg0_1                 torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  arg1_1                 torch [2048, 1] -> device [1, 2048, 64] in HBM = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B) broadcast (loaded once)
+IO   => HBM I/O total = 8650752 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4456448 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 57.67 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 73.31 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":2097152,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":131072,"broadcast":true,"dims":[1,2048,64],"logical":[2048,1],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcastcol rows=2048 cols=1024 cores=32 tiles=0 lx=0 io_hbm_bytes=8650752 kernel_us=69.515 pred_us=73.311 err_pct=+5.5 bw_gbps=124.4 memset_us=94.680 other_dev_us=382.351 total_dev_us=546.546
+-- mulbcast [2048,1024]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  arg0_1                 torch [2048, 1024] -> device [16, 2048, 64] in HBM = 2097152 elems x 2B = 4194304 B  (hbm counted: 4194304 B)
+IO     input  arg1_1                 torch [1, 1024] -> device [16, 1, 64] in HBM = 1024 elems x 2B = 2048 B  (hbm counted: 2048 B) broadcast (loaded once)
+IO   => HBM I/O total = 8390656 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=4196352 B (read)   W=4194304 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 55.94 us
+MODEL   turn = a*min(R,W) = 0.00574*4194304 = 24.08 us
+MODEL   => T_model = 71.11 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":2097152,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":2097152,"broadcast":false,"dims":[16,2048,64],"logical":[2048,1024],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":1024,"broadcast":true,"dims":[16,1,64],"logical":[1,1024],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=2048 cols=1024 cores=32 tiles=0 lx=0 io_hbm_bytes=8390656 kernel_us=64.105 pred_us=71.107 err_pct=+10.9 bw_gbps=130.9 memset_us=124.257 other_dev_us=996.964 total_dev_us=1185.326
+-- copy [2048,2048]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  buf1                   device [1, 64] in HBM = 64 elems x 2B = 128 B  (hbm counted: 128 B) broadcast (loaded once)
+IO   => HBM I/O total = 16777344 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8388736 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 111.85 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 142.18 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":4194304,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"buf1","role":"input","mem":"hbm","elems":64,"broadcast":true,"dims":[1,64],"logical":[],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=copy rows=2048 cols=2048 cores=32 tiles=0 lx=0 io_hbm_bytes=16777344 kernel_us=137.501 pred_us=142.181 err_pct=+3.4 bw_gbps=122.0 memset_us=153.365 other_dev_us=613.120 total_dev_us=903.986
+-- bcast [2048,2048]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [1, 2048] -> device [32, 1, 64] in HBM = 2048 elems x 2B = 4096 B  (hbm counted: 4096 B) broadcast (loaded once)
+IO   => HBM I/O total = 16781312 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8392704 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 111.88 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 142.21 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":4194304,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":2048,"broadcast":true,"dims":[32,1,64],"logical":[1,2048],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=2048 cols=2048 cores=32 tiles=0 lx=0 io_hbm_bytes=16781312 kernel_us=135.551 pred_us=142.215 err_pct=+4.9 bw_gbps=123.8 memset_us=174.763 other_dev_us=440.713 total_dev_us=751.027
+-- bcastcol [2048,2048]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [2048, 1] -> device [1, 2048, 64] in HBM = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B) broadcast (loaded once)
+IO   => HBM I/O total = 17039360 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8650752 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 113.60 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 144.40 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":4194304,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":131072,"broadcast":true,"dims":[1,2048,64],"logical":[2048,1],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcastcol rows=2048 cols=2048 cores=32 tiles=0 lx=0 io_hbm_bytes=17039360 kernel_us=140.941 pred_us=144.401 err_pct=+2.5 bw_gbps=120.9 memset_us=138.509 other_dev_us=606.783 total_dev_us=886.233
+-- mulbcast [2048,2048]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg0_1                 torch [2048, 2048] -> device [32, 2048, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [1, 2048] -> device [32, 1, 64] in HBM = 2048 elems x 2B = 4096 B  (hbm counted: 4096 B) broadcast (loaded once)
+IO   => HBM I/O total = 16781312 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8392704 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 111.88 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 142.21 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":4194304,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":4194304,"broadcast":false,"dims":[32,2048,64],"logical":[2048,2048],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":2048,"broadcast":true,"dims":[32,1,64],"logical":[1,2048],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=2048 cols=2048 cores=32 tiles=0 lx=0 io_hbm_bytes=16781312 kernel_us=133.687 pred_us=142.215 err_pct=+6.4 bw_gbps=125.5 memset_us=169.085 other_dev_us=573.195 total_dev_us=875.967
+-- copy [2048,4096]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg0_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  buf1                   device [1, 64] in HBM = 64 elems x 2B = 128 B  (hbm counted: 128 B) broadcast (loaded once)
+IO   => HBM I/O total = 33554560 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16777344 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 223.70 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 284.36 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":8388608,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"buf1","role":"input","mem":"hbm","elems":64,"broadcast":true,"dims":[1,64],"logical":[],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=copy rows=2048 cols=4096 cores=32 tiles=0 lx=0 io_hbm_bytes=33554560 kernel_us=275.653 pred_us=284.361 err_pct=+3.2 bw_gbps=121.7 memset_us=244.414 other_dev_us=1027.088 total_dev_us=1547.155
+-- bcast [2048,4096]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg0_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg1_1                 torch [1, 4096] -> device [64, 1, 64] in HBM = 4096 elems x 2B = 8192 B  (hbm counted: 8192 B) broadcast (loaded once)
+IO   => HBM I/O total = 33562624 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16785408 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 223.75 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 284.43 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":8388608,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":4096,"broadcast":true,"dims":[64,1,64],"logical":[1,4096],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=2048 cols=4096 cores=32 tiles=0 lx=0 io_hbm_bytes=33562624 kernel_us=273.793 pred_us=284.429 err_pct=+3.9 bw_gbps=122.6 memset_us=296.279 other_dev_us=941.059 total_dev_us=1511.131
+-- bcastcol [2048,4096]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg0_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg1_1                 torch [2048, 1] -> device [1, 2048, 64] in HBM = 131072 elems x 2B = 262144 B  (hbm counted: 262144 B) broadcast (loaded once)
+IO   => HBM I/O total = 33816576 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=17039360 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 225.44 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 286.58 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":8388608,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":131072,"broadcast":true,"dims":[1,2048,64],"logical":[2048,1],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcastcol rows=2048 cols=4096 cores=32 tiles=0 lx=0 io_hbm_bytes=33816576 kernel_us=280.827 pred_us=286.581 err_pct=+2.0 bw_gbps=120.4 memset_us=238.049 other_dev_us=921.427 total_dev_us=1440.303
+-- mulbcast [2048,4096]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg0_1                 torch [2048, 4096] -> device [64, 2048, 64] in HBM = 8388608 elems x 2B = 16777216 B  (hbm counted: 16777216 B)
+IO     input  arg1_1                 torch [1, 4096] -> device [64, 1, 64] in HBM = 4096 elems x 2B = 8192 B  (hbm counted: 8192 B) broadcast (loaded once)
+IO   => HBM I/O total = 33562624 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=16785408 B (read)   W=16777216 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 223.75 us
+MODEL   turn = a*min(R,W) = 0.00574*16777216 = 96.30 us
+MODEL   => T_model = 284.43 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":8388608,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":8388608,"broadcast":false,"dims":[64,2048,64],"logical":[2048,4096],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":4096,"broadcast":true,"dims":[64,1,64],"logical":[1,4096],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=2048 cols=4096 cores=32 tiles=0 lx=0 io_hbm_bytes=33562624 kernel_us=276.117 pred_us=284.429 err_pct=+3.0 bw_gbps=121.6 memset_us=251.507 other_dev_us=984.156 total_dev_us=1511.780
+## SC2 ROWS control: {bcast,mulbcast} x ROWS{512,2048,8192} @ COLS=512
+-- bcast [512,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [512, 512] -> device [8, 512, 64] in HBM = 262144 elems x 2B = 524288 B  (hbm counted: 524288 B)
+IO     input  arg0_1                 torch [512, 512] -> device [8, 512, 64] in HBM = 262144 elems x 2B = 524288 B  (hbm counted: 524288 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 1049600 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=525312 B (read)   W=524288 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 7.00 us
+MODEL   turn = a*min(R,W) = 0.00574*524288 = 3.01 us
+MODEL   => T_model = 8.89 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":262144,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":262144,"broadcast":false,"dims":[8,512,64],"logical":[512,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":262144,"broadcast":false,"dims":[8,512,64],"logical":[512,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=512 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=1049600 kernel_us=7.943 pred_us=8.895 err_pct=+12.0 bw_gbps=132.1 memset_us=33.521 other_dev_us=63.874 total_dev_us=105.338
+-- mulbcast [512,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [512, 512] -> device [8, 512, 64] in HBM = 262144 elems x 2B = 524288 B  (hbm counted: 524288 B)
+IO     input  arg0_1                 torch [512, 512] -> device [8, 512, 64] in HBM = 262144 elems x 2B = 524288 B  (hbm counted: 524288 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 1049600 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=525312 B (read)   W=524288 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 7.00 us
+MODEL   turn = a*min(R,W) = 0.00574*524288 = 3.01 us
+MODEL   => T_model = 8.89 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":262144,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":262144,"broadcast":false,"dims":[8,512,64],"logical":[512,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":262144,"broadcast":false,"dims":[8,512,64],"logical":[512,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=512 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=1049600 kernel_us=8.374 pred_us=8.895 err_pct=+6.2 bw_gbps=125.3 memset_us=34.417 other_dev_us=31.182 total_dev_us=73.973
+-- bcast [2048,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 4195328 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2098176 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 27.97 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 35.55 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":1048576,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=2048 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=4195328 kernel_us=32.618 pred_us=35.554 err_pct=+9.0 bw_gbps=128.6 memset_us=65.209 other_dev_us=266.761 total_dev_us=364.588
+-- mulbcast [2048,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg0_1                 torch [2048, 512] -> device [8, 2048, 64] in HBM = 1048576 elems x 2B = 2097152 B  (hbm counted: 2097152 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 4195328 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=2098176 B (read)   W=2097152 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 27.97 us
+MODEL   turn = a*min(R,W) = 0.00574*2097152 = 12.04 us
+MODEL   => T_model = 35.55 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":1048576,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":1048576,"broadcast":false,"dims":[8,2048,64],"logical":[2048,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=2048 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=4195328 kernel_us=32.198 pred_us=35.554 err_pct=+10.4 bw_gbps=130.3 memset_us=82.435 other_dev_us=314.631 total_dev_us=429.264
+-- bcast [8192,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op add
+IO     output op0                    torch [8192, 512] -> device [8, 8192, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg0_1                 torch [8192, 512] -> device [8, 8192, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 16778240 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8389632 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 111.85 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 142.19 us
+MODEL FEATS [{"name":"add","is_reduction":false,"out_elems":4194304,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":4194304,"broadcast":false,"dims":[8,8192,64],"logical":[8192,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":4194304,"broadcast":false,"dims":[8,8192,64],"logical":[8192,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=bcast rows=8192 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=16778240 kernel_us=140.974 pred_us=142.188 err_pct=+0.9 bw_gbps=119.0 memset_us=166.807 other_dev_us=599.219 total_dev_us=907.000
+-- mulbcast [8192,512]
+  op_it_space_splits={d0: 32, d1: 1}
+IO -- device-layout I/O (cost model, stick-padded) --
+IO   op mul
+IO     output op0                    torch [8192, 512] -> device [8, 8192, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg0_1                 torch [8192, 512] -> device [8, 8192, 64] in HBM = 4194304 elems x 2B = 8388608 B  (hbm counted: 8388608 B)
+IO     input  arg1_1                 torch [1, 512] -> device [8, 1, 64] in HBM = 512 elems x 2B = 1024 B  (hbm counted: 1024 B) broadcast (loaded once)
+IO   => HBM I/O total = 16778240 B  (lx 0 B, ~free)
+MODEL -- estimate (turnaround): T = (R+W)/BW_PEAK + a*min(R,W) --
+MODEL   R=8389632 B (read)   W=8388608 B (write)   loop_trip L=1
+MODEL   base = (R+W)/150 = 111.85 us
+MODEL   turn = a*min(R,W) = 0.00574*8388608 = 48.15 us
+MODEL   => T_model = 142.19 us
+MODEL FEATS [{"name":"mul","is_reduction":false,"out_elems":4194304,"cores":32,"dtype_bytes":2,"args":[{"name":"op0","role":"output","mem":"hbm","elems":4194304,"broadcast":false,"dims":[8,8192,64],"logical":[8192,512],"loop_factor":1},{"name":"arg0_1","role":"input","mem":"hbm","elems":4194304,"broadcast":false,"dims":[8,8192,64],"logical":[8192,512],"loop_factor":1},{"name":"arg1_1","role":"input","mem":"hbm","elems":512,"broadcast":true,"dims":[8,1,64],"logical":[1,512],"loop_factor":1}],"reduction_cores":1,"loop_trip":1,"tiles_output_dim":false,"tile_rows_per_core":0.0,"is_matmul":false,"matmul_macs":0,"matmul_rows_per_core":0.0,"matmul_cols_per_core":0.0,"matmul_a_bytes":0,"matmul_b_bytes":0,"hbm_pattern":""}]
+SUMMARY op=mulbcast rows=8192 cols=512 cores=32 tiles=0 lx=0 io_hbm_bytes=16778240 kernel_us=142.041 pred_us=142.188 err_pct=+0.1 bw_gbps=118.1 memset_us=164.078 other_dev_us=473.671 total_dev_us=779.790
+==== DONE -> forward haoyang_logs/broadcast_smallcols_20260710_220159.log ====
