@@ -258,9 +258,6 @@ class AutomatedCoarseTilingTests(
         for p in reversed(self.patchers):
             p.__exit__(None, None, None)
 
-    def rand_device(self, shape: Sequence[int]) -> torch.Tensor:
-        return torch.rand(shape, dtype=torch.float16, device=DEVICE_NAME)
-
     # ------------------------------------------------------------------
     # Compile and observe
     # ------------------------------------------------------------------
@@ -392,7 +389,7 @@ class AutomatedCoarseTilingTests(
         """
         return _TilingCase(
             body=functools.partial(torch.softmax, dim=0),
-            args=(self.rand_device((512, 1024)),),
+            args=(torch.rand((512, 1024), dtype=torch.float16, device=DEVICE_NAME),),
             named_dims=(["R", "C"],),
             pins=(("C", 4),),  # Reduction axis is not tiled for now
             expected=(4,),
