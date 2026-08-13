@@ -13,61 +13,6 @@
 # limitations under the License.
 
 """Automated coarse tiling: hint preservation and hint-free tile discovery.
-
-Coarse tiling today is *hint-driven*: ``spyre_hint(num_tiles_per_dim=...)``
-scopes (from user code, or from a Spyre decomposition -- see
-``decompositions.py``'s SDPA) are turned into ``DimHint``s by
-``assign_dim_hints``, grouped by ``hints_to_coarse_tile_groups``, and stamped
-onto each op as ``loop_info`` (a ``CoarseTileInfo``) by ``coarse_tile``.  Nothing
-picks a tiling when the caller supplies none.
-
-Phase 1 of the compiler-optimization roadmap ("Coarse Tiling Optimization")
-makes the tiling a *solved* quantity: the allocator enumerates tile options and
-chooses them jointly with core division and LX residency.  This file pins the
-three behaviours that transition demands, over three of the four models the
-scratchpad suite uses (softmax, MLP, SwiGLU; SDPA is excluded -- see
-``parameter_models``):
-
-===========  =============================================  ===============
-hint_mode    Contract                                       Status today
-===========  =============================================  ===============
-hinted       Every level the hints ask for is applied, and   passes
-             nothing else is tiled.
-unhinted     With no hints at all the compiler finds a       xfail
-             tiling on its own.
-partial      Hinted levels survive verbatim; the compiler    xfail
-             fills in the levels the caller left open.
-===========  =============================================  ===============
-
-The two xfail rows are marked with ``expected_unimplemented``, not
-``unittest.expectedFailure``: they must fail *only* by reaching an unbuilt part
-of the feature, never by an unrelated typo or backend break.
-
-``solver_method`` is a parameter axis so a new solver is one string in
-``_SOLVERS`` -- adding ``"simulated_annealing"`` there generates the whole
-model x hint_mode matrix against ``SimulatedAnnealingLayoutSolver``.  The axis
-has no effect on the *hinted* rows today (hint-driven tiling is decided in
-``_maybe_coarse_tile_hints``, pre-stickification, long before any layout solver
-runs); it exists because Phase 1 moves the tiling decision into the solver, and
-these tests should start distinguishing solvers the day it does.
-
-Two notes on scope, each measured on device rather than assumed:
-
-* ``co_optimizing_lx_planning`` is deliberately left at its default (off).  A
-  coarse-tiled graph put through the co-optimizing allocator raises
-  ``AttributeError: 'MutationLayoutSHOULDREMOVE' object has no attribute
-  'device_layout'`` from ``_output_stride_to_device_size``
-  (``scratchpad/allocator.py:903``, reached via ``_split_fits_sticks``): the
-  tile drain op ``coarse_tile_copy_*`` carries a mutation layout the sizing
-  path does not expect.  Phase 1 has to fix that before tiling can be a solver
-  variable; until then, turning co-optimization on here would fail every row
-  for a reason that has nothing to do with hints.
-* The tolerances below are far tighter than the scratchpad suite's 0.1/0.1.
-  They have to be: reduction-dim coarse tiling currently returns *wrong
-  numbers* (softmax tiled over its reduced axis is off by more than the output
-  magnitude itself), and 0.1/0.1 hides that completely.  Every tolerance here
-  is set from a measured good run with room to spare, and the tiling each model
-  asks for is the one that is numerically correct today.
 """
 
 import dataclasses
