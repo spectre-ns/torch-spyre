@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Automated coarse tiling: hint preservation and hint-free tile discovery.
-"""
+"""Automated coarse tiling: hint preservation and hint-free tile discovery."""
 
 import dataclasses
 import functools
