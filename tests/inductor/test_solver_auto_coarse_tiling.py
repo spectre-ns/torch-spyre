@@ -32,6 +32,7 @@ from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
@@ -80,6 +81,113 @@ def expected_unimplemented(fn):
 # nest reads (4,) where the interior ops read (4, 2).
 _Counts = tuple[int, ...]
 
+# The same nest with each level labelled by the hint scope that created it:
+# ``(hint_id, count)``, outermost level first.  ``hint_id`` is ``None`` for a
+# level that could not be attributed to a scope (see ``_label_nest``).
+#
+# The label is what makes a pinned level distinguishable from a discovered one
+# by *identity* rather than by position.  Position cannot do it: a level's
+# place in the nest is decided by hint id ordering (``_hints_levels`` in
+# wsr/coarse_tile_hints.py sorts by it), so reading "the first k levels are the
+# pinned ones" silently assumes the tile search mints ids above the caller's --
+# true of span overflow's ``_SPAN_OVERFLOW_HINT_ID = 10000``, but a fact about
+# one namespace choice, not about what a pin means.  Checking labels lets a
+# discovered level land *outside* a pinned one without failing the test, while
+# still catching a pin that was dropped or re-tiled.
+_Level = tuple[Optional[int], int]
+_Nest = tuple[_Level, ...]
+
+
+def _trip_counts(nest: _Nest) -> _Counts:
+    """Drop the labels: the plain outermost-first trip counts of ``nest``."""
+    return tuple(count for _, count in nest)
+
+
+def _tiling_hint_ids(op) -> tuple[int, ...]:
+    """Ids of the hint scopes that actually tile ``op``, outermost first.
+
+    Mirrors the two filters ``_hints_levels`` applies when it turns hints into
+    levels: a hint the op is broadcast against (``loop_var is None``) and a
+    split of 1 both produce no loop level, so neither can label one.
+    """
+    return tuple(
+        sorted(
+            h.hint_id
+            for h in getattr(op, "dim_hints", [])
+            if h.loop_var is not None and h.split_count != 1
+        )
+    )
+
+
+def _group_hint_ids(ops: Sequence) -> tuple[int, ...]:
+    """The ids of one loop group's levels, outermost first.
+
+    ``loop_count`` is a group-level fact -- every op in a group carries the
+    whole nest, including the levels it is invariant at -- so an op's own
+    hints need not cover all of them.  This unions across the group the way
+    ``_hints_levels`` does, keeping an id as soon as *some* member is tiled by
+    it, which is exactly the rule that decided the group's levels.
+    """
+    best: dict[int, DimHint] = {}
+    for op in ops:
+        for h in getattr(op, "dim_hints", []):
+            prev = best.get(h.hint_id)
+            if (
+                prev is None
+                or prev.loop_var is None
+                or (prev.split_count == 1 and h.split_count > 1)
+            ):
+                best[h.hint_id] = h
+    return tuple(
+        sorted(
+            h.hint_id
+            for h in best.values()
+            if h.loop_var is not None and h.split_count != 1
+        )
+    )
+
+
+def _label_nest(op, group_ids: tuple[int, ...]) -> _Nest:
+    """Pair ``op``'s trip counts with the hint ids that produced them.
+
+    Two ways to attribute, tried in order, and both are a length agreement --
+    ids and counts are each sorted outermost-first, so equal lengths make the
+    pairing positional and unambiguous:
+
+    1. the op's own tiling hints, which is what a *trimmed* nest needs: a
+       reduction's fill op carries a subsequence of its group's counts (only
+       the output levels outer to the reduction -- see
+       ``_compute_fill_loop_info_planned``), so the group's list is too long
+       for it, and
+    2. the group's levels, which is what an op that is loop-invariant at one
+       of them needs -- there the op's own list is too short.
+
+    Neither fitting leaves the levels unlabelled rather than guessing at a
+    subset; a caller asserting on labels sees ``None`` and says so.
+    """
+    counts = tuple(int(count) for count in op.loop_info.loop_count)
+    own_ids = _tiling_hint_ids(op)
+    for ids in (own_ids, group_ids):
+        if len(ids) == len(counts):
+            return tuple(zip(ids, counts))
+    return tuple((None, count) for count in counts)
+
+
+def _label_tiling(operations: Sequence) -> dict[str, _Nest]:
+    """Every coarse-tiled op in ``operations``, mapped to its labelled nest."""
+    tiled = [op for op in operations if getattr(op, "loop_info", None) is not None]
+    by_group: dict[tuple[int, ...], list] = {}
+    for op in tiled:
+        # Group index is loop_group_id[0]; the rest of the tuple is nesting
+        # depth, which a trimmed nest truncates (_compute_fill_loop_info_planned
+        # keeps the prefix), so keying on the whole tuple would split a group.
+        by_group.setdefault(tuple(op.loop_info.loop_group_id[:1]), []).append(op)
+    group_ids = {key: _group_hint_ids(ops) for key, ops in by_group.items()}
+    return {
+        op.get_name(): _label_nest(op, group_ids[tuple(op.loop_info.loop_group_id[:1])])
+        for op in tiled
+    }
+
 
 @dataclasses.dataclass(frozen=True)
 class _TilingCase:
@@ -105,7 +213,9 @@ class _TilingCase:
     partial_pins / partial_expected / partial_named_dims:
         The same for the *partial* mode, where the caller pins a strict subset
         of the tiling and leaves the rest to the compiler.  ``partial_expected``
-        is the prefix that must survive verbatim.  ``partial_named_dims``
+        is one count per entry of ``partial_pins``, in that order: what each
+        pinned level must still be divided by, wherever the compiler ends up
+        nesting it among the levels it discovers.  ``partial_named_dims``
         defaults to ``named_dims``, and is overridden only when withholding a
         *name* is the only way to withhold a hint -- again, the
         decomposition-hinted case, where the caller cannot delete a scope the
@@ -157,17 +267,18 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     ``CustomPreSchedulingPasses`` itself, so observing its result means
     substituting this subclass for it.  ``coarse_tile`` stamps ``loop_info``
     well before the scheduler is built, so reading it here sees the final plan.
+
+    ``dim_hints`` is an input the tiling passes read and never clear, so it is
+    still on the ops here and each level can be labelled with the scope that
+    asked for it -- which is the only thing that distinguishes a caller's pin
+    from a level the compiler found on its own.
     """
 
-    tiling: dict[str, _Counts] = {}
+    tiling: dict[str, _Nest] = {}
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
-        type(self).tiling = {
-            op.get_name(): tuple(int(count) for count in op.loop_info.loop_count)
-            for op in graph.operations
-            if getattr(op, "loop_info", None) is not None
-        }
+        type(self).tiling = _label_tiling(graph.operations)
 
 
 class AutomatedCoarseTilingTests(
@@ -211,7 +322,7 @@ class AutomatedCoarseTilingTests(
         *,
         layout_solver: str,
         auto_tiling: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _Counts]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _Nest]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
         # Raises the "gate is missing" NotImplementedError before compiling.
         if auto_tiling:
@@ -246,6 +357,47 @@ class AutomatedCoarseTilingTests(
         )
 
     # ------------------------------------------------------------------
+    # Reading the labels
+    # ------------------------------------------------------------------
+    def _classify_levels(
+        self, tiling: dict[str, _Nest], pin_counts: _Counts
+    ) -> tuple[set[int], set[int]]:
+        """Split the applied levels into the caller's pins and the rest.
+
+        ``pin_counts[i]`` is the count the caller's *i*-th ``spyre_hint`` scope
+        asked for, outermost first.  That indexing is the identification:
+        ``get_id`` is a per-compile counter starting at 0 and ``spyre_hint`` is
+        its only caller, so with ``fullgraph=True`` the scopes wrapped around
+        the model own hint ids ``0..len(pin_counts)-1`` in nesting order, and
+        every other id on a level was minted by the compiler.  (A model hinted
+        by its own decomposition would break that split -- it also mints low
+        ids -- which is one more reason the SDPA case is left out below.)
+
+        Asserts each pinned level carries the count it was pinned to, wherever
+        in the nest it ended up, and returns the ``(pinned, discovered)`` id
+        sets so the caller can say which of the two it expected.
+        """
+        pinned = dict(enumerate(pin_counts))
+        seen_pinned: set[int] = set()
+        discovered: set[int] = set()
+        for name, nest in sorted(tiling.items()):
+            for hint_id, count in nest:
+                if hint_id is None:
+                    continue
+                if hint_id in pinned:
+                    self.assertEqual(
+                        count,
+                        pinned[hint_id],
+                        f"{name} tiles the level pinned by hint_{hint_id} "
+                        f"{count} ways, not the pinned {pinned[hint_id]} "
+                        f"(its nest is {nest})",
+                    )
+                    seen_pinned.add(hint_id)
+                else:
+                    discovered.add(hint_id)
+        return seen_pinned, discovered
+
+    # ------------------------------------------------------------------
     # The three contracts
     # ------------------------------------------------------------------
     def _check_hints_preserved(self, case: _TilingCase, solver: str) -> None:
@@ -258,7 +410,8 @@ class AutomatedCoarseTilingTests(
             "no op was coarse-tiled: the hints were dropped before coarse_tile "
             f"(expected the nest {case.expected})",
         )
-        for name, counts in sorted(tiling.items()):
+        nests = {name: _trip_counts(nest) for name, nest in tiling.items()}
+        for name, counts in sorted(nests.items()):
             self.assertEqual(
                 counts,
                 case.expected[: len(counts)],
@@ -267,10 +420,28 @@ class AutomatedCoarseTilingTests(
             )
         self.assertIn(
             case.expected,
-            set(tiling.values()),
+            set(nests.values()),
             f"no op carries the full hinted nest {case.expected}; "
-            f"the applied tiling was {tiling}",
+            f"the applied tiling was {nests}",
         )
+        # With the tile search off, the caller's scopes are the only thing that
+        # may tile anything: every level is accounted for by a pin, and the
+        # positional reading above and the labels have to agree.  A case hinted
+        # by its own decomposition pins nothing, and asserts only the counts.
+        if case.pins:
+            seen_pinned, discovered = self._classify_levels(tiling, case.expected)
+            self.assertEqual(
+                seen_pinned,
+                set(range(len(case.pins))),
+                f"the applied tiling {tiling} does not carry one level per "
+                f"hint: {len(case.pins)} scopes were opened around the model",
+            )
+            self.assertFalse(
+                discovered,
+                f"levels {sorted(discovered)} were invented by the compiler, "
+                f"but only the {len(case.pins)} hinted ones were asked for "
+                f"(the applied tiling was {tiling})",
+            )
         self._assert_matches_cpu(case, device, cpu)
 
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
@@ -286,7 +457,16 @@ class AutomatedCoarseTilingTests(
         self._assert_matches_cpu(case, device, cpu)
 
     def _check_partial_hints_preserved(self, case: "_TilingCase", solver: str) -> None:
-        """Pinned levels survive verbatim; the compiler fills in the rest."""
+        """Pinned levels survive verbatim; the compiler fills in the rest.
+
+        Both halves are checked by label, not by position, so the contract is
+        the one a pin actually carries -- *this dimension, divided this many
+        ways* -- and not "and outside everything the tile search adds".  Where
+        the compiler nests its own levels relative to a pin is its choice to
+        make: it may put them inside a pin, outside one, or in a separate loop
+        group over ops the pins never covered, and only the numerics
+        (``_assert_matches_cpu``) can call any of those wrong.
+        """
         cpu, device, tiling = self._compile_and_collect(
             case,
             "partial",
@@ -294,22 +474,18 @@ class AutomatedCoarseTilingTests(
             layout_solver=solver,
             auto_tiling=True,
         )
-        pinned = case.partial_expected
         self.assertTrue(tiling, "no op was coarse-tiled: the pins were dropped")
-        for name, counts in sorted(tiling.items()):
-            # A pin keeps the low hint id spyre_hint handed it, and the solver
-            # mints its own from a reserved base above those, so a pinned level
-            # always stays outside a discovered one.
-            self.assertEqual(
-                counts[: len(pinned)],
-                pinned[: len(counts)],
-                f"{name} is tiled {counts}, which does not preserve the pinned "
-                f"levels {pinned}",
-            )
+        seen_pinned, discovered = self._classify_levels(tiling, case.partial_expected)
+        self.assertEqual(
+            seen_pinned,
+            set(range(len(case.partial_pins))),
+            f"the applied tiling {tiling} lost a pinned level: the pins "
+            f"{case.partial_expected} should all still be there",
+        )
         self.assertTrue(
-            any(len(counts) > len(pinned) for counts in tiling.values()),
-            f"the pins {pinned} survived but nothing was added: the tile search "
-            f"left every unpinned dimension untiled ({tiling})",
+            discovered,
+            f"the pins {case.partial_expected} survived but nothing was added: "
+            f"the tile search left every unpinned dimension untiled ({tiling})",
         )
         self._assert_matches_cpu(case, device, cpu)
 
