@@ -62,8 +62,8 @@ def expected_unimplemented(fn):
     Because it is imperative rather than a pytest mark, ``-m 'not xfail'`` does
     not deselect these; they still run and still xfail at runtime.
 
-    Move to ``utils_inductor.py`` when Step 0.2 of the implementation plan
-    lands its shared copy.
+    Nothing here is specific to coarse tiling; it belongs in
+    ``utils_inductor.py`` once a second suite wants it.
     """
 
     @functools.wraps(fn)
@@ -189,7 +189,7 @@ def _label_nest(op, group_hints: tuple[DimHint, ...]) -> _Nest:
     is safe as long as nothing keys on them: a pin still shows up labelled on
     the ops that carry the untrimmed nest, and the count-only checks in
     ``_check_hints_preserved`` cover the trimmed op.  A reduction-tiled case
-    (Step 5) is what would make a real handler for them worth writing.
+    is what would make a real handler for them worth writing.
     """
     counts = tuple(int(count) for count in op.loop_info.loop_count)
     if len(group_hints) != len(counts):
