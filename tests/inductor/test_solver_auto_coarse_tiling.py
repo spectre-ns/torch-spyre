@@ -14,11 +14,11 @@
 
 """Automated coarse tiling: hint preservation and hint-free tile discovery."""
 
-import os
-import sys
 import dataclasses
 import functools
 import pytest
+import os
+import sys
 import torch
 import unittest
 
@@ -361,7 +361,12 @@ class AutomatedCoarseTilingTests(
 
         cpu_result = case.body(*(arg.to("cpu") for arg in case.args))
 
-        model = functools.partial(_apply_pins, pins, case.body) if pins else case.body
+        if pins:
+
+            def model(*args):
+                return _apply_pins(pins, case.body, *args)
+        else:
+            model = case.body
         CollectTilingPasses.tiling = {}
         # TODO: Patch coarse tiling config here
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
