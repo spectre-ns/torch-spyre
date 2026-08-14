@@ -135,33 +135,20 @@ def _is_subsequence(counts: _Counts, nest: _Counts) -> bool:
     return all(count in remaining for count in counts)
 
 
-def _tiling_hints(op) -> tuple[DimHint, ...]:
-    """The hints that actually tile ``op``, outermost (lowest id) first.
-
-    Mirrors the two filters ``_hints_levels`` applies when it turns hints into
-    levels: a hint the op is broadcast against (``loop_var is None``) and a
-    split of 1 both produce no loop level, so neither can label one.
-    """
-    return tuple(
-        sorted(
-            (
-                h
-                for h in getattr(op, "dim_hints", [])
-                if h.loop_var is not None and h.split_count != 1
-            ),
-            key=lambda h: h.hint_id,
-        )
-    )
-
-
 def _group_hints(ops: Sequence) -> tuple[DimHint, ...]:
     """One hint per level of a loop group, outermost first.
 
-    ``loop_count`` is a group-level fact -- every op in a group carries the
-    whole nest, including the levels it is invariant at -- so an op's own
-    hints need not cover all of them.  This unions across the group the way
-    ``_hints_levels`` does, keeping a scope as soon as *some* member is tiled
-    by it, which is exactly the rule that decided the group's levels.
+    The group, not the op, is the unit here.  ``loop_count`` is a group-level
+    fact -- every member carries the whole nest, including the levels it is
+    invariant at -- so a single op's ``dim_hints`` can be *shorter* than the
+    nest and is not a list the counts can be zipped against.  This unions
+    across the group the way ``_hints_levels`` does, keeping a scope as soon
+    as *some* member is tiled by it, which is exactly the rule that decided
+    the group's levels.
+
+    Two filters mirror that function: a hint the op is broadcast against
+    (``loop_var is None``) and a split of 1 both produce no loop level, so
+    neither can label one.
     """
     best: dict[int, DimHint] = {}
     for op in ops:
@@ -184,33 +171,34 @@ def _group_hints(ops: Sequence) -> tuple[DimHint, ...]:
 def _label_nest(op, group_hints: tuple[DimHint, ...]) -> _Nest:
     """Pair ``op``'s trip counts with the hints that produced them.
 
-    Two ways to attribute, tried in order, and both are a length agreement --
-    hints and counts are each ordered outermost-first, so equal lengths make
-    the pairing positional and unambiguous:
+    The group's hints are the label list, and the pairing is positional:
+    both sequences are ordered outermost-first, so equal lengths make it
+    unambiguous.  The op's own hints are deliberately not consulted -- being
+    a subset of the group's, they can only agree on length by being the same
+    list, and where they *would* differ (below) the op has none at all.
 
-    1. the op's own tiling hints, which is what a *trimmed* nest needs: a
-       reduction's fill op carries a subsequence of its group's counts (only
-       the output levels outer to the reduction -- see
-       ``_compute_fill_loop_info_planned``), so the group's list is too long
-       for it, and
-    2. the group's levels, which is what an op that is loop-invariant at one
-       of them needs -- there the op's own list is too short.
-
-    Neither fitting leaves the levels unlabelled rather than guessing at a
-    subset; a caller asserting on labels sees a bare count and says so.
+    The lengths disagree for a *trimmed* nest: a reduction's fill op keeps
+    only the output levels outer to the reduction
+    (``_compute_fill_loop_info_planned``), as does the ``reduce_copy`` built
+    from it.  Neither is constructed through ``copy_op_metadata``, so neither
+    carries ``dim_hints`` to fall back on, and their levels come back
+    unlabelled rather than guessed at from a subset that merely fits.  That
+    is safe as long as nothing keys on them: a pin still shows up labelled on
+    the ops that carry the untrimmed nest, and the count-only checks in
+    ``_check_hints_preserved`` cover the trimmed op.  A reduction-tiled case
+    (Step 5) is what would make a real handler for them worth writing.
     """
     counts = tuple(int(count) for count in op.loop_info.loop_count)
-    for hints in (_tiling_hints(op), group_hints):
-        if len(hints) == len(counts):
-            return tuple(
-                _Level(
-                    count=count,
-                    hint_id=h.hint_id,
-                    dim=h.dim_names[0] if h.dim_names else None,
-                )
-                for h, count in zip(hints, counts)
-            )
-    return tuple(_Level(count=count) for count in counts)
+    if len(group_hints) != len(counts):
+        return tuple(_Level(count=count) for count in counts)
+    return tuple(
+        _Level(
+            count=count,
+            hint_id=h.hint_id,
+            dim=h.dim_names[0] if h.dim_names else None,
+        )
+        for h, count in zip(group_hints, counts)
+    )
 
 
 def _label_tiling(operations: Sequence) -> dict[str, _Nest]:
@@ -375,6 +363,7 @@ class AutomatedCoarseTilingTests(
             # TODO: Implement coarse tiling configuration
             raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
 
+        # declare the tensor dimensions
         named_dims = case.dims_for(hint_mode)
         if named_dims is not None:
             for arg, dims in zip(case.args, named_dims):
