@@ -14,6 +14,8 @@
 
 """Automated coarse tiling: hint preservation and hint-free tile discovery."""
 
+import os
+import sys
 import dataclasses
 import functools
 import pytest
@@ -36,6 +38,7 @@ from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
+sys.path.insert(0, os.path.dirname(__file__))
 from test_scratchpad_use import _ParameterizedScratchpadMeta  # noqa: E402
 
 try:
@@ -251,10 +254,6 @@ class _TilingCase:
         *name* is the only way to withhold a hint -- again, the
         decomposition-hinted case, where the caller cannot delete a scope the
         compiler emitted.
-    blocked:
-        hint_mode -> substring of the error a *known* backend gap raises today.
-        A matching failure xfails with that reason; anything else fails red,
-        and so does a clean pass.
     """
 
     body: Callable[..., torch.Tensor]
@@ -265,7 +264,6 @@ class _TilingCase:
     atol: float
     rtol: float
     partial_named_dims: Optional[tuple[Sequence[str], ...]] = None
-    blocked: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @property
     def hinted_nest(self) -> _Counts:
@@ -327,23 +325,12 @@ class AutomatedCoarseTilingTests(
 
     def setUp(self):
         torch.manual_seed(0xAFFE)
-        self.patchers = [
-            t_inductor_config.patch("force_disable_caches", True),
-            ts_inductor_config.patch("allow_all_ops_in_lx_planning", True),
-            patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
-        ]
-        for p in self.patchers:
-            p.__enter__()
         # Named dims live in module state that outlives a compile, so a stale
         # name left by another test would silently bind a hint here.
         _pnd.reset()
         self.addCleanup(_pnd.reset)
         torch.compiler.reset()
         self.addCleanup(torch.compiler.reset)
-
-    def tearDown(self):
-        for p in reversed(self.patchers):
-            p.__exit__(None, None, None)
 
     # ------------------------------------------------------------------
     # Compile and observe
@@ -376,8 +363,19 @@ class AutomatedCoarseTilingTests(
 
         model = functools.partial(_apply_pins, pins, case.body) if pins else case.body
         CollectTilingPasses.tiling = {}
-        # TODO: Patch course tiling config here
-        with ts_inductor_config.patch(layout_solver=layout_solver):
+        # TODO: Patch coarse tiling config here
+        # force_disable_caches belongs to torch's inductor config, not Spyre's;
+        # CustomPreSchedulingPasses is a plain module attribute that
+        # enable_spyre_context re-imports per compile, so it is swapped with
+        # patch.object rather than a config knob.
+        with (
+            t_inductor_config.patch(force_disable_caches=True),
+            ts_inductor_config.patch(
+                allow_all_ops_in_lx_planning=True,
+                layout_solver=layout_solver,
+            ),
+            patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
+        ):
             device_result = torch.compile(model, fullgraph=True)(*case.args).to("cpu")
 
         return cpu_result, device_result, CollectTilingPasses.tiling
@@ -670,7 +668,7 @@ class AutomatedCoarseTilingTests(
     parameter_axes = {"hint_mode": tuple(_CHECKS), "solver_method": ("cpsat",)}
 
     # SDPA is omitted: it is the one model whose hints come from the compiler
-    # using SDPA in this test suit requires resolution of
+    # using SDPA in this test suite requires resolution of
     # https://github.com/torch-spyre/torch-spyre/issues/3198
 
     parameter_models = (
