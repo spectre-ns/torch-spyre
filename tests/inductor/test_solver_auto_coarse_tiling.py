@@ -16,14 +16,13 @@
 
 import dataclasses
 import functools
-import os
-import sys
-from collections.abc import Callable, Sequence
-from typing import Optional
-
 import pytest
 import torch
 import unittest
+
+from collections.abc import Callable, Sequence
+from typing import Optional
+
 from unittest.mock import patch
 
 from torch._inductor import config as t_inductor_config
@@ -36,7 +35,6 @@ from torch_spyre._inductor import spyre_hint
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from test_scratchpad_use import _ParameterizedScratchpadMeta  # noqa: E402
 
 try:
