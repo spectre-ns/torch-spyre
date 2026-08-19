@@ -7262,7 +7262,6 @@ class TestCoeffThroughFloor(unittest.TestCase):
         expr = floor(128 * s / 2)
         self.assertEqual(coeff_through_floor(expr, s), 64)
 
-
 class TestTileHelpers(unittest.TestCase):
     """Tests for tile.py."""
 
@@ -7525,6 +7524,12 @@ class TestTileSpecRepresentation(unittest.TestCase):
             core_divisions=[CoreDivision(output_splits={0: 2}, tiling=spec)],
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
+
+    def test_tiling_rides_on_core_division_not_a_parallel_list(self):
+        # The single most important representation constraint: a tiling is a
+        # field of a CoreDivision candidate, never a list beside core_divisions.
+        self.assertIn("tiling", CoreDivision.__dataclass_fields__)
+        self.assertNotIn("tilings", CoreDivisionBuffer.__dataclass_fields__)
 
 
 class TestTileSpecLoweringOutput(unittest.TestCase):
