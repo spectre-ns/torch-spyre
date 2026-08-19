@@ -89,6 +89,16 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     plan_coarse_tile_groups,
     reduction_loop_vars,
 )
+from torch_spyre._inductor.wsr.coarse_tile import (
+    BoundaryRole,
+    decide_boundary_role,
+)
+from torch_spyre._inductor.wsr.tile_prediction import (
+    PredictedBuffer,
+    predict_boundary_role,
+    predict_buffer_set,
+    predict_frame,
+)
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     CoarseTilingPass,
     _derive_group_idx_offset,
@@ -6899,6 +6909,199 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             self.assertFalse(
                 hasattr(op, "loop_info") and isinstance(op.loop_info, CoarseTileInfo)
             )
+
+
+# ===========================================================================
+# Stage 4 — Prediction and tiling-aware views
+# ===========================================================================
+
+
+def _ftl_pointwise(shape, name="buf0", dtype=torch.float16):
+    """A real ComputedBuffer(Pointwise) with a FixedTiledLayout and write dep."""
+    from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+    from torch._inductor.dependencies import MemoryDep
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    size = list(shape)
+    stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
+    within_stick = len(size) - 1
+    dim_order = [i for i in range(len(size)) if i != within_stick] + [within_stick]
+    dev = SpyreTensorLayout([int(s) for s in size], stride, dtype, dim_order)
+    layout = FixedTiledLayout("spyre:0", dtype, size, stride, dev)
+    data = MagicMock(spec=Pointwise)
+    data.ranges = list(size)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sum(s * int(st) for s, st in zip(syms, stride))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(
+            reads=set(), writes={MemoryDep(name, index, syms, tuple(shape))}
+        )
+    )
+    return op
+
+
+class TestBoundaryRole(unittest.TestCase):
+    """decide_boundary_role -- the classification _propagate_tiled_op dispatches
+    on and the predictor reads."""
+
+    def _tiled(self, name, group, tiled_dims, red_dims=None, data=None):
+        op = _make_op(data or _make_pointwise([Integer(64)]), name)
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(group,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=tiled_dims,
+            loop_tiled_reduction_dims=red_dims or [],
+        )
+        op.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(reads=set(), writes=set())
+        )
+        return op
+
+    def test_untiled_when_no_loop_info(self):
+        op = _make_op(_make_pointwise([Integer(64)]), "op0")  # _make_op dels loop_info
+        self.assertIs(decide_boundary_role(op, [op]), BoundaryRole.UNTILED)
+
+    def test_untiled_when_loop_invariant(self):
+        op = self._tiled("op0", 0, [[]])
+        self.assertIs(decide_boundary_role(op, [op]), BoundaryRole.UNTILED)
+
+    def test_loop_internal_when_no_outside_consumer(self):
+        op = self._tiled("op0", 0, [[0]])
+        self.assertIs(decide_boundary_role(op, [op]), BoundaryRole.LOOP_INTERNAL)
+
+    def test_boundary_when_outside_consumer(self):
+        prod = self._tiled("op0", 0, [[0]])
+        cons = _make_op(_make_pointwise([Integer(64)]), "op1")
+        cons.loop_info = CoarseTileInfo(
+            loop_group_id=(1,), loop_count=[Integer(4)], loop_tiled_dims=[[0]]
+        )
+        cons.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads=[SimpleNamespace(name="op0")], writes=set()
+            )
+        )
+        self.assertIs(decide_boundary_role(prod, [prod, cons]), BoundaryRole.BOUNDARY)
+
+    def test_boundary_when_graph_output(self):
+        op = self._tiled("op0", 0, [[0]])
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+            return_value={"op0"},
+        ):
+            self.assertIs(decide_boundary_role(op, [op]), BoundaryRole.BOUNDARY)
+
+    def test_reduction_role(self):
+        red = self._tiled(
+            "op0",
+            0,
+            [[]],
+            red_dims=[[0]],
+            data=_make_reduction([Integer(8)], [Integer(16)]),
+        )
+        self.assertIs(decide_boundary_role(red, [red]), BoundaryRole.REDUCTION)
+
+
+class TestPredictFrame(unittest.TestCase):
+    """predict_frame == what coarse_tile actually applies, and mutates no IR."""
+
+    def _apply_and_compare(self, shape, tiling, levels):
+        op = _ftl_pointwise(shape)
+        # R7.1: the predictor must not mutate the op.
+        ranges_before = list(op.data.ranges)
+        size_before = list(op.layout.size)
+        frame = predict_frame(op, tiling)
+        self.assertEqual(list(op.data.ranges), ranges_before)
+        self.assertEqual(list(op.layout.size), size_before)
+
+        pred_ranges = [int(r) for r in frame.ranges]
+        pred_devsize = list(frame.layout.device_layout.device_size)
+        pred_stride = [int(s) for s in frame.layout.stride]
+
+        op.dim_hints = tile_spec_to_dim_hints(op, tiling, list(range(len(tiling.axes))))
+        coarse_tile(_graph([op]), [([op], levels)])
+
+        self.assertEqual(pred_ranges, [int(r) for r in op.data.ranges])
+        self.assertEqual(pred_devsize, list(op.layout.device_layout.device_size))
+        self.assertEqual(pred_stride, [int(s) for s in op.layout.stride])
+
+    def test_single_output_axis(self):
+        self._apply_and_compare(
+            (512, 256, 128), TileSpec((TileAxis(0, 4),)), [(0, Integer(4))]
+        )
+
+    def test_nested_output_axes(self):
+        self._apply_and_compare(
+            (512, 256, 128),
+            TileSpec((TileAxis(0, 4), TileAxis(1, 2))),
+            [(0, Integer(4)), (1, Integer(2))],
+        )
+
+    def test_non_outermost_axis(self):
+        self._apply_and_compare(
+            (256, 512, 64), TileSpec((TileAxis(1, 8),)), [(0, Integer(8))]
+        )
+
+    def test_untiled_frame_is_the_committed_layout(self):
+        op = _ftl_pointwise((256, 128))
+        frame = predict_frame(op, TileSpec())
+        self.assertIs(frame.layout, op.layout)
+        self.assertEqual([int(r) for r in frame.ranges], [256, 128])
+
+
+class TestPredictBufferSet(unittest.TestCase):
+    """predict_buffer_set / predict_boundary_role over a hypothesized group."""
+
+    def _consumer(self, name, reads_name):
+        cons = _make_op(_make_pointwise([Integer(64)]), name)
+        cons.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads=[SimpleNamespace(name=reads_name)], writes=set()
+            )
+        )
+        return cons
+
+    def test_untiled_role(self):
+        op = _ftl_pointwise((256, 128), "op0")
+        self.assertIs(
+            predict_boundary_role(op, TileSpec(), {"op0"}, [op]), BoundaryRole.UNTILED
+        )
+
+    def test_loop_internal_when_group_contains_all_consumers(self):
+        op = _ftl_pointwise((256, 128), "op0")
+        role = predict_boundary_role(op, TileSpec((TileAxis(0, 2),)), {"op0"}, [op])
+        self.assertIs(role, BoundaryRole.LOOP_INTERNAL)
+
+    def test_boundary_when_consumer_outside_group(self):
+        op = _ftl_pointwise((256, 128), "op0")
+        cons = self._consumer("op1", "op0")
+        role = predict_boundary_role(
+            op, TileSpec((TileAxis(0, 2),)), {"op0"}, [op, cons]
+        )
+        self.assertIs(role, BoundaryRole.BOUNDARY)
+
+    def test_buffer_set_boundary_adds_full_buf(self):
+        op = _ftl_pointwise((256, 128), "op0")
+        cons = self._consumer("op1", "op0")
+        pbs = predict_buffer_set(op, TileSpec((TileAxis(0, 2),)), {"op0"}, [op, cons])
+        self.assertIs(pbs.role, BoundaryRole.BOUNDARY)
+        by_kind = {b.kind: b.size for b in pbs.buffers}
+        self.assertIn("tile_scratch", by_kind)
+        self.assertIn("full_buf", by_kind)
+        self.assertEqual(by_kind["tile_scratch"], 256 // 2 * 128)
+        self.assertEqual(by_kind["full_buf"], 256 * 128)
+
+    def test_buffer_set_loop_internal_has_only_tile_scratch(self):
+        op = _ftl_pointwise((256, 128), "op0")
+        pbs = predict_buffer_set(op, TileSpec((TileAxis(0, 2),)), {"op0"}, [op])
+        self.assertEqual([b.kind for b in pbs.buffers], ["tile_scratch"])
+        self.assertEqual(
+            pbs.buffers[0], PredictedBuffer("tile_scratch", 256 // 2 * 128)
+        )
 
 
 if __name__ == "__main__":

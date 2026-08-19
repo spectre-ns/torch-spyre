@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import Counter
+from enum import Enum
 from typing import NamedTuple
 
 import sympy
@@ -1287,6 +1288,51 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
             )
 
 
+class BoundaryRole(Enum):
+    """How a tiled op's own output buffer must be materialized.
+
+    This is the single source of truth for the classification that
+    :func:`_propagate_tiled_op` applies and that the stage-4 predictor
+    (``wsr.tile_prediction``) reads to price a candidate without applying it.
+    Extracting it keeps one copy of the rule (M6).
+    """
+
+    UNTILED = 0  # not tiled, or loop-invariant: nothing is materialized
+    LOOP_INTERNAL = 1  # per-tile scratch, reused in place -> LX-eligible
+    BOUNDARY = 2  # drained across a loop boundary: full_buf + a write copy
+    REDUCTION = 3  # reduction-tiled: accumulator + identity fill + combine op
+
+
+def decide_boundary_role(
+    op: ComputedBuffer,
+    operations: list[Operation],
+) -> BoundaryRole:
+    """Classify a tiled op's output-buffer role -- a pure predicate, no mutation.
+
+    Mirrors :func:`_propagate_tiled_op`'s branch structure exactly: the reduction
+    path (``_propagate_tiled_reduction_op``, which sets ``output_tiled_dims=[]``
+    unconditionally and materializes an accumulator/fill/combine) is
+    ``REDUCTION``; an untiled or loop-invariant op is ``UNTILED``; a tiled op
+    with no outside consumer and no graph output is ``LOOP_INTERNAL`` (per-tile
+    scratch); anything drained across a loop-group boundary is ``BOUNDARY``.
+    """
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None:
+        return BoundaryRole.UNTILED
+    if isinstance(op.data, Reduction) and any(
+        dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+    ):
+        return BoundaryRole.REDUCTION
+    if all(not dims for dims in loop_info.loop_tiled_dims):
+        return BoundaryRole.UNTILED
+    outside_consumers, is_graph_output = _find_outside_consumers(
+        op.get_name(), loop_info.loop_group_id, operations
+    )
+    if not outside_consumers and not is_graph_output:
+        return BoundaryRole.LOOP_INTERNAL
+    return BoundaryRole.BOUNDARY
+
+
 def _propagate_tiled_op(
     op: ComputedBuffer,
     operations: list[Operation],
@@ -1326,22 +1372,27 @@ def _propagate_tiled_op(
 
     if loop_info is None:
         return
-    loop_group_id = loop_info.loop_group_id
 
+    # The classification rule lives once, in decide_boundary_role; the mutation
+    # stays here. (The REDUCTION case already returned above via the
+    # has_tiled_reduction branch, so only the pointwise roles reach this point.)
+    role = decide_boundary_role(op, operations)
+    if role is BoundaryRole.UNTILED:
+        # Not tiled, or loop-invariant (loop_tiled_dims all empty).
+        return
+    if role is BoundaryRole.LOOP_INTERNAL:
+        # The buffer is a per-tile scratch region reused every iteration.
+        # Its own write must not advance at any level.
+        loop_info.output_tiled_dims = []
+        return
+
+    # BOUNDARY: drained across a loop-group boundary. Re-fetch the consumers the
+    # patch step needs (decide_boundary_role only reported the role, not them).
+    loop_group_id = loop_info.loop_group_id
     buf_name = op.get_name()
     outside_consumers, is_graph_output = _find_outside_consumers(
         buf_name, loop_group_id, operations
     )
-
-    # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant.
-    if all(not dims for dims in loop_info.loop_tiled_dims):
-        return
-
-    if not outside_consumers and not is_graph_output:
-        # Loop-internal: the buffer is a per-tile scratch region reused every
-        # iteration.  Its own write must not advance at any level.
-        loop_info.output_tiled_dims = []
-        return
 
     # Reconstruct the original (pre-division) ranges.
     full_ranges = _compute_full_ranges(op)
