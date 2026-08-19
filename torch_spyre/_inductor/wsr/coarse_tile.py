@@ -739,24 +739,34 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     return None
 
 
-def _loop_var_to_reduction_ranges_pos(
-    op: ComputedBuffer, sym: sympy.Symbol
-) -> int | None:
-    """Return position of loop variable sym in op.data.reduction_ranges, or None.
+def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
+    """Return the op's reduction loop variables, ordered as in
+    ``op.data.reduction_ranges``.
 
     Uses dep-tracking symbols (d0, d1, ...) rather than SymT.R0_INDEX symbols
     (r0_0, r0_1, ...) which are a different namespace.  Finds reduction symbols
     by set-subtracting output index symbols from input index symbols, in
     dep.ranges order (which matches reduction_ranges order).
+
+    This is the single source of truth for that derivation. Both directions go
+    through it: ``_loop_var_to_reduction_ranges_pos`` (loop_var -> position) and
+    coarse tiling's reduction-axis lowering (its inverse, position -> loop_var,
+    in ``scratchpad.coarse_tiling.tile_spec_to_dim_hints``).
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()
     out_dep = next(iter(rw.writes))
     out_syms = out_dep.index.free_symbols
     in_dep = next(d for d in rw.reads if hasattr(d, "index"))
-    reduction_syms = [s for s in in_dep.ranges if s not in out_syms]
+    return [s for s in in_dep.ranges if s not in out_syms]
+
+
+def _loop_var_to_reduction_ranges_pos(
+    op: ComputedBuffer, sym: sympy.Symbol
+) -> int | None:
+    """Return position of loop variable sym in op.data.reduction_ranges, or None."""
     try:
-        return reduction_syms.index(sym)
+        return reduction_loop_vars(op).index(sym)
     except ValueError:
         return None
 
