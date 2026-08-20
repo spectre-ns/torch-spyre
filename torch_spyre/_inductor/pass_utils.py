@@ -18,6 +18,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
 
+import regex
 import torch
 import sympy
 from sympy import Expr
@@ -40,8 +41,8 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
 from .core_mapping import core_to_slice_mapping
-from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
-from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
+from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS, TOPK_OPS
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .provenance import preserve_provenance
@@ -61,8 +62,8 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
     layout = buf.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         # Reading real_layout() through a mutation layout is only valid once
-        # the target buffer's own layout is a committed FixedTiledLayout. Two
-        # producers of this shape:
+        # the target buffer's own layout is a committed FixedTiledLayout.
+        # Three producers of this shape:
         #  - the copy-back elision optimization (propagate_layouts.py), which
         #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
         #  - coarse_tile.py's nested output-dim + reduction-dim tiling
@@ -70,13 +71,18 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
         #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
         #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
         #    reads that copy op's own output the same way an ordinary
-        #    producer's output would be read.
+        #    producer's output would be read; or
+        #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE op
+        #    whose target is a locally-created graph-output buffer (e.g.
+        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_op's
+        #    inserted coarse_tile_copy_* op reads the mutation op's own output
+        #    the same way. The mutation target there is an ordinary
+        #    ComputedBuffer, not a SpyreEmptyFallback, so this case is
+        #    recognized by layout alone.
         mutation_target = layout.get_buffer()
         is_elided = getattr(buf, ELIDED_COPY_BACK_ATTR, False)
-        is_carry_into_accum = isinstance(
-            mutation_target, SpyreEmptyFallback
-        ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
-        if not (is_elided or is_carry_into_accum):
+        is_committed_target = isinstance(mutation_target.get_layout(), FixedTiledLayout)
+        if not (is_elided or is_committed_target):
             raise RuntimeError(f"unexpected mutation layout on read buffer {buf}")
         layout = layout.real_layout()
     if not isinstance(layout, FixedTiledLayout):
@@ -108,6 +114,17 @@ def op_read_writes(op: Operation) -> ReadWrites:
         rw = op.get_read_writes()
         op.__dict__["_ts_cached_read_writes"] = rw
     return rw
+
+
+def op_short_name(op: Operation) -> str:
+    """Resolve an operation's short name, including fused FX origins."""
+
+    for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
+        target = getattr(fx_node, "target", None)
+        for attr in ("_opname", "__name__", "name"):
+            if name := getattr(target, attr, None):
+                return str(name)
+    return "None"
 
 
 def invalidate_op_read_writes(op: Operation) -> None:
@@ -366,20 +383,25 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
 
 
-def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
-    """Return names of deps whose loaded values are used as indices in scatter output_indexer.
+def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
+    """Return names of the index tensors used in a Scatter op's output_indexer.
 
-    For Scatter ops the indirect index is encoded in the output_indexer closure.
-    Extract the index buffer names directly from the 'indices' closure variable.
+    For Scatter ops the indirect index is encoded in the output_indexer
+    closure. Extract the index buffer names directly from the 'indices'
+    closure variable, preserving the order of `indices` (position within that
+    list is the scattered dimension). Returns [] if op isn't a Scatter, or if
+    the closure doesn't expose an 'indices' variable in the expected shape
+    (e.g. because Inductor renamed it), in which case a warning is logged
+    since downstream passes will silently miss the scatter index tensors.
     """
     from torch._inductor.ir import Scatter
 
     if not isinstance(op.data, Scatter):
-        return set()
+        return []
 
     fn = op.data.output_indexer
     if fn.__closure__ is None:
-        return set()
+        return []
 
     freevars = fn.__code__.co_freevars
     try:
@@ -387,18 +409,38 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
             name: cell.cell_contents for name, cell in zip(freevars, fn.__closure__)
         }
     except ValueError:
-        return set()
+        return []
 
-    if "indices" not in cells:
+    indices = None
+    if "indices" in cells:
+        indices = cells["indices"]
+    elif "index_loader" in cells:
+        # Fallback: PyTorch Inductor may use index_loader instead of direct indices.
+        # Try to extract the indices from index_loader's closure.
+        index_loader = cells["index_loader"]
+        if hasattr(index_loader, "__closure__") and index_loader.__closure__:
+            loader_freevars = index_loader.__code__.co_freevars
+            try:
+                loader_cells = {
+                    name: cell.cell_contents
+                    for name, cell in zip(loader_freevars, index_loader.__closure__)
+                }
+                if "indices" in loader_cells:
+                    indices = loader_cells["indices"]
+            except (ValueError, AttributeError):
+                pass
+
+    if indices is None:
         logger.warning(
-            "Scatter.output_indexer closure has no 'indices' variable — "
-            "Inductor may have renamed it. Scatter index tensors will not be "
-            "excluded from stick compatibility checks. (freevars: %s)",
+            "Scatter.output_indexer closure has no 'indices' variable or "
+            "'index_loader' — Inductor structure may have changed. "
+            "Scatter index tensors will not be excluded from stick compatibility "
+            "checks. (freevars: %s)",
             list(freevars),
         )
-        return set()
-    indices = cells["indices"]
-    names = set()
+        return []
+
+    names = []
     for idx_tensor in indices:
         if idx_tensor is None:
             continue
@@ -407,8 +449,109 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
         while hasattr(node, "data"):
             node = node.data
         if hasattr(node, "name") and node.name is not None:
-            names.add(node.name)
+            names.append(node.name)
     return names
+
+
+def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
+    """Return names of deps whose loaded values are used as indices in scatter output_indexer."""
+    return set(_scatter_index_buf_names_ordered(op))
+
+
+def _build_indirect_store_subs(
+    op: ComputedBuffer,
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Map indirect symbols in scatter writes to (IndexedBase subs, sizes).
+
+    For Scatter ops, the scatter indices are loop vars in write_dep.index.
+    Identify which loop vars come from scatter index buffers by extracting
+    those buffers and seeing which symbols appear in their index expressions.
+    Returns ({sym: IndexedBase[...]}, None) -- sizes is always None since the
+    scattered-dim size isn't recoverable from op alone; see compute_coordinates,
+    which treats sizes=None as "skip unknown symbols silently."
+    """
+    from sympy import IndexedBase
+
+    rw = op.get_read_writes()
+    writes = [
+        d
+        for d in rw.writes
+        if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
+    ]
+    if not writes:
+        return {}, None
+    write_dep = writes[0]
+
+    # Extract scatter index symbols (symbols in write_dep.index not in loop ranges).
+    all_write_syms = write_dep.index.free_symbols
+    loop_syms = set(write_dep.ranges.keys())
+    scatter_index_syms = all_write_syms - loop_syms
+
+    if not scatter_index_syms:
+        # No scatter symbols found.
+        return {}, None
+
+    # Try to map scatter symbols to index buffers from the closure.
+    index_buf_names = _scatter_index_buf_names_ordered(op)
+    if index_buf_names:
+        # Build map of all read deps by name
+        read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+        dep_by_name = {d.name: d for d in read_deps}
+
+        # Recover each symbol's relative creation order from its numeric
+        # tmp<N> suffix. Inductor's LoopBody.add_indirect assigns indirect
+        # placeholder symbols with a monotonic counter as output_indexer
+        # iterates over `indices` in position order (lowering.py's
+        # index_output_size_and_inner_fn), and the placeholder is later
+        # substituted 1:1 with the real tmp<N> CSE variable. So sorting by
+        # suffix recovers the same order as `indices` -- free_symbols itself
+        # is an unordered set and cannot be zipped directly.
+        def _sym_sort_key(s: sympy.Symbol) -> tuple[int, int, str]:
+            m = regex.search(r"(\d+)$", s.name)
+            return (0, int(m.group(1)), "") if m else (1, 0, s.name)
+
+        ordered_syms = sorted(scatter_index_syms, key=_sym_sort_key)
+
+        # CSE can dedupe two indices entries that load the same buffer at the
+        # same index expression, so len(ordered_syms) may be < len(indices).
+        # Only pair positionally when counts agree -- pairing at a mismatched
+        # count would silently attribute one index buffer's symbol to
+        # another, which is the exact bug this replaces.
+        subs = {}
+        if len(ordered_syms) == len(index_buf_names):
+            for sym, index_buf_name in zip(ordered_syms, index_buf_names):
+                if index_buf_name not in dep_by_name:
+                    continue
+                index_dep = dep_by_name[index_buf_name]
+                subs[sym] = IndexedBase(index_dep.name)[index_dep.index]
+        else:
+            logger.warning(
+                "_build_indirect_store_subs: %d scatter symbols but %d index "
+                "buffers (CSE likely deduped identical index loads) -- "
+                "cannot safely pair symbols to buffers positionally; "
+                "falling back to placeholder subs. symbols=%s indices=%s",
+                len(ordered_syms),
+                len(index_buf_names),
+                ordered_syms,
+                index_buf_names,
+            )
+        if subs:
+            return subs, None
+
+    # Fallback: if we couldn't extract index buffer names from the closure,
+    # create placeholder subs so that scatter_access_subs can be built.
+    # The actual buffer names don't matter for layout enforcement.
+    subs = {
+        sym: IndexedBase(f"scatter_idx_{i}")[sym]
+        for i, sym in enumerate(scatter_index_syms)
+    }
+
+    # The valid range for a scatter-index symbol isn't recoverable here (it's
+    # the mutation target's scattered-dim size, not visible from op alone).
+    # Return None, matching indirect_info_from_op's documented convention:
+    # sizes=None tells compute_coordinates to skip unknown symbols silently
+    # rather than raising Unsupported or misreading a fabricated size.
+    return subs, None
 
 
 def indirect_info_from_op(
@@ -426,6 +569,24 @@ def indirect_info_from_op(
     """
     if op is None:
         return set(), {}, None
+
+    from torch._inductor.ir import Scatter
+
+    # For scatter ops, extract info from the write side instead of reads.
+    if isinstance(op.data, Scatter):
+        subs, sizes = _build_indirect_store_subs(op)
+        scatter_names: set[str] = set()
+        for expr in subs.values():
+            if hasattr(expr, "base") and hasattr(expr.base, "name"):
+                scatter_names.add(expr.base.name)
+        access_subs = {
+            sym: IndirectAccess(sympy.Symbol(expr.base.name))
+            for sym, expr in subs.items()
+            if hasattr(expr, "base")
+        }
+        return scatter_names, access_subs, sizes
+
+    # For gather and other ops, use the read side.
     subs, sizes = _build_indirect_load_subs(op)
     names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
@@ -1435,6 +1596,15 @@ def _is_matmul_op(op: Operation) -> bool:
     )
 
 
+def is_topk(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing a topk reduction."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in TOPK_OPS
+    )
+
+
 # TODO: Select and store the core mapping before LX planning, then pass the
 # winning mapping to codegen.
 class _ViewPrep(NamedTuple):
@@ -1506,6 +1676,10 @@ def _prepare_per_core_view(
         buf_layout = V.graph.get_buffer(buf_name).layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return None
+
+    if is_topk(op):
+        return None
+
     dev_layout = buf_layout.device_layout
     device_size = dev_layout.device_size
     stride_map = dev_layout.stride_map
@@ -1564,6 +1738,7 @@ def _per_core_view_from_prep(
     # can't be placed on a device dim); cross-op view comparisons must treat it
     # as "no match", since its empty view means "couldn't tell", not "whole".
     unrepresentable = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, False)
+
     # No real split -> whole-buffer view, representable regardless of layout. Must
     # precede the ``prep is None`` guard to match the original ordering.
     if not any(n > 1 for d in coeff_splits for n in d.values()):
@@ -1678,7 +1853,7 @@ def _per_core_view_from_prep(
         if prep.is_matmul and config.core_id_k_fast_emission
         else None
     )
-    core_to_slot_by_name = core_to_slice_mapping(
+    core_to_slot = core_to_slice_mapping(
         iter_symbols,
         dim_splits,
         num_cores,
@@ -1689,9 +1864,7 @@ def _per_core_view_from_prep(
     # compare equal even if they name their iter axes differently.
     pruned_core_to_slot: list[tuple[int, "Expr"]] = []
     for sym, dev_dim in sym_to_device_dim.items():
-        expr = core_to_slot_by_name.get(str(sym))
-        if expr is not None:
-            pruned_core_to_slot.append((dev_dim, expr))
+        pruned_core_to_slot.append((dev_dim, core_to_slot[sym]))
     pruned_core_to_slot.sort(key=lambda x: x[0])
 
     view = PerCoreView(
