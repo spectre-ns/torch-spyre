@@ -1519,6 +1519,114 @@ def _spec_contains(spec: TileSpec, pin: TileSpec) -> bool:
     return all(axis in remaining for axis in pin.axes)
 
 
+def _op_read_span_is_evaluable(op: Operation) -> bool:
+    """True when the read-distance filter can compute concrete post-tile spans.
+
+    The span math needs a ``ComputedBuffer`` with a ``FixedTiledLayout`` whose
+    ``device_layout`` is fully static (integer sizes, strides, stride map, stick
+    size). For anything else -- a symbolic shape, a layout without
+    ``device_layout`` -- the filter cannot prove a violation, so it leaves the
+    option set untouched (fail open) rather than dropping candidates it cannot
+    evaluate.
+    """
+    from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+        _layout_has_static_span_metadata,
+    )
+
+    if not isinstance(op, ComputedBuffer):
+        return False
+    try:
+        layout = op.get_layout()
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return False
+    if getattr(layout, "device_layout", None) is None:
+        return False
+    try:
+        return _layout_has_static_span_metadata(layout)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _spec_within_read_distance(
+    op: ComputedBuffer, spec: TileSpec, max_cores: int
+) -> bool:
+    """True when tiling ``op`` by ``spec`` keeps every per-core read span within
+    ``MAX_SPAN_BYTES`` (the MVLOC read-distance limit).
+
+    Reuses ``_remaining_span_candidates_after_tile`` -- the post-tile span
+    validator the span-overflow planner uses -- so a candidate is admitted only
+    when it leaves no overflowing span, exactly as ``_search_min_cost_tile_plan``
+    requires. The untiled ``spec`` (no axes) validates the op's own full-size
+    read, so an op whose untiled read already overflows fails here.
+
+    ``max_cores`` matches the planner's ``config.sencores`` gate, so the two
+    agree on what "fits". Fails open: any evaluation error (e.g. a post-tile
+    layout that cannot be reconstructed for this candidate) keeps the spec
+    rather than dropping a possibly-valid tiling.
+    """
+    from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+        _remaining_span_candidates_after_tile,
+    )
+
+    split_by_host_dim = {
+        axis.host_dim: axis.count for axis in spec.axes if not axis.is_reduction
+    }
+    k_split = next((axis.count for axis in spec.axes if axis.is_reduction), None)
+    try:
+        remaining = _remaining_span_candidates_after_tile(
+            op, max_cores, split_by_host_dim, k_split=k_split
+        )
+    except (
+        Unsupported,
+        AttributeError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        KeyError,
+        IndexError,
+    ):
+        return True
+    return not remaining
+
+
+def _drop_read_distance_violations(
+    op: Operation, options: list[TileSpec], max_cores: int
+) -> list[TileSpec]:
+    """Drop every discovered tiling whose per-core span exceeds the read-distance
+    limit, raising ``Unsupported`` when none fit.
+
+    The CP-SAT discovery path (``auto_coarse_tiling``) enumerates tilings with no
+    span term in its cost model, so a chosen ``TileSpec`` is never otherwise
+    checked against ``MAX_SPAN_BYTES``. This applies the span-overflow planner's
+    own gate to the discovered option set: a coarse tiling only shrinks a
+    per-core span, so an op under no pressure loses nothing, but the untiled
+    option (and any tiling that fails to bring an overflowing read back under the
+    limit) is removed for an op whose full-size read overflows -- the solve is
+    then forced to pick a tiling that fits. When *no* candidate satisfies the
+    limit it raises rather than returning an empty set, matching
+    ``_search_min_cost_tile_plan``: an op that cannot be tiled to fit must abort,
+    not fall through to an over-span plan.
+
+    Ops whose span is not statically evaluable are returned unchanged (fail
+    open): the filter only drops what it can prove violates the limit.
+    """
+    if not _op_read_span_is_evaluable(op):
+        return options
+    surviving = [
+        spec for spec in options if _spec_within_read_distance(op, spec, max_cores)
+    ]
+    if not surviving:
+        from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
+
+        raise Unsupported(
+            f"Cannot tile {op.get_name()}: no discovered coarse tiling keeps the "
+            "per-core read span within the read-distance limit of "
+            f"{MAX_SPAN_BYTES / (1024**2):.3f} MB; the untiled read and every "
+            "candidate tiling overflow it."
+        )
+    return surviving
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -1792,8 +1900,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
           in a separate, earlier phase (which could not nest). The pin is honored
           under unified tiling whether or not discovery is on.
         - **Discovery** (an extra ``auto_coarse_tiling`` turns on) offers an
-          *un-pinned* op the output-axis tilings it could take; without it an
-          un-pinned op stays untiled.
+          *un-pinned* op the output-axis tilings it could take, minus any whose
+          per-core read span would still exceed the read-distance limit
+          (``MAX_SPAN_BYTES``); the untiled option is dropped too when the op's
+          own full-size read overflows, and an op with no fitting tiling raises
+          ``Unsupported`` (see :func:`_drop_read_distance_violations`). Without
+          discovery an un-pinned op stays untiled.
 
         Filtered by op kind either way:
 
@@ -1847,7 +1959,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         if not config.auto_coarse_tiling:
             return untiled
-        return options
+        # Discovery offers an unpinned op tilings the solve is free to pick, but
+        # the CP-SAT cost model carries no span term, so a discovered TileSpec is
+        # never otherwise checked against the hardware read-distance limit
+        # (MAX_SPAN_BYTES) the span-overflow planner enforces. Drop any candidate
+        # whose per-core read span would still overflow that limit -- including
+        # the untiled option when the op's own full-size read overflows -- so the
+        # solve can never choose a tiling that reintroduces the very span
+        # violation coarse tiling exists to prevent, and abort when none fit.
+        return _drop_read_distance_violations(op, options, max_cores)
 
     def _commit_divisions(
         self,

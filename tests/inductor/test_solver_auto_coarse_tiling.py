@@ -23,19 +23,31 @@ import torch
 import unittest
 
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import Optional
 
-from unittest.mock import patch
+import sympy
+from unittest.mock import MagicMock, patch
 
 from torch._inductor import config as t_inductor_config
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
 
+from torch_spyre._C import SpyreTensorLayout
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad.allocator import (
+    _spec_within_read_distance,
+    select_allocator,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import TileSpec
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -734,3 +746,116 @@ class AutomatedCoarseTilingTests(
     def run_case(self, params: dict, factory: Callable) -> None:
         """Body of one generated method: build the model, check its contract."""
         self._CHECKS[params["hint_mode"]](self, factory(self), params["solver_method"])
+
+
+# ---------------------------------------------------------------------------
+# Read-distance (span-limit) enforcement on the discovery path
+# ---------------------------------------------------------------------------
+# Device-free op builders, mirroring the span-overflow / enumerate-tilings
+# tests: a real FixedTiledLayout ComputedBuffer over a lightweight Pointwise
+# mock is all _tiling_candidates -> enumerate_tile_options -> the read-distance
+# filter needs.
+def _fixed_tiled_layout(shape, dtype=torch.float16):
+    size = list(shape)
+    stride = list(FlexibleLayout.contiguous_strides(size))
+    stride_ints = [int(s) for s in stride]
+    size_ints = [int(s) for s in size]
+    within_stick_dim = len(size_ints) - 1
+    dim_order = [i for i in range(len(size_ints)) if i != within_stick_dim]
+    dim_order.append(within_stick_dim)
+    device_layout = SpyreTensorLayout(size_ints, stride_ints, dtype, dim_order)
+    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
+
+
+def _pointwise_op(shape, name="buf0"):
+    data = MagicMock(spec=Pointwise)
+    data.ranges = list(shape)
+    layout = _fixed_tiled_layout(shape)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sympy.Integer(0)
+    for sym, stride in zip(syms, layout.stride):
+        index += sym * int(stride)
+    write = MemoryDep(name, index, syms, tuple(shape))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(reads=set(), writes={write})
+    )
+    return op
+
+
+# (1, 8195, 256, 64) fp16 = 268.7 MB, just over the 256 MiB read-distance limit;
+# splitting dim 1 (8195 = 5*11*149) by 5 -> 53.7 MB brings it back under.
+_OVERFLOW_SHAPE = (1, 8195, 256, 64)
+# dim 1 is prime with no divisor <= _MAX_AUTO_TILE_SPLIT_COUNT, so it cannot be
+# tiled; even the largest legal split of dim 2 leaves the span over the limit,
+# so no discovered tiling (untiled included) fits.
+_UNTILEABLE_OVERFLOW_SHAPE = (1, 1048583, 256, 64)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+class DiscoveryReadDistanceTests(unittest.TestCase):
+    """The auto-tiling discovery path never offers the solve an over-span tiling.
+
+    Integration check for the real ``_tiling_candidates`` wiring (config gates ->
+    ``enumerate_tile_options`` -> the read-distance filter): under
+    ``auto_coarse_tiling`` an unpinned op whose untiled read overflows
+    ``MAX_SPAN_BYTES`` loses the untiled option -- it must be tiled to fit --
+    while a fitting op keeps it, and an op that cannot be tiled to fit raises
+    ``Unsupported``, matching the span-overflow planner's own gate. No device or
+    solve is needed: ``_tiling_candidates`` is a pure function of the op and
+    config.
+    """
+
+    _AUTO_CFG = dict(
+        co_optimizing_lx_planning=True,
+        unified_tiling=True,
+        auto_coarse_tiling=True,
+        layout_solver="cpsat",
+        sencores=4,
+    )
+
+    def _candidates(self, op, **overrides):
+        cfg = {**self._AUTO_CFG, **overrides}
+        with ts_inductor_config.patch(cfg):
+            alloc = select_allocator()
+            return alloc._tiling_candidates(op, cfg["sencores"])
+
+    def test_untiled_dropped_for_overspan_unhinted_op(self):
+        op = _pointwise_op(_OVERFLOW_SHAPE)
+        options = self._candidates(op)
+
+        # The untiled read overflows, so untiled is not offered -- the solve is
+        # forced to tile -- but a fitting tiling remains.
+        self.assertNotIn(TileSpec(), options)
+        self.assertTrue(options)
+        # And every option the solve is offered actually fits the limit.
+        with ts_inductor_config.patch(self._AUTO_CFG):
+            for spec in options:
+                self.assertTrue(
+                    _spec_within_read_distance(op, spec, 4),
+                    f"discovery offered an over-span tiling {spec}",
+                )
+
+    def test_untiled_kept_for_fitting_unhinted_op(self):
+        op = _pointwise_op((1, 2, 16, 64))
+        options = self._candidates(op)
+
+        # Nothing overflows, so untiled stays on the menu.
+        self.assertIn(TileSpec(), options)
+
+    def test_raises_when_no_discovered_tiling_fits(self):
+        op = _pointwise_op(_UNTILEABLE_OVERFLOW_SHAPE)
+
+        with self.assertRaisesRegex(Unsupported, "read-distance limit"):
+            self._candidates(op)
+
+    def test_no_filtering_without_auto_coarse_tiling(self):
+        # Discovery off -> the op stays untiled and the read-distance filter never
+        # runs, even when the untiled read overflows: the drop is discovery's job.
+        op = _pointwise_op(_OVERFLOW_SHAPE)
+        options = self._candidates(op, auto_coarse_tiling=False)
+
+        self.assertEqual(options, [TileSpec()])
