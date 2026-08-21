@@ -1909,16 +1909,24 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         Filtered by op kind either way:
 
-        - **Restickify / matmul** offer nothing, pin or no pin: neither tiling
-          form is correct post-stickification. Matmul output-dim tiling hits the
-          ``_resize_device_layout`` gap (#3218) and the backend rejects the SDSC;
-          K/reduction tiling routes through the accumulator/combine path whose
-          numerics are ~2 orders off CPU (see ``_mlp_case``). A pin naming a
-          matmul axis is therefore dropped *here* and honored on the tileable ops
-          it also covers, with the group boundary reconciling the two.
-        - **Everything else** (pointwise, non-matmul reduction) offers only
-          output-axis tilings (``is_clean``); reduction tiling of e.g. softmax's
-          max/sum is numerically fragile and dropped.
+        - **Restickify** offers nothing, pin or no pin: no tiling form is correct
+          post-stickification.
+        - **Everything else** -- pointwise, reduction, *and matmul* -- offers only
+          output-axis tilings (``is_clean``). That single filter, plus the
+          enumerator's refusal to emit the stick (innermost) dim, already drops
+          the numerically fragile forms for every op kind, so matmul needs no
+          guard of its own: a matmul's K/reduction axis is not an output axis and
+          is excluded (reduction tiling routes through the accumulator/combine
+          path, ~2 orders off CPU -- see ``_mlp_case``), and its N/stick dim is
+          never emitted. What remains for a matmul is row/M-axis output tiling,
+          which is correct and backend-accepted (see
+          ``test_hint_matmul_row_tiling``), so a pin or a discovered tiling on
+          that axis is honored the same as for any other op.
+
+        (The ``_resize_device_layout`` gap #3218 that rejects a tile-sized read
+        copy is confined to the span-overflow path, where a matmul feeds a
+        differently-shaped consumer -- a separate mechanism, still xfailed, not
+        reached by the ordinary M-axis output tiling offered here.)
 
         An op already tiled (``loop_info`` set, e.g. by a prior apply) is left
         untouched, so the solve never re-tiles or un-tiles it.
@@ -1930,7 +1938,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled
-        if self._get_op_name(op) == "restickify" or _is_matmul_op(op):
+        if self._get_op_name(op) == "restickify":
             return untiled
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
             dim_hints_to_tile_spec,

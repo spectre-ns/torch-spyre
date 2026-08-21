@@ -32,9 +32,10 @@ from unittest.mock import MagicMock, patch
 from torch._inductor import config as t_inductor_config
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 
 from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
@@ -786,6 +787,36 @@ def _pointwise_op(shape, name="buf0"):
     return op
 
 
+def _matmul_op(out_shape=(128, 256), k=64, name="mm"):
+    """A minimal matmul ``ComputedBuffer`` for ``_tiling_candidates`` unit tests.
+
+    Mirrors ``_pointwise_op`` but gives the op a ``Reduction`` ``data`` carrying
+    a matmul reduction type, so ``_is_matmul_op`` recognises it. Like the
+    pointwise mock it declares no reads, keeping the read-distance filter
+    permissive; the enumerator's own filters (output-axis ``is_clean``, stick-dim
+    exclusion) are what these tests exercise, so the reduction ranges only need
+    to exist, not to enumerate.
+    """
+    data = MagicMock(spec=Reduction)
+    data.ranges = list(out_shape)
+    data.reduction_ranges = [k]
+    data.reduction_type = BATCH_MATMUL_OP
+    layout = _fixed_tiled_layout(out_shape)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(out_shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sympy.Integer(0)
+    for sym, stride in zip(syms, layout.stride):
+        index += sym * int(stride)
+    write = MemoryDep(name, index, syms, tuple(out_shape))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(reads=set(), writes={write})
+    )
+    return op
+
+
 # (1, 8195, 256, 64) fp16 = 268.7 MB, just over the 256 MiB read-distance limit;
 # splitting dim 1 (8195 = 5*11*149) by 5 -> 53.7 MB brings it back under.
 _OVERFLOW_SHAPE = (1, 8195, 256, 64)
@@ -859,3 +890,46 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         options = self._candidates(op, auto_coarse_tiling=False)
 
         self.assertEqual(options, [TileSpec()])
+
+    def test_matmul_offered_output_tiling(self):
+        # A matmul is no longer excluded by an op-kind guard: under discovery it
+        # is offered its row/M-axis (host_dim 0, non-reduction) output tilings,
+        # exactly like any other op.  This locks in the removal of the former
+        # `_is_matmul_op(op)` short-circuit in `_tiling_candidates`.
+        op = _matmul_op(out_shape=(128, 256))
+        options = self._candidates(op)
+
+        self.assertIn(TileSpec(), options)  # untiled still offered (read fits)
+        tiled = [t for t in options if not t.is_untiled]
+        self.assertTrue(
+            tiled,
+            "matmul was offered no tiling -- the removed matmul guard has "
+            f"silently returned (options were {options})",
+        )
+        for spec in tiled:
+            self.assertEqual(
+                [a.host_dim for a in spec.axes],
+                [0],
+                f"matmul offered a non-M-axis output tiling {spec}",
+            )
+
+    def test_matmul_never_offered_reduction_or_stick_tiling(self):
+        # Removing the guard does not open the numerically-fragile forms: the
+        # `is_clean` filter still drops every reduction (K) tiling, and the
+        # enumerator never emits the stick (innermost / N) dim.  So no offered
+        # spec tiles a reduction axis or the last host dim.
+        out_shape = (128, 256)
+        stick_dim = len(out_shape) - 1
+        op = _matmul_op(out_shape=out_shape)
+        options = self._candidates(op)
+
+        for spec in options:
+            self.assertFalse(
+                any(a.is_reduction for a in spec.axes),
+                f"matmul offered a reduction tiling {spec} (K-tiling is "
+                "~2 orders off CPU -- see _mlp_case)",
+            )
+            self.assertFalse(
+                any(a.host_dim == stick_dim for a in spec.axes),
+                f"matmul offered a stick-dim tiling {spec}",
+            )
