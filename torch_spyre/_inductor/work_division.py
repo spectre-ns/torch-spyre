@@ -64,7 +64,10 @@ from .work_division_constraints import (
     collect_work_division_constraints,
     has_qfp8wt_tensor,
 )
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .scratchpad.plan_solver import TileSpec
 
 from .logging_utils import get_inductor_logger
 from . import config

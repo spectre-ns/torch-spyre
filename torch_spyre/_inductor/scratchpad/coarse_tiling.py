@@ -41,18 +41,21 @@ from ..errors import Unsupported
 from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
+    _loop_var_to_ranges_pos,
+    _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
 from .passes import ScratchpadOptimizationPass
-from .plan_solver import TileSpec
+from .plan_solver import TileAxis, TileSpec
 
 
 def tile_spec_to_dim_hints(
     op: ComputedBuffer,
     spec: TileSpec,
     hint_ids: Sequence[int],
+    dim_names: Sequence[Sequence[str]] | None = None,
 ) -> list[DimHint]:
     """Lower a :class:`TileSpec` into per-op :class:`DimHint`s.
 
@@ -60,6 +63,12 @@ def tile_spec_to_dim_hints(
     count and the op's *own* loop variable for that axis, paired with the group's
     ``hint_id`` for that level. ``hint_ids`` has one entry per axis, outermost
     first, matching the group's ``levels``.
+
+    ``dim_names`` defaults to the discovered-tiling label ``["_coarse_tile"]`` on
+    every axis. A caller re-applying a *carried* pin passes the pin's own names
+    per axis so the applied level keeps the caller's dim name (e.g. ``"S"``)
+    rather than being relabelled as compiler-discovered -- the identity a
+    consumer keying on the pin (debug output, the hint-preservation tests) reads.
 
     The output-axis case is exactly ``_dims_to_hints`` (span overflow): resolve
     the loop var from ``op_out_coords(op)[host_dim]``. The reduction-axis case is
@@ -71,10 +80,15 @@ def tile_spec_to_dim_hints(
             f"tile_spec_to_dim_hints: {len(hint_ids)} hint_ids for "
             f"{len(spec.axes)} axes on {op.get_name()}"
         )
+    if dim_names is not None and len(dim_names) != len(spec.axes):
+        raise ValueError(
+            f"tile_spec_to_dim_hints: {len(dim_names)} dim_names for "
+            f"{len(spec.axes)} axes on {op.get_name()}"
+        )
     out_coords = op_out_coords(op)
     red_vars: list[sympy.Symbol] | None = None
     hints: list[DimHint] = []
-    for axis, hint_id in zip(spec.axes, hint_ids):
+    for i, (axis, hint_id) in enumerate(zip(spec.axes, hint_ids)):
         if axis.is_reduction:
             if not isinstance(op.data, Reduction):
                 raise Unsupported(
@@ -107,7 +121,9 @@ def tile_spec_to_dim_hints(
             loop_var = next(iter(free_symbols))
         hints.append(
             DimHint(
-                dim_names=["_coarse_tile"],
+                dim_names=(
+                    ["_coarse_tile"] if dim_names is None else list(dim_names[i])
+                ),
                 split_count=axis.count,
                 loop_var=loop_var,
                 is_reduction=axis.is_reduction,
@@ -115,6 +131,118 @@ def tile_spec_to_dim_hints(
             )
         )
     return hints
+
+
+def dim_hints_to_tile_spec(
+    op: ComputedBuffer,
+    dim_hints: Sequence[DimHint],
+) -> TileSpec:
+    """Lift an op's :class:`DimHint`s back into the :class:`TileSpec` they tile.
+
+    The inverse of :func:`tile_spec_to_dim_hints`: where that lowers each
+    :class:`TileAxis` to the loop var it tiles, this recovers the axis's
+    positional ``host_dim`` from the hint's ``loop_var``. Both directions go
+    through the same resolvers -- ``_loop_var_to_ranges_pos`` for an output axis,
+    ``_loop_var_to_reduction_ranges_pos`` for a reduction one -- so a spec
+    round-trips through a lowering and back unchanged.
+
+    Only hints that actually produce a loop level become axes, applying the same
+    two filters ``_hints_levels`` uses to decide a group's nest: a hint the op is
+    broadcast against (``loop_var is None``) and a split of 1 both tile nothing.
+    What survives is ordered outermost-first by ``hint_id`` (``spyre_hint``'s
+    counter increases inwards), which is exactly the order a :class:`TileSpec`
+    nests its axes in.
+
+    This is how a pin can reach the tile search as a *constraint* rather than a
+    mutation: the pin lives on the op as a ``DimHint`` (minted by
+    ``assign_dim_hints``, never applied to the graph), and the solver reads its
+    ``TileSpec`` here to restrict the op's candidates to the tilings that honor
+    it. The ``hint_id`` is not carried onto the axis -- ``TileAxis`` has no field
+    for it -- but the axis order preserves it positionally, so a caller that must
+    re-stamp the caller's original id on apply can recover it by pairing the
+    sorted hints back against ``spec.axes``.
+
+    Raises ``Unsupported`` if a level-producing hint's ``loop_var`` cannot be
+    placed on ``op``: a hint naming an axis the op does not carry is not a tiling
+    this op can take, and silently dropping it would understate the nest.
+    """
+    leveled = sorted(
+        (h for h in dim_hints if h.loop_var is not None and h.split_count != 1),
+        key=lambda h: h.hint_id,
+    )
+    if not leveled:
+        return TileSpec()
+    out_coords = op_out_coords(op)
+    axes: list[TileAxis] = []
+    for h in leveled:
+        if h.is_reduction:
+            if not isinstance(op.data, Reduction):
+                raise Unsupported(
+                    f"dim_hints_to_tile_spec: reduction hint_{h.hint_id} on "
+                    f"non-Reduction op {op.get_name()}."
+                )
+            host_dim = _loop_var_to_reduction_ranges_pos(op, h.loop_var)
+        else:
+            host_dim = _loop_var_to_ranges_pos(out_coords, h.loop_var)
+        if host_dim is None:
+            kind = "reduction" if h.is_reduction else "output"
+            raise Unsupported(
+                f"dim_hints_to_tile_spec: hint_{h.hint_id}'s loop var "
+                f"{h.loop_var} is not an {kind} axis of {op.get_name()}."
+            )
+        axes.append(
+            TileAxis(
+                host_dim=host_dim, count=h.split_count, is_reduction=h.is_reduction
+            )
+        )
+    return TileSpec(axes=tuple(axes))
+
+
+def _carried_pins(op: Operation) -> dict[tuple[int, int, bool], DimHint]:
+    """Index ``op``'s un-applied hints by the axis each tiles.
+
+    The key is ``(host_dim, count, is_reduction)`` -- the identity a chosen
+    :class:`TileAxis` matches on -- and the value is the ``DimHint`` it came
+    from, so :class:`CoarseTilingPass` can recover a carried pin's ``hint_id``
+    and dim name when it applies a spec that contains that axis. Reuses
+    :func:`dim_hints_to_tile_spec`'s own filter and ordering, then pairs each
+    resolved axis back with its origin hint. Empty when the op carries no
+    level-producing hint (the unhinted / discovered-only cases) or when a hint
+    fails to resolve on the op -- either way the reuse it feeds is inert.
+    """
+    dim_hints = list(getattr(op, "dim_hints", None) or [])
+    leveled = sorted(
+        (h for h in dim_hints if h.loop_var is not None and h.split_count != 1),
+        key=lambda h: h.hint_id,
+    )
+    if not leveled:
+        return {}
+    try:
+        spec = dim_hints_to_tile_spec(op, dim_hints)
+    except Unsupported:
+        return {}
+    return {
+        (axis.host_dim, axis.count, axis.is_reduction): h
+        for axis, h in zip(spec.axes, leveled)
+    }
+
+
+def _find_carried_pin(
+    pins_by_op: Mapping[str, Mapping[tuple[int, int, bool], DimHint]],
+    group_ops: Sequence[Operation],
+    axis: TileAxis,
+) -> DimHint | None:
+    """The carried pin some group op holds for ``axis``, or ``None``.
+
+    A group shares one spec, so any member that carried the pin identifies it;
+    the first match wins.
+    """
+    key = (axis.host_dim, axis.count, axis.is_reduction)
+    for op in group_ops:
+        pin = pins_by_op.get(op.get_name(), {}).get(key)
+        if pin is not None:
+            return pin
+    return None
 
 
 def derive_tiling_groups(
@@ -197,21 +325,52 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         groups_specs = derive_tiling_groups(graph, self._choices)
         if not groups_specs:
             return
-        # Both bases are derived off the graph *before* this pass stamps any of
-        # its own hints/groups, so pre-existing (hint-driven) ids are avoided
-        # and the ids this pass mints increase monotonically.
-        next_hint_id = _derive_hint_id_base(graph)
+        # Snapshot each op's carried pins before the loop below overwrites any
+        # dim_hints. A carried pin is a caller hint that reached the solve as
+        # data (``_solver_owns_tiling``) instead of a pre-stickification tiling;
+        # reusing its id/name below is what lets a pin keep its identity after
+        # being applied here rather than pre-stickification.
+        pins_by_op = {
+            op.get_name(): _carried_pins(op)
+            for group_ops, _ in groups_specs
+            for op in group_ops
+        }
+        # Fresh ids for compiler-discovered levels start above every id already
+        # on the graph -- the carried pins included, so a reused pin id (small)
+        # never clashes with a minted one. The group-id offset is derived the
+        # same way, both *before* this pass stamps anything of its own.
+        next_fresh_id = _derive_hint_id_base(graph)
         group_idx_offset = _derive_group_idx_offset(graph)
+        # A pin can spread across ops the solve split into different spec-groups,
+        # but ``validate_coarse_tile_groups`` forbids one hint id in two groups.
+        # So a pin's own id is reused by the *first* group that carries its axis
+        # and every later group mints a fresh id for that axis instead: the pin
+        # still surfaces under its own id (and name) at least once -- enough to
+        # identify it -- while the rest reads as discovered. This assumes a pin
+        # nests outermost (its small id sorts outer), which holds for every pin
+        # the caller places today; a pin used as an inner level would want its id
+        # ordered against the discovered ones, not simply reused.
+        claimed_pin_ids: set[int] = set()
         groups: list[tuple] = []
         for group_ops, spec in groups_specs:
-            hint_ids = list(range(next_hint_id, next_hint_id + len(spec.axes)))
-            next_hint_id += len(spec.axes)
+            axis_ids: list[int] = []
+            axis_names: list[list[str]] = []
+            for axis in spec.axes:
+                pin = _find_carried_pin(pins_by_op, group_ops, axis)
+                if pin is not None and pin.hint_id not in claimed_pin_ids:
+                    claimed_pin_ids.add(pin.hint_id)
+                    axis_ids.append(pin.hint_id)
+                    axis_names.append(list(pin.dim_names))
+                else:
+                    axis_ids.append(next_fresh_id)
+                    axis_names.append(["_coarse_tile"])
+                    next_fresh_id += 1
             levels = [
                 (hint_id, sympy.Integer(axis.count))
-                for hint_id, axis in zip(hint_ids, spec.axes)
+                for hint_id, axis in zip(axis_ids, spec.axes)
             ]
             for op in group_ops:
-                op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
+                op.dim_hints = tile_spec_to_dim_hints(op, spec, axis_ids, axis_names)
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
         coarse_tile_post_stickify(

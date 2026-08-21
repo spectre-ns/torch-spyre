@@ -254,6 +254,16 @@ class _TilingCase:
         *name* is the only way to withhold a hint -- again, the
         decomposition-hinted case, where the caller cannot delete a scope the
         compiler emitted.
+    partial_expects_discovery:
+        Whether the partial mode requires the compiler to add a level *beyond*
+        the pins.  True for a model with a free axis left unpinned (the MLP's
+        ``Dout``, SwiGLU's ``Dh``), which the tile search then finds.  False when
+        pinning the caller's subset leaves nothing the search may safely take:
+        softmax pins its only tileable output axis (``C``), and its other axis is
+        the reduction one, which the search excludes as numerically fragile -- so
+        the pin surviving *is* the whole contract, and demanding a discovered
+        level on top would demand the one tiling that is known wrong.  The pin is
+        still asserted preserved either way.
     """
 
     body: Callable[..., torch.Tensor]
@@ -264,6 +274,7 @@ class _TilingCase:
     atol: float
     rtol: float
     partial_named_dims: Optional[tuple[Sequence[str], ...]] = None
+    partial_expects_discovery: bool = True
 
     @property
     def hinted_nest(self) -> _Counts:
@@ -346,8 +357,6 @@ class AutomatedCoarseTilingTests(
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _Nest]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
         # declare the tensor dimensions
-        if hint_mode == "partial":
-            raise NotImplementedError("Partial hinting is currently unsupported")
         named_dims = case.dims_for(hint_mode)
         if named_dims is not None:
             for arg, dims in zip(case.args, named_dims):
@@ -549,12 +558,20 @@ class AutomatedCoarseTilingTests(
             f"the applied tiling {tiling} lost a pinned level: the pins "
             f"{list(case.partial_pins)} should all still be there",
         )
-        self.assertTrue(
-            discovered,
-            f"the pins {list(case.partial_pins)} survived but nothing was "
-            f"added: the tile search left every unpinned dimension untiled "
-            f"({tiling})",
-        )
+        if case.partial_expects_discovery:
+            self.assertTrue(
+                discovered,
+                f"the pins {list(case.partial_pins)} survived but nothing was "
+                f"added: the tile search left every unpinned dimension untiled "
+                f"({tiling})",
+            )
+        else:
+            self.assertFalse(
+                discovered,
+                f"nothing was expected beyond the pins {list(case.partial_pins)}, "
+                f"but the tile search added {list(discovered.values())} -- this "
+                f"model has no dimension it may safely tile past its pin ({tiling})",
+            )
         self._assert_matches_cpu(case, device, cpu)
 
     # ------------------------------------------------------------------
@@ -570,8 +587,10 @@ class AutomatedCoarseTilingTests(
         compile and is *numerically wrong* today -- the tiled max and sum drain
         through coarse_tile_combine/reduce_copy and land further from CPU than
         the output magnitude itself -- so C is the whole prescribed plan.  The
-        partial mode pins that same single level; what it leaves to the
-        compiler is R, plus any finer division of C.
+        partial mode pins that same single level and, uniquely among these
+        models, expects *no* discovery on top (``partial_expects_discovery`` is
+        False): the only other axis is R, which the tile search excludes for the
+        very reason above, so the pin surviving is the whole contract.
         """
         return _TilingCase(
             body=functools.partial(torch.softmax, dim=0),
@@ -579,6 +598,10 @@ class AutomatedCoarseTilingTests(
             named_dims=(["R", "C"],),
             pins=(("C", 4),),  # Reduction axis is not tiled for now
             partial_pins=(("C", 4),),
+            # C is the only tileable output axis, so pinning it leaves the search
+            # nothing safe to add (R is the excluded reduction axis): the pin
+            # surviving is the whole partial contract here.
+            partial_expects_discovery=False,
             # A good run lands at 2e-5 on outputs of order 1/512; the
             # reduction-tiled one lands at 3e-3, and this has to separate them.
             atol=5e-4,
@@ -706,8 +729,6 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["hint_mode"] in ("partial",):
-            decorators.append(expected_unimplemented)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:

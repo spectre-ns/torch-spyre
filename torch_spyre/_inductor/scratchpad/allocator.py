@@ -1505,6 +1505,20 @@ def _canonical_key(splits: tuple[dict, dict]) -> tuple:
     return (tuple(sorted(out.items())), tuple(sorted(red.items())))
 
 
+def _spec_contains(spec: TileSpec, pin: TileSpec) -> bool:
+    """True if every ``pin`` axis appears in ``spec`` in pin order (a sub-nest).
+
+    Subsequence, not equality: a pin fixes some levels and the solve is free to
+    nest discovered levels inside or outside them, so a spec honours the pin as
+    long as the pin's axes occur within it, in the same relative order. Axis
+    identity is exact -- ``TileAxis`` is frozen, so ``in`` matches host_dim,
+    count and is_reduction together, which is what makes a pin's *count* binding
+    and not just its axis.
+    """
+    remaining = iter(spec.axes)
+    return all(axis in remaining for axis in pin.axes)
+
+
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -1762,55 +1776,78 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         return cds or fixed
 
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
-        """Coarse-tiling options to pair with ``op``'s divisions (untiled first).
+        """Coarse-tiling options to pair with ``op``'s divisions.
 
-        Always offers the untiled ``TileSpec`` -- with the gate off it is the
-        only option, so enumeration and every downstream plan stay bit-identical
-        to today. When auto coarse tiling is enabled on the CP-SAT co-opt path,
-        an *un-hinted* op (one the pre-stickification passes have not already
-        tiled, i.e. ``loop_info is None``) also offers real tilings, filtered by
-        op kind:
+        With unified tiling off the only option is the untiled ``TileSpec``, so
+        enumeration and every downstream plan stay bit-identical to today. With
+        it on (the CP-SAT co-opt path), the solve is the single authority on
+        coarse tiling -- the pre-stickification hint pass has stood down
+        (``_solver_owns_tiling``), so a caller's hint reaches here as data on
+        ``op.dim_hints`` rather than as an already-applied tiling. Two roles:
 
-        - **Restickify ops** offer nothing: they are layout-conversion copies,
-          and coarse-tiling one fragments the graph into mismatched groups the
-          backend scheduler cannot handle.
-        - **Matmuls** (``_is_matmul_op``) offer nothing: neither tiling form is
-          correct in this post-stickification path. Output-dim tiling hits the
-          ``_resize_device_layout`` gap (#3218, xfailed) and the backend rejects
-          the SDSC; K/reduction tiling routes through the accumulator/combine
-          path whose matmul numerics are ~2 orders off CPU (see ``_mlp_case``).
-          Both work only pre-stickification via hints, so until #3218 lands the
-          solver leaves matmuls untiled.
+        - A **carried pin** (a hint the caller placed) is *mandatory*: the option
+          set is reduced to the tilings that contain it and untiled is dropped,
+          so the solve can only pick a tiling that honours the pin. This is what
+          lets a pin compose with discovery in one solve instead of being applied
+          in a separate, earlier phase (which could not nest). The pin is honored
+          under unified tiling whether or not discovery is on.
+        - **Discovery** (an extra ``auto_coarse_tiling`` turns on) offers an
+          *un-pinned* op the output-axis tilings it could take; without it an
+          un-pinned op stays untiled.
+
+        Filtered by op kind either way:
+
+        - **Restickify / matmul** offer nothing, pin or no pin: neither tiling
+          form is correct post-stickification. Matmul output-dim tiling hits the
+          ``_resize_device_layout`` gap (#3218) and the backend rejects the SDSC;
+          K/reduction tiling routes through the accumulator/combine path whose
+          numerics are ~2 orders off CPU (see ``_mlp_case``). A pin naming a
+          matmul axis is therefore dropped *here* and honored on the tileable ops
+          it also covers, with the group boundary reconciling the two.
         - **Everything else** (pointwise, non-matmul reduction) offers only
-          output-axis tilings (``is_clean``). Reduction tiling of e.g. softmax's
-          max/sum is numerically fragile, so it is dropped there.
+          output-axis tilings (``is_clean``); reduction tiling of e.g. softmax's
+          max/sum is numerically fragile and dropped.
 
-        A hinted op keeps its pinned tiling untouched (loop_info already set),
-        so the solve never re-tiles or un-tiles it.
+        An op already tiled (``loop_info`` set, e.g. by a prior apply) is left
+        untouched, so the solve never re-tiles or un-tiles it.
         """
         untiled = [TileSpec()]
         if getattr(self, "_suppress_tiling", False):
             return untiled
-        if not (
-            config.unified_tiling
-            and config.auto_coarse_tiling
-            and config.layout_solver == "cpsat"
-        ):
+        if not (config.unified_tiling and config.layout_solver == "cpsat"):
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled
         if self._get_op_name(op) == "restickify" or _is_matmul_op(op):
             return untiled
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            dim_hints_to_tile_spec,
+        )
         from torch_spyre._inductor.wsr.enumerate_tilings import enumerate_tile_options
 
         try:
-            options = enumerate_tile_options(op, max_cores)
+            # enumerate_tile_options returns untiled first; the is_clean filter
+            # keeps it and the output-only specs, preserving that order.
+            options = [t for t in enumerate_tile_options(op, max_cores) if t.is_clean]
         except Unsupported:
+            options = list(untiled)
+
+        try:
+            pin = dim_hints_to_tile_spec(op, getattr(op, "dim_hints", []))
+        except Unsupported:
+            pin = TileSpec()
+        if not pin.is_untiled:
+            # Mandatory pin: keep only pin-honouring tilings, drop untiled, and
+            # always offer the bare pin so a pin the enumerator does not reach on
+            # its own (a legal tiling it happens not to emit) is never lost.
+            honoring = [t for t in options if _spec_contains(t, pin)]
+            if pin not in honoring:
+                honoring.append(pin)
+            return honoring
+
+        if not config.auto_coarse_tiling:
             return untiled
-        # enumerate_tile_options returns the untiled spec first; the is_clean
-        # filter keeps it (the untiled spec is is_clean) and the output-only
-        # specs, preserving that order.
-        return [t for t in options if t.is_clean]
+        return options
 
     def _commit_divisions(
         self,

@@ -110,6 +110,7 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_group_idx_offset,
     _derive_hint_id_base,
     derive_tiling_groups,
+    dim_hints_to_tile_spec,
     tile_spec_to_dim_hints,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -7413,6 +7414,48 @@ class TestTileSpecLoweringOutput(unittest.TestCase):
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
 
+    def test_roundtrip_output_axes(self):
+        # spec -> dim_hints -> spec is the identity on a legal output tiling.
+        op = self._op(3)
+        spec = TileSpec((TileAxis(0, 4), TileAxis(2, 2)))
+        hints = tile_spec_to_dim_hints(op, spec, [0, 1])
+        self.assertEqual(dim_hints_to_tile_spec(op, hints), spec)
+
+    def test_split_of_one_and_broadcast_hints_are_not_levels(self):
+        # The two filters _hints_levels applies: a split of 1 and a hint the op
+        # is broadcast against (loop_var None) tile nothing, so neither becomes
+        # an axis -- only the real level survives.
+        op = self._op(2)
+        hints = [
+            DimHint(["A"], 1, sympy.Symbol("c0"), False, hint_id=0),
+            DimHint(["B"], 4, None, False, hint_id=1),
+            DimHint(["C"], 2, sympy.Symbol("c1"), False, hint_id=2),
+        ]
+        self.assertEqual(dim_hints_to_tile_spec(op, hints), TileSpec((TileAxis(1, 2),)))
+
+    def test_axes_ordered_outermost_first_by_hint_id(self):
+        # Hints given out of hint_id order still come back outermost-first, the
+        # nesting order a TileSpec encodes.
+        op = self._op(3)
+        hints = [
+            DimHint(["B"], 2, sympy.Symbol("c2"), False, hint_id=5),
+            DimHint(["A"], 4, sympy.Symbol("c0"), False, hint_id=1),
+        ]
+        self.assertEqual(
+            dim_hints_to_tile_spec(op, hints),
+            TileSpec((TileAxis(0, 4), TileAxis(2, 2))),
+        )
+
+    def test_unresolvable_output_loop_var_raises(self):
+        op = self._op(2)  # coords c0, c1
+        hints = [DimHint(["Z"], 4, sympy.Symbol("c9"), False, hint_id=0)]
+        with self.assertRaises(Unsupported):
+            dim_hints_to_tile_spec(op, hints)
+
+    def test_no_levels_is_untiled(self):
+        op = self._op(2)
+        self.assertEqual(dim_hints_to_tile_spec(op, []), TileSpec())
+
 
 class TestTileSpecLoweringReduction(unittest.TestCase):
     """The reduction-axis lowering is the inverse of reduction_loop_vars."""
@@ -7470,6 +7513,31 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
         spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
+
+    def test_roundtrip_reduction_axis(self):
+        # spec -> dim_hints -> spec is the identity through the reduction
+        # resolver too, the inverse of reduction_loop_vars.
+        op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="buf0",
+            hints=((1, 0),),
+        )
+        spec = TileSpec((TileAxis(0, 4, is_reduction=True),))
+        hints = tile_spec_to_dim_hints(op, spec, [3])
+        self.assertEqual(dim_hints_to_tile_spec(op, hints), spec)
+
+    def test_reduction_hint_on_pointwise_raises(self):
+        op = _make_real_pointwise_op(
+            ranges=[Integer(8), Integer(16)],
+            input_shapes_strides=[([8, 16], [16, 1])],
+            name="buf0",
+            hints=((0, 0),),
+        )
+        hints = [DimHint(["R"], 4, sympy.Symbol("d0"), True, hint_id=0)]
+        with self.assertRaises(Unsupported):
+            dim_hints_to_tile_spec(op, hints)
 
 
 def _loop_var_to_reduction_ranges_pos_public(op, sym):
@@ -7600,7 +7668,9 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref = _make_hinted_op(
             _make_pointwise([Integer(256), Integer(128)]), "op0", hints=((0, 0), (1, 1))
         )
-        coarse_tile_pre_stickify(_graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])])
+        coarse_tile_pre_stickify(
+            _graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])]
+        )
         ref_fields = self._loop_fields(ref)
         ref_ranges = list(ref.data.ranges)
 
