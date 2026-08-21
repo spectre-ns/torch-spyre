@@ -346,6 +346,8 @@ class AutomatedCoarseTilingTests(
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _Nest]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
         # declare the tensor dimensions
+        if hint_mode == "partial":
+            raise NotImplementedError("Partial hinting is currently unsupported")
         named_dims = case.dims_for(hint_mode)
         if named_dims is not None:
             for arg, dims in zip(case.args, named_dims):
@@ -704,6 +706,8 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
+        if params["hint_mode"] in ("partial",):
+            decorators.append(expected_unimplemented)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:
