@@ -142,7 +142,13 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame:
         full_strides = [sympy.sympify(s) for s in op.layout.stride]
         tile_strides = [sympy.sympify(s) for s in layout.stride]
         write_index = _rescale_index(write_index, full_strides, tile_strides)
-        read_index = _rescale_index(read_index, full_strides, tile_strides)
+        # The read index is rescaled against the *output* strides, so a term in
+        # an input's own stride basis (a matmul operand, a broadcast/transpose)
+        # will not match any output stride -- it is unaffected by an output-dim
+        # tiling and must pass through unchanged (strict=False).
+        read_index = _rescale_index(
+            read_index, full_strides, tile_strides, strict=False
+        )
 
     iter_space = _predict_iter_space(op, output_counts, reduction_counts)
     return PredictedFrame(

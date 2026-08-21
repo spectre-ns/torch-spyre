@@ -41,7 +41,7 @@ from ..errors import Unsupported
 from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
-    coarse_tile,
+    coarse_tile_post_stickify,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
@@ -214,4 +214,6 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                 op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
-        coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
+        coarse_tile_post_stickify(
+            graph, groups=groups, group_idx_offset=group_idx_offset
+        )

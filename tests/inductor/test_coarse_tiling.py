@@ -7584,7 +7584,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
     def test_single_level_matches_hint_path(self):
         # Reference: hint path, hint_id 0, group 0.
         ref = _make_hinted_op(_make_pointwise([Integer(256)]), "op0", hints=((0, 0),))
-        coarse_tile(_graph([ref]), [([ref], [(0, Integer(4))])])
+        coarse_tile_pre_stickify(_graph([ref]), [([ref], [(0, Integer(4))])])
         ref_fields = self._loop_fields(ref)
         ref_range = ref.data.ranges[0]
 
@@ -7600,7 +7600,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref = _make_hinted_op(
             _make_pointwise([Integer(256), Integer(128)]), "op0", hints=((0, 0), (1, 1))
         )
-        coarse_tile(_graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])])
+        coarse_tile_pre_stickify(_graph([ref]), [([ref], [(0, Integer(4)), (1, Integer(2))])])
         ref_fields = self._loop_fields(ref)
         ref_ranges = list(ref.data.ranges)
 
@@ -7757,7 +7757,7 @@ class TestPredictFrame(unittest.TestCase):
         pred_stride = [int(s) for s in frame.layout.stride]
 
         op.dim_hints = tile_spec_to_dim_hints(op, tiling, list(range(len(tiling.axes))))
-        coarse_tile(_graph([op]), [([op], levels)])
+        coarse_tile_pre_stickify(_graph([op]), [([op], levels)])
 
         self.assertEqual(pred_ranges, [int(r) for r in op.data.ranges])
         self.assertEqual(pred_devsize, list(op.layout.device_layout.device_size))

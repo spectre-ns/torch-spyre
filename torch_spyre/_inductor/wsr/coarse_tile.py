@@ -2587,9 +2587,23 @@ class _NameSwapHandler(WrapperHandler):
 
 
 def _rescale_index(
-    index: Expr, full_strides: list[Expr], tile_strides: list[Expr]
+    index: Expr,
+    full_strides: list[Expr],
+    tile_strides: list[Expr],
+    strict: bool = True,
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
+
+    ``strict`` (default) requires every non-constant term to match a
+    ``full_strides`` entry -- correct for a *write* index, whose every term is
+    one of the output layout's own strides. A *read* index is rescaled against
+    the output strides too, but an input whose layout differs from the output
+    (a matmul operand, a broadcast/transpose) carries terms in its own stride
+    basis that no output stride matches; those are unaffected by an output-dim
+    tiling and must pass through unchanged, so predicted read indices call this
+    with ``strict=False``. (The real coarse_tile rescales a consumer read
+    against the dep's *own* coefficients -- see ``_patch_retiled_load_indexes``;
+    lenient pass-through is the prediction-time analogue.)
 
     `index` is affine in some set of loop variables, with one additive term
     per dimension whose coefficient equals the matching entry in
@@ -2687,10 +2701,14 @@ def _rescale_index(
                 del remaining[i]
                 break
         else:
-            raise RuntimeError(
-                f"_rescale_index: no matching full_stride for term {term} "
-                f"in index {index}; full_strides={full_strides}"
-            )
+            if strict:
+                raise RuntimeError(
+                    f"_rescale_index: no matching full_stride for term {term} "
+                    f"in index {index}; full_strides={full_strides}"
+                )
+            # Lenient (read-index) mode: a term in the input's own stride basis
+            # is unaffected by an output-dim tiling -- keep it as is.
+            new_index += term
     return new_index
 
 
