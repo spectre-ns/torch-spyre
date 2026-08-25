@@ -20,12 +20,12 @@ arrives in stage 5. Its whole contract is to answer "what tilings could this op
 legally take", exhaustively and deterministically, so the solver has a complete
 candidate set to search.
 
-The strategy is **exact divisors** (see the RFC / plan §3.0): a split count is
+The strategy is **exact divisors**: a split count is
 admissible only if it divides its dim's extent exactly, because coarse tiling
 emits equal-sized loop tiles. This is not a new rule -- it is exactly what
 :func:`_split_candidates_for_host_dim` already computes for the span-overflow
-path -- so this module *reuses* those predicates rather than restating them
-(M6). Two consequences of the strategy are visible to users and neither is a
+path -- so this module *reuses* those predicates rather than restating them.
+Two consequences of the strategy are visible to users and neither is a
 bug: a prime extent is effectively untileable (its only divisors are 1 and
 itself, and the self-split is a unit tile), and padding a dim to a composite
 extent is the lever that opens divisors (stage 6).
@@ -33,7 +33,7 @@ extent is the lever that opens divisors (stage 6).
 Reductions are enumerated here too, but **single-level only**: never nested with
 an output axis and never two reduction dims at once. Those shapes are the ones
 the reduction-tiling path gets wrong today, so the enumerator must not offer
-them (R1.8).
+them.
 
 Two deliberate departures from the span-overflow path:
 
@@ -44,8 +44,8 @@ Two deliberate departures from the span-overflow path:
   rather than trusting the stick-alignment predicate the 448 path relies on.
 * **It does not run on span pressure.** ``_candidate_host_dims`` only offers dims
   that relieve an overflowing span; enumerating from it would return the untiled
-  option alone for an op under no pressure, and the solver would never tile it
-  (R1.9). This enumerates every legally-splittable non-stick dim regardless of
+  option alone for an op under no pressure, and the solver would never tile it.
+  This enumerates every legally-splittable non-stick dim regardless of
   pressure.
 """
 
@@ -72,7 +72,7 @@ from .span_overflow_hint_analysis import (
 )
 
 # Default caps for the enumerator. Split counts stay bounded by
-# ``_MAX_AUTO_TILE_SPLIT_COUNT`` (imported, NOT migrated to config.py: R1.7);
+# ``_MAX_AUTO_TILE_SPLIT_COUNT`` (imported, NOT migrated to config.py);
 # these two bound the *shape* of the option set, not individual splits.
 _MAX_TILE_DIMS = 2
 _MAX_TILE_OPTIONS = 64
@@ -184,7 +184,7 @@ def _reduction_split_counts(op: ComputedBuffer, red_pos: int) -> list[int]:
 
 
 def _canonical_key(spec: TileSpec) -> tuple:
-    """Deterministic ordering key -- explicitly NOT ``_combo_cost`` (R1.2).
+    """Deterministic ordering key -- explicitly NOT ``_combo_cost``.
 
     Shallower nests first, then output axes before reduction axes, then by the
     axis tuple. Truncation from the tail therefore drops the deepest, most
@@ -205,7 +205,7 @@ def _finalize_options(options: list[TileSpec], max_options: int) -> list[TileSpe
             seen.add(spec)
             unique.append(spec)
     rest = sorted((s for s in unique if not s.is_untiled), key=_canonical_key)
-    # The untiled option is mandatory (R1.3) and always leads, so truncation
+    # The untiled option is mandatory and always leads, so truncation
     # from the tail can never drop it.
     result = [TileSpec()] + rest
     if max_options is not None and len(result) > max_options:
@@ -223,17 +223,17 @@ def enumerate_tile_options(
 ) -> list[TileSpec]:
     """Return the coarse tilings ``op`` could legally take, untiled first.
 
-    The set always contains the empty (untiled) :class:`TileSpec` (R1.3) and
+    The set always contains the empty (untiled) :class:`TileSpec` and
     every single- or nested-output tiling over exact divisors of non-stick
     output dims (up to ``max_dims`` dims tiled at once), plus every single-level
     reduction tiling when ``op`` is a Reduction and ``enable_reduction_tiling``
     is set. It never emits a nested output+reduction spec or a multi-reduction
-    spec (R1.8). Deterministic and unconsumed; the solver in stage 5 prices and
+    spec. Deterministic and unconsumed; the solver in stage 5 prices and
     chooses among these.
 
     ``max_cores`` is accepted for the stage-5 caller's signature and is advisory
     here -- a split count is a valid tiling independent of the core count, so it
-    does not prune the option set (R1.9).
+    does not prune the option set.
     """
     del max_cores  # advisory only; reserved for the stage-5 caller (see above)
     options: list[TileSpec] = [TileSpec()]
@@ -261,7 +261,7 @@ def enumerate_tile_options(
                 )
                 options.append(TileSpec(axes))
 
-    # --- reduction options: single-level only (R1.8) --------------------------
+    # --- reduction options: single-level only ---------------------------------
     if isinstance(op.data, Reduction) and config.enable_reduction_tiling:
         n_red = len(getattr(op.data, "reduction_ranges", []))
         for red_pos in range(n_red):

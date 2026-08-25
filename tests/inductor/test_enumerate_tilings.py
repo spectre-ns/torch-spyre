@@ -144,11 +144,11 @@ def _expected_output_specs(dim_sizes, stick_dim, max_dims):
 class TestOutputEnumeration(unittest.TestCase):
     def test_untiled_option_present_and_first(self):
         opts = enumerate_tile_options(_pointwise_op((512, 256, 128)))
-        self.assertTrue(opts[0].is_untiled)  # R1.3
+        self.assertTrue(opts[0].is_untiled)
         self.assertEqual(opts.count(TileSpec()), 1)
 
     def test_no_span_pressure_still_yields_more_than_untiled(self):
-        # R1.9: a splittable op with no overflow must still offer real tilings.
+        # A splittable op with no overflow must still offer real tilings.
         opts = enumerate_tile_options(_pointwise_op((512, 256, 128)))
         self.assertGreater(len(opts), 1)
 
@@ -167,7 +167,7 @@ class TestOutputEnumeration(unittest.TestCase):
                 self.assertLessEqual(axis.count, _MAX_AUTO_TILE_SPLIT_COUNT)
 
     def test_matches_brute_force_reference(self):
-        # R1.1: the returned set equals an independently computed divisor set.
+        # The returned set equals an independently computed divisor set.
         shape = (512, 256, 128)
         opts = enumerate_tile_options(_pointwise_op(shape), max_options=1000)
         expected = _expected_output_specs(shape, stick_dim=2, max_dims=2)
@@ -230,7 +230,7 @@ class TestReductionEnumeration(unittest.TestCase):
 
 
 class TestNoBadReductionOptions(unittest.TestCase):
-    """R1.8 -- never a nested output+reduction spec or a multi-reduction spec."""
+    """Never a nested output+reduction spec or a multi-reduction spec."""
 
     def test_no_mixed_or_multi_reduction_specs(self):
         with patch.object(config, "enable_reduction_tiling", True):
