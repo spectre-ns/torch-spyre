@@ -29,12 +29,13 @@ adds.
 Concretely, it adds **tiling** — a *temporal split*, sequential loop iterations
 on one core — as a third axis of the single CP-SAT model (M1) that already
 chooses **core division** — a *spatial split*, parallel across cores — and LX
-residency together, so all three partitioning decisions are made against one
-injected objective (M2). Tiling and division collapse into a per-operation
+residency together, so all three partitioning decisions are made in one solve
+against the existing objective — tiling itself left **unquantified** (M2
+deferred, §4). Tiling and division collapse into a per-operation
 **config** enumerated and tabled with the rest of the model (M4), feasible on
 the *combination* rather than per subsystem (M5). The solver enumerates every
 valid output-range tiling option per operation and lets tiling *groups* emerge
-from minimizing that objective — a group is a maximal run of operations with no
+from the joint solve — a group is a maximal run of operations with no
 loop-nest break — rather than being pre-computed from hint scopes. A tiling or
 division hint is a **pin** in the roadmap's pinned/optimized sense (M3): it
 collapses its axis at enumeration time (H2) and the solver optimizes the rest of
@@ -58,8 +59,7 @@ tracks that own them.
 
 | Roadmap requirement | How this document satisfies it |
 |---|---|
-| M1 — one CP-SAT solve, one objective | Tiling joins the existing joint division + residency model as a third axis (§1–§3); no separate tiling stage (*Alternatives*). |
-| M2 — injected objective | This phase **delivers** the objective namespace and sympy→CP-SAT lowering later phases consume (§4, R3); today's two-phase lexicographic solve collapses into a single minimized cost. |
+| M1 — one CP-SAT solve, one objective | Tiling joins the existing joint division + residency model as a third axis (§1–§3); no separate tiling stage (*Alternatives*). The objective is today's, unchanged. |
 | M3 — pinned / optimized modes | A tiling or division hint pins its axis (R5); the (untiled, work-division-seed) config is the baseline candidate M3's invariant requires (R2.4). |
 | M4 — enumerate-and-table | The (tiling, division) `PartitionConfig` cross product, with derived scalars bound by `AddElement` (§1, R2). |
 | M5 — feasibility on the combination | Span and divisibility are checked on the config *pair*, discharging the `core_split_estimate = 1` guess (R2.3) — roadmap consequence 1. |
@@ -71,9 +71,11 @@ tracks that own them.
 | C2 — determinism, tractability, fallback | Determinism, warm-start, and the fallback path (R8). |
 
 **Owed to later phases** (roadmap Phase 1, *"Owed to later phases"*): the M4
-config encoding, the M2 objective namespace, the M7 predictor, and **tiling-aware
+config encoding, the M7 predictor, and **tiling-aware
 per-core views** evaluated against a *predicted* post-tiling frame (R2.6) — the
-last of which Phase 3 cannot start without.
+last of which Phase 3 cannot start without. The M2 objective namespace is *not*
+among these: tiling is left unquantified (§4), so the injected-objective
+machinery is deferred rather than built here.
 
 **Deferred to other phases / tracks, not solved here.**
 
@@ -83,6 +85,7 @@ last of which Phase 3 cannot start without.
 | Relayout *pricing*, restickify placement and sharing, padding as layout legalization | Phase 3 / collateral document 3 (R6, R10) |
 | Op re-ordering as a decision | Phase 4 / collateral document 4 (R4.4) |
 | Enumeration scaling (signature dedup, per-dimension channeling, lazy enumeration) | Phase 5 / collateral document 5 (§6) |
+| Injected / caller-supplied objective (M2); quantifying tiling in the cost | Deferred — track C1 / a later phase (§4, R9) |
 | Cost-model calibration in microseconds | Track C1 (R9) |
 
 ## Motivation
@@ -139,15 +142,18 @@ The joint pattern is already proven for two of the three axes.
 `CpSatLayoutSolver`, which picks division and placement in one model. This RFC
 adds tiling as a third axis of that same model.
 
-Making the objective caller-supplied is not a motivation this document argues for
-on its own — it is roadmap requirement **M2**, and Phase 1 is the phase that
-*delivers* the injectable objective namespace later phases consume (§4). One
-enabling fact is worth recording because it is what makes the delivery cheap:
-recent work on the `tighten-spill-cost` branch encapsulated the per-buffer spill
-term into `_LifetimeBufferWithCpVars.spill_cost()`, which now returns a
-`cp_model.LinearExpr` already gated on `1 - in_buffer`. That makes today's
-hardcoded objective a single overridable hook — the natural point at which to
-hang M2's injection.
+Making the objective caller-supplied — roadmap requirement **M2** — is
+deliberately **not** a goal of this phase. Tiling is left **unquantified** (§4):
+the existing objective is kept, and a tiling earns its place only through the LX
+residency and core division it enables, both already scored. Deferring the
+injection keeps this phase's surface small — no cost grammar, no lowering, no new
+solver objective — and leaves M2 to the phase that first has a term worth
+injecting (track C1). The joint model this phase builds is what would make that
+later step cheap: recent work on the `tighten-spill-cost` branch encapsulated the
+per-buffer spill term into `_LifetimeBufferWithCpVars.spill_cost()`, which now
+returns a `cp_model.LinearExpr` already gated on `1 - in_buffer` — a single hook
+an injected objective could later hang from without disturbing the solve this
+phase ships.
 
 ## Background: what exists today
 
@@ -371,7 +377,7 @@ Objective (`_run`, `:446`) is two-phase lexicographic: minimize
 maximize `sum(cores)`. The second lexicographic phase is skipped entirely when no
 buffer has a division to choose, which is the placement-only path. (This
 "two-phase" is the objective's lexicographic structure, distinct from the
-roadmap's Phase N; §4 / M2 collapse it to one minimized cost.)
+roadmap's Phase N; §4 **retains** it unchanged — tiling adds no term.)
 
 ### Why the three cannot simply be reordered
 
@@ -389,9 +395,10 @@ Sections 1–3 instantiate the roadmap's shared-model requirements for the tilin
 axis: the config cross product is the M4 enumerate-and-table encoding (§1), its
 joint span/divisibility check is M5 feasibility-on-the-combination (§1–§2), and
 the per-adjacent-pair loop-nest-break booleans are the Phase 1 variables from
-which grouping falls out of the objective (§2–§3). Section 4 delivers the M2
-objective namespace, §5 places the solve in the pass list under M7/M8, and §6
-covers tractability under C2 and defers enumeration scaling to Phase 5.
+which grouping falls out of the objective (§2–§3). Section 4 keeps the existing
+objective and explains why tiling is left unquantified (M2 deferred), §5 places
+the solve in the pass list under M7/M8, and §6 covers tractability under C2 and
+defers enumeration scaling to Phase 5.
 
 ### 1. Config-as-unit (M4 encoding, M5 feasibility)
 
@@ -872,57 +879,40 @@ central simplification, and it buys three things at once:
 groups) becomes a constraint: `cut[i] == 0` is forced for every `i` interior to
 a hint scope.
 
-### 4. The M2 objective namespace (delivered by this phase)
+### 4. The objective (unchanged — tiling is left unquantified)
 
-Requirement M2 — that the objective be injected rather than hardcoded — is a
-shared-model requirement, but Phase 1 is where the namespace and lowering are
-*built*, because it is the first phase whose axis contributes terms and the
-roadmap lists "the M2 objective namespace" among what Phase 1 owes later phases.
-This section specifies that deliverable; it does not re-argue M2's rationale (see
-the roadmap). A new module `torch_spyre/_inductor/scratchpad/cost_expr.py`
-provides:
+Coarse tiling is **not quantified in the objective**. This phase does *not*
+deliver an injected objective namespace or a sympy→CP-SAT cost lowering: the
+solver keeps today's objective verbatim — the two-phase lexicographic solve
+(`ilp_solver_ortools.py:479`): minimize `sum(spill_cost)`, lock it with the
+rounded inequality, then maximize `sum(cores)`. Tiling adds candidates to the
+model but contributes **no term of its own**. All tiling options are therefore
+*equal weight* — the solver never prefers one tiling to another for its own
+sake, only for what it does to the two things the existing objective already
+scores: LX residency and core division.
 
-- **A symbol namespace** the solver binds to model variables. Per-buffer:
-  `size`, `read_count`, `in_lx`, `spilled`, `cores`, `tile_count`,
-  `is_intermediate`. Aggregator: `SumOverBuffers`. Globals:
-  `total_hbm_bytes`, `peak_lx_bytes`, `idle_cores`.
-  `peak_lx_bytes` is defined as the packing high-water mark — one
-  `AddMaxEquality` over the `top[b]` vars `_add_no_overlap_2d` already creates
-  (`:568`) — *not* a time-indexed occupancy sum, which would cost a constraint
-  per timestep and is why the naive reading of "peak" is rejected.
-  `tile_count` and `in_lx` are the primitives from which a performance profile
-  is derived; there is no group-count symbol.
+That indirection is the whole mechanism, and it is enough to make tiling
+worthwhile without a term. A tiling shrinks an op's per-tile scratch footprint
+(`min_footprint` divides by the output tile count, §2), which is exactly what
+can lift a buffer into LX and out of the spill sum; and it changes which buffers
+exist at all, so a different tiling hands `spill_cost` a different set to sum
+over. Tiling thus reaches the objective only through footprint and the predicted
+buffer set — never through a tiling-cost term, a group count, or a loop-overhead
+term (cuts stay free, §3).
 
-  `SumOverEdges` is **reserved, not provided**. With relayout deferred (R6) no
-  edge-indexed term survives, so shipping the aggregator with nothing to
-  aggregate would be dead API. The name is held for R6.3's
-  `relayout_bytes = SumOverEdges(relayout[e] * bytes[e])`, and `relayout_bytes`
-  is likewise absent for now.
-
-  Anything beyond this list must arrive as a per-config scalar, precomputed into
-  the §2 table and bound by one more `AddElement`. The tile *shape* is
-  deliberately not a symbol (R3.7).
-- **A lowering** `lower(expr, bindings) -> cp_model.LinearExpr` over an
-  explicitly bounded sympy subset (R3.3). Anything outside that subset raises
-  `CostExpressionError` naming the offending node. Silently approximating an
-  objective is worse than a compile error.
-- **A default objective** built from today's terms:
-  `SumOverBuffers(spill_cost) - SumOverBuffers(cores)`.
-
-The objective is a **single expression minimized in one phase** — the model
-computes one total cost and minimizes it (`Minimize(expr)`), with no
-lexicographic sequence and no per-phase locking. This is the collapse M2
-mandates ("one expression in one unit, not a ranking"), not a decision this
-document makes on its own; `CostSpec` therefore wraps a single sympy expression,
-and a bare expression is the normal form. The hard guarantee that parallelism can
-never buy a spill is no longer structural but a matter of relative weight — the
-default weights the spill term to dominate the core term so the practical outcome
-tracks today's spill-first intent (R3.2, R3.5).
+Requirement **M2** — a caller-supplied, injected objective — is therefore
+**deferred, not delivered here**. With tiling unquantified there is no new term
+to inject, and building the injection machinery (a symbol namespace, a
+`CostSpec`, a sympy→CP-SAT `lower`) ahead of any consumer would be dead API. The
+one binding discipline this phase *does* keep is R3.7's: every per-config scalar
+the model needs — footprint, cores, derived pad — enters through one
+`AddElement` table lookup, never a new symbol or a constraint that scales with
+anything but the buffer and adjacent-pair counts.
 
 **The predictor is load-bearing for what this objective *means*, not only for how
 accurate it is.** §3 prices a cut partly through residency the run's interior
-loses, and no symbol here expresses that directly — there is no "this buffer
-would have been scratch under a different cut assignment" term. The pricing works
+loses, and the objective does not express that directly — there is no "this
+buffer would have been scratch under a different cut assignment" term. The pricing works
 because the *predicted buffer set itself* varies with the cut assignment: a
 different assignment yields a different set of buffers to sum `spill_cost` over.
 So R7.1's predictor is not merely an accuracy input to the objective, it is part
@@ -1027,9 +1017,9 @@ greedy.
 - **Warm-start** via `AddHint` with the current heuristic's plan. The solve is
   then genuinely **anytime**: a timeout keeps the best incumbent found (R8.3),
   and because that incumbent is never worse than the warm-start plan under the
-  injected objective, early stopping does not regress below the heuristic's own
-  plan — the spill-dominant default (R3.5) keeps that tracking today's spill-first
-  intent. The harder floor is the `SolveError` path — `INFEASIBLE` or no
+  retained objective, early stopping does not regress below the heuristic's own
+  plan — the objective is today's spill-first solve (R3.5), unchanged. The harder
+  floor is the `SolveError` path — `INFEASIBLE` or no
   incumbent, caught at the new pass slot, then the existing tiling method with
   the greedy solver — which is M9 ("failure never discards a pin"): the fallback
   runs over the already-pinned candidate sets, so a hint is respected there too.
@@ -1093,9 +1083,12 @@ issue #1756 restriction at `propagate_layouts.py:271`, `:455`, and `:1078` — i
   failure modes are preserved: it *raises* `Unsupported` when no combo passes
   (`:1395`, `:1399`), and returns `None` only when there are no candidate host
   dims at all (`:1303`).
-- **R1.2** `_combo_cost` is **dropped** — the injected objective (§4) is the only
-  ranking, applied by the solver over the enumerated set, so the enumerator does
-  not pre-rank options by a cost proxy. It instead emits every feasible option
+- **R1.2** `_combo_cost` is **dropped** — the solver's objective (§4) is the only
+  ranking, applied over the enumerated set, so the enumerator does
+  not pre-rank options by a cost proxy. (Tiling being unquantified, that ranking
+  is indirect: the solver prefers a tiling only for the residency and division it
+  buys, never a tiling-cost proxy — which is exactly why the enumerator must not
+  smuggle one back in.) It instead emits every feasible option
   within the R1.7 caps in a **deterministic, feasibility-tiered** order, and
   truncation to `max_options` (when a cap binds) drops from that order's tail.
   The tiers, outermost first: (1) the **mandatory keeps** — the untiled option
@@ -1243,96 +1236,42 @@ issue #1756 restriction at `propagate_layouts.py:271`, `:455`, and `:1078` — i
   A tiling whose predicted frame cannot be built is excluded the same way — never
   pin on a slicing that cannot be verified.
 
-### R3 — Injected cost function (the M2 deliverable)
+### R3 — Objective (unchanged; tiling unquantified)
 
-R3 specifies the M2 objective namespace this phase delivers. It is not a separate
-design decision from M2 — the collapse to a single minimized cost (R3.2) is M2's,
-the per-config `AddElement` binding (R3.7) is M4's, and the fact that a pinned
-axis contributes no objective terms is H4's. What R3 adds is the concrete
-signature, grammar, and scaling rules for the tiling axis.
+Tiling is left unquantified (§4): the solver keeps today's objective and tiling
+contributes no term of its own. There is consequently **no injected objective,
+no `CostSpec`, and no sympy→CP-SAT lowering** — requirement M2 is deferred, not
+delivered by this phase (§4). What R3 records is what stays the same, and the one
+config-binding discipline that carries over unchanged.
 
-- **R3.1** Signature change. Today (`scratchpad/plan_solver.py:261`, `:298`)
-  neither ABC is keyword-only, and only one takes `log_lx_usage`:
-
-  ```python
-  # today
-  def plan_layout(
-      self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-  ) -> list[LifetimeBoundBuffer]: ...
-
-  def plan_layout_and_core_divisions(
-      self, buffers: Sequence[CoreDivisionBuffer]
-  ) -> list[CoreDivisionBuffer]: ...
-  ```
-
-  ```python
-  # proposed — `objective` added, trailing arguments made keyword-only
-  def plan_layout(
-      self,
-      buffers: Sequence[LifetimeBoundBuffer],
-      *,
-      objective: CostSpec | sympy.Expr | None = None,
-      log_lx_usage: bool = False,
-  ) -> list[LifetimeBoundBuffer]: ...
-
-  def plan_layout_and_core_divisions(
-      self,
-      buffers: Sequence[CoreDivisionBuffer],
-      *,
-      objective: CostSpec | sympy.Expr | None = None,
-  ) -> list[CoreDivisionBuffer]: ...
-  ```
-
-  Introducing `*` is source-compatible: every in-tree caller already passes
-  `log_lx_usage` by keyword (`allocator.py:184`, `:1348`). The four concrete
-  overrides move in lockstep — `ilp_solver_ortools.py:348`, `greedy_solver.py:134`,
-  `firstfit_bestfit_solver.py:186`, `simulated_annealing.py:122`.
-
-- **R3.2** The objective is a **single total expression minimized in one phase**
-  (`Minimize(expr)`). There is no lexicographic sequence and no per-phase
-  locking: today's two-phase lexicographic solve (`ilp_solver_ortools.py:479`) is
-  **replaced, not generalized**. The hard guarantee that parallelism can never
-  buy a spill becomes a weighting choice (R3.5) — a term whose scale must
-  dominate another is expressed by its coefficient, subject to the
-  `COST_SCALE`/overflow rules in R3.4.
-- **R3.3** Supported sympy subset, stated exhaustively. Products of two model
-  variables are expensive in CP-SAT (they must be reified), so they are limited
-  now and may relax later:
-  - `Add`; `Mul` with at most one non-constant factor per term (otherwise
-    reified with `AddMultiplicationEquality`); `Pow` with a small non-negative
-    integer exponent (expanded); `Integer` / `Rational` / `Float` coefficients.
-  - `Min` / `Max` → `AddMinEquality` / `AddMaxEquality` over reified int vars.
-  - `Piecewise` whose conditions are boolean model vars, reified via
-    `OnlyEnforceIf`.
-  - **Rejected**, with `CostExpressionError` naming the node: transcendentals
-    (`log`, `exp`, `sqrt`), division by a variable, unbound free symbols,
-    symbolic shapes.
-- **R3.4** Rational and float coefficients are scaled to integers by a
-  documented `COST_SCALE` (lcm of denominators, capped). Raise if the scaled
-  coefficients would risk int64 overflow rather than silently wrapping.
-- **R3.5** `objective=None` selects the default single-phase objective built from
-  today's terms (`SumOverBuffers(spill_cost) - SumOverBuffers(cores)`), with the
-  spill term weighted to dominate. Because the solve is single-phase rather than
-  two-phase lexicographic, **exact bit-identity with today's plans is not
-  required**; the guarantee is spill-parity (no plan spills a buffer today's
-  objective would have kept resident) with no core-count regression at equal
-  spill.
-- **R3.6** The four placement-only solvers (`greedy`, `firstfit`, `bestfit`,
-  `simulated_annealing`; registry at `allocator.py:2108-2113`) accept the
-  parameter for ABC conformance, ignore a non-`None` objective, and log a warning
-  once. The ABC docstring states this explicitly — the contract must not imply
-  support these solvers lack. Note `LAYOUT_SOLVER` has a fifth value, `cpsat`,
-  which is handled ahead of that registry (`allocator.py:2159`) and is the one
-  solver for which `objective` is honoured.
-- **R3.7** **Symbol binding is bounded.** Every symbol resolves to either an
-  existing model variable or a single `AddElement` lookup over a per-config table
-  computed at enumeration time. No symbol may add constraints scaling with
-  anything but the buffer count and the adjacent-pair count (the edge count
-  rejoins this list when R6.3 lands `relayout[e]`) — which is why `peak_lx_bytes` is the
-  packing high-water mark over the existing `top[b]` vars rather than a
-  time-indexed occupancy sum, and why the tile *shape* is not a symbol. A term
-  needing shape sensitivity precomputes a per-config scalar instead. Adding a
-  symbol that violates this is a design error, not a performance trade-off.
+- **R3.1** **No signature change.** `plan_layout` and
+  `plan_layout_and_core_divisions` (`scratchpad/plan_solver.py:261`, `:298`) keep
+  today's signatures; no `objective`/`CostSpec` parameter is added. An earlier
+  draft made the objective caller-supplied by adding a keyword-only `objective`
+  to both ABCs and their four overrides; with tiling unquantified there is
+  nothing to inject, so that parameter — and the placement-only solvers'
+  ignore-and-warn handling of it — is withdrawn.
+- **R3.2** **The two-phase lexicographic solve is retained**, not collapsed.
+  Today's objective (`ilp_solver_ortools.py:479`) — minimize `sum(spill_cost)`,
+  lock it with the rounded inequality, then maximize `sum(cores)` — is reused
+  verbatim. The hard guarantee that parallelism can never buy a spill therefore
+  stays **structural** (the spill phase is minimized and locked before the core
+  phase runs), not a matter of relative weight.
+- **R3.5** The default — and only — objective is today's spill-first, then
+  cores. Because the solve is unchanged, tiling-disabled parity is **exact**: at
+  `tile=None` the `CoreDivision` → `PartitionConfig` migration must not move a
+  single address or core count (see *Testing*).
+- **R3.7** **Symbol binding is bounded.** Every symbol the model resolves is
+  either an existing model variable or a single `AddElement` lookup over a
+  per-config table computed at enumeration time. No binding may add constraints
+  scaling with anything but the buffer count and the adjacent-pair count (the
+  edge count rejoins this list when R6.3 lands `relayout[e]`) — which is why
+  `peak_lx_bytes`, if a later phase adds it, is the packing high-water mark over
+  the existing `top[b]` vars rather than a time-indexed occupancy sum, and why
+  the tile *shape* is not a symbol. A per-config scalar that needs shape
+  sensitivity is precomputed into the table instead. This discipline is what
+  keeps the model linear in the graph size, tiling or no tiling; violating it is
+  a design error, not a performance trade-off.
 
 ### R4 — Tiling groups
 
@@ -1580,8 +1519,9 @@ Phase 3 depends on them.
     Phase 3.
   - **Deferred to Phase 3:** `relayout[e]` as a *determined*, cost-only edge
     variable, precomputed once per edge at enumeration time from those same views,
-    plus a `relayout_bytes = SumOverEdges(relayout[e] * bytes[e])` term in the
-    objective namespace, inside R3.7's linear-binding rule.
+    plus a `relayout_bytes` cost term (`SumOverEdges(relayout[e] * bytes[e])`) —
+    which Phase 3 introduces together with the injected-objective machinery this
+    phase defers (M2, §4), still inside R3.7's linear-binding rule.
 
   An earlier draft filed the view extension under the deferred half. That would
   have left the non-deferred `config_matches` path depending on a mechanism this
@@ -1682,8 +1622,9 @@ one that keeps its solved value.
   `UNIFIED_TILING` on but `AUTO_COARSE_TILING` off, the joint model still
   co-optimizes core division and residency and still honours tiling hints (R5.1),
   but every un-hinted op stays `tile=None`; this is the safe-rollout state, whose
-  plans differ from today only in the M2 objective collapse, not in any new
-  tiling. Turning it on admits the enumerator's non-span-pressure options (R1.9).
+  plans match today's exactly — the objective is unchanged (R3.5) and no
+  un-hinted op is tiled. Turning it on admits the enumerator's non-span-pressure
+  options (R1.9).
   Span-forced tiling a graph *requires* for feasibility is not gated by it — that
   path remains the retained span-overflow tiler (§5, R8.3).
 - **R8.2** Warm-start the model via `AddHint` with the current heuristic's plan,
@@ -1736,9 +1677,10 @@ is explicit, with the owner named.
 - **No ring transfers.** The `core_div_mismatch` hard wall stays. Dissolving it
   needs a data ring or reduce-sum ring emitted in the SuperDSC schedule, which
   is separate work outside the roadmap.
-- **No cost-model calibration in microseconds.** This phase delivers the M2
-  *mechanism* (§4); tuning the objective to measured µs is the roadmap's **track
-  C1**, not this document.
+- **No cost-model calibration in microseconds, and no injected objective.** This
+  phase leaves tiling **unquantified** (§4) and does *not* build the M2 injection
+  mechanism; injecting any tiling term at all, and tuning the objective to
+  measured µs, are the roadmap's **track C1**, not this document.
 - **No operation reordering** beyond the existing `reorder_unhinted_interlopers`.
   Order as a decision is the roadmap's **Phase 4** (R4.4).
 - **No time-varying addresses / defragmentation.** LX relocation and compaction
@@ -1802,24 +1744,25 @@ decision axis. It is entirely per-config table content (M4).
 
 **New**
 
-- `torch_spyre/_inductor/scratchpad/cost_expr.py` — the **M2 objective namespace**
-  this phase delivers: symbol namespace, `CostSpec`, sympy→CP-SAT lowering,
-  `CostExpressionError`.
 - `torch_spyre/_inductor/wsr/enumerate_tilings.py` — `enumerate_tile_options`,
   built on the R1.4 predicates; output ranges plus single-level reduction (R1.8).
+
+No `scratchpad/cost_expr.py`: tiling is unquantified (§4), so the injected
+objective namespace, `CostSpec`, and sympy→CP-SAT lowering are not built here.
 
 **Modified**
 
 - `scratchpad/plan_solver.py` — `TileOption` (op-local `dims`, §1),
-  `PartitionConfig`; `CoreDivision` retained as a config field; the R3.1
-  signatures.
+  `PartitionConfig`; `CoreDivision` retained as a config field. No solver-signature
+  change (R3.1): the `plan_layout` ABCs are untouched.
 - `scratchpad/ilp_solver_ortools.py` — new `_TilingBufferWithCpVars` subclass of
   `_CoreDivisionBufferWithCpVars` (`:244`) carrying the two-level `tile`/`div`
   pair in place of `division`, plus the boundary vars (R4.8–R4.10); per-buffer
   direction-indexed cut-claim dicts (`cut_parents`/`cut_children`) reconciled
   by an `_add_cut_equalities` sweep in `_run`; read
   copies as optional rectangles in `_add_no_overlap_2d` (`:568`); relayout
-  deferred (R6); single-phase objective driven by `CostSpec`; `_extract` writes
+  deferred (R6); the objective is **unchanged** — the existing two-phase
+  lexicographic solve (R3.2), no `CostSpec`; `_extract` writes
   `chosen_config` and reconstructs `groups` from the solved cuts.
 - `scratchpad/allocator.py` — `_enumerate_core_divisions` (`:1558`) becomes config
   enumeration; `_cd_parent_matches` (`:1973`) becomes `_config_matches`, on
@@ -1867,20 +1810,16 @@ integration" gap), `docs/source/compiler/coarse_tiling_loops.md`, and
    `unlisted_test_mode: mandatory_success`, so a test added to any of them must
    be green to land — an expected failure satisfies that, an unexpected pass
    does not.
-2. **Parity, gate on with tiling disabled.** Spill outcomes must match today's
-   CP-SAT output and core counts must not regress at equal spill. Exact
-   bit-identity is **not** required, because the objective is now single-phase
-   (R3.2, R3.5); this is the regression guard for the `CoreDivision` →
-   `PartitionConfig` migration.
-3. **Cost lowering.** Unit tests for the R3.3 accept/reject table and R3.4
-   scaling (single-phase `Minimize` of one total expression; no per-phase
-   locking), with a `CostExpressionError` case per rejected construct. Plus R3.7:
-   every namespace symbol adds at most one `AddElement` (or the single
-   `AddMaxEquality` for `peak_lx_bytes`), and model size grows linearly in buffer
-   count and adjacent-pair count as the graph scales. Also assert `SumOverEdges`
-   and `relayout_bytes` are **absent** from the exported namespace (§4) — a
-   reserved name that silently resolves would let an objective reference a term
-   the model never constrains.
+2. **Parity, gate on with tiling disabled.** Because the objective is unchanged
+   (R3.2, R3.5), tiling-disabled output must be **bit-identical** to today's
+   CP-SAT plans — same addresses, same core counts. This is the regression guard
+   for the `CoreDivision` → `PartitionConfig` migration.
+3. **Bounded config binding (R3.7).** Every per-config scalar the model binds —
+   footprint, cores, derived pad — resolves to at most one `AddElement` lookup,
+   and model size grows linearly in buffer count and adjacent-pair count as the
+   graph scales. No injected-objective machinery ships (§4): there is no cost
+   grammar, `CostSpec`, or `lower` to test, and the solve's objective — today's
+   two-phase lexicographic — is exercised by the item-2 parity tests.
 4. **Cut tables and structural contiguity.** The `cut[i]` triple table is total —
    every `(tile_src, tile_dst)` pair appears exactly once — and `cut[i]` is
    pinned to 1 at every untileable boundary and on **both** boundaries of every
@@ -2003,12 +1942,15 @@ without seeing LX occupancy or the core division still has to guess. Rejected in
 favour of one joint model — which is the roadmap's M1, not a choice re-opened
 here.
 
-**Keeping the hardcoded objective and adding tiling terms to it.**
-Requires editing the solver for every cost experiment, and the interesting
-question — how to trade HBM traffic against parallelism against loop overhead —
-is exactly the one that needs iteration. Rejected in favour of injection, which
-is M2. (Today's objective is two-phase lexicographic; §4 replaces it with a
-single-phase weighted one — the collapse M2 mandates, see R3.2.)
+**Injecting a caller-supplied objective (M2) in this phase.** An injectable
+sympy→CP-SAT objective would let cost experiments — how to trade HBM traffic
+against parallelism against loop overhead — run without editing the solver, and
+was an earlier plan for this phase. But with tiling left **unquantified** (§4)
+there is no term to inject yet, so the machinery (a symbol namespace, `CostSpec`,
+a `lower`) would ship ahead of any consumer. Deferred to the phase that first has
+a tiling term worth weighing (track C1); this phase keeps today's hardcoded
+two-phase lexicographic objective unchanged (R3.2), and a tiling earns its place
+only through the residency and division it buys.
 
 **Pre-computing tiling groups from producer/consumer connectivity, then having
 CP-SAT pick one tiling per group.** A smaller model, but the grouping heuristic
@@ -2038,21 +1980,22 @@ each aligns with a roadmap requirement rather than standing alone:
 - **Config cap per op — resolved: no cap.** The model does not cap configs per op;
   model size is controlled by external pruning of the enumerated set (§6, R2.4),
   and shrinking the table is the roadmap's Phase 5.
-- **Default objective — resolved: keep today's terms, single-phase.** The default
-  stays today's spill and core terms, now combined into one single-phase weighted
-  objective rather than the two-phase lexicographic solve (§4, R3.2, R3.5) — the
-  M2 collapse.
+- **Default objective — resolved: keep today's objective, unchanged.** The
+  objective stays today's two-phase lexicographic solve — spill, then cores;
+  tiling is left **unquantified** and adds no term of its own (§4, R3.2, R3.5).
+  M2 injection is deferred rather than delivered here.
 
 ## Open questions
 
 Most of these are owned by a roadmap track or a later phase; they are listed here
 because tiling is where the question first bites.
 
-- **Objective tuning (track C1).** The single-phase default reproduces today's
-  terms with the spill term weighted to dominate. What weighting, and what
-  additional terms (tile count / loop overhead, `peak_lx_bytes`), should the
-  default carry once the mechanism is trusted? Calibration is C1's, but the tiling
-  terms are what it first has to weigh.
+- **Objective tuning (track C1).** Tiling is unquantified today (§4): the
+  objective is the retained two-phase lexicographic solve. What tiling terms —
+  tile count / loop overhead, `peak_lx_bytes` — are worth adding, at what
+  weighting against spill and cores, once the deferred M2 injection mechanism
+  exists to carry them? Calibration is C1's, and the tiling terms are what it
+  first has to weigh.
 - **Discretionary padding (R10.3).** Does the padding-cost measurement justify
   enumerating pad-beyond-legality rows, or does the derived pad stay purely in the
   apply step? Open until the benchmark runs.
