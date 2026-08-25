@@ -544,6 +544,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
 
+            # Attempt to find a solution which minimizes the distance between cores.
+            model.add(sum(core_terms) >= round(solver.ObjectiveValue()))
+            model.minimize(sum(core_cost_terms))
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                raise SolveError("CP-SAT memory planner found no feasible plan")
+
         final_tensors = self._extract(solver, tensors)
 
         if logger.isEnabledFor(logging.DEBUG):
