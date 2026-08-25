@@ -7262,6 +7262,7 @@ class TestCoeffThroughFloor(unittest.TestCase):
         expr = floor(128 * s / 2)
         self.assertEqual(coeff_through_floor(expr, s), 64)
 
+
 class TestTileHelpers(unittest.TestCase):
     """Tests for tile.py."""
 
