@@ -195,6 +195,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
             parent: m.new_bool_var(f"merge_{parent}_{b.name}")
             for parent in b.in_place_parents
         }
+        self.core_cost = None
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -268,8 +269,18 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         # reduction-axis split, so a reduction-parallel division counts its full
         # parallelism (``output_partition`` alone would score it as 1 core).
         cores_used = [cd.cores_used for cd in b.core_divisions]
+        core_cost = [
+            sum(
+                [
+                    split**2
+                    for split in (cd.output_splits | cd.reduction_splits).values()
+                ]
+            )
+            for cd in b.core_divisions
+        ]
         self.division = m.new_int_var(0, len(b.core_divisions) - 1, f"div_{b.name}")
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
+        self.core_cost = m.new_int_var(0, max(core_cost), f"core_cost_{b.name}")
         # total cores this op uses under the chosen div
         self.cores = m.new_int_var(0, max(cores_used), f"occ_{b.name}")
 
@@ -277,6 +288,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         # chosen division index
         m.add_element(self.division, per_core, self.eff_size)
         m.add_element(self.division, cores_used, self.cores)
+        m.add_element(self.division, core_cost, self.core_cost)
 
     @property
     def parents(self) -> list[str]:
@@ -485,8 +497,18 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # maximize, so we skip the re-solve and the extract below reads the
         # phase-1 assignment still held by ``solver``.
         core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
+        core_cost_terms = [
+            sb.core_cost for sb in tensors.values() if sb.core_cost is not None
+        ]
         if core_terms:
             model.maximize(sum(core_terms))
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                raise SolveError("CP-SAT memory planner found no feasible plan")
+
+            # Attempt to find a solution which minimizes the distance between cores.
+            model.add(sum(core_terms) >= round(solver.ObjectiveValue()))
+            model.minimize(sum(core_cost_terms))
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
