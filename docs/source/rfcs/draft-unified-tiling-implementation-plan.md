@@ -207,34 +207,32 @@ relation without ever naming it.
 | Stage | What lands | Requirements | Gate |
 |---|---|---|---|
 | **1** | Declarative tiling, applied | R2.1, R4.5, R7.3 (half) | pass-430's tiling reproduced through `TileSpec` with identical `loop_info` |
-| **2** | The cost-function seam | R3.1, R3.6, R8.5 | no plan changes anywhere |
+| **2** | *(withdrawn)* — tiling is left **unquantified**, so no cost-function seam / `objective` parameter is built (§4) | — | — |
 | **3** | Tiling option enumeration, reductions included | R1.1–R1.9 | enumerator set equals a brute-force reference; no nested/multi-level reduction option |
 | **4** | Prediction and tiling-aware views | R2.6, R6.3, R7.1 | predicted view equals the view recomputed after `coarse_tile` |
-| **5** | The solver: candidates, cuts, enablement | R2.2–R2.5, R4.1–R4.10, R5.1–R5.8, R6.1, R6.2, R7.2–R7.5, R8.1–R8.4 | gate on ⇒ end-to-end correct; `INFEASIBLE` ⇒ today's behaviour |
+| **5** | The solver: candidates, cuts, enablement | R2.2–R2.5, R4.1–R4.10, R5.1–R5.8, R6.1, R6.2, R7.2–R7.5, R8.1–R8.5 | gate on ⇒ end-to-end correct; `INFEASIBLE` ⇒ today's behaviour |
 | **6** | Padding *(conditional)* | R10.1–R10.6 | opened by R10.3's measurement **or** by a tileability blocker |
-| **7** | The M2 objective collapse *(deferred)* | R3.2–R3.5, R3.7 | spill-parity + no core regression vs a captured CP-SAT baseline |
+| **7** | The M2 objective injection *(out of scope)* — deferred M2 / track-C1 work; the objective is unchanged here (R3.2 retains the two-phase solve) | R3.5, R3.7 | — |
 
 ```text
-#3736 ──▶ stage 1 ──┐
-                    ├──▶ 3 ──▶ 4 ──▶ 5
-          stage 2 ──┘
+#3736 ──▶ stage 1 ──▶ 3 ──▶ 4 ──▶ 5
 R10.3 bench ─────────────────────▶ (opens stage 6)
-stage 7 ─────────────────────────▶ any time, or never
+stage 7 ─────────────────────────▶ out of scope (future M2 / track C1)
 ```
 
-Stages 1 and 2 are independent of each other and can run in parallel: stage 1
-touches no solver, stage 2 touches no tiling. Both must land before stage 5,
-which is the first to put a tiling in front of the solver.
+Stage 2 is **withdrawn**: with tiling left unquantified the objective is
+untouched (§4), so there is no cost-function seam to build and nothing has to land
+before stage 5 on its account. Stage 1 alone must precede stage 5, the first
+stage to put a tiling in front of the solver.
 
 **Stages 6 and 7 are off the critical path by design.** The R10.3 measurement is
 independent of everything and should start at stage 1, because its answer is one
 of the two things that decides whether stage 6 exists (the other is §3.0's
-tileability argument). Stage 7 — collapsing the objective — is deferred
-because it changes every existing plan for reasons unrelated to tiling, and
-because the retained two-phase objective is enough for stages 3–8 to be built and
-proved against (stage 2 says why). When a cost model is ready it arrives through
-stage 2's `objective` parameter, so stage 7 can land before, after, or between
-the tiling stages without reordering any of them.
+tileability argument). Stage 7 — injecting a caller-supplied objective (M2) — is
+**out of scope** for the tiling axis: the objective stays today's two-phase solve
+(§4, R3.2), tiling reaches it only through footprint and the predicted buffer set,
+and a future M2 effort would build its own injection seam. It can land before,
+after, or between the tiling stages, or never, without reordering any of them.
 
 **Why the middle is one large stage.** Stages 3, 4 and 5 could each be cut
 finer — and stage 5 was three stages in an earlier draft. They are not, because
@@ -401,38 +399,19 @@ What survives of the old step 0, and which stage now owns it:
 
 | Deliverable | Where | Stage | Requirement |
 |---|---|---|---|
-| Promote `expected_unimplemented` out of the #3736 suite | `tests/inductor/utils_inductor.py` | 2 | — |
-| Lift `_allocation_fingerprint` (`:803`) onto `BaseTestScratchpadUsage` (`:73`) so a suite that is not `CoOptAllocatorIntegrationTests` can use it | `test_scratchpad_use.py` | 7 | R3.5 |
-| Capture today's CP-SAT plans for the four prescribed models as the parity baseline — recorded nowhere today | `tests/inductor/` fixture | 7 | R3.5 |
+| Promote `expected_unimplemented` out of the #3736 suite | `tests/inductor/utils_inductor.py` | 3 | — |
 | `TileAxis`, `TileSpec`, `CoreDivision.tiling` with derived properties | `scratchpad/plan_solver.py:93` | 1 | R2.1 |
-| `objective` keyword-only param on both ABCs and all four `plan_layout` overrides | `plan_solver.py:260,297`; `ilp_solver_ortools.py:348`, `greedy_solver.py:134`, `firstfit_bestfit_solver.py:186`, `simulated_annealing.py:122` | 2 | R3.1 |
-| Ignore a non-`None` objective, warn once — in the **three placement-only files only**, explicitly *not* `ilp_solver_ortools.py` | `greedy_solver.py`, `firstfit_bestfit_solver.py`, `simulated_annealing.py` | 2 | R3.6 |
-| `CostSpec` type accepted by the signature | `scratchpad/cost_expr.py` | 2 | R3.1 |
-| `CostExpressionError`, `validate()`, `lower()` | `scratchpad/cost_expr.py` | 7 | R3.3 |
-| `sym_is_lx`, `sym_inv_cores` symbol properties | `plan_solver.py` | 7 | R3.7 |
 | `enumerate_tile_options` | new `wsr/enumerate_tilings.py` | 3 | R1.1 |
 | `PredictedFrame` / `PredictedBufferSet`, including the reduction accumulator / fill / combine | new `wsr/tile_prediction.py` | 4 | R7.1 |
 | `unified_tiling`, `auto_coarse_tiling` gates, default off | `config.py` (match the `os.environ.get(...) == "1"` style at `:22-25`) | 5 | R8.1, R5.8 |
 | ~~`_UNIFIED_TILING_HINT_ID = 20000`, a reserved `hint_id` base~~ — **withdrawn**: no `hint_id` reaches the representation, and the apply adapter mints from a derived base (*Architecture*) | — | — | R4.5 |
 | CI config yaml for `test_enumerate_tilings.py` (#3736 already added the one for `test_solver_auto_coarse_tiling.py`) | `tests/configs/torch_spyre_tests/inductor/` | 3 | — |
 
-**Four, three, and five are three different counts, and the R3.6 row is the one
-that has to be narrow.** There are four `plan_layout` definitions to re-sign
-(R3.1) but only three files to put the ignore-and-warn in, because
-`BestFitLayoutSolver` subclasses `FirstFitLayoutSolver` (`:248`) and inherits its
-`plan_layout` — one warn covers both registry entries. And R3.6's own "four
-placement-only solvers" counts *registry keys*
-(`_PLACEMENT_SOLVERS`, `allocator.py:2108-2113` = greedy / bestfit / firstfit /
-simulated_annealing), with `cpsat` handled ahead of the registry at `:2159` as
-"the one solver for which `objective` is honoured". An earlier draft of this row
-said "the four solvers above", which swept `ilp_solver_ortools.py` into the
-ignore set and would have landed a warn-and-ignore in the one path stage 2
-exists to wire up.
-
-R3.1 is source-compatible. Four in-tree callers reach `plan_layout`, and none
-passes `log_lx_usage` positionally: `allocator.py:184` and `:1348` pass it by
-keyword, `allocator.py:1468` and `simulated_annealing.py:81` pass only
-`buffers`.
+The `objective`-parameter seam these notes once described — four `plan_layout`
+signatures to re-sign (R3.1), the three-file ignore-and-warn (R3.6), the
+`cpsat`-only honouring path — is **withdrawn with stage 2**: tiling is
+unquantified, so no `objective` parameter is added and the `plan_layout` ABCs are
+left untouched (§4).
 
 ## Stage 1 — Declarative tiling, applied
 
@@ -546,67 +525,43 @@ Also pinned here: R4.5's group round-trip and the derived `group_idx_offset`, an
 R7.3's ordering half — the pass runs inside `plan_allocation` and leaves the op
 count unchanged when it does nothing.
 
-## Stage 2 — The cost-function seam
+## Stage 2 — *(withdrawn: the objective is left unchanged)*
 
-Retains today's objective and changes no plan. Its whole job is to put the
-injection point in place, so a cost model can be substituted when one is ready
-without the tiling stages waiting on a reweighting first.
+An earlier plan spent a stage building a **cost-function seam** — an `objective`
+parameter on the solver ABCs — so a cost model could later be injected without
+the tiling stages waiting on a reweighting first. That seam is **withdrawn**:
+tiling is left *unquantified* (§4), the objective stays today's two-phase
+lexicographic solve verbatim, and there is nothing to inject into. The reasoning
+that made the seam unnecessary for the tiling axis is what the rest of this
+section records, because it is also why leaving tiling unquantified is sound.
 
-**What is deferred.** R3.2's collapse of the two-phase lexicographic solve into a
-single weighted `Minimize` changes every existing CP-SAT plan with tiling off, for
-reasons that have nothing to do with tiling. It moves to stage 7, off the
-critical path, and takes R3.3, R3.4, R3.5 and R3.7 with it.
+**Why the retained two-phase solve already expresses tiling's benefit.** Phase 1
+minimizes spill over `eff_size`, and stage 1's `min_footprint` divides by
+`tiling.tile_count`, so a tiled candidate is simply a smaller one. The space cost
+of what tiling materializes is visible too — `full_buf` and the boundary copies
+enter the buffer set as real IR (*Architecture*), so they occupy LX and
+contribute spill like any other buffer. Tiling therefore reaches the objective
+through footprint and the predicted buffer set alone, no term required.
 
-**Why the tiling axis does not need it.** The retained two-phase solve already
-expresses tiling's *benefit* without being told to: phase 1 minimizes spill over
-`eff_size`, and stage 1's `min_footprint` divides by `tiling.tile_count`, so a
-tiled candidate is simply a smaller one. The space cost of what tiling
-materializes is visible too — `full_buf` and the boundary copies enter the buffer
-set as real IR (*Architecture*), so they occupy LX and contribute spill like any
-other buffer.
-
-**What the retained objective cannot say.** Two things, and both need covering
-elsewhere:
+**What the retained objective cannot say** — two things, both covered elsewhere:
 
 - **The time cost of tiling is invisible.** Extra copy ops execute every
-  iteration; nothing in `sum(spill_cost)` or `sum(cores)` prices that. A cost
-  model is what fixes this, which is the point of the seam.
+  iteration; nothing in `sum(spill_cost)` or `sum(cores)` prices that. Only a
+  cost model fixes this — which is deferred M2 / track-C1 work (stage 7, out of
+  scope), not something this plan builds.
 - **There is no weighting, so tile depth is unbounded.** Phase 1 is
   *lexicographically* absolute on spill — it will accept arbitrarily many tile
   levels to avoid one spilled buffer, because a deeper nest is never worse by that
   measure. Nothing in the model bounds it. Two things outside the model do: the
   enumerator's cap (R1.7, `_MAX_AUTO_TILE_SPLIT_COUNT = 64`) and R1.2's tiered
-  ordering with truncation from the tail. Both are stage 3, and this deferral
-  makes them load-bearing rather than conveniences — worth saying out loud,
-  because a reader of stage 3 alone would take the cap for a performance guard.
+  ordering with truncation from the tail. Both are stage 3, and leaving tiling
+  unquantified makes them load-bearing rather than conveniences — worth saying out
+  loud, because a reader of stage 3 alone would take the cap for a performance
+  guard.
 
-| Work item | Where | Requirement |
-|---|---|---|
-| `objective` keyword-only param, typed `CostSpec \| sympy.Expr \| None`, on both ABCs and all four `plan_layout` overrides | `plan_solver.py:260,297`; `ilp_solver_ortools.py:348`, `greedy_solver.py:134`, `firstfit_bestfit_solver.py:186`, `simulated_annealing.py:122` | R3.1 |
-| Ignore a non-`None` objective, warn once — in the **three placement-only files only** | `greedy_solver.py`, `firstfit_bestfit_solver.py`, `simulated_annealing.py` | R3.6 |
-| CP-SAT: `objective=None` selects today's two-phase solve **verbatim**; a non-`None` objective raises `NotImplementedError("unified-tiling: objective lowering")` | `ilp_solver_ortools.py` | R3.1 |
-
-**Raise, don't ignore, on the CP-SAT path.** R3.6's ignore-and-warn exists for the
-placement solvers, where the parameter is there only for ABC conformance. CP-SAT
-is the one solver that must honour an objective (`allocator.py:2159`), so
-accepting one and quietly dropping it would be a lie that survives into stage 7.
-A declared stub under the marker prefix is honest, and it shows up in the
-completion grep (*Staging*).
-
-**Gate.** No plan changes anywhere. Every existing suite passes unmodified, which
-needs no baseline fixture and no comparison — the point of retaining the
-objective is that there is nothing to compare.
-
-### 2.1 Tests
-
-Device-free, in `test_scratchpad_solver.py`.
-
-| Class | Covers |
-|---|---|
-| `TestObjectiveSeam` | R3.1 — `objective` keyword-only on both ABCs and all four overrides, accepts a `sympy.Expr`; R3.6 — the three placement files ignore it and warn once; CP-SAT raises on a non-`None` objective |
-
-R8.5 needs no new work: it is covered by the existing
-`TestCpSatAllocatorFallback`.
+**R8.5** (the CP-SAT fallback) needs no new work regardless: it is covered by the
+existing `TestCpSatAllocatorFallback`, and rides under stage 5 with the rest of
+the R8 family.
 
 ## Stage 3 — Tiling option enumeration
 
@@ -1008,22 +963,26 @@ stay closed and this stage is only its first row.
 (derived pad reaches sizing) and R10.4 (two matmuls sharing an operand emit one
 padded buffer).
 
-## Stage 7 — The M2 objective collapse (deferred)
+## Stage 7 — The M2 objective injection *(out of scope)*
 
-**Deferred, and substitutable.** Stage 2 lands the seam; this stage lands what
-goes through it. R3.2 replaces `_run`'s two-phase lexicographic solve
-(`ilp_solver_ortools.py:446-518` — minimize `sum(spill_cost)`, lock it with
-`model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))` at `:479`, then
-maximize `sum(cores)`) with one weighted `Minimize`. That changes **every
-existing CP-SAT plan with tiling switched off entirely** — a blast radius with
-nothing to do with tiling, which is exactly why it is off the critical path.
+**Out of scope for the tiling axis; deferred M2 / track-C1 work.** Tiling is left
+**unquantified** (§4): the objective is *not* changed here. The two-phase
+lexicographic solve (`ilp_solver_ortools.py:446-518` — minimize `sum(spill_cost)`,
+lock it with `model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))` at
+`:479`, then maximize `sum(cores)`) is **retained verbatim** (R3.2), and stage 2's
+`objective` seam is withdrawn. Injecting a caller-supplied cost function — the
+original M2 collapse — is therefore a separate future effort that would build its
+own seam; nothing in stages 1–6 depends on it, and it can land before, after, or
+between them, or never.
 
-Order-independent with respect to stages 1–6: it can land before them, after
-them, or in the middle. Expect it to be superseded in part — when Isuru's
-`predict_ops` is ready it arrives through stage 2's `objective` parameter, and
-§7.2/§7.3 below are the reference for taking it. What cannot be substituted is
-the collapse itself (R3.2) and the grammar the parameter accepts (R3.3, R3.4),
-since those are properties of this repo's solver rather than of any producer.
+The subsections below are **retained only as reference** for whoever eventually
+takes on M2 (for example when Isuru's `predict_ops` is ready): a working
+end-to-end injection already exists on `isuruf/torch-spyre@cost`, and §7.1's
+parity approach is how any future objective change would be validated against
+today's plans. They do **not** describe planned work in this PR, and their
+requirement labels (R3.2's collapse, R3.3/R3.4's grammar) refer to that withdrawn
+injected-objective design. The CP-SAT cost-lowering pitfalls a prototype captured
+live in git history (the removed `tests/inductor/test_cost_expr.py`).
 
 ### 7.1 Build the quality gate first
 
@@ -1204,7 +1163,7 @@ applied per method.
 |---|---|---|
 | `TestCostExprLowering` | R3.3 accept/reject table (one `CostExpressionError` case per rejected construct, raised by `validate` **before** any ortools error can surface), unbound-symbol containment, `Min`/`Max` flattening preserves the arg set, R3.4 one scale for the whole expression + overflow, R3.7 binding bounds, `SumOverEdges`/`relayout_bytes` **absent** | 3 |
 | `TestSinglePhaseObjective` | R3.2 — one `Minimize`, no lock inequality, no second `Solve`, **and exactly one `Solve` when the objective is empty** | 3 |
-| `TestUnifiedTilingParity` | R3.5 — spill-parity and no core regression against the §2.1 baseline fixture | 2 |
+| `TestUnifiedTilingParity` | R3.5 — spill-parity and no core regression against a captured baseline fixture (§7.1) | 2 |
 
 R8.5 needs no new work: it is covered by the existing
 `TestCpSatAllocatorFallback`.
@@ -1244,13 +1203,13 @@ SOL (`test_scratchpad_solver.py`), ENU (`test_enumerate_tilings.py`), BENCH
 | R2.4 | 5 | SOL | seed pair always retained; signature dedup keyed on `(splits, tiling)` together; no cap |
 | R2.5 | 5 | SOL | empty candidate set raises `Unsupported` at today's point |
 | R2.6 | 4 | SOL+E2E | `prep_cache` key includes tile; negative cache-sharing test; predicted view == recomputed post-`coarse_tile` |
-| R3.1 | 2 | SOL | `objective` keyword-only on both ABCs and all four `plan_layout` overrides; accepts a `sympy.Expr`; CP-SAT raises on a non-`None` value until stage 7 |
-| R3.2 | 7 | SOL | one `Minimize`; no lock inequality; no second `Solve`; exactly one `Solve` on an empty objective; no cost-expr/legacy fork |
-| R3.3 | 7 | SOL | accept case per node; `CostExpressionError` per rejected construct, raised by `validate` before lowering and naming the node; unbound symbols rejected |
-| R3.4 | 7 | SOL | one `COST_SCALE` for the whole expression; overflow raises; no float coefficient reaches `AddMinEquality` |
-| R3.5 | 7 | E2E | baseline fixture captured before the collapse; parity asserted on spill set + core count, not exact fingerprints. **Quality gate, not a validity one** |
-| R3.6 | 2 | SOL | the four registry placement solvers ignore objective and warn once, from three files; `cpsat` honours it |
-| R3.7 | 7 | SOL | ≤ 1 `AddElement` per symbol **and** ≤ 1 reified var per `Min`/`Max` surviving flattening; model size linear; `SumOverEdges`/`relayout_bytes` absent |
+| R3.1 | — | — | **No signature change**: the `objective` parameter is withdrawn with stage 2; the `plan_layout` ABCs are untouched (§4) |
+| R3.2 | — | SOL | the two-phase lexicographic solve is **retained**, not collapsed; tiling adds no objective term |
+| R3.3 | — | — | *withdrawn* — no injected cost grammar (out of scope, stage 7 reference only) |
+| R3.4 | — | — | *withdrawn* — no `COST_SCALE` / cost lowering (out of scope, stage 7 reference only) |
+| R3.5 | 1/5 | E2E | tiling-disabled output is **bit-identical** to today's plans (objective unchanged); covered by existing suites, no baseline fixture needed |
+| R3.6 | — | — | *withdrawn* — no `objective` parameter for the placement solvers to ignore (§4) |
+| R3.7 | 5 | SOL | ≤ 1 `AddElement` per per-config scalar (footprint, cores, pad); model size linear in buffer + adjacent-pair count |
 | R4.1 | 5 | SOL | triple table total; `cut` determined not merely constrained |
 | R4.2 | 5 | SOL | untileable boundary pinned; every cut-free run is a contiguous slice |
 | R4.3 | 5 | SOL+E2E | hint scope never split |
@@ -1297,21 +1256,22 @@ SOL (`test_scratchpad_solver.py`), ENU (`test_enumerate_tilings.py`), BENCH
    on a slicing agreement that does not hold — wrong data, and outside R7.4's
    degrade-to-spill safety. The negative cache-sharing test is the cheapest
    guard, and it is the first commit of that stage's PR.
-2. **Nothing in the model bounds tile depth (stage 2's deferral).** The retained
-   two-phase objective is lexicographically absolute on spill, so a deeper nest is
-   never worse by its measure and it will tile arbitrarily to avoid one spilled
-   buffer. The only bounds are outside the model — the enumerator's cap (R1.7) and
-   R1.2's truncation, both stage 3 — which this deferral promotes from
-   conveniences to load-bearing. A cost model through stage 2's seam is what
-   actually fixes it.
+2. **Nothing in the model bounds tile depth (tiling left unquantified).** The
+   retained two-phase objective is lexicographically absolute on spill, so a deeper
+   nest is never worse by its measure and it will tile arbitrarily to avoid one
+   spilled buffer. The only bounds are outside the model — the enumerator's cap
+   (R1.7) and R1.2's truncation, both stage 3 — which leaving tiling unquantified
+   (§4) promotes from conveniences to load-bearing. A future cost model (M2, out
+   of scope) is what would actually price it.
 3. **R4.6 in stage 5 (§5.2).** Omitting the hint-driven pin produces plans
    `coarse_tile` will reject at apply — an illegal emission, not a fallback.
-4. **Name-keyed symbol binding (stage 7).** Producer and solver agree only
-   through the buffer name, and every failure mode of that agreement is quiet: an
-   unbound symbol is a `NameError` from generated code, a dropped `Min` arg is a
-   wrong cost with no error at all (both live on the reference branch today).
-   Nothing downstream can detect it — the plan is legal, just worse. `validate`'s
-   containment check and the flattening test are the only guards.
+4. **Name-keyed symbol binding — *out of scope (deferred M2)*.** A risk only if a
+   future M2 objective is built (stage 7, out of scope); this plan injects no
+   objective, so it does not apply here. For that future work: producer and solver
+   would agree only through the buffer name, and every failure mode of that
+   agreement is quiet — an unbound symbol is a `NameError` from generated code, a
+   dropped `Min` arg is a wrong cost with no error at all (both live on the
+   reference branch today).
 5. **Mutating the graph inside the allocator (§5.4).** Applying tiling as a
    pre-pass puts IR mutation inside `plan_allocation`, which every allocator
    shares and which `allocator.py:2211` retries on `SolveError`. If the mutation
@@ -1323,10 +1283,10 @@ SOL (`test_scratchpad_solver.py`), ENU (`test_enumerate_tilings.py`), BENCH
    tiling option (R2.2) and `_views_for_divs`' sympy prep is no longer
    candidate-invariant (R2.6). Both were built assuming they are paid once per
    op.
-7. **The objective collapse (stage 7).** Changes every existing plan with tiling
-   off. Off the critical path now, and gated on a baseline that has to be captured
-   before the change — but the baseline does not exist yet, so the capture has to
-   precede the collapse whenever it is scheduled.
+7. **The objective collapse — *out of scope (deferred M2)*.** Would change every
+   existing plan with tiling off. Out of scope for the tiling axis (§4): the
+   objective is unchanged here, so this is a risk for a future M2 effort only, not
+   this plan.
 
 ## Plan corrections — this revision
 
@@ -1396,10 +1356,10 @@ Found while grounding this plan against the tree, and folded back into
 | R1.4 | Reuse list omitted `_remaining_span_candidates_after_tile` (`:1236`) — the span-*sufficiency* check both public entry points compose (`:1344`, `:1471`), and the one R2.3's joint span feasibility should extend rather than restate. Added with that rationale. |
 | R4.5 | Handled `loop_group_id` collision via `group_idx_offset` but not `hint_id`. Added the second namespace: span-overflow mints from `_SPAN_OVERFLOW_HINT_ID = 10000`, so a third producer needs its own reserved base or `validate_coarse_tile_groups` raises during apply — an illegal emission, not something the model could rule out. **Since superseded**: the representation carries no `hint_id`, and the apply adapter mints from a derived base, so the third namespace is unnecessary (*Architecture*). The correction stands as a description of the hazard; the reserved-base remedy does not. |
 
-**One pending fold-back, not yet applied.** R3.7 bounds symbol binding at one
-`AddElement` per symbol but is silent on the aux vars `Min`/`Max` reification
-creates (§7.3). The plan carries the tighter bound and pins it; R3.7 should gain
-the second clause.
+**One pending fold-back, now moot.** An earlier note asked R3.7 to gain a second
+clause bounding the aux vars `Min`/`Max` reification creates (§7.3). With tiling
+left unquantified and no cost lowering built (§4), there are no such aux vars, so
+R3.7's single `AddElement`-per-scalar clause stands as written.
 
 **Two earlier flags retracted.** Both came from a misreading of the RFC, not
 from the RFC:
