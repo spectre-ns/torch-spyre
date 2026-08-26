@@ -14,9 +14,9 @@
 
 """Enumerate the coarse tilings an op could take.
 
-Stage 3 of the coarse-tiling optimization: a *pure, unconsumed* enumerator.
+A *pure, unconsumed* enumerator for the coarse-tiling optimization.
 Nothing calls it yet -- the solver that prices and chooses among these options
-arrives in stage 5. Its whole contract is to answer "what tilings could this op
+arrives separately. Its whole contract is to answer "what tilings could this op
 legally take", exhaustively and deterministically, so the solver has a complete
 candidate set to search.
 
@@ -28,7 +28,7 @@ path -- so this module *reuses* those predicates rather than restating them.
 Two consequences of the strategy are visible to users and neither is a
 bug: a prime extent is effectively untileable (its only divisors are 1 and
 itself, and the self-split is a unit tile), and padding a dim to a composite
-extent is the lever that opens divisors (stage 6).
+extent is the lever that opens divisors.
 
 Reductions are enumerated here too, but **single-level only**: never nested with
 an output axis and never two reduction dims at once. Those shapes are the ones
@@ -215,7 +215,6 @@ def _finalize_options(options: list[TileSpec], max_options: int) -> list[TileSpe
 
 def enumerate_tile_options(
     op: ComputedBuffer,
-    max_cores: int = 1,
     *,
     max_dims: int = _MAX_TILE_DIMS,
     max_splits_per_dim: int = _MAX_SPLITS_PER_DIM,
@@ -228,14 +227,9 @@ def enumerate_tile_options(
     output dims (up to ``max_dims`` dims tiled at once), plus every single-level
     reduction tiling when ``op`` is a Reduction and ``enable_reduction_tiling``
     is set. It never emits a nested output+reduction spec or a multi-reduction
-    spec. Deterministic and unconsumed; the solver in stage 5 prices and
+    spec. Deterministic and unconsumed; the solver prices and
     chooses among these.
-
-    ``max_cores`` is accepted for the stage-5 caller's signature and is advisory
-    here -- a split count is a valid tiling independent of the core count, so it
-    does not prune the option set.
     """
-    del max_cores  # advisory only; reserved for the stage-5 caller (see above)
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
         return options

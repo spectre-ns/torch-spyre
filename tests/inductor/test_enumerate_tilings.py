@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device-free tests for the stage-3 tiling-option enumerator.
+"""Device-free tests for the tiling-option enumerator.
 
 The enumerator is pure and unconsumed, so these tests need no solver and no
 device: they build the same lightweight ``FixedTiledLayout`` ops the
