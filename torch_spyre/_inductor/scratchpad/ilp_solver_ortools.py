@@ -37,8 +37,9 @@ constraint model over :class:`CoreDivisionBuffer`s:
   (``_check_in_place_relationships``) makes this exact. The parent keeps its
   full lifetime, so the footprint above a smaller child stays protected on the
   handoff tick (``_add_no_overlap_2d``).
-* **Objective** (two-phase lexicographic, in ``_run``). *Residency is the hard
-  priority.* Phase 1 minimizes total **HBM transfer traffic** via
+* **Objective** (three-phase lexicographic, in ``_run``; each phase locks the
+  prior phase's optimum as a constraint before optimizing the next). *Residency
+  is the hard priority.* Phase 1 minimizes total **HBM transfer traffic** via
   ``spill_cost(b) * (1 - in_buffer)`` -- the *differential* traffic a spill adds
   over residency (resident buffers contribute 0). An intermediate costs
   ``(num_consumers + 1) * size`` (the producer's HBM write, which residency turns
@@ -50,8 +51,15 @@ constraint model over :class:`CoreDivisionBuffer`s:
   a buffer match its consumers and reside). Phase 2 then *holds that residency
   optimum* and maximizes total core usage (``sum_b cores_b``) so every buffer --
   resident or spilled, the latter free of the slicing gate -- takes its most
-  parallel division, which the allocator commits. Parallelism never costs a
-  spill.
+  parallel division. Parallelism never costs a spill. Phase 3 in turn *holds the
+  parallelism optimum* and breaks the remaining ties toward a **balanced**
+  division by minimizing the summed squared split factors
+  (``sum_b sum_axis split**2``): among divisions that use the same number of
+  cores, one spreading the split across more axes with smaller factors scores
+  lower than one that hammers a single axis (``2x2`` over ``4x1``). This only
+  refines the division the allocator commits -- it can never spill a buffer or
+  reduce its core count. Op shape is not yet visible to the solver, so this is a
+  proxy for balance rather than a full cost model.
 
 After the solve, ``_justify`` slides each in-place-merged placement unit down to
 the lowest free address, squeezing out float gaps the search leaves. It coarsens
@@ -63,14 +71,14 @@ The same model also serves plain :class:`LifetimeBoundBuffer`s via
 ``plan_layout`` (the ``MemoryPlanSolver`` contract the placement-only allocator
 calls). Those buffers carry no candidate divisions, so the division-dependent
 pieces -- per-core sizing, the slicing-match gate, the merge division gate and
-the phase-2 parallelism objective -- simply drop out: the footprint is the
-buffer's ``size`` and the solve reduces to minimising HBM traffic under the 2D
-no-overlap with in-place reuse. Residency is then gated only by capacity and by
-the allocator's own ``residency_reason`` bars (which both paths honour, since
-that field lives on the base buffer). That specialisation
-lives on the buffer wrappers (``_LifetimeBufferWithCpVars`` and its joint
-subclass ``_CoreDivisionBufferWithCpVars``), so the solver methods below are
-written once against whichever wrapper ``_wrap`` chose.
+the phase-2 parallelism and phase-3 balance objectives -- simply drop out: the
+footprint is the buffer's ``size`` and the solve reduces to minimising HBM
+traffic under the 2D no-overlap with in-place reuse. Residency is then gated
+only by capacity and by the allocator's own ``residency_reason`` bars (which
+both paths honour, since that field lives on the base buffer). That
+specialisation lives on the buffer wrappers (``_LifetimeBufferWithCpVars`` and
+its joint subclass ``_CoreDivisionBufferWithCpVars``), so the solver methods
+below are written once against whichever wrapper ``_wrap`` chose.
 """
 
 from __future__ import annotations
@@ -269,12 +277,18 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         # reduction-axis split, so a reduction-parallel division counts its full
         # parallelism (``output_partition`` alone would score it as 1 core).
         cores_used = [cd.cores_used for cd in b.core_divisions]
+        # Balance heuristic: the sum of squared per-axis split factors. For a
+        # fixed core count (product of the factors, held at its phase-2 optimum)
+        # this is smallest when the split is spread across more axes with smaller
+        # factors, so minimizing it favours a balanced division over one that
+        # hammers a single axis (e.g. 2x2 over 4x1, both four cores). The two
+        # split namespaces are coeff-keyed and iterated separately -- a union
+        # would silently drop a factor whose coeff collides across the two.
         core_cost = [
             sum(
-                [
-                    split**2
-                    for split in (cd.output_splits | cd.reduction_splits).values()
-                ]
+                split**2
+                for split in list(cd.output_splits.values())
+                + list(cd.reduction_splits.values())
             )
             for cd in b.core_divisions
         ]
@@ -340,7 +354,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
     model (joint division, slicing-match residency gate, 2D no-overlap with
-    in-place lifetime shortening) and the HBM-traffic objective.
+    in-place lifetime shortening) and the three-phase lexicographic objective
+    (residency, then parallelism, then division balance).
     """
 
     def __init__(
@@ -476,6 +491,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         # TODO: Update objective to a maxmin optimization to optimize overall
         # throughput.
+        #
+        # The objective is a three-phase lexicographic solve: residency (phase
+        # 1), then parallelism (phase 2), then division balance (phase 3). Each
+        # phase locks the prior optimum as a constraint before optimizing the
+        # next, so a later phase only breaks ties the earlier ones leave open.
+
+        # Phase 1 -- residency (the hard priority): minimize total HBM transfer
+        # traffic so as much as possible stays resident in LX.
         hbm_terms = [sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()]
         status = cp_model.INFEASIBLE
         if hbm_terms:
@@ -484,10 +507,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
             # Lock in the residency optimum (the traffic value, not just the
-            # count) so phase 2 can never trade a spill for parallelism.
-
-            # Rounding avoids loss of precision as the objective function is
-            # the sum and multiplication of integers.
+            # count) so phase 2 can never trade a spill for parallelism. Rounding
+            # avoids loss of precision as the objective is a sum/product of ints.
             model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
 
         # Phase 2 -- parallelism: holding the residency optimum, maximize total
@@ -497,17 +518,27 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # maximize, so we skip the re-solve and the extract below reads the
         # phase-1 assignment still held by ``solver``.
         core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
+        # A core_cost term exists for exactly the same buffers as a core term
+        # (both are set only on division-carrying buffers), so phase 3 runs
+        # whenever phase 2 does.
         core_cost_terms = [
             sb.core_cost for sb in tensors.values() if sb.core_cost is not None
         ]
+        occupancy: Optional[int] = None
         if core_terms:
             model.maximize(sum(core_terms))
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
+            occupancy = round(solver.ObjectiveValue())
 
-            # Attempt to find a solution which minimizes the distance between cores.
-            model.add(sum(core_terms) >= round(solver.ObjectiveValue()))
+            # Phase 3 -- shape balance: holding the parallelism optimum (the
+            # objective is integer, so the round is exact), break the remaining
+            # ties toward a balanced division by minimizing the summed squared
+            # split factors. The phase-2 solution still satisfies this lock, so
+            # phase 3 only refines the choice among equally parallel divisions
+            # and can never spill a buffer or lower its core count.
+            model.add(sum(core_terms) >= occupancy)
             model.minimize(sum(core_cost_terms))
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -517,13 +548,17 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         if logger.isEnabledFor(logging.DEBUG):
             spilled = [n for n, t in final_tensors.items() if t.address is None]
+            # The final solve minimized the balance cost when there were
+            # divisions to choose (phase 3, with occupancy held at ``occupancy``);
+            # otherwise only phase 1 ran and the objective is HBM traffic.
             logger.debug(
                 "[CP-SAT layout solver] tensors=%d resident=%d %s=%d "
-                "status=%s walltime=%.2f ms",
+                "occupancy=%s status=%s walltime=%.2f ms",
                 len(tensors),
                 len(tensors) - len(spilled),
-                "occupancy" if core_terms else "hbm_traffic",
+                "balance" if core_terms else "hbm_traffic",
                 round(solver.ObjectiveValue()),
+                occupancy if occupancy is not None else "n/a",
                 solver.StatusName(status),
                 solver.WallTime() * 1e3,
             )
