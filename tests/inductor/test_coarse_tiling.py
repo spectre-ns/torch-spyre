@@ -7526,6 +7526,7 @@ class TestTileSpecRepresentation(unittest.TestCase):
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
 
+
 class TestTileSpecLoweringOutput(unittest.TestCase):
     """tile_spec_to_dim_hints on output axes — same DimHints as the hint path."""
 
