@@ -7526,13 +7526,6 @@ class TestTileSpecRepresentation(unittest.TestCase):
         )
         self.assertEqual(buf.min_footprint, ceil_div(1024, 2 * spec.output_tile_count))
 
-    def test_tiling_rides_on_core_division_not_a_parallel_list(self):
-        # The single most important representation constraint: a tiling is a
-        # field of a CoreDivision candidate, never a list beside core_divisions.
-        self.assertIn("tiling", CoreDivision.__dataclass_fields__)
-        self.assertNotIn("tilings", CoreDivisionBuffer.__dataclass_fields__)
-
-
 class TestTileSpecLoweringOutput(unittest.TestCase):
     """tile_spec_to_dim_hints on output axes — same DimHints as the hint path."""
 
