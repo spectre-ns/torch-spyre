@@ -1233,17 +1233,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             self.assertEqual(buf.address is None, name in solver.spill_reasons)
 
     def test_phase3_prefers_balanced_division(self):
-        # Lexicographic phase 3 breaks ties toward a balanced core division.
-        # Both candidates use four cores with the same per-core footprint, so
-        # phases 1-2 (residency and occupancy) are indifferent between them; they
-        # differ only in the summed squared split factors phase 3 minimizes: one
-        # splits a single axis four ways (4**2 = 16), the other splits two axes
-        # twice each (2**2 + 2**2 = 8). The balanced division must win.
-        #
-        # Two buffers carry the candidates in opposite order and both are
-        # force-spilled (so no residency/merge gate constrains the division): an
-        # index-agnostic tie-break driven by the objective -- not by candidate
-        # position -- must pick the balanced division for each.
+        #verify the solver prefers the balanced core split
         unbalanced = CoreDivision(output_splits={256: 4})  # 4 cores, cost 16
         balanced = CoreDivision(output_splits={256: 2, 128: 2})  # 4 cores, cost 8
         self.assertEqual(unbalanced.cores_used, balanced.cores_used)
