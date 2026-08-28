@@ -21,7 +21,7 @@ from .logging_utils import _get_env_bool
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
-    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
+    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
 hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
