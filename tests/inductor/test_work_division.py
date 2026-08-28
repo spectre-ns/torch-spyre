@@ -571,11 +571,16 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
     _PATCH_TARGET = "torch_spyre._inductor.work_division_constraints.op_read_writes"
     _PLACEHOLDER_TD = _tensor_dep("conv_placeholder", (128,), (_isym("_conv"),))
 
-    def _context(self, stride):
+    def _context(self, stride, kernel=(3, 3)):
         mb, out, i, j = (_isym(name) for name in ("mb", "out", "i", "j"))
         op = _computed_buffer((2, 3, 8, 16), name="strided_conv")
         op.data.op_info = {
-            "conv_params": {"stride_i": stride[0], "stride_j": stride[1]}
+            "conv_params": {
+                "stride_i": stride[0],
+                "stride_j": stride[1],
+                "kernel_h": kernel[0],
+                "kernel_w": kernel[1],
+            }
         }
         return (
             _make_context(
@@ -587,17 +592,39 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
             j,
         )
 
-    def test_blocks_spatial_dims_for_strided_conv(self):
-        ctx, i, j = self._context((2, 1))
+    def _blocked(self, ctx, i, j):
+        """Run the constraint against the (mb, out, i, j) output write ranges."""
         rw = MagicMock()
         # Inductor stores ranges in OrderedSet, which does not support slices.
         rw.writes = [MagicMock(ranges=(_isym("mb"), _isym("out"), i, j))]
         with patch(self._PATCH_TARGET, return_value=rw):
-            self.assertEqual(conv_spatial_blocked_vars(ctx).blocked, {i, j})
+            return conv_spatial_blocked_vars(ctx).blocked
+
+    def test_blocks_spatial_dims_for_strided_conv(self):
+        # Strided conv blocks both spatial axes regardless of kernel extent.
+        ctx, i, j = self._context((2, 1))
+        self.assertEqual(self._blocked(ctx, i, j), {i, j})
 
     def test_allows_spatial_dims_for_unstrided_conv(self):
-        ctx, _, _ = self._context((1, 1))
-        self.assertEqual(conv_spatial_blocked_vars(ctx).blocked, set())
+        # An unstrided conv with a real (extent > 1) window on both axes splits
+        # spatially per-core, so nothing is blocked.
+        ctx, i, j = self._context((1, 1), kernel=(3, 3))
+        self.assertEqual(self._blocked(ctx, i, j), set())
+
+    def test_blocks_collapsed_window_dims_for_unstrided_depthwise(self):
+        # A 1x1 depthwise conv has a collapsed window on both axes; superdsc
+        # leaves the per-core padding for such an axis unassigned, so a spatial
+        # split mis-addresses each core's slice even though the conv is
+        # unstrided. Both spatial axes must stay whole.
+        ctx, i, j = self._context((1, 1), kernel=(1, 1))
+        self.assertEqual(self._blocked(ctx, i, j), {i, j})
+
+    def test_blocks_only_collapsed_axis_for_asymmetric_kernel(self):
+        # 1xN depthwise conv: the H axis (kernel_h == 1) is collapsed and must
+        # stay whole, but the real W window (kernel_w == 3) still splits
+        # per-core, so only the collapsed axis is blocked.
+        ctx, i, j = self._context((1, 1), kernel=(1, 3))
+        self.assertEqual(self._blocked(ctx, i, j), {i})
 
     def test_span_commit_conflicting_with_spatial_block_raises_unsupported(self):
         ctx, i, j = self._context((2, 1))
