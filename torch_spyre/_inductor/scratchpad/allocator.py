@@ -89,11 +89,12 @@ from torch_spyre._inductor.scratchpad.utils import (
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
+    OP_INFEASIBLE_FOR_LX,
     counted_loop_lifetime_end_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
-from torch_spyre._inductor.constants import DEVICE_NAME
+from torch_spyre._inductor.constants import DEVICE_NAME, POOL_OPS
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -440,6 +441,31 @@ class ScratchpadAllocator:
                 return True
         return False
 
+    @staticmethod
+    def _read_by_lx_infeasible_op(
+        graph: GraphLowering, name: str, uses: list[int]
+    ) -> bool:
+        """True if a consumer that reads ``name`` cannot take an LX-resident
+        operand.
+
+        A windowed pool (:data:`OP_INFEASIBLE_FOR_LX`) reads its input through a
+        data stage carrying ``PADDED_FULLSPAN_WUNNEEDED`` padding, which the L3
+        scheduler cannot combine with LX paging -- a pool that reads ``name``
+        from LX aborts exactly as an LX-resident pool *output* does, so ``name``
+        must resolve from HBM. Mirrors the consumer scan in
+        :meth:`_is_index_or_indirectly_accessed`.
+        """
+        for u in uses:
+            consumer = graph.operations[u]
+            if op_short_name(consumer) not in OP_INFEASIBLE_FOR_LX:
+                continue
+            if any(
+                isinstance(dep, MemoryDep) and dep.name == name
+                for dep in op_read_writes(consumer).reads
+            ):
+                return True
+        return False
+
     def _buffer_residency_reason(
         self,
         graph: GraphLowering,
@@ -478,6 +504,14 @@ class ScratchpadAllocator:
             buf_user_deps: every buffer's ``(op, dep)`` users, from
                 :func:`_get_buffer_user_deps`, for the read-side advancing check.
         """
+        if op is not None and op_short_name(op) in OP_INFEASIBLE_FOR_LX:
+            # Hard DeepTools L3-scheduler limit (see OP_INFEASIBLE_FOR_LX): a
+            # windowed pool's data stage cannot combine LX paging with its
+            # windowed padding, so its output must stay in HBM. Checked before
+            # _op_output_good_for_lx_reuse so it also holds under
+            # allow_all_ops_in_lx_planning and a planned relayout source, which
+            # that predicate would otherwise wave through.
+            return "op output infeasible for LX (windowed pool)"
         if op is None or not self._op_output_good_for_lx_reuse(op, planned_lx_buffers):
             return "op not allowed"
         if not hasattr(getattr(op, "layout", None), "device_layout"):
@@ -508,6 +542,11 @@ class ScratchpadAllocator:
             # Index tensors and the value tensors they index into are read via
             # data-dependent (indirect) addressing, must stay in hbm.
             return "index tensor or indirectly accessed"
+        if self._read_by_lx_infeasible_op(graph, name, uses):
+            # A windowed pool consumer reads this buffer through its
+            # windowed-padded data stage, which the L3 scheduler cannot page
+            # from LX (same limit as the pool's own output). Resolve from HBM.
+            return "read by windowed pool (LX-infeasible)"
         if name in graph_output_names:
             # A graph output normally can't reside (the value must land back in
             # HBM), but with boundary cloning on it is pinned via an output clone
@@ -561,6 +600,8 @@ class ScratchpadAllocator:
             return "no consumer reads it from LX"
         if self._is_index_or_indirectly_accessed(graph, name, uses, None):
             return "index tensor or indirectly accessed"
+        if self._read_by_lx_infeasible_op(graph, name, uses):
+            return "read by windowed pool (LX-infeasible)"
         if _extern_kernel_in_live_range(graph, uses):
             return "extern kernel user or live across extern kernel"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
@@ -1228,6 +1269,19 @@ def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol
     }
 
 
+def _is_windowed_pool(op: Operation) -> bool:
+    """True for a windowed pool (avgpoolfwd) reduction op.
+
+    Its output spatial split cannot be re-chosen by the joint solver without
+    risking a mis-addressed per-core input; see the pin in ``_division_map``.
+    """
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in POOL_OPS
+    )
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -1750,6 +1804,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             elif op.name in fixed_division_ops:
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "offset mutation component"
+                )
+            elif _is_windowed_pool(op):
+                # A windowed pool (avgpoolfwd) reads its input at
+                # ``out*stride + window``. Co-optimization is free to pick a
+                # spatial output split whose per-core input DSM address the
+                # deeptools scheduler mis-computes -- silently wrong output
+                # (e.g. co-opt chose H_out x4 / W_out x6 for a 24x24 k2s2 pool
+                # and produced ~40% wrong elements, while the work-division
+                # pass's H_out x12 / W_out x2 for the same op is correct). The
+                # safe divisions are exactly the ones the (non-co-optimized)
+                # work-division pass commits, so pin the pool to that upstream
+                # division rather than letting the joint solver re-divide it.
+                # The window (reduction) axes are additionally guarded by
+                # pool_window_blocked_vars / reduction_window_blocked_vars.
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "windowed pool"
                 )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [

@@ -51,6 +51,27 @@ OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE = frozenset(
     }
 )
 
+# Ops that cannot have ANY operand in LX -- a hard DeepTools-scheduler
+# feasibility limit, not a profitability heuristic. `avg_pool2d` lowers to the
+# `avgpoolfwd` windowed reduction, whose data stage carries a
+# PADDED_FULLSPAN_WUNNEEDED windowed padding on its pooled spatial dimension.
+# The L3 DL-ops scheduler (libL3DlOpsScheduler) does not support paging (LX
+# chunking) and windowed padding on the same dimension, so an LX-resident pool
+# operand makes it abort with "Expect valid lower and upper bound parameters"
+# (any kernel/stride/shape, single- or multi-core). Both directions are
+# infeasible: the op's own output must not be LX-resident, and no buffer it
+# reads may be LX-resident either -- the read goes through the same
+# windowed-padded data stage. Unlike OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE this is
+# honored UNCONDITIONALLY: it is not bypassed by `allow_all_ops_in_lx_planning`
+# or by a planned LX-relayout source. The pre-co-optimization work-division
+# algorithm never placed a pool operand in LX, which is why co-optimized LX
+# planning is what exposed this.
+OP_INFEASIBLE_FOR_LX = frozenset(
+    {
+        "avg_pool2d",
+    }
+)
+
 
 def round_up_to_alignment(arg: int, alignment: int) -> int:
     return ((arg + alignment - 1) // alignment) * alignment
