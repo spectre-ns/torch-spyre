@@ -597,6 +597,8 @@ def restickify_padding_blocked_vars(
         if concretize_expr(ctx.it_space[dim]) % stick_size
     }
     return ConstraintResult(blocked=padded)
+
+
 def pool_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
     """Block a windowed pool's reduction (window) axes from splitting across cores.
 
