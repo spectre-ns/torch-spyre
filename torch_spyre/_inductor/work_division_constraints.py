@@ -114,6 +114,7 @@ def collect_work_division_constraints(
         coarse_tile_local_dim_split_domains,
         plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
+        pool_window_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
@@ -573,6 +574,27 @@ def restickify_padding_blocked_vars(
         if concretize_expr(ctx.it_space[dim]) % stick_size
     }
     return ConstraintResult(blocked=padded)
+def pool_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Block a windowed pool's reduction (window) axes from splitting across cores.
+
+    ``AVGPOOL2D_OP`` (avgpoolfwd) is a windowed reduction executed as a single
+    pool instruction on the datapath: each output reads its whole kH x kW window
+    and the ``scaling_factor`` (1/(kH*kW)) is applied to the full-window sum.
+    There is no cross-core accumulation of a partial-window pool, so splitting a
+    window (reduction) axis across cores makes each core pool only part of the
+    window -- silent wrong output (the generic reduction-split path assumes a
+    summable partial, which the pool datapath does not provide). This was latent
+    because the old work-division algorithm never split the window, but
+    co-optimization does: it split kW=2 of a 24x24 k2s2 avg_pool2d across two
+    cores and produced ~19% wrong elements. Splitting the *output* spatial dims
+    stays legal -- each output pixel's window is wholly local to the core that
+    owns it.
+    """
+    if not (
+        isinstance(ctx.op.data, Reduction) and ctx.op.data.reduction_type in POOL_OPS
+    ):
+        return ConstraintResult()
+    return ConstraintResult(blocked=set(ctx.reduction_vars))
 
 
 def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
