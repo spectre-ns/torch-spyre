@@ -85,7 +85,7 @@ def _fixed_tiled_layout(shape, dtype=torch.float16, element_arrangement=None):
     device_layout = SpyreTensorLayout(size, stride, dtype, dim_order)
     if element_arrangement is not None:
         device_layout = device_layout.with_element_arrangement(element_arrangement)
-    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
+    return FixedTiledLayout(torch.device("spyre:0"), dtype, size, stride, device_layout)
 
 
 def _tensor_dep(name, shape, symbols, element_arrangement=None):
