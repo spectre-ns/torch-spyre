@@ -814,7 +814,7 @@ def enumerate_work_division_candidates(
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
-
+    
     it_space = iteration_space_from_op(op)
 
     input_tds, output_td = collect_tensor_deps(

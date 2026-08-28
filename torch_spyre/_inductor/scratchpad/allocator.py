@@ -93,6 +93,7 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
+from torch_spyre._inductor.constants import DEVICE_NAME
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -1727,7 +1728,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         result = {}
         for op in graph.operations:
-            if op.name in fixed_division_ops:
+            op_layout = (
+                op.maybe_get_layout() if isinstance(op, ComputedBuffer) else None
+            )
+            if isinstance(op, ComputedBuffer) and (
+                op_layout is None or op_layout.device.type != DEVICE_NAME
+            ):
+                # A CPU/host ComputedBuffer (a fallback or CPU-roundtrip output)
+                # carries a plain FixedLayout with no ``device_layout``: it is
+                # not tiled, so it can be neither core-divided nor LX-resident.
+                # Pin it to its fixed single-core division -- so it still anchors
+                # the slicing-match as a producer/consumer -- rather than letting
+                # it reach the enumerators, which dereference ``device_layout``
+                # and raise. Both branches below (the pruned
+                # ``_enum_split_options`` and the joint
+                # ``_enumerate_core_divisions``) assume a device layout; this
+                # mirrors the work-division pass guard in ``_iter_computed_buffers``.
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "cpu/host buffer"
+                )
+            elif op.name in fixed_division_ops:
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "offset mutation component"
                 )
