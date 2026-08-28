@@ -30,14 +30,17 @@ import dataclasses
 import typing
 from sympy import Expr, Symbol, divisors
 
-from torch._inductor.ir import ComputedBuffer, Reduction
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
 from torch_spyre._C import ElementArrangement
 
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    CONV2D_FWD_OP,
+    DEPTHWISE_CONV2D_OP,
     KEEP_BY_INDEX_OP,
+    POOL_OPS,
     _MAX_K_PER_CORE,
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
@@ -46,6 +49,7 @@ from .errors import Unsupported
 from .pass_utils import (
     concretize_expr,
     indirect_forbidden_split_syms,
+    is_restickify_coords,
     op_read_writes,
 )
 from .logging_utils import get_inductor_logger
@@ -101,6 +105,8 @@ def collect_work_division_constraints(
     for constraint in (
         coordinate_mask_blocked_vars,
         conv_spatial_blocked_vars,
+        reduction_window_blocked_vars,
+        restickify_padding_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
@@ -196,6 +202,55 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
         and concretize_expr(ctx.it_space[sym]) > 1
     }
     return ConstraintResult(blocked=blocked)
+
+
+def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Keep pooling and convolution kernel windows local to each core."""
+
+    if not isinstance(ctx.op.data, Reduction):
+        return ConstraintResult()
+    op = ctx.op.data.reduction_type
+    if op in POOL_OPS:
+        window_dims = ctx.reduction_vars
+    elif op == CONV2D_FWD_OP:
+        op_info = getattr(ctx.op.data, "op_info", None)
+        conv_params = (
+            op_info.get("conv_params", {}) if isinstance(op_info, dict) else {}
+        )
+        kernel_dims = sum(
+            int(conv_params.get(name, 1)) > 1 for name in ("kernel_h", "kernel_w")
+        )
+        window_dims = ctx.reduction_vars[-kernel_dims:] if kernel_dims else []
+    elif op == DEPTHWISE_CONV2D_OP:
+        # Depthwise reduction order is kh, kw, then optional group. Unlike the
+        # forward-conv path, a group dimension may therefore follow the window.
+        window_dims = ctx.reduction_vars[:2]
+    else:
+        return ConstraintResult()
+
+    return ConstraintResult(blocked=set(window_dims))
+
+
+def restickify_padding_blocked_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep an unaligned restickify stick dimension on one core."""
+
+    if (
+        not isinstance(ctx.op.data, Pointwise)
+        or len(ctx.input_tds) != 1
+        or not is_restickify_coords(
+            ctx.input_tds[0].device_coords, ctx.output_td.device_coords
+        )
+    ):
+        return ConstraintResult()
+
+    padded = {
+        dim
+        for dim, stick_size in ctx.stick_vars.items()
+        if concretize_expr(ctx.it_space[dim]) % stick_size
+    }
+    return ConstraintResult(blocked=padded)
 
 
 def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:

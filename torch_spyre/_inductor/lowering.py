@@ -1876,6 +1876,43 @@ def lower_prod_dim(x, dim, keepdim=False):
     return with_int64_fallback(_prod_dim_impl, x)
 
 
+@register_spyre_lowering(torch.ops.aten.any.dim, type_promotion_kind=None)
+@register_spyre_lowering(torch.ops.aten.any.dims, type_promotion_kind=None)
+def lower_any_dim(x, dim, keepdim=False):
+    x = to_dtype(x, torch.float16)
+    x.realize()
+
+    # Handle both single dimension and tuple of dimensions
+    axis = [dim] if isinstance(dim, int) else list(dim)
+
+    kwargs = lowering._make_reduction_inner(
+        x, axis=axis, keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+    )
+    result = Reduction.create(
+        reduction_type="absmax",
+        input_node=x,
+        **kwargs,
+    )
+    result.realize()
+    return to_dtype(result, torch.bool)
+
+
+@register_spyre_lowering(torch.ops.aten.any.default, type_promotion_kind=None)
+def lower_any_def(x):
+    x = to_dtype(x, torch.float16)
+    x.realize()
+    kwargs = lowering._make_reduction_inner(
+        x, axis=None, keepdims=None, dtype=x.dtype, override_return_dtype=None
+    )
+    result = Reduction.create(
+        reduction_type="absmax",
+        input_node=x,
+        **kwargs,
+    )
+    result.realize()
+    return to_dtype(result, torch.bool)
+
+
 # ============================================================================
 # Direct c10d Lowerings
 # ============================================================================

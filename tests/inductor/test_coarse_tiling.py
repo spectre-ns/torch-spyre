@@ -71,6 +71,7 @@ from torch_spyre._inductor.constants import (
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
+from torch_spyre._inductor.core_mapping import derive_operation_mapping
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_info import CoarseTileInfo, copy_op_metadata
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -633,10 +634,12 @@ def _make_tiled_op_spec() -> OpSpec:
         allocation={"hbm": 0x2000},
         device_tile_advance_expr=tile_advance_expr,
     )
+    iteration_space = {c0: (Integer(128), 1)}
     return OpSpec(
         op="abs",
         is_reduction=False,
-        iteration_space={c0: (Integer(128), 1)},
+        iteration_space=iteration_space,
+        core_id_to_work_slice=derive_operation_mapping(iteration_space),
         args=[tensor_in, tensor_out],
         op_info={},
         tiled_symbols=[[c0]],
@@ -3082,14 +3085,16 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             allocation={"hbm": 0x2000},
             device_tile_advance_expr=tile_advance_expr,
         )
+        iteration_space = {
+            c0: (Integer(2), 1),
+            c1: (Integer(4), 1),
+            c2: (Integer(64), 1),
+        }
         return OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={
-                c0: (Integer(2), 1),
-                c1: (Integer(4), 1),
-                c2: (Integer(64), 1),
-            },
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[tensor_in, tensor_out],
             op_info={},
             tiled_symbols=[[c0, c1]],
@@ -3576,6 +3581,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
                 op="batchmatmul",
                 is_reduction=True,
                 iteration_space=iteration_space,
+                core_id_to_work_slice=derive_operation_mapping(iteration_space),
                 args=args,
                 op_info=op_info,
             )
@@ -4045,10 +4051,12 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             allocation={"hbm": 0x3000},
             device_tile_advance_expr=64 * out,
         )
+        iteration_space = {c0: (Integer(128), 1)}
         op = OpSpec(
             op="add",
             is_reduction=False,
-            iteration_space={c0: (Integer(128), 1)},
+            iteration_space=iteration_space,
+            core_id_to_work_slice=derive_operation_mapping(iteration_space),
             args=[tensor_in0, tensor_in1, tensor_out],
             op_info={},
             tiled_symbols=[[c0]],
