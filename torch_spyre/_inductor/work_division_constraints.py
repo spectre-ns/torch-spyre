@@ -42,6 +42,7 @@ from .constants import (
     DEPTHWISE_CONV2D_OP,
     KEEP_BY_INDEX_OP,
     POOL_OPS,
+    STAGGERED_EAS,
     _MAX_K_PER_CORE,
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
@@ -557,6 +558,15 @@ def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
     )
 
 
+def has_staggered_ea_tensor(tds: "list[TensorDep]") -> bool:
+    """True if any tensor carries a staggered EA (``FP32_TO_DL16`` / ``DL16_TO_FP32``)."""
+    return any(
+        hasattr(td.layout.device_layout, "element_arrangement")
+        and td.layout.device_layout.element_arrangement in STAGGERED_EAS
+        for td in tds
+    )
+
+
 def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     """Restrict QFP8WT tensors' second stick dimension to split=1.
 
@@ -587,10 +597,20 @@ def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
 
 def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict reduction K to split=1 for QFP8WT batchmatmul.
+    """Restrict reduction K to split=1 for QFP8WT / staggered-EA batchmatmul.
 
     Splitting K would require partial-sum accumulation across cores, which the
     QFP8WT matmul kernel does not support.
+
+    The same restriction applies when an operand carries a staggered EA
+    (``FP32_TO_DL16`` / ``DL16_TO_FP32``): those layouts reorder elements
+    *within a stick* along the contraction (K) axis, so a K-split hands each
+    core a strided slice of the staggered operand that the matmul's K-fast
+    cohort accumulation mis-addresses -- silent wrong results. This is the
+    root cause of the co-optimization ``test_stagger_to_standard_ea`` width-128
+    failures, where the balance tie-break splits K of the ``mm(x_staggered, P)``
+    that ``spyre.stagger_to_standard_ea`` lowers to (the non-co-opt matmul cost
+    model never picks that K-split, so the greedy path is unaffected).
     """
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
@@ -598,7 +618,7 @@ def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintRe
         return ConstraintResult()
 
     all_tds = ctx.input_tds + [ctx.output_td]
-    if not has_qfp8wt_tensor(all_tds):
+    if not (has_qfp8wt_tensor(all_tds) or has_staggered_ea_tensor(all_tds)):
         return ConstraintResult()
 
     return ConstraintResult(
