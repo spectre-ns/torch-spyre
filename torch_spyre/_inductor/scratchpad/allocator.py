@@ -94,7 +94,7 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
-from torch_spyre._inductor.constants import DEVICE_NAME, POOL_OPS
+from torch_spyre._inductor.constants import DEVICE_NAME, KEEP_BY_INDEX_OP, POOL_OPS
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -1282,6 +1282,47 @@ def _is_windowed_pool(op: Operation) -> bool:
     )
 
 
+def _keep_by_index_layout_group_ops(graph: GraphLowering) -> set[str]:
+    """Op names in every keep_by_index's tightly-coupled layout group.
+
+    keep_by_index reproduces a fragile multi-stick search layout that its input
+    restickifies and output clones carry too. The plain work-division pass
+    divides this producer/reduction/consumer chain into mutually compatible
+    per-core slicings, but the joint solver may hand its members incompatible
+    divisions -- e.g. an output clone splitting the search axis while the
+    reduction keeps it whole -- which drops the second search stick's kept
+    values (silently wrong, ~2-3% of a 6x17x4x128 dim-3 keep_by_index). Pin the
+    whole one-hop group to its fixed (work-division) division so co-optimization
+    keeps the compatible split, mirroring the windowed-pool pin. The reduction's
+    own unsafe splits are separately blocked by
+    ``keep_by_index_search_adjacent_blocked_vars``, which keeps that fixed
+    division safe to pin to.
+    """
+    kbi_ops = [
+        op
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == KEEP_BY_INDEX_OP
+    ]
+    if not kbi_ops:
+        return set()
+    kbi_names = {op.name for op in kbi_ops}
+    group: set[str] = set(kbi_names)
+    # Producers of each reduction's input buffers (the input restickifies).
+    for kbi in kbi_ops:
+        group |= {
+            dep.name for dep in op_read_writes(kbi).reads if isinstance(dep, MemoryDep)
+        }
+    # Consumers of any keep_by_index output (the output clones).
+    for op in graph.operations:
+        if isinstance(op, ComputedBuffer) and kbi_names.intersection(
+            dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
+        ):
+            group.add(op.name)
+    return group
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -1778,6 +1819,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         max_cores = config.sencores
         fixed_division_ops = ops_in_offset_mutation_component(graph)
+        keep_by_index_group_ops = _keep_by_index_layout_group_ops(graph)
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
         result = {}
@@ -1820,6 +1862,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # pool_window_blocked_vars / reduction_window_blocked_vars.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "windowed pool"
+                )
+            elif op.name in keep_by_index_group_ops:
+                # A keep_by_index reduction and its input restickifies / output
+                # clones carry a fragile multi-stick search layout that the
+                # joint solver can slice incompatibly (dropping the second
+                # search stick's kept values). Pin the whole group to the
+                # work-division pass's mutually compatible division. See
+                # _keep_by_index_layout_group_ops.
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "keep_by_index layout group"
                 )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [

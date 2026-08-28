@@ -120,6 +120,7 @@ def collect_work_division_constraints(
         topk_split_domains,
         keep_by_index_k_split_constraint,
         keep_by_index_pinned_search_space_vars,
+        keep_by_index_search_adjacent_blocked_vars,
         indirect_access_split_domains,
     ):
         result = constraint(ctx)
@@ -805,14 +806,14 @@ def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> Constrain
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
-def keep_by_index_pinned_search_space_vars(
-    ctx: WorkDivConstraintContext,
-) -> ConstraintResult:
-    """Keep one keep_by_index full-search output axis on each core.
+def _keep_by_index_search_axis(ctx: WorkDivConstraintContext) -> Symbol | None:
+    """The iteration symbol of the keep_by_index full-search output axis.
 
-    A broadcast indices input can omit unrelated output/batch axes. Preserve the
-    prior coordinate-based policy: select one simplest output coordinate absent
-    from the semantic indices operand rather than pinning every absent symbol.
+    The search axis is the simplest output device coordinate absent from the
+    semantic indices operand. A broadcast indices input can omit unrelated
+    output/batch axes, so select one simplest such coordinate rather than every
+    absent symbol. Returns ``None`` for a non-keep_by_index op or when no such
+    axis exists.
     """
     if (
         not (
@@ -821,8 +822,7 @@ def keep_by_index_pinned_search_space_vars(
         )
         or len(ctx.input_tds) < 2
     ):
-        return ConstraintResult()
-
+        return None
     index_coords = ctx.input_tds[1].device_coords
     candidates = [
         coord
@@ -830,19 +830,76 @@ def keep_by_index_pinned_search_space_vars(
         if coord.free_symbols and not any(coord.equals(index) for index in index_coords)
     ]
     if not candidates:
-        return ConstraintResult()
-
+        return None
     search_coord = min(
         candidates, key=lambda coord: (len(coord.free_symbols), str(coord))
     )
-    search_axis = next(
+    return next(
         (axis for axis in ctx.it_space if axis in search_coord.free_symbols), None
     )
+
+
+def keep_by_index_pinned_search_space_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep the keep_by_index full-search output axis whole on each core."""
+    search_axis = _keep_by_index_search_axis(ctx)
     return (
         ConstraintResult(allowed_splits={search_axis: frozenset({1})})
         if search_axis is not None
         else ConstraintResult()
     )
+
+
+def keep_by_index_search_adjacent_blocked_vars(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Block the output dim that encloses a multi-stick keep_by_index search axis.
+
+    keep_by_index masks each output search position by comparing its search
+    coordinate against the K selected indices, and the datapath sweeps the whole
+    search axis on each core as one unit. When the search axis is wider than one
+    stick, splitting the output dim laid out immediately outside it -- the dim
+    whose sweep the search axis is nested inside -- across cores corrupts that
+    sweep: each core then compares only the first stick's worth of search
+    positions, so kept values beyond the first stick come back as the fill value
+    -- silently wrong (~1.5-2.4% of a 6x17x4x128 dim-3 keep_by_index) and a
+    dxp_standalone abort at some core counts. This is independent of
+    co-optimization: the plain work-division pass hits it too whenever it happens
+    to split that dim. The leading and other batch dims split correctly, so only
+    the enclosing dim is blocked, and only when the search axis spans more than
+    one stick (a single-stick search has no second stick to drop). Both split
+    enumerators consume this.
+
+    The enclosing dim is identified by stride rather than device-coordinate
+    adjacency: it is the output-index symbol whose coefficient equals the search
+    axis's coefficient times its extent (the dim one memory level out from
+    search). This is stable across the stickified layout, where a multi-stick
+    search axis itself decomposes into two device coordinates.
+    """
+    search_axis = _keep_by_index_search_axis(ctx)
+    if search_axis is None:
+        return ConstraintResult()
+
+    # A search axis no wider than one stick has no second stick to drop, so the
+    # datapath sweep is split-safe -- leave those parallel. stick_vars maps the
+    # stick dim to its elements-per-stick; absent it, block conservatively.
+    search_extent = concretize_expr(ctx.it_space[search_axis])
+    elems_per_stick = next(iter(ctx.stick_vars.values()), None)
+    if elems_per_stick is not None and search_extent <= elems_per_stick:
+        return ConstraintResult()
+
+    write_index = ctx.output_td.dep.index
+    search_coeff = write_index.coeff(search_axis)
+    if search_coeff == 0:
+        return ConstraintResult()
+    enclosing_coeff = search_coeff * search_extent
+    blocked = {
+        v
+        for v in ctx.it_space
+        if v != search_axis and write_index.coeff(v) == enclosing_coeff
+    }
+    return ConstraintResult(blocked=blocked)
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:

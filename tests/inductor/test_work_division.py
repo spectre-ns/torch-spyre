@@ -61,6 +61,7 @@ from torch_spyre._inductor.work_division_constraints import (
     pool_window_blocked_vars,
     keep_by_index_k_split_constraint,
     keep_by_index_pinned_search_space_vars,
+    keep_by_index_search_adjacent_blocked_vars,
     qfp8wt_matmul_k_split_domains,
     qfp8wt_split_domains,
     reduction_window_blocked_vars,
@@ -470,6 +471,64 @@ class TestKeepByIndexConstraints(unittest.TestCase):
             result = keep_by_index_pinned_search_space_vars(ctx)
 
         self.assertEqual(result.allowed_splits, {batch: frozenset({1})})
+
+    def _search_adjacent_ctx(self, out_shape, search_extent, stick):
+        # 4D keep_by_index whose search axis is the last dim: values/output share
+        # (b0, b1, enc, search); indices carry K at the search position instead.
+        b0, b1, enc, search, k = (_isym(n) for n in ("b0", "b1", "enc", "search", "k"))
+        op = _computed_buffer(
+            out_shape, name="keep_by_index", reduction_type="keepbyindex"
+        )
+        idx_shape = (*out_shape[:-1], out_shape[-1] // 16 or 1)
+        output_td = _tensor_dep("keep_by_index", out_shape, (b0, b1, enc, search))
+        ctx = _make_context(
+            op,
+            output_td,
+            input_tds=[
+                _tensor_dep("values", out_shape, (b0, b1, enc, search)),
+                _tensor_dep("indices", idx_shape, (b0, b1, enc, k)),
+            ],
+            it_space={
+                b0: out_shape[0],
+                b1: out_shape[1],
+                enc: out_shape[2],
+                search: search_extent,
+                k: idx_shape[-1],
+            },
+            stick_vars={search: stick},
+            reduction_vars=(k,),
+        )
+        return (
+            ctx,
+            {"b0": b0, "b1": b1, "enc": enc, "search": search},
+            MagicMock(writes=[output_td.dep]),
+        )
+
+    def test_multistick_search_blocks_only_the_enclosing_dim(self):
+        # search axis (128) spans two 64-element sticks: the dim laid out one
+        # memory level outside it (enc, stride == search extent) must not split;
+        # the leading batch dims stay free.
+        ctx, sym, rw = self._search_adjacent_ctx((6, 17, 4, 128), 128, 64)
+        with patch(
+            "torch_spyre._inductor.work_division_constraints.op_read_writes",
+            return_value=rw,
+        ):
+            result = keep_by_index_search_adjacent_blocked_vars(ctx)
+        self.assertEqual(result.blocked, {sym["enc"]})
+        self.assertNotIn(sym["b0"], result.blocked)
+        self.assertNotIn(sym["b1"], result.blocked)
+        self.assertNotIn(sym["search"], result.blocked)
+
+    def test_single_stick_search_blocks_nothing(self):
+        # a search axis no wider than one stick (64) has no second stick to drop,
+        # so its enclosing dim stays free.
+        ctx, _sym, rw = self._search_adjacent_ctx((6, 17, 4, 64), 64, 64)
+        with patch(
+            "torch_spyre._inductor.work_division_constraints.op_read_writes",
+            return_value=rw,
+        ):
+            result = keep_by_index_search_adjacent_blocked_vars(ctx)
+        self.assertEqual(result.blocked, set())
 
 
 class TestCostModelConstraints(unittest.TestCase):
