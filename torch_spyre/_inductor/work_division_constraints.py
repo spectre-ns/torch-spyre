@@ -264,6 +264,29 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     return ConstraintResult(blocked=blocked)
 
 
+def pool_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Block a windowed pool's reduction (window) axes from splitting across cores.
+
+    ``AVGPOOL2D_OP`` (avgpoolfwd) is a windowed reduction executed as a single
+    pool instruction on the datapath: each output reads its whole kH x kW window
+    and the ``scaling_factor`` (1/(kH*kW)) is applied to the full-window sum.
+    There is no cross-core accumulation of a partial-window pool, so splitting a
+    window (reduction) axis across cores makes each core pool only part of the
+    window -- silent wrong output (the generic reduction-split path assumes a
+    summable partial, which the pool datapath does not provide). This was latent
+    because the old work-division algorithm never split the window, but
+    co-optimization does: it split kW=2 of a 24x24 k2s2 avg_pool2d across two
+    cores and produced ~19% wrong elements. Splitting the *output* spatial dims
+    stays legal -- each output pixel's window is wholly local to the core that
+    owns it.
+    """
+    if not (
+        isinstance(ctx.op.data, Reduction) and ctx.op.data.reduction_type in POOL_OPS
+    ):
+        return ConstraintResult()
+    return ConstraintResult(blocked=set(ctx.reduction_vars))
+
+
 def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
     """Keep pooling and convolution kernel windows local to each core."""
 
