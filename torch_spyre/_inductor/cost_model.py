@@ -1368,8 +1368,8 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
     # model that trivial dim is simply extent 1, so floor at 1: an N=1 matmul
     # (a matrix-vector product, e.g. the fp32->fp16 stagger_to_standard_ea path)
     # otherwise gives N=0 and a divide-by-zero in ``K`` / ``B_total`` below.
-    M = max(1.0, o.matmul_rows_per_core * m_split)
-    N = max(1.0, o.matmul_cols_per_core * n_split)
+    M = o.matmul_rows_per_core * m_split
+    N = o.matmul_cols_per_core * n_split
     if o.matmul_a_bytes:
         K = o.matmul_a_bytes / (M * o.dtype_bytes)
     elif o.matmul_b_bytes:
