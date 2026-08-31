@@ -1328,6 +1328,35 @@ def _is_indirect_access_op(op: Operation) -> bool:
     return isinstance(op, ComputedBuffer) and bool(indirect_access_subs_from_op(op))
 
 
+def _reads_offset_slice(op: Operation) -> bool:
+    """True for an op that reads an input at a constant (slice) offset.
+
+    A sliced read -- ``exp(x[:, :, 32:96])`` reads its operand at index
+    ``... + 32`` -- carries a non-zero constant term in the read index.
+    Splitting the sliced dim across cores mis-addresses the per-core slice: the
+    sliced dim is a non-stick device coordinate offset into a wider operand dim
+    (``d2 + 32`` into a 128-wide dim in the restickified operand), so a per-core
+    sub-range lands at a span the DSM read address cannot express -- silent ~44%
+    error on ``exp(x[:, :, 32:96])`` over 128x192x256. The work-division pass
+    picks a safe division for these ops (it never split the offset dim); the
+    joint solver does, so pin the op to that fixed division, mirroring the
+    keep_by_index pin. Correctness is unchanged (the fixed division is what the
+    non-co-optimized path uses); only the offending split is removed. Blocking
+    the offset dim alone is not enough -- it forces the solver onto a different
+    unsafe split for a sliced reduction -- so the whole op is pinned. Indirect
+    (data-dependent) offsets are handled by ``_is_indirect_access_op``.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    for dep in op_read_writes(op).reads:
+        if not isinstance(dep, MemoryDep):
+            continue
+        const = dep.index.as_coeff_Add()[0]
+        if const.is_number and int(const) != 0:
+            return True
+    return False
+
+
 def _keep_by_index_layout_group_ops(graph: GraphLowering) -> set[str]:
     """Op names in every keep_by_index's tightly-coupled layout group.
 
@@ -1990,6 +2019,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # division pass's entry-split division. See _is_indirect_access_op.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "indirect access entry split"
+                )
+            elif _reads_offset_slice(op):
+                # An op reading a sliced input (a non-zero constant read offset)
+                # cannot have its sliced dim split across cores -- the per-core
+                # offset slice mis-addresses. Pin to the work-division pass's
+                # safe division. See _reads_offset_slice.
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "offset slice read"
                 )
             elif _is_coarse_tiled(op):
                 # A coarse-tiled op belongs to a fused loop group whose per-core
