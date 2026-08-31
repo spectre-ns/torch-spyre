@@ -95,7 +95,12 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
-from torch_spyre._inductor.constants import DEVICE_NAME, KEEP_BY_INDEX_OP, POOL_OPS
+from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_FP8_OP,
+    DEVICE_NAME,
+    KEEP_BY_INDEX_OP,
+    POOL_OPS,
+)
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -1364,6 +1369,50 @@ def _keep_by_index_layout_group_ops(graph: GraphLowering) -> set[str]:
     return group
 
 
+def _fp8_matmul_group_ops(graph: GraphLowering) -> set[str]:
+    """Op names in every fp8 matmul's fused quantize/dequant group.
+
+    An fp8 batchmatmul (``batchmatmulfp8``) fuses with the fp8 quantize of its
+    operands and the dequant/bias of its output into one SDSC bundle. The
+    DeepTools L3 scheduler distributes that bundle across temporal loops
+    assuming one per-core division; the joint solver can hand the matmul and its
+    fused neighbours incompatible divisions -- e.g. the matmul left single-core
+    (``{}``) and LX-resident while its operands split -- which aborts scheduling
+    (``distributeElemArrToTemporalLoops: Not enough elements to distribute``,
+    seen on a 4x128 @ 128x1024 fp8 scaled_mm). Pin the one-hop group (matmul +
+    operand producers + output consumers) to the work-division pass's mutually
+    compatible division, mirroring the keep_by_index pin. Only the *fused*
+    neighbours need it -- the quantize chain feeding the operand producers is a
+    separate bundle whose division may differ. The pre-co-optimization path
+    never hit this because it never placed the fp8 bundle single-core in LX.
+    A plain fp16 batchmatmul is unaffected: it fuses no quantize and schedules
+    single-core-in-LX fine, so only the fp8 op is grouped.
+    """
+    mm_ops = [
+        op
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    ]
+    if not mm_ops:
+        return set()
+    mm_names = {op.name for op in mm_ops}
+    group: set[str] = set(mm_names)
+    # Producers of each matmul's operand buffers (the fp8 quantize outputs).
+    for mm in mm_ops:
+        group |= {
+            dep.name for dep in op_read_writes(mm).reads if isinstance(dep, MemoryDep)
+        }
+    # Consumers of any fp8 matmul output (the dequant / bias-add).
+    for op in graph.operations:
+        if isinstance(op, ComputedBuffer) and mm_names.intersection(
+            dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
+        ):
+            group.add(op.name)
+    return group
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -1869,6 +1918,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         max_cores = config.sencores
         fixed_division_ops = ops_in_offset_mutation_component(graph)
         keep_by_index_group_ops = _keep_by_index_layout_group_ops(graph)
+        fp8_matmul_group_ops = _fp8_matmul_group_ops(graph)
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
         result = {}
@@ -1921,6 +1971,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # _keep_by_index_layout_group_ops.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "keep_by_index layout group"
+                )
+            elif op.name in fp8_matmul_group_ops:
+                # An fp8 matmul fuses with its operand quantizes / output dequant
+                # into one SDSC bundle the DeepTools scheduler distributes
+                # assuming a single division; the joint solver can slice the
+                # bundle's members incompatibly (matmul single-core-in-LX, its
+                # operands split) and abort scheduling. Pin the group to the
+                # work-division pass's compatible division. See
+                # _fp8_matmul_group_ops.
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "fp8 matmul layout group"
                 )
             elif _is_indirect_access_op(op):
                 # A gather/scatter's index-entry split is either mislabeled as a
