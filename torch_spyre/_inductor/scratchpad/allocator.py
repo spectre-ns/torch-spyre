@@ -1873,14 +1873,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
             )
         except (ValueError, RuntimeError, TypeError):
-            # TypeError covers a cost term that is piecewise in the solver's own
-            # symbolic vars and so cannot be built symbolically: coarse_underfill_eff
-            # branches on ``raw >= eff0``, and with a coarse-tiled op's symbolic
-            # tile_rows_per_core / cols that Relational has no truth value
-            # (``cannot determine truth value of Relational``). Dropping to the
-            # memory-only objective is the intended fallback -- and lossless for a
-            # coarse-tiled graph, whose ops are already pinned to a fixed division
-            # by ``_is_coarse_tiled`` (the cost objective cannot re-divide them).
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
@@ -1958,16 +1950,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if isinstance(op, ComputedBuffer) and (
                 op_layout is None or op_layout.device.type != DEVICE_NAME
             ):
-                # A CPU/host ComputedBuffer (a fallback or CPU-roundtrip output)
-                # carries a plain FixedLayout with no ``device_layout``: it is
-                # not tiled, so it can be neither core-divided nor LX-resident.
-                # Pin it to its fixed single-core division -- so it still anchors
-                # the slicing-match as a producer/consumer -- rather than letting
-                # it reach the enumerators, which dereference ``device_layout``
-                # and raise. Both branches below (the pruned
-                # ``_enum_split_options`` and the joint
-                # ``_enumerate_core_divisions``) assume a device layout; this
-                # mirrors the work-division pass guard in ``_iter_computed_buffers``.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "cpu/host buffer"
                 )
@@ -1976,65 +1958,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     op, [_fixed_core_division(op)], "offset mutation component"
                 )
             elif _is_windowed_pool(op):
-                # A windowed pool (avgpoolfwd) reads its input at
-                # ``out*stride + window``. Co-optimization is free to pick a
-                # spatial output split whose per-core input DSM address the
-                # deeptools scheduler mis-computes -- silently wrong output
-                # (e.g. co-opt chose H_out x4 / W_out x6 for a 24x24 k2s2 pool
-                # and produced ~40% wrong elements, while the work-division
-                # pass's H_out x12 / W_out x2 for the same op is correct). The
-                # safe divisions are exactly the ones the (non-co-optimized)
-                # work-division pass commits, so pin the pool to that upstream
-                # division rather than letting the joint solver re-divide it.
-                # The window (reduction) axes are additionally guarded by
-                # pool_window_blocked_vars / reduction_window_blocked_vars.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "windowed pool"
                 )
             elif op.name in keep_by_index_group_ops:
-                # A keep_by_index reduction and its input restickifies / output
-                # clones carry a fragile multi-stick search layout that the
-                # joint solver can slice incompatibly (dropping the second
-                # search stick's kept values). Pin the whole group to the
-                # work-division pass's mutually compatible division. See
-                # _keep_by_index_layout_group_ops.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "keep_by_index layout group"
                 )
             elif op.name in fp8_matmul_group_ops:
-                # An fp8 matmul fuses with its operand quantizes / output dequant
-                # into one SDSC bundle the DeepTools scheduler distributes
-                # assuming a single division; the joint solver can slice the
-                # bundle's members incompatibly (matmul single-core-in-LX, its
-                # operands split) and abort scheduling. Pin the group to the
-                # work-division pass's compatible division. See
-                # _fp8_matmul_group_ops.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "fp8 matmul layout group"
                 )
             elif _is_indirect_access_op(op):
-                # A gather/scatter's index-entry split is either mislabeled as a
-                # reduction (scatter) or a tie the solver breaks toward a single
-                # core (gather), so co-optimization drops it. Pin to the work-
-                # division pass's entry-split division. See _is_indirect_access_op.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "indirect access entry split"
                 )
             elif _reads_offset_slice(op):
-                # An op reading a sliced input (a non-zero constant read offset)
-                # cannot have its sliced dim split across cores -- the per-core
-                # offset slice mis-addresses. Pin to the work-division pass's
-                # safe division. See _reads_offset_slice.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "offset slice read"
                 )
             elif _is_coarse_tiled(op):
-                # A coarse-tiled op belongs to a fused loop group whose per-core
-                # work mapping must stay uniform across its members. The joint
-                # solver can slice them incompatibly (e.g. compute ops single-
-                # core, a sibling read copy split), corrupting the shared loop
-                # nest's addressing. Pin to the work-division pass's group-
-                # consistent division. See _is_coarse_tiled.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "coarse-tile loop group"
                 )
