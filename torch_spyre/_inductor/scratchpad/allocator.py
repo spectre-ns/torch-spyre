@@ -40,6 +40,7 @@ from torch._inductor.graph import GraphLowering
 from torch_spyre._inductor.pass_utils import (
     commit_iteration_space_ownership,
     concretize_expr,
+    indirect_access_subs_from_op,
     indirect_info_from_op,
     iteration_space_from_op,
     op_read_writes,
@@ -1303,6 +1304,25 @@ def _is_coarse_tiled(op: Operation) -> bool:
     return getattr(op, "loop_info", None) is not None
 
 
+def _is_indirect_access_op(op: Operation) -> bool:
+    """True for a gather (``index``) or scatter (``index_put``) op.
+
+    An indirect op accesses one operand through a runtime index
+    (``IndirectAccess``): a gather reads ``src[idx]``, a scatter writes
+    ``dest[idx]``. The work-division pass parallelizes these on the index-entry
+    dim and never on the shared table/destination data dim (splitting the shared
+    base is silently wrong). The joint solver does not preserve that split: a
+    scatter's entry dim reaches ``_core_division`` as a reduction split (write
+    coeff 0 through IndirectAccess) which the solver then avoids, and a gather's
+    entry split is a plain tie the memory-only objective breaks toward a single
+    core -- both drop the multicore entry-dim parallelism. Pin every indirect op
+    to its fixed (work-division) division so co-optimization keeps the entry
+    split, mirroring the keep_by_index pin. Correctness is unchanged either way
+    (the shared data dim is never split); this restores the expected parallelism.
+    """
+    return isinstance(op, ComputedBuffer) and bool(indirect_access_subs_from_op(op))
+
+
 def _keep_by_index_layout_group_ops(graph: GraphLowering) -> set[str]:
     """Op names in every keep_by_index's tightly-coupled layout group.
 
@@ -1901,6 +1921,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # _keep_by_index_layout_group_ops.
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "keep_by_index layout group"
+                )
+            elif _is_indirect_access_op(op):
+                # A gather/scatter's index-entry split is either mislabeled as a
+                # reduction (scatter) or a tie the solver breaks toward a single
+                # core (gather), so co-optimization drops it. Pin to the work-
+                # division pass's entry-split division. See _is_indirect_access_op.
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "indirect access entry split"
                 )
             elif _is_coarse_tiled(op):
                 # A coarse-tiled op belongs to a fused loop group whose per-core
