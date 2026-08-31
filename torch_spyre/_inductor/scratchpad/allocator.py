@@ -1950,7 +1950,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "cpu/host buffer"
                 )
-            elif op.name in  ops_in_offset_mutation_component(graph):
+            elif op.name in ops_in_offset_mutation_component(graph):
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "offset mutation component"
                 )
