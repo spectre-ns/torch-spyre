@@ -1362,12 +1362,6 @@ def _matmul_axes_for_split_cost(o) -> tuple | None:
     m_split = max(1, o.matmul_m_split)
     n_split = max(1, o.matmul_n_split)
     k_split = max(1, o.reduction_cores)
-    # ``matmul_rows_per_core`` / ``matmul_cols_per_core`` are left at their 0.0
-    # sentinel for a trivial (size-1) M / N dim -- the extractor's "no underfill
-    # derate" signal, which the bundled model reads as N/A. For the split-cost
-    # model that trivial dim is simply extent 1, so floor at 1: an N=1 matmul
-    # (a matrix-vector product, e.g. the fp32->fp16 stagger_to_standard_ea path)
-    # otherwise gives N=0 and a divide-by-zero in ``K`` / ``B_total`` below.
     M = o.matmul_rows_per_core * m_split
     N = o.matmul_cols_per_core * n_split
     if o.matmul_a_bytes:
