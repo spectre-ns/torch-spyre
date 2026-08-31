@@ -1938,8 +1938,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         max_cores = config.sencores
         fixed_division_ops = ops_in_offset_mutation_component(graph)
-        keep_by_index_group_ops = _keep_by_index_layout_group_ops(graph)
-        fp8_matmul_group_ops = _fp8_matmul_group_ops(graph)
+        fp8_matmul_group_ops = 
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
         result = {}
@@ -1961,11 +1960,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "windowed pool"
                 )
-            elif op.name in keep_by_index_group_ops:
+            elif op.name in _keep_by_index_layout_group_ops(graph):
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "keep_by_index layout group"
                 )
-            elif op.name in fp8_matmul_group_ops:
+            elif op.name in _fp8_matmul_group_ops(graph):
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "fp8 matmul layout group"
                 )
