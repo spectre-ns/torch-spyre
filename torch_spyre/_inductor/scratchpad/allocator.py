@@ -1774,7 +1774,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             cost_expr = sympy.sympify(
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
             )
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError, TypeError):
+            # TypeError covers a cost term that is piecewise in the solver's own
+            # symbolic vars and so cannot be built symbolically: coarse_underfill_eff
+            # branches on ``raw >= eff0``, and with a coarse-tiled op's symbolic
+            # tile_rows_per_core / cols that Relational has no truth value
+            # (``cannot determine truth value of Relational``). Dropping to the
+            # memory-only objective is the intended fallback -- and lossless for a
+            # coarse-tiled graph, whose ops are already pinned to a fixed division
+            # by ``_is_coarse_tiled`` (the cost objective cannot re-divide them).
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
