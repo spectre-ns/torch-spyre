@@ -1937,8 +1937,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``utils.ops_in_offset_mutation_component``.
         """
         max_cores = config.sencores
-        fixed_division_ops = ops_in_offset_mutation_component(graph)
-        fp8_matmul_group_ops = 
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
         result = {}
@@ -1952,7 +1950,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "cpu/host buffer"
                 )
-            elif op.name in fixed_division_ops:
+            elif op.name in  ops_in_offset_mutation_component(graph):
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "offset mutation component"
                 )
