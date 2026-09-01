@@ -514,11 +514,6 @@ class ScratchpadAllocator:
             # Index tensors and the value tensors they index into are read via
             # data-dependent (indirect) addressing, must stay in hbm.
             return "index tensor or indirectly accessed"
-        if self._read_by_lx_infeasible_op(graph, name, uses):
-            # A windowed pool consumer reads this buffer through its
-            # windowed-padded data stage, which the L3 scheduler cannot page
-            # from LX (same limit as the pool's own output). Resolve from HBM.
-            return "read by windowed pool (LX-infeasible)"
         if name in graph_output_names:
             # A graph output normally can't reside (the value must land back in
             # HBM), but with boundary cloning on it is pinned via an output clone
