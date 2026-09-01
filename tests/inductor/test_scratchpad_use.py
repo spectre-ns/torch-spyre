@@ -1467,56 +1467,6 @@ class TestSelectAllocator(unittest.TestCase):
                 select_allocator()
 
 
-class TestReadByLxInfeasibleOp(unittest.TestCase):
-    """Unit tests for ``ScratchpadAllocator._read_by_lx_infeasible_op``: a buffer
-    read by a windowed pool (``OP_INFEASIBLE_FOR_LX``) must stay in HBM, because
-    the pool reads it through a windowed-padded data stage the L3 scheduler
-    cannot page from LX (same limit that blocks an LX-resident pool output)."""
-
-    @staticmethod
-    def _op(opname: str, reads: list[str]):
-        from torch._inductor.dependencies import MemoryDep
-        from sympy import Integer
-
-        # op_short_name reads the fx origin target's _opname; op_read_writes is
-        # patched, so its reads come from this stashed list.
-        return SimpleNamespace(
-            origin_node=SimpleNamespace(target=SimpleNamespace(_opname=opname)),
-            origins=(),
-            _reads=[MemoryDep(r, Integer(0), (), ()) for r in reads],
-        )
-
-    @contextmanager
-    def _patched(self):
-        with patch(
-            "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
-            side_effect=lambda op: SimpleNamespace(reads=op._reads, writes=[]),
-        ):
-            yield
-
-    def _run(self, ops, name):
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-
-        graph = SimpleNamespace(operations=ops)
-        with self._patched():
-            return ScratchpadAllocator._read_by_lx_infeasible_op(
-                graph, name, list(range(len(ops)))
-            )
-
-    def test_pool_consumer_reading_buffer_blocks(self):
-        ops = [self._op("relu", []), self._op("avg_pool2d", ["buf0"])]
-        self.assertTrue(self._run(ops, "buf0"))
-
-    def test_pool_consumer_not_reading_buffer_does_not_block(self):
-        # A pool is present but reads a different buffer.
-        ops = [self._op("relu", ["buf0"]), self._op("avg_pool2d", ["buf9"])]
-        self.assertFalse(self._run(ops, "buf0"))
-
-    def test_only_non_pool_consumers_do_not_block(self):
-        ops = [self._op("relu", ["buf0"]), self._op("mul", ["buf0"])]
-        self.assertFalse(self._run(ops, "buf0"))
-
-
 class TestInplaceEdgeGate(unittest.TestCase):
     """Unit tests for ``ScratchpadAllocator._inplace_edge_ok``, the sole predicate
     defining a legal in-place edge (shared by the normal producer path and the

@@ -446,31 +446,6 @@ class ScratchpadAllocator:
                 return True
         return False
 
-    @staticmethod
-    def _read_by_lx_infeasible_op(
-        graph: GraphLowering, name: str, uses: list[int]
-    ) -> bool:
-        """True if a consumer that reads ``name`` cannot take an LX-resident
-        operand.
-
-        A windowed pool (:data:`OP_INFEASIBLE_FOR_LX`) reads its input through a
-        data stage carrying ``PADDED_FULLSPAN_WUNNEEDED`` padding, which the L3
-        scheduler cannot combine with LX paging -- a pool that reads ``name``
-        from LX aborts exactly as an LX-resident pool *output* does, so ``name``
-        must resolve from HBM. Mirrors the consumer scan in
-        :meth:`_is_index_or_indirectly_accessed`.
-        """
-        for u in uses:
-            consumer = graph.operations[u]
-            if op_short_name(consumer) not in OP_INFEASIBLE_FOR_LX:
-                continue
-            if any(
-                isinstance(dep, MemoryDep) and dep.name == name
-                for dep in op_read_writes(consumer).reads
-            ):
-                return True
-        return False
-
     def _buffer_residency_reason(
         self,
         graph: GraphLowering,
