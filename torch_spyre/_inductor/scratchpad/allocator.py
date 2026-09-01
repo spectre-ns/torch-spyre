@@ -567,8 +567,6 @@ class ScratchpadAllocator:
             return "no consumer reads it from LX"
         if self._is_index_or_indirectly_accessed(graph, name, uses, None):
             return "index tensor or indirectly accessed"
-        if self._read_by_lx_infeasible_op(graph, name, uses):
-            return "read by windowed pool (LX-infeasible)"
         if _extern_kernel_in_live_range(graph, uses):
             return "extern kernel user or live across extern kernel"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
