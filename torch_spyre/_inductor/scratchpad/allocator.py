@@ -90,7 +90,6 @@ from torch_spyre._inductor.scratchpad.utils import (
     _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
-    OP_INFEASIBLE_FOR_LX,
     counted_loop_lifetime_end_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
@@ -510,14 +509,6 @@ class ScratchpadAllocator:
             buf_user_deps: every buffer's ``(op, dep)`` users, from
                 :func:`_get_buffer_user_deps`, for the read-side advancing check.
         """
-        if op is not None and op_short_name(op) in OP_INFEASIBLE_FOR_LX:
-            # Hard DeepTools L3-scheduler limit (see OP_INFEASIBLE_FOR_LX): a
-            # windowed pool's data stage cannot combine LX paging with its
-            # windowed padding, so its output must stay in HBM. Checked before
-            # _op_output_good_for_lx_reuse so it also holds under
-            # allow_all_ops_in_lx_planning and a planned relayout source, which
-            # that predicate would otherwise wave through.
-            return "op output infeasible for LX (windowed pool)"
         if op is None or not self._op_output_good_for_lx_reuse(op, planned_lx_buffers):
             return "op not allowed"
         if not hasattr(getattr(op, "layout", None), "device_layout"):
