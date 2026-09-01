@@ -1275,6 +1275,19 @@ def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol
     }
 
 
+def _is_cpu_host_buffer(op: Operation) -> bool:
+    """True for a ComputedBuffer that is not on the Spyre device.
+
+    CPU/host buffers participate in the joint division map (as producers or
+    consumers in the slicing-match) but never reside in LX and are never
+    re-sliced, so they keep their committed division.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    layout = op.maybe_get_layout()
+    return layout is None or layout.device.type != DEVICE_NAME
+
+
 def _is_windowed_pool(op: Operation) -> bool:
     """True for a windowed pool (avgpoolfwd) reduction op.
 
@@ -1357,85 +1370,50 @@ def _reads_offset_slice(op: Operation) -> bool:
     return False
 
 
-def _keep_by_index_layout_group_ops(graph: GraphLowering) -> set[str]:
-    """Op names in every keep_by_index's tightly-coupled layout group.
+def _fused_layout_group_ops(graph: GraphLowering, seed_types: set[str]) -> set[str]:
+    """Op names in every fused layout group seeded by ``seed_types``.
 
-    keep_by_index reproduces a fragile multi-stick search layout that its input
-    restickifies and output clones carry too. The plain work-division pass
-    divides this producer/reduction/consumer chain into mutually compatible
-    per-core slicings, but the joint solver may hand its members incompatible
-    divisions -- e.g. an output clone splitting the search axis while the
-    reduction keeps it whole -- which drops the second search stick's kept
-    values (silently wrong, ~2-3% of a 6x17x4x128 dim-3 keep_by_index). Pin the
-    whole one-hop group to its fixed (work-division) division so co-optimization
-    keeps the compatible split, mirroring the windowed-pool pin. The reduction's
-    own unsafe splits are separately blocked by
-    ``keep_by_index_search_adjacent_blocked_vars``, which keeps that fixed
-    division safe to pin to.
+    A group is one seed reduction plus the input producers it reads (one hop
+    back) and the consumers of its output (one hop forward): the tightly coupled
+    neighbours the work-division pass slices into a single mutually compatible
+    per-core division. The joint solver, free to divide each op independently,
+    can hand the group's members incompatible divisions and corrupt the shared
+    per-core addressing/scheduling, so the caller pins the whole group to its
+    fixed (work-division) division. Two op kinds need this identical treatment:
+
+    * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
+      input restickifies and output clones carry too; an output clone splitting
+      the search axis while the reduction keeps it whole drops the second search
+      stick's kept values (silently wrong, ~2-3% of a 6x17x4x128 dim-3
+      keep_by_index). Its own unsafe splits are separately blocked by
+      ``keep_by_index_search_adjacent_blocked_vars``.
+    * ``batchmatmulfp8`` fuses the fp8 quantize of its operands and the
+      dequant/bias of its output into one SDSC bundle; leaving the matmul
+      single-core-in-LX (``{}``) while its operands split aborts DeepTools L3
+      scheduling (``distributeElemArrToTemporalLoops: Not enough elements to
+      distribute``, a 4x128 @ 128x1024 fp8 scaled_mm). Only the fused neighbours
+      need it -- the quantize chain feeding the operand producers is a separate
+      bundle -- and a plain fp16 batchmatmul (no fused quantize) is not seeded.
     """
-    kbi_ops = [
+    seeds = [
         op
         for op in graph.operations
         if isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type == KEEP_BY_INDEX_OP
+        and op.data.reduction_type in seed_types
     ]
-    if not kbi_ops:
+    if not seeds:
         return set()
-    kbi_names = {op.name for op in kbi_ops}
-    group: set[str] = set(kbi_names)
-    # Producers of each reduction's input buffers (the input restickifies).
-    for kbi in kbi_ops:
+    seed_names = {op.name for op in seeds}
+    group: set[str] = set(seed_names)
+    # Producers of each seed's input buffers (restickifies / fp8 quantize).
+    for seed in seeds:
         group |= {
-            dep.name for dep in op_read_writes(kbi).reads if isinstance(dep, MemoryDep)
+            dep.name for dep in op_read_writes(seed).reads if isinstance(dep, MemoryDep)
         }
-    # Consumers of any keep_by_index output (the output clones).
+    # Consumers of any seed output (output clones / dequant / bias-add).
     for op in graph.operations:
-        if isinstance(op, ComputedBuffer) and kbi_names.intersection(
-            dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
-        ):
-            group.add(op.name)
-    return group
-
-
-def _fp8_matmul_group_ops(graph: GraphLowering) -> set[str]:
-    """Op names in every fp8 matmul's fused quantize/dequant group.
-
-    An fp8 batchmatmul (``batchmatmulfp8``) fuses with the fp8 quantize of its
-    operands and the dequant/bias of its output into one SDSC bundle. The
-    DeepTools L3 scheduler distributes that bundle across temporal loops
-    assuming one per-core division; the joint solver can hand the matmul and its
-    fused neighbours incompatible divisions -- e.g. the matmul left single-core
-    (``{}``) and LX-resident while its operands split -- which aborts scheduling
-    (``distributeElemArrToTemporalLoops: Not enough elements to distribute``,
-    seen on a 4x128 @ 128x1024 fp8 scaled_mm). Pin the one-hop group (matmul +
-    operand producers + output consumers) to the work-division pass's mutually
-    compatible division, mirroring the keep_by_index pin. Only the *fused*
-    neighbours need it -- the quantize chain feeding the operand producers is a
-    separate bundle whose division may differ. The pre-co-optimization path
-    never hit this because it never placed the fp8 bundle single-core in LX.
-    A plain fp16 batchmatmul is unaffected: it fuses no quantize and schedules
-    single-core-in-LX fine, so only the fp8 op is grouped.
-    """
-    mm_ops = [
-        op
-        for op in graph.operations
-        if isinstance(op, ComputedBuffer)
-        and isinstance(op.data, Reduction)
-        and op.data.reduction_type == BATCH_MATMUL_FP8_OP
-    ]
-    if not mm_ops:
-        return set()
-    mm_names = {op.name for op in mm_ops}
-    group: set[str] = set(mm_names)
-    # Producers of each matmul's operand buffers (the fp8 quantize outputs).
-    for mm in mm_ops:
-        group |= {
-            dep.name for dep in op_read_writes(mm).reads if isinstance(dep, MemoryDep)
-        }
-    # Consumers of any fp8 matmul output (the dequant / bias-add).
-    for op in graph.operations:
-        if isinstance(op, ComputedBuffer) and mm_names.intersection(
+        if isinstance(op, ComputedBuffer) and seed_names.intersection(
             dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
         ):
             group.add(op.name)
@@ -1939,45 +1917,37 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         max_cores = config.sencores
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
 
+        # Ops pinned to their committed (work-division) division: each guard
+        # detects a distinct wrong-code or scheduling hazard the joint solver
+        # would hit by re-slicing the op, and all share the one remedy -- keep the
+        # fixed division. The graph-level group sets are loop-invariant, so build
+        # them once here rather than rescanning graph.operations for every op.
+        offset_mut = ops_in_offset_mutation_component(graph)
+        kbi_group = _fused_layout_group_ops(graph, {KEEP_BY_INDEX_OP})
+        fp8_group = _fused_layout_group_ops(graph, {BATCH_MATMUL_FP8_OP})
+
         result = {}
         for op in graph.operations:
-            op_layout = (
-                op.maybe_get_layout() if isinstance(op, ComputedBuffer) else None
-            )
-            if isinstance(op, ComputedBuffer) and (
-                op_layout is None or op_layout.device.type != DEVICE_NAME
-            ):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "cpu/host buffer"
-                )
-            elif op.name in ops_in_offset_mutation_component(graph):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "offset mutation component"
-                )
+            reason: Optional[str] = None
+            if _is_cpu_host_buffer(op):
+                reason = "cpu/host buffer"
+            elif op.name in offset_mut:
+                reason = "offset mutation component"
             elif _is_windowed_pool(op):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "windowed pool"
-                )
-            elif op.name in _keep_by_index_layout_group_ops(graph):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "keep_by_index layout group"
-                )
-            elif op.name in _fp8_matmul_group_ops(graph):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "fp8 matmul layout group"
-                )
+                reason = "windowed pool"
+            elif op.name in kbi_group:
+                reason = "keep_by_index layout group"
+            elif op.name in fp8_group:
+                reason = "fp8 matmul layout group"
             elif _is_indirect_access_op(op):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "indirect access entry split"
-                )
+                reason = "indirect access entry split"
             elif _reads_offset_slice(op):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "offset slice read"
-                )
+                reason = "offset slice read"
             elif _is_coarse_tiled(op):
-                divs = _legal_fixed_division(
-                    op, [_fixed_core_division(op)], "coarse-tile loop group"
-                )
+                reason = "coarse-tile loop group"
+
+            if reason is not None:
+                divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
