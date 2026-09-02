@@ -868,7 +868,7 @@ def enumerate_work_division_candidates(
         return dict(zip(axis_vars, combo))
 
     def valid_split(splits):
-        if math.prod(splits.values()) > max_cores:  # core budget
+        if math.prod(splits.values()) != max_cores:  # core budget
             return False
         if sum(1 for v in reduction_vars if splits[v] > 1) > 1:  # <= 1 K-split
             return False
@@ -890,7 +890,7 @@ def enumerate_work_division_candidates(
         if valid_split(splits := create_splits(vars_, combo))
     ]
 
-    return candidates[:MAX_SPLIT_COUNT]
+    return candidates
 
 
 def work_division_splits_are_legal(
