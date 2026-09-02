@@ -1881,22 +1881,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # would hit by re-slicing the op, and all share the one remedy -- keep the
         # fixed division. The graph-level group sets are loop-invariant, so build
         # them once here rather than rescanning graph.operations for every op.
-        offset_mut = ops_in_offset_mutation_component(graph)
-        kbi_group = _fused_layout_group_ops(graph, {KEEP_BY_INDEX_OP})
-        fp8_group = _fused_layout_group_ops(graph, {BATCH_MATMUL_FP8_OP})
 
         result = {}
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
                 reason = "cpu/host buffer"
-            elif op.name in offset_mut:
+            elif op.name in ops_in_offset_mutation_component(graph):
                 reason = "offset mutation component"
             elif _is_windowed_pool(op):
                 reason = "windowed pool"
-            elif op.name in kbi_group:
+            elif op.name in _fused_layout_group_ops(graph, {KEEP_BY_INDEX_OP}):
                 reason = "keep_by_index layout group"
-            elif op.name in fp8_group:
+            elif op.name in _fused_layout_group_ops(graph, {BATCH_MATMUL_FP8_OP}):
                 reason = "fp8 matmul layout group"
             elif _is_indirect_access_op(op):
                 reason = "indirect access entry split"
