@@ -75,6 +75,7 @@ logger = get_inductor_logger("work_division")
 
 # Maximum memory-access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
+MAX_SPLIT_COUNT = 64
 
 
 @dataclasses.dataclass
@@ -889,7 +890,7 @@ def enumerate_work_division_candidates(
         if valid_split(splits := create_splits(vars_, combo))
     ]
 
-    return candidates
+    return candidates[:MAX_SPLIT_COUNT]
 
 
 def work_division_splits_are_legal(
