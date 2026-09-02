@@ -1914,6 +1914,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                         op, _enum_split_options(op, profiles, matmul_roles)
                     )
                 ]
+                if not divs:
+                    divs = _legal_fixed_division(
+                        op, [_fixed_core_division(op)], "Pruned set is empty"
+                    )
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
             if not divs:
