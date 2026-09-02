@@ -2566,7 +2566,9 @@ def select_allocator() -> ScratchpadAllocator:
         # The isinstance check above just proved this factory's solver is a
         # CoreDivisionLayoutSolver at runtime; narrow the static type to match.
         return CoOptimizingAllocator(
-            layout_planning=cast(CoreDivisionSolverFactory, solver_cls), size=size, prune=True,
+            layout_planning=cast(CoreDivisionSolverFactory, solver_cls),
+            size=size,
+            prune=True,
         )
 
     return ScratchpadAllocator(layout_planning=solver_cls, size=size)
