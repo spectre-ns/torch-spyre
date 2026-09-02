@@ -870,7 +870,9 @@ def enumerate_work_division_candidates(
     def valid_split(splits):
         if math.prod(splits.values()) != max_cores:  # core budget
             return False
-        if sum(1 for v in reduction_vars if v in splits and splits[v] > 1) > 1:  # <= 1 K-split
+        if (
+            sum(1 for v in reduction_vars if v in splits and splits[v] > 1) > 1
+        ):  # <= 1 K-split
             return False
         if any(  # per-core span <= MAX_SPAN_BYTES, on element-valued it_space
             get_per_core_span(td, splits, it_space, symbol_meta) > MAX_SPAN_BYTES
