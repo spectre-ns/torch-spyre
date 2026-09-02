@@ -75,7 +75,7 @@ logger = get_inductor_logger("work_division")
 
 # Maximum memory-access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
-MAX_SPLIT_COUNT = 64
+MAX_AXIS_COUNT = 2
 
 
 @dataclasses.dataclass
@@ -883,7 +883,7 @@ def enumerate_work_division_candidates(
             return False
         return all(splits.get(v, 1) in allowed for v, allowed in allowed_splits.items())
 
-    vars_ = list(it_space_adjusted.keys())
+    vars_ = list(it_space_adjusted.keys())[:MAX_AXIS_COUNT]
     candidates = [
         splits
         for combo in itertools.product(*(factors(v) for v in vars_))
