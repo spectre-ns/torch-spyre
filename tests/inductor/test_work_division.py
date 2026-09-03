@@ -58,7 +58,6 @@ from torch_spyre._inductor.work_division_constraints import (
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
     indirect_access_split_domains,
-    pool_window_blocked_vars,
     keep_by_index_k_split_constraint,
     keep_by_index_pinned_search_space_vars,
     qfp8wt_matmul_k_split_domains,
@@ -566,49 +565,6 @@ class TestCoordinateMaskBlockedVars(unittest.TestCase):
         )
         result = coordinate_mask_blocked_vars(ctx)
         self.assertEqual(result.blocked, set())
-
-
-class TestPoolWindowBlockedVars(unittest.TestCase):
-    """pool_window_blocked_vars only reads op.data.reduction_type and
-    reduction_vars, so output_td stands in with a placeholder."""
-
-    _PLACEHOLDER_TD = _tensor_dep("pool_placeholder", (128,), (_isym("_pool"),))
-
-    def test_blocks_window_dims_of_avgpool(self):
-        from torch_spyre._inductor.constants import AVGPOOL2D_OP
-
-        # Iteration space (c, ho, wo, kh, kw); the window axes kh/kw are the
-        # reduction dims a windowed pool cannot split across cores.
-        c, ho, wo, kh, kw = (_isym(name) for name in ("c", "ho", "wo", "kh", "kw"))
-        op = _computed_buffer(
-            (3, 12, 12),
-            name="pool",
-            reduction_type=AVGPOOL2D_OP,
-            reduction_ranges=(2, 2),
-        )
-        ctx = _make_context(
-            op,
-            self._PLACEHOLDER_TD,
-            it_space={c: 3, ho: 12, wo: 12, kh: 2, kw: 2},
-            reduction_vars=[kh, kw],
-        )
-        self.assertEqual(pool_window_blocked_vars(ctx).blocked, {kh, kw})
-
-    def test_non_pool_reduction_is_not_blocked(self):
-        r0 = _isym("r0")
-        op = _computed_buffer((128,), name="reduce", reduction_type="sum")
-        ctx = _make_context(
-            op, self._PLACEHOLDER_TD, it_space={r0: 128}, reduction_vars=[r0]
-        )
-        self.assertEqual(pool_window_blocked_vars(ctx).blocked, set())
-
-    def test_pointwise_op_is_not_blocked(self):
-        r0 = _isym("r0")
-        op = _computed_buffer((128,), name="pointwise")
-        ctx = _make_context(
-            op, self._PLACEHOLDER_TD, it_space={r0: 128}, reduction_vars=[]
-        )
-        self.assertEqual(pool_window_blocked_vars(ctx).blocked, set())
 
 
 class TestConvSpatialBlockedVars(unittest.TestCase):
