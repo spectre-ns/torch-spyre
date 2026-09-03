@@ -1260,27 +1260,6 @@ def _is_windowed_pool(op: Operation) -> bool:
     )
 
 
-def _is_coarse_tiled(op: Operation) -> bool:
-    """True for an op carrying coarse-tiling loop metadata (``loop_info``).
-
-    Coarse tiling fuses a loop group's ops into one counted loop nest that
-    shares a single per-core work mapping. The (non-co-optimized) work-division
-    pass divides that whole group into mutually compatible per-core slicings and
-    preserves them through unit tiles (#4096). The joint solver, free to divide
-    each op independently, can instead hand the group's members incompatible
-    divisions -- e.g. every compute op driven to a single core while a sibling
-    read copy stays split across cores -- which corrupts the shared loop nest's
-    per-core addressing: silently wrong output (~9% of a hinted two-GEMM MLP
-    tiled S x Dout). Pin every coarse-tiled op to its fixed (work-division)
-    division so co-optimization keeps the group-consistent slicing, mirroring
-    the windowed-pool and keep_by_index pins. Co-optimization still chooses LX
-    placement for these buffers; only their core division is fixed. (Work-
-    division hint preservation under co-optimization is not otherwise supported
-    yet -- see the co_optimizing_lx_planning patches in test_work_division_hint.)
-    """
-    return getattr(op, "loop_info", None) is not None
-
-
 def _is_indirect_access_op(op: Operation) -> bool:
     """True for a gather (``index``) or scatter (``index_put``) op.
 
