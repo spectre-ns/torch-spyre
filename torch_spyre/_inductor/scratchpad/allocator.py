@@ -1260,6 +1260,36 @@ def _is_windowed_pool(op: Operation) -> bool:
     )
 
 
+def _is_coarse_tiled(op: Operation) -> bool:
+    """True for an op inside a coarse-tile loop group (carries ``loop_info``)."""
+    return getattr(op, "loop_info", None) is not None
+
+
+def _drop_reduction_splits_in_coarse_group(
+    op: Operation, divs: list[CoreDivision]
+) -> list[CoreDivision]:
+    """Forbid K-splitting a matmul/reduction op inside a coarse-tile counted loop.
+
+    A coarse-tile group runs its ops inside a counted loop that already
+    accumulates across tiles (e.g. a flash-attention running sum). A candidate
+    that splits a *reduction* axis (a K-split: an axis absent from the write
+    index) adds a second, cross-core partial-sum accumulation nested inside that
+    loop nest, and the two are not combined correctly -- silently wrong output
+    (~86% element mismatch on ``buf21``, the flash-attention output matmul, tiled
+    over H). The identical K-split is correct *outside* a coarse group, so this is
+    scoped to ``loop_info`` ops and only drops reduction-split candidates --
+    output-axis splits (and single-core) are still offered, so the joint solver
+    keeps whatever safe parallelism it can. Narrower than pinning the op's whole
+    division. Never returns an empty list: if every candidate carries a reduction
+    split, the originals are kept so the solve still has something legal to pick
+    (correctness there falls back to the non-co-optimized path).
+    """
+    if not _is_coarse_tiled(op):
+        return divs
+    safe = [cd for cd in divs if not cd.reduction_splits]
+    return safe or divs
+
+
 def _is_indirect_access_op(op: Operation) -> bool:
     """True for a gather (``index``) or scatter (``index_put``) op.
 
@@ -1894,6 +1924,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     )
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
+            if reason is None:
+                # Correctness guard for matmuls/reductions inside a coarse-tile
+                # counted loop: drop K-split (reduction-axis) candidates, which
+                # the loop nest cannot accumulate correctly. No-op outside a
+                # coarse group. See _drop_reduction_splits_in_coarse_group.
+                divs = _drop_reduction_splits_in_coarse_group(op, divs)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
             result[op.name] = divs
