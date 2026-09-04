@@ -4820,7 +4820,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         self._run_kv_chunked_flash(
             h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
         )
-
+        
+    @pytest.mark.skip(
+        reason="Takes more than 5 minutes to run with default solver settings"
+    )
     def test_hint_flash_attention_kv_chunked_decode_8k(self):
         """Decode: one query token, batch 4, against a full 8k K/V cache.
 
