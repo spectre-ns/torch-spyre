@@ -52,6 +52,7 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._inductor.work_division import (
     enumerate_work_division_candidates,
+    has_work_div_hint,
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -2080,6 +2081,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         fp8_matmul_group = _fused_layout_group_ops(graph, {BATCH_MATMUL_FP8_OP})
 
         result = {}
+        hinted_unpinned: list[str] = []
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
@@ -2120,7 +2122,30 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _drop_reduction_splits_in_coarse_group(op, divs)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
+            if (
+                reason is None
+                and len(divs) > 1
+                and not config.ignore_work_division_hints
+                and isinstance(op, ComputedBuffer)
+                and has_work_div_hint(op)
+            ):
+                # Hint preservation under co-optimization is not implemented yet:
+                # this op carries a user ``work_div`` hint that work division
+                # committed, but it is not pinned by any guard above and has more
+                # than one candidate, so the joint solver may pick a different
+                # division. Warn rather than pin -- pinning every hinted op would
+                # silently disable co-optimization for hinted graphs, and the
+                # solver's choice is correct, just not the one asked for.
+                hinted_unpinned.append(op.name)
             result[op.name] = divs
+
+        if hinted_unpinned:
+            logger.warning(
+                "work_division_hint: co-optimization may override the hinted core "
+                "division for %s. Hint preservation under co-optimization is not "
+                "supported yet; set CO_OPTIMIZING_LX_PLANNING=0 to honour the hint.",
+                ", ".join(sorted(hinted_unpinned)),
+            )
 
         return result
 
