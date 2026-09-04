@@ -188,8 +188,10 @@ layout_solver: Literal[
 # budget without an incumbent raises SolveError, and scratchpad_planning falls
 # back to greedy placement (correct, but co-optimization is lost for that
 # graph). Raise it if large graphs are falling back; 0 disables the limit.
+# The default matches the budget CpSatLayoutSolver hard-coded before this knob
+# existed, so exposing it does not change how long any solve is allowed to run.
 cpsat_time_limit_seconds: float = float(
-    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "120")
 )
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch

@@ -679,9 +679,10 @@ Environment Variables
        divisions and LX placement jointly (default ``1``; set ``0`` for
        placement-only planning on work division's own splits)
    * - ``CPSAT_TIME_LIMIT_SECONDS``
-     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
-       disables the limit). A solve that exhausts it falls back to greedy
-       placement for that graph
+     - Wall-clock budget for one CP-SAT solve (default ``120``; ``0``
+       disables the limit). Exhausting it is not itself fatal -- the best
+       plan found so far is used. Only a solve that finds no feasible plan
+       within the budget falls back to greedy placement for that graph
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
