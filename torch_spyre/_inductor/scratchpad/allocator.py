@@ -52,6 +52,7 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._inductor.work_division import (
     enumerate_work_division_candidates,
+    has_work_div_hint,
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -1343,9 +1344,34 @@ def _fused_layout_group_ops(
     graph: GraphLowering, seed_reasons: dict[str, str]
 ) -> dict[str, str]:
     """Map each op in a fused layout group to the pin reason of its seed.
+
     ``seed_reasons`` maps a seed reduction type to the reason string reported
-    when its group is pinned. A group is one seed reduction plus ... (existing
-    docstring body unchanged)
+    when its group is pinned; every op in that seed's group inherits it.
+
+    A group is one seed reduction plus the input producers it reads (one hop
+    back) and the consumers of its output (one hop forward): the tightly coupled
+    neighbours the work-division pass slices into a single mutually compatible
+    per-core division. The joint solver, free to divide each op independently,
+    can hand the group's members incompatible divisions and corrupt the shared
+    per-core addressing/scheduling, so the caller pins the whole group to its
+    fixed (work-division) division. Two op kinds need this identical treatment:
+
+    * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
+      input restickifies and output clones carry too; an output clone splitting
+      the search axis while the reduction keeps it whole drops the second search
+      stick's kept values (silently wrong, ~2-3% of a 6x17x4x128 dim-3
+      keep_by_index). Its own unsafe splits are separately blocked by
+      ``keep_by_index_search_adjacent_blocked_vars``.
+    * ``batchmatmulfp8`` fuses the fp8 quantize of its operands and the
+      dequant/bias of its output into one SDSC bundle; leaving the matmul
+      single-core-in-LX (``{}``) while its operands split aborts DeepTools L3
+      scheduling (``distributeElemArrToTemporalLoops: Not enough elements to
+      distribute``, a 4x128 @ 128x1024 fp8 scaled_mm). Only the fused neighbours
+      need it -- the quantize chain feeding the operand producers is a separate
+      bundle -- and a plain fp16 batchmatmul (no fused quantize) is not seeded.
+
+    Both seeds are scanned in one pass, so adding a seed costs no extra graph
+    walk.
     """
     seeds = [
         op
@@ -2069,6 +2095,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             },
         )
         result = {}
+        hinted_unpinned: list[str] = []
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
@@ -2107,7 +2134,30 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _drop_reduction_splits_in_coarse_group(op, divs)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
+            if (
+                reason is None
+                and len(divs) > 1
+                and not config.ignore_work_division_hints
+                and isinstance(op, ComputedBuffer)
+                and has_work_div_hint(op)
+            ):
+                # Hint preservation under co-optimization is not implemented yet:
+                # this op carries a user ``work_div`` hint that work division
+                # committed, but it is not pinned by any guard above and has more
+                # than one candidate, so the joint solver may pick a different
+                # division. Warn rather than pin -- pinning every hinted op would
+                # silently disable co-optimization for hinted graphs, and the
+                # solver's choice is correct, just not the one asked for.
+                hinted_unpinned.append(op.name)
             result[op.name] = divs
+
+        if hinted_unpinned:
+            logger.warning(
+                "work_division_hint: co-optimization may override the hinted core "
+                "division for %s. Hint preservation under co-optimization is not "
+                "supported yet; set CO_OPTIMIZING_LX_PLANNING=0 to honour the hint.",
+                ", ".join(sorted(hinted_unpinned)),
+            )
 
         return result
 
