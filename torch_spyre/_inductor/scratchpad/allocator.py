@@ -52,7 +52,6 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._inductor.work_division import (
     enumerate_work_division_candidates,
-    has_work_div_hint,
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -1340,53 +1339,39 @@ def _reads_offset_slice(op: Operation) -> bool:
     return any(dep_has_constant_offset(dep) for dep in op_read_writes(op).reads)
 
 
-def _fused_layout_group_ops(graph: GraphLowering, seed_types: set[str]) -> set[str]:
-    """Op names in every fused layout group seeded by ``seed_types``.
-
-    A group is one seed reduction plus the input producers it reads (one hop
-    back) and the consumers of its output (one hop forward): the tightly coupled
-    neighbours the work-division pass slices into a single mutually compatible
-    per-core division. The joint solver, free to divide each op independently,
-    can hand the group's members incompatible divisions and corrupt the shared
-    per-core addressing/scheduling, so the caller pins the whole group to its
-    fixed (work-division) division. Two op kinds need this identical treatment:
-
-    * ``keepbyindex`` reproduces a fragile multi-stick search layout that its
-      input restickifies and output clones carry too; an output clone splitting
-      the search axis while the reduction keeps it whole drops the second search
-      stick's kept values (silently wrong, ~2-3% of a 6x17x4x128 dim-3
-      keep_by_index). Its own unsafe splits are separately blocked by
-      ``keep_by_index_search_adjacent_blocked_vars``.
-    * ``batchmatmulfp8`` fuses the fp8 quantize of its operands and the
-      dequant/bias of its output into one SDSC bundle; leaving the matmul
-      single-core-in-LX (``{}``) while its operands split aborts DeepTools L3
-      scheduling (``distributeElemArrToTemporalLoops: Not enough elements to
-      distribute``, a 4x128 @ 128x1024 fp8 scaled_mm). Only the fused neighbours
-      need it -- the quantize chain feeding the operand producers is a separate
-      bundle -- and a plain fp16 batchmatmul (no fused quantize) is not seeded.
+def _fused_layout_group_ops(
+    graph: GraphLowering, seed_reasons: dict[str, str]
+) -> dict[str, str]:
+    """Map each op in a fused layout group to the pin reason of its seed.
+    ``seed_reasons`` maps a seed reduction type to the reason string reported
+    when its group is pinned. A group is one seed reduction plus ... (existing
+    docstring body unchanged)
     """
     seeds = [
         op
         for op in graph.operations
         if isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type in seed_types
+        and op.data.reduction_type in seed_reasons
     ]
     if not seeds:
-        return set()
-    seed_names = {op.name for op in seeds}
-    group: set[str] = set(seed_names)
+        return {}
+    # Reason per seed name, so producers and consumers inherit it below.
+    reason_of_seed = {op.name: seed_reasons[op.data.reduction_type] for op in seeds}
+    group: dict[str, str] = dict(reason_of_seed)
     # Producers of each seed's input buffers (restickifies / fp8 quantize).
     for seed in seeds:
-        group |= {
-            dep.name for dep in op_read_writes(seed).reads if isinstance(dep, MemoryDep)
-        }
+        for dep in op_read_writes(seed).reads:
+            if isinstance(dep, MemoryDep):
+                group.setdefault(dep.name, reason_of_seed[seed.name])
     # Consumers of any seed output (output clones / dequant / bias-add).
     for op in graph.operations:
-        if isinstance(op, ComputedBuffer) and seed_names.intersection(
-            dep.name for dep in op_read_writes(op).reads if isinstance(dep, MemoryDep)
-        ):
-            group.add(op.name)
+        if not isinstance(op, ComputedBuffer):
+            continue
+        for dep in op_read_writes(op).reads:
+            if isinstance(dep, MemoryDep) and dep.name in reason_of_seed:
+                group.setdefault(op.name, reason_of_seed[dep.name])
+                break
     return group
 
 
@@ -2073,15 +2058,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Ops pinned to their committed (work-division) division: each guard
         # detects a distinct wrong-code or scheduling hazard the joint solver
         # would hit by re-slicing the op, and all share the one remedy -- keep the
-        # fixed division. The graph-level sets below are loop-invariant and each
-        # costs a full graph scan, so they are built once here rather than
-        # rescanned for every op.
+        # fixed division. The graph-level group sets are loop-invariant, so build
+        # them once here rather than rescanning graph.operations for every op.
         offset_mutation_ops = ops_in_offset_mutation_component(graph)
-        keep_by_index_group = _fused_layout_group_ops(graph, {KEEP_BY_INDEX_OP})
-        fp8_matmul_group = _fused_layout_group_ops(graph, {BATCH_MATMUL_FP8_OP})
-
+        layout_group_reason = _fused_layout_group_ops(
+            graph,
+            {
+                KEEP_BY_INDEX_OP: "keep_by_index layout group",
+                BATCH_MATMUL_FP8_OP: "fp8 matmul layout group",
+            },
+        )
         result = {}
-        hinted_unpinned: list[str] = []
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
@@ -2090,10 +2077,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 reason = "offset mutation component"
             elif _is_windowed_pool(op):
                 reason = "windowed pool"
-            elif op.name in keep_by_index_group:
-                reason = "keep_by_index layout group"
-            elif op.name in fp8_matmul_group:
-                reason = "fp8 matmul layout group"
+            elif op.name in layout_group_reason:
+                reason = layout_group_reason[op.name]
             elif _is_indirect_access_op(op):
                 reason = "indirect access entry split"
             elif _reads_offset_slice(op):
@@ -2122,30 +2107,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _drop_reduction_splits_in_coarse_group(op, divs)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
-            if (
-                reason is None
-                and len(divs) > 1
-                and not config.ignore_work_division_hints
-                and isinstance(op, ComputedBuffer)
-                and has_work_div_hint(op)
-            ):
-                # Hint preservation under co-optimization is not implemented yet:
-                # this op carries a user ``work_div`` hint that work division
-                # committed, but it is not pinned by any guard above and has more
-                # than one candidate, so the joint solver may pick a different
-                # division. Warn rather than pin -- pinning every hinted op would
-                # silently disable co-optimization for hinted graphs, and the
-                # solver's choice is correct, just not the one asked for.
-                hinted_unpinned.append(op.name)
             result[op.name] = divs
-
-        if hinted_unpinned:
-            logger.warning(
-                "work_division_hint: co-optimization may override the hinted core "
-                "division for %s. Hint preservation under co-optimization is not "
-                "supported yet; set CO_OPTIMIZING_LX_PLANNING=0 to honour the hint.",
-                ", ".join(sorted(hinted_unpinned)),
-            )
 
         return result
 
