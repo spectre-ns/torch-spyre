@@ -82,6 +82,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     calculate_liveness,
     get_buffer_users,
     ops_in_offset_mutation_component,
+    dep_has_constant_offset,
     get_op_pointwise_inputs,
     buffer_not_read_in_full,
     get_ncores_for_buffers,
@@ -1326,16 +1327,15 @@ def _reads_offset_slice(op: Operation) -> bool:
     the offset dim alone is not enough -- it forces the solver onto a different
     unsafe split for a sliced reduction -- so the whole op is pinned. Indirect
     (data-dependent) offsets are handled by ``_is_indirect_access_op``.
+
+    Shares ``dep_has_constant_offset`` with ``_writes_at_constant_offset``, the
+    write-side detector behind ``ops_in_offset_mutation_component``: both ask the
+    same question of a dep, so they must answer it the same way (in particular,
+    per-core/coarse-tile shifts are symbolic and are not offsets).
     """
     if not isinstance(op, ComputedBuffer):
         return False
-    for dep in op_read_writes(op).reads:
-        if not isinstance(dep, MemoryDep):
-            continue
-        const = dep.index.as_coeff_Add()[0]
-        if const.is_number and int(const) != 0:
-            return True
-    return False
+    return any(dep_has_constant_offset(dep) for dep in op_read_writes(op).reads)
 
 
 def _fused_layout_group_ops(graph: GraphLowering, seed_types: set[str]) -> set[str]:
@@ -1818,6 +1818,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             cost_expr = sympy.sympify(
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
             )
+        # TypeError: a symbolic cost expression (#3810) can reach
+        # coarse_underfill_eff with a sympy term where a float is expected. As
+        # with the other two, an unusable prediction just means the solve falls
+        # back to its own lexicographic objective.
         except (ValueError, RuntimeError, TypeError):
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
@@ -1888,21 +1892,25 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Ops pinned to their committed (work-division) division: each guard
         # detects a distinct wrong-code or scheduling hazard the joint solver
         # would hit by re-slicing the op, and all share the one remedy -- keep the
-        # fixed division. The graph-level group sets are loop-invariant, so build
-        # them once here rather than rescanning graph.operations for every op.
+        # fixed division. The graph-level sets below are loop-invariant and each
+        # costs a full graph scan, so they are built once here rather than
+        # rescanned for every op.
+        offset_mutation_ops = ops_in_offset_mutation_component(graph)
+        keep_by_index_group = _fused_layout_group_ops(graph, {KEEP_BY_INDEX_OP})
+        fp8_matmul_group = _fused_layout_group_ops(graph, {BATCH_MATMUL_FP8_OP})
 
         result = {}
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
                 reason = "cpu/host buffer"
-            elif op.name in ops_in_offset_mutation_component(graph):
+            elif op.name in offset_mutation_ops:
                 reason = "offset mutation component"
             elif _is_windowed_pool(op):
                 reason = "windowed pool"
-            elif op.name in _fused_layout_group_ops(graph, {KEEP_BY_INDEX_OP}):
+            elif op.name in keep_by_index_group:
                 reason = "keep_by_index layout group"
-            elif op.name in _fused_layout_group_ops(graph, {BATCH_MATMUL_FP8_OP}):
+            elif op.name in fp8_matmul_group:
                 reason = "fp8 matmul layout group"
             elif _is_indirect_access_op(op):
                 reason = "indirect access entry split"
@@ -1920,7 +1928,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 ]
                 if not divs:
                     divs = _legal_fixed_division(
-                        op, [_fixed_core_division(op)], "Pruned set is empty"
+                        op, [_fixed_core_division(op)], "empty pruned candidate set"
                     )
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
@@ -2604,12 +2612,16 @@ def scratchpad_planning(
         allocator = select_allocator()
     try:
         allocator.plan_allocation(graph)
-    except SolveError:
-        # When a solve error arises we assume a strong excpetion guarentee
-        # meaning despite the solver failing. The allocator has not mutated
-        # the state of the graph allowing a second attempt with a
-        # greedy approach.
-        logger.debug("solve error detected. falling back to greedy solver.")
+    except SolveError as exc:
+        # The allocator gives a strong exception guarantee: a failed solve has
+        # not mutated the graph, so a second attempt with greedy is safe. Now
+        # that co-optimization is on by default, taking this path silently
+        # loses both the joint division and the LX plan quality, so it warns.
+        logger.warning(
+            "LX plan solve failed (%s); falling back to greedy placement. "
+            "Co-optimization is skipped for this graph.",
+            exc,
+        )
         ScratchpadAllocator(
             GreedyLayoutSolver, size=_lx_planning_size()
         ).plan_allocation(graph)

@@ -675,7 +675,13 @@ Environment Variables
      - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
        ``scratchpad_planning`` pass)
    * - ``CO_OPTIMIZING_LX_PLANNING``
-     - Use the co-optimizing LX allocator strategy (default ``0``)
+     - Use the co-optimizing LX allocator strategy, which chooses core
+       divisions and LX placement jointly (default ``1``; set ``0`` for
+       placement-only planning on work division's own splits)
+   * - ``CPSAT_TIME_LIMIT_SECONDS``
+     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
+       disables the limit). A solve that exhausts it falls back to greedy
+       placement for that graph
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)

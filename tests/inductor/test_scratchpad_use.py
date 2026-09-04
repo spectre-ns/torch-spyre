@@ -2092,6 +2092,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         on the joint (co-optimizing) allocator."""
         from torch_spyre._inductor.pass_utils import op_short_name
         from torch_spyre._inductor.scratchpad import allocator as alloc_mod
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
         sencores = 32
         x = self.rand_device((64, 1024))
@@ -2119,15 +2120,34 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     "reads": [d.name for d in op.get_read_writes().reads],
                 }
 
+        # The joint solve is what this test is about, but ``scratchpad_planning``
+        # silently retries with greedy placement on SolveError -- and greedy also
+        # fires the merge (that is the sibling test), so without this the whole
+        # test would pass on the fallback path.
+        greedy_calls = {"count": 0}
+        original_greedy = GreedyLayoutSolver.plan_layout
+
+        def counting_greedy(solver_self, *args, **kwargs):
+            greedy_calls["count"] += 1
+            return original_greedy(solver_self, *args, **kwargs)
+
         with self.pre_scheduling_iterating_pass(visit):
             with patch.object(alloc_mod, "_lx_planning_size", lambda: lx_budget):
-                with ts_inductor_config.patch(
-                    lx_planning=True,
-                    layout_solver="cpsat",
-                    co_optimizing_lx_planning=True,
-                    sencores=sencores,
-                ):
-                    result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+                with patch.object(GreedyLayoutSolver, "plan_layout", counting_greedy):
+                    with ts_inductor_config.patch(
+                        lx_planning=True,
+                        layout_solver="cpsat",
+                        co_optimizing_lx_planning=True,
+                        sencores=sencores,
+                    ):
+                        result = torch.compile(fn, fullgraph=True)(x).to("cpu")
+
+        self.assertEqual(
+            greedy_calls["count"],
+            0,
+            "CP-SAT fell back to greedy placement, so this test did not "
+            "exercise the joint co-optimizer",
+        )
 
         # Group LX-resident buffers by address; a shared address == in-place reuse.
         addr_to_buffers: dict[int, list[str]] = {}

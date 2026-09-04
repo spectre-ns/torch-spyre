@@ -114,7 +114,6 @@ def collect_work_division_constraints(
         coarse_tile_local_dim_split_domains,
         plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
-        pool_window_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
         topk_split_domains,
@@ -246,8 +245,11 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
 
     # Collapsed-window block is depthwise-only (the direct forward path handles
     # its own collapsed windows). The last two write dims are (H, W) == (i, j),
-    # matched to kernel_h / kernel_w.
-    is_depthwise = "stride_i" in conv_params or "stride_j" in conv_params
+    # matched to kernel_h / kernel_w. Discriminate the two direct-conv paths by
+    # reduction_type, as ``reduction_window_blocked_vars`` does -- the stride key
+    # spelling is only a naming convention and would silently mis-classify a
+    # forward conv that later adopted stride_i/stride_j.
+    is_depthwise = getattr(ctx.op.data, "reduction_type", None) == DEPTHWISE_CONV2D_OP
     kernel_extents = (
         conv_params.get("kernel_h", 1),
         conv_params.get("kernel_w", 1),
@@ -265,31 +267,18 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     return ConstraintResult(blocked=blocked)
 
 
-def pool_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Block a windowed pool's reduction (window) axes from splitting across cores.
-
-    ``AVGPOOL2D_OP`` (avgpoolfwd) is a windowed reduction executed as a single
-    pool instruction on the datapath: each output reads its whole kH x kW window
-    and the ``scaling_factor`` (1/(kH*kW)) is applied to the full-window sum.
-    There is no cross-core accumulation of a partial-window pool, so splitting a
-    window (reduction) axis across cores makes each core pool only part of the
-    window -- silent wrong output (the generic reduction-split path assumes a
-    summable partial, which the pool datapath does not provide). This was latent
-    because the old work-division algorithm never split the window, but
-    co-optimization does: it split kW=2 of a 24x24 k2s2 avg_pool2d across two
-    cores and produced ~19% wrong elements. Splitting the *output* spatial dims
-    stays legal -- each output pixel's window is wholly local to the core that
-    owns it.
-    """
-    if not (
-        isinstance(ctx.op.data, Reduction) and ctx.op.data.reduction_type in POOL_OPS
-    ):
-        return ConstraintResult()
-    return ConstraintResult(blocked=set(ctx.reduction_vars))
-
-
 def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Keep pooling and convolution kernel windows local to each core."""
+    """Keep pooling and convolution kernel windows local to each core.
+
+    For ``POOL_OPS`` (avgpoolfwd) the whole reduction space is the window: the
+    pool is a single datapath instruction whose ``scaling_factor``
+    (1/(kH*kW)) is applied to the full-window sum, and there is no cross-core
+    accumulation of a partial-window pool. Splitting a window axis therefore
+    makes each core pool only part of the window -- silent wrong output (the
+    generic reduction-split path assumes a summable partial, which the pool
+    datapath does not provide). Splitting the *output* spatial dims stays legal:
+    each output pixel's window is wholly local to the core that owns it.
+    """
 
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
@@ -600,21 +589,29 @@ def restickify_padding_blocked_vars(
     return ConstraintResult(blocked=padded)
 
 
-def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
+def _has_ea_tensor(
+    tds: "list[TensorDep]", eas: "frozenset[ElementArrangement]"
+) -> bool:
+    """True if any tensor's device layout carries one of ``eas``.
+
+    Layouts without an ``element_arrangement`` (the plain, non-EA case) simply
+    do not match.
+    """
     return any(
         hasattr(td.layout.device_layout, "element_arrangement")
-        and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+        and td.layout.device_layout.element_arrangement in eas
         for td in tds
     )
+
+
+def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
+    """True if any tensor carries the QFP8WT (2D stick) element arrangement."""
+    return _has_ea_tensor(tds, frozenset({ElementArrangement.QFP8WT}))
 
 
 def has_staggered_ea_tensor(tds: "list[TensorDep]") -> bool:
     """True if any tensor carries a staggered EA (``FP32_TO_DL16`` / ``DL16_TO_FP32``)."""
-    return any(
-        hasattr(td.layout.device_layout, "element_arrangement")
-        and td.layout.device_layout.element_arrangement in STAGGERED_EAS
-        for td in tds
-    )
+    return _has_ea_tensor(tds, STAGGERED_EAS)
 
 
 def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
@@ -859,10 +856,16 @@ def keep_by_index_search_adjacent_blocked_vars(
         return ConstraintResult()
 
     # A search axis no wider than one stick has no second stick to drop, so the
-    # datapath sweep is split-safe -- leave those parallel. stick_vars maps the
-    # stick dim to its elements-per-stick; absent it, block conservatively.
+    # datapath sweep is split-safe -- leave those parallel. stick_vars maps each
+    # stick dim to its elements-per-stick, so the entry must be looked up by the
+    # search axis: an op can have several stick vars (one per operand stick dim,
+    # two for a QFP8WT 2D stick) inserted in tensor-dep order, and reading an
+    # arbitrary one compares this axis's extent against an unrelated operand's
+    # stick width -- which fails *open* into the wrong-code path above whenever
+    # that operand's stick is wider. When the search axis is not a stick dim at
+    # all, "spans more than one stick" does not apply and we block conservatively.
     search_extent = concretize_expr(ctx.it_space[search_axis])
-    elems_per_stick = next(iter(ctx.stick_vars.values()), None)
+    elems_per_stick = ctx.stick_vars.get(search_axis)
     if elems_per_stick is not None and search_extent <= elems_per_stick:
         return ConstraintResult()
 

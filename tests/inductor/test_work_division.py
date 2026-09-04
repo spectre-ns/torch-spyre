@@ -571,13 +571,26 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
     _PATCH_TARGET = "torch_spyre._inductor.work_division_constraints.op_read_writes"
     _PLACEHOLDER_TD = _tensor_dep("conv_placeholder", (128,), (_isym("_conv"),))
 
-    def _context(self, stride, kernel=(3, 3)):
+    def _context(self, stride, kernel=(3, 3), reduction_type=DEPTHWISE_CONV2D_OP):
+        """Build a direct-conv context.
+
+        ``reduction_type`` selects the direct-conv path, which is what
+        ``conv_spatial_blocked_vars`` discriminates on; the stride key spelling
+        follows that path's convention (depthwise: stride_i/stride_j, forward:
+        stride_h/stride_w) but is not itself the discriminator.
+        """
         mb, out, i, j = (_isym(name) for name in ("mb", "out", "i", "j"))
-        op = _computed_buffer((2, 3, 8, 16), name="strided_conv")
+        op = _computed_buffer(
+            (2, 3, 8, 16),
+            name="strided_conv",
+            reduction_type=reduction_type,
+            reduction_ranges=kernel,
+        )
+        depthwise = reduction_type == DEPTHWISE_CONV2D_OP
         op.data.op_info = {
             "conv_params": {
-                "stride_i": stride[0],
-                "stride_j": stride[1],
+                "stride_i" if depthwise else "stride_h": stride[0],
+                "stride_j" if depthwise else "stride_w": stride[1],
                 "kernel_h": kernel[0],
                 "kernel_w": kernel[1],
             }
@@ -625,6 +638,14 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
         # per-core, so only the collapsed axis is blocked.
         ctx, i, j = self._context((1, 1), kernel=(1, 3))
         self.assertEqual(self._blocked(ctx, i, j), {i})
+
+    def test_collapsed_window_block_is_depthwise_only(self):
+        # The collapsed-window block is scoped to the depthwise path by
+        # reduction_type: an unstrided 1x1 *forward* conv keeps both spatial
+        # axes splittable. Guards against re-deriving the path from the stride
+        # key spelling, which would mis-classify a forward conv.
+        ctx, i, j = self._context((1, 1), kernel=(1, 1), reduction_type=CONV2D_FWD_OP)
+        self.assertEqual(self._blocked(ctx, i, j), set())
 
     def test_span_commit_conflicting_with_spatial_block_raises_unsupported(self):
         ctx, i, j = self._context((2, 1))

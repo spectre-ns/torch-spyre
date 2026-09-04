@@ -181,6 +181,17 @@ layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
 
+# Wall-clock budget for one CP-SAT solve, in seconds. The joint objective is
+# lexicographic and re-solves the same model up to three times (residency, then
+# parallelism, then division balance), so this bounds each phase, not the pass.
+# It is a compile-time guard, not a correctness one: a solve that runs out of
+# budget without an incumbent raises SolveError, and scratchpad_planning falls
+# back to greedy placement (correct, but co-optimization is lost for that
+# graph). Raise it if large graphs are falling back; 0 disables the limit.
+cpsat_time_limit_seconds: float = float(
+    os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "30")
+)
+
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
 validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
