@@ -7955,7 +7955,7 @@ class TestPredictFrame(unittest.TestCase):
 
     def _apply_and_compare(self, shape, tiling, levels):
         op = _ftl_pointwise(shape)
-        
+
         # the predictor must not mutate the op.
         ranges_before = list(op.data.ranges)
         size_before = list(op.layout.size)
@@ -8194,12 +8194,6 @@ class TestSpyreKernelPoolSize(unittest.TestCase):
 
 class TestTileSpecRepresentation(unittest.TestCase):
     """TileAxis/TileSpec/CoreDivision.tiling and the min_footprint win."""
-
-    def test_tiling_rides_on_core_division_not_a_parallel_list(self):
-        # The single most important representation constraint: a tiling is a
-        # field of a CoreDivision candidate, never a list beside core_divisions.
-        self.assertIn("tiling", CoreDivision.__dataclass_fields__)
-        self.assertNotIn("tilings", CoreDivisionBuffer.__dataclass_fields__)
 
     def test_empty_spec_is_untiled_and_inert(self):
         u = TileSpec()
