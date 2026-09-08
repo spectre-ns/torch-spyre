@@ -14,11 +14,11 @@
 
 """Declarative coarse tiling, applied inside the scratchpad planning pass.
 
-This is stage 1 of the coarse-tiling optimization: a tiling stated as data (a
+The tiling is stated as data (a
 :class:`~torch_spyre._inductor.scratchpad.plan_solver.TileSpec` per op) and
 *applied* to a real graph through a :class:`ScratchpadOptimizationPass`. The
 tiling is an input here, not a search -- candidate enumeration and the solver
-that chooses among tilings arrive in later stages.
+that chooses among tilings live elsewhere.
 
 The pass mints hint ids and a group-id offset from bases derived off the graph
 (never a reserved constant), so a tiling applied here cannot collide with a
@@ -41,11 +41,11 @@ from ..errors import Unsupported
 from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
-    coarse_tile,
+    coarse_tile_post_stickify,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
-from .passes import ScratchpadOptimizationPass
+from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
 
 
@@ -181,7 +181,7 @@ def _derive_group_idx_offset(graph: GraphLowering) -> int:
 class CoarseTilingPass(ScratchpadOptimizationPass):
     """Apply a declared coarse tiling to a graph, inside the scratchpad pass.
 
-    Stage 1: the tiling is an *input* (``choices``: operation name -> TileSpec),
+    The tiling is an *input* (``choices``: operation name -> TileSpec),
     not a search. Consecutive ops sharing a non-empty spec form one loop group;
     the pass mints hint ids and a group-id offset from bases derived off the
     graph, stamps each op's ``dim_hints``, validates group contiguity, then calls
@@ -214,4 +214,12 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                 op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
-        coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
+        # This pass runs inside scratchpad/LX planning -- after stickification
+        # (insert_restickify) and the post-stickify span-overflow WSR pass -- so
+        # every op already carries a committed FixedTiledLayout. Use the
+        # post-stickify entry point (run_read_copies=False): a read copy-in here
+        # would only be a useless HBM-to-HBM copy, exactly as the sibling
+        # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
+        coarse_tile_post_stickify(
+            graph, groups=groups, group_idx_offset=group_idx_offset
+        )
