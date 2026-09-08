@@ -548,7 +548,7 @@ class TestBuildingBlocks(unittest.TestCase):
             transposed_inputs=True,
             reshape_output=True,
         )
-        
+
     @config.patch(
         {
             "cpsat_time_limit_seconds": 30,
