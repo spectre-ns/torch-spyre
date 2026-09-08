@@ -60,29 +60,6 @@ from .coarse_tile import (
 )
 
 
-def _exact_div(value, count: int):
-    """Divide an extent by a tile count, requiring exact division."""
-    if isinstance(value, (int, sympy.Integer)):
-        iv = int(value)
-        if iv % count != 0:
-            raise Unsupported(
-                f"tile prediction: extent {iv} is not divisible by tile count "
-                f"{count} (coarse tiling emits equal-sized tiles)."
-            )
-        return sympy.Integer(iv // count)
-    return sympy.sympify(value) / count
-
-
-def _output_and_reduction_counts(tiling: TileSpec):
-    """Split a TileSpec into total per-dim counts, output vs reduction."""
-    output_counts: dict[int, int] = {}
-    reduction_counts: dict[int, int] = {}
-    for axis in tiling.axes:
-        target = reduction_counts if axis.is_reduction else output_counts
-        target[axis.host_dim] = target.get(axis.host_dim, 1) * axis.count
-    return output_counts, reduction_counts
-
-
 @dataclass
 class PredictedFrame:
     """The tiled frame a candidate produces for one op -- measured, not applied.
@@ -109,52 +86,27 @@ class PredictedFrame:
         return (self.iter_space, self.write_index, self.read_index)
 
 
-def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame:
-    """Predict the per-tile frame ``op`` would take under ``tiling`` -- no IR
-    mutation.
+def _exact_div(value, count: int):
+    """Divide an extent by a tile count, requiring exact division."""
+    if isinstance(value, (int, sympy.Integer)):
+        iv = int(value)
+        if iv % count != 0:
+            raise Unsupported(
+                f"tile prediction: extent {iv} is not divisible by tile count "
+                f"{count} (coarse tiling emits equal-sized tiles)."
+            )
+        return sympy.Integer(iv // count)
+    return sympy.sympify(value) / count
 
-    Output axes shrink ``op.data.ranges`` and the physical output layout (via
-    ``_post_tile_layout_for_splits``, the same resize real tiling uses); reduction
-    axes shrink ``op.data.reduction_ranges`` only, since the op's own output
-    buffer is the accumulator and keeps its full output extent.
-    """
-    output_counts, reduction_counts = _output_and_reduction_counts(tiling)
 
-    ranges = list(op.data.ranges)
-    for d, c in output_counts.items():
-        ranges[d] = _exact_div(ranges[d], c)
-
-    reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
-    for d, c in reduction_counts.items():
-        reduction_ranges[d] = _exact_div(reduction_ranges[d], c)
-
-    if output_counts:
-        layout = _predict_output_layout(op, ranges)
-    else:
-        layout = op.layout
-
-    rw = op.get_read_writes()
-    write_index = next(iter(rw.writes)).index
-    read_index = next((d.index for d in rw.reads if hasattr(d, "index")), write_index)
-    if output_counts:
-        # _rescale_index matches by coefficient value and needs sympy strides
-        # (it reads ``.is_number``); the mock/host layouts can carry plain ints.
-        full_strides = [sympy.sympify(s) for s in op.layout.stride]
-        tile_strides = [sympy.sympify(s) for s in layout.stride]
-        write_index = _rescale_index(write_index, full_strides, tile_strides)
-        read_index = _rescale_index(read_index, full_strides, tile_strides)
-
-    iter_space = _predict_iter_space(op, output_counts, reduction_counts)
-    return PredictedFrame(
-        op_name=op.get_name(),
-        tiling=tiling,
-        ranges=ranges,
-        reduction_ranges=reduction_ranges,
-        layout=layout,
-        write_index=write_index,
-        read_index=read_index,
-        iter_space=iter_space,
-    )
+def _output_and_reduction_counts(tiling: TileSpec):
+    """Split a TileSpec into total per-dim counts, output vs reduction."""
+    output_counts: dict[int, int] = {}
+    reduction_counts: dict[int, int] = {}
+    for axis in tiling.axes:
+        target = reduction_counts if axis.is_reduction else output_counts
+        target[axis.host_dim] = target.get(axis.host_dim, 1) * axis.count
+    return output_counts, reduction_counts
 
 
 def _predict_output_layout(op: ComputedBuffer, tiled_ranges: list) -> FixedTiledLayout:
@@ -210,3 +162,51 @@ def _predict_iter_space(
                 if sym in iter_space:
                     iter_space[sym] = _exact_div(iter_space[sym], count)
     return iter_space
+
+
+def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame:
+    """Predict the per-tile frame ``op`` would take under ``tiling`` -- no IR
+    mutation.
+
+    Output axes shrink ``op.data.ranges`` and the physical output layout (via
+    ``_post_tile_layout_for_splits``, the same resize real tiling uses); reduction
+    axes shrink ``op.data.reduction_ranges`` only, since the op's own output
+    buffer is the accumulator and keeps its full output extent.
+    """
+    output_counts, reduction_counts = _output_and_reduction_counts(tiling)
+
+    ranges = list(op.data.ranges)
+    for d, c in output_counts.items():
+        ranges[d] = _exact_div(ranges[d], c)
+
+    reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+    for d, c in reduction_counts.items():
+        reduction_ranges[d] = _exact_div(reduction_ranges[d], c)
+
+    if output_counts:
+        layout = _predict_output_layout(op, ranges)
+    else:
+        layout = op.layout
+
+    rw = op.get_read_writes()
+    write_index = next(iter(rw.writes)).index
+    read_index = next((d.index for d in rw.reads if hasattr(d, "index")), write_index)
+    if output_counts:
+        # _rescale_index matches by coefficient value and needs sympy strides
+        # (it reads ``.is_number``); the mock/host layouts can carry plain ints.
+        full_strides = [sympy.sympify(s) for s in op.layout.stride]
+        tile_strides = [sympy.sympify(s) for s in layout.stride]
+        write_index = _rescale_index(write_index, full_strides, tile_strides)
+        read_index = _rescale_index(read_index, full_strides, tile_strides)
+
+    iter_space = _predict_iter_space(op, output_counts, reduction_counts)
+    return PredictedFrame(
+        op_name=op.get_name(),
+        tiling=tiling,
+        ranges=ranges,
+        reduction_ranges=reduction_ranges,
+        layout=layout,
+        write_index=write_index,
+        read_index=read_index,
+        iter_space=iter_space,
+    )
