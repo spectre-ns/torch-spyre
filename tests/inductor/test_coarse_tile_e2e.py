@@ -4798,7 +4798,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             N_KV=8,
             with_mask=True,
         )
-
+        
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_hint_flash_attention_kv_chunked_prefill_8k(self):
         """Chunked prefill: a 512-token query block against an 8k K/V cache.
 
