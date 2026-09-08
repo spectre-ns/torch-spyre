@@ -7955,7 +7955,8 @@ class TestPredictFrame(unittest.TestCase):
 
     def _apply_and_compare(self, shape, tiling, levels):
         op = _ftl_pointwise(shape)
-        # R7.1: the predictor must not mutate the op.
+        
+        # the predictor must not mutate the op.
         ranges_before = list(op.data.ranges)
         size_before = list(op.layout.size)
         frame = predict_frame(op, tiling)
@@ -7966,6 +7967,7 @@ class TestPredictFrame(unittest.TestCase):
         pred_devsize = list(frame.layout.device_layout.device_size)
         pred_stride = [int(s) for s in frame.layout.stride]
 
+        # mutate the IR and check that the mutation matches the predicted values
         op.dim_hints = tile_spec_to_dim_hints(op, tiling, list(range(len(tiling.axes))))
         coarse_tile_post_stickify(_graph([op]), [([op], levels)])
 
