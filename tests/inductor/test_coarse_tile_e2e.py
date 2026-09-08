@@ -4836,7 +4836,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_flash_attention_kv_chunked_unit_h_tile(self):
         """h_tiles == H (one head per tile) is numerically exact."""
         self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
-        
+
     @config.patch(
         {
             "cpsat_time_limit_seconds": 30,
