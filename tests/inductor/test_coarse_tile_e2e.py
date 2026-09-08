@@ -4816,9 +4816,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
         )
 
-    @pytest.mark.skip(
-        reason="Takes more than 5 minutes to run with default solver settings"
-    )
     def test_hint_flash_attention_kv_chunked_decode_8k(self):
         """Decode: one query token, batch 4, against a full 8k K/V cache.
 
@@ -6939,9 +6936,8 @@ class TestCoOptKSplitCoarseGroup(InductorTestCase):
     parallelize it by splitting the *reduction* (contraction) axis across
     cores -- a K-split. The counted loop already accumulates across tiles; a
     K-split adds a second, cross-core partial-sum accumulation nested inside
-    that loop nest, and the two are not combined correctly. The result is
-    silently wrong (~86% element mismatch on the flash-attention output matmul
-    before the fix).
+    that loop nest, and the two are not combined correctly, so the output is
+    silently wrong.
 
     The identical K-split is correct *outside* a coarse group (see
     :class:`TestCoarseTileMatmulKTilingE2E` for the supported explicit-``K``
@@ -6960,65 +6956,68 @@ class TestCoOptKSplitCoarseGroup(InductorTestCase):
 
     @mock_patch.object(config, "co_optimizing_lx_planning", True)
     def test_matmul_in_h_tiled_loop_not_k_split(self):
-        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
-        scale = 1.0 / math.sqrt(math.sqrt(D))
+        """Three inputs, four ops, one hint -- the smallest graph that trips it.
 
-        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
-        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        Reduced from a flash-attention shape by bisecting against the guard
+        (correct with ``_drop_reduction_splits_in_coarse_group``, wrong without).
+        Each element below is load-bearing: removing any one stops the joint
+        solver choosing the K-split, so the test would keep passing while
+        silently covering nothing.
+
+        * The ``exp`` producing the matmul's LHS. With the matmul reading an
+          input directly the solver takes an output-axis split and the graph is
+          correct either way.
+        * The ``/ den`` consumer *outside* the tiled region. It ties the matmul
+          output's division to a non-tiled consumer, capping the output-axis
+          parallelism available; the contraction is then the only axis left to
+          split, which is what tempts the solver into the K-split.
+        * ``Lq`` and ``Lk`` both spanning >= 2 sticks (128 at fp16). At 64 each
+          is a single stick and no reduction-split candidate survives.
+
+        ``H=4`` tiled 2 is the smallest head configuration that works: ``H=2``
+        trips a *separate* wrong-code bug (mismatches with the guard on as well),
+        so it is deliberately not used here.
+
+        Tolerances sit between two measured numbers: summing 128 fp16 products
+        and then dividing by ``den`` leaves a ~0.3% noise floor (max abs diff
+        ~0.045), while dropping the guard mismatches ~17% of elements -- a ~50x
+        margin, so the test discriminates sharply without being flaky on
+        rounding.
+        """
+        B, H, Lq, Lk, D = 1, 4, 128, 128, 64
+
+        scores_t = torch.randn(B, H, Lk, Lq, dtype=torch.float16)
         values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        den_t = torch.rand(B, H, Lq, dtype=torch.float16) + 1.0
 
-        def flash(queries, keys, values):
-            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
-                output = torch.zeros_like(queries)
-            with spyre_hint(named_dims=["B", "H", "Lq"]):
-                M = torch.full(
-                    (B, H, Lq),
-                    float("-inf"),
-                    device=queries.device,
-                    dtype=torch.float16,
-                )
-            with spyre_hint(named_dims=["B", "H", "Lq"]):
-                denominator = torch.zeros(
-                    (B, H, Lq), device=queries.device, dtype=torch.float16
-                )
-            with spyre_hint(num_tiles_per_dim={"B": 1}):
-                with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    keys_T = keys.transpose(-1, -2).contiguous()
-                    scores = torch.matmul(queries * scale, keys_T * scale)
-                    scores = scores.transpose(-1, -2).contiguous()
-                    block_max = torch.amax(scores, dim=-2)
-                    max_running = torch.maximum(M, block_max)
-                    exp_scores = torch.exp(scores - max_running.unsqueeze(-2))
-                    correction = torch.exp(M - max_running)
-                    denominator = denominator * correction + exp_scores.sum(dim=-2)
-                    # The K-split hazard lives on this contraction (over Lk):
-                    output = output * correction.unsqueeze(-1) + torch.matmul(
-                        exp_scores.transpose(-1, -2), values
-                    )
-                    M = max_running
-            return output / denominator.unsqueeze(-1)
+        def attend(scores, values, den):
+            with spyre_hint(num_tiles_per_dim={"H": 2}):
+                weights = torch.exp(scores * 0.05)
+                # The K-split hazard lives on this contraction (over Lk):
+                out = torch.matmul(weights.transpose(-1, -2), values)
+            return out / den.unsqueeze(-1)
 
-        ref = flash(queries_t, keys_t, values_t)
+        ref = attend(scores_t, values_t, den_t)
 
-        queries_dev = queries_t.to("spyre")
-        keys_dev = keys_t.to("spyre")
+        scores_dev = scores_t.to("spyre")
         values_dev = values_t.to("spyre")
+        den_dev = den_t.to("spyre")
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("H", H)
         _declare_tensor_dim("Lq", Lq)
         _declare_tensor_dim("Lk", Lk)
         _declare_tensor_dim("D", D)
-        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
-        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(scores_dev, ["B", "H", "Lk", "Lq"])
         _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(den_dev, ["B", "H", "Lq"])
 
-        result = torch.compile(flash)(queries_dev, keys_dev, values_dev).cpu()
+        result = torch.compile(attend)(scores_dev, values_dev, den_dev).cpu()
         torch.testing.assert_close(
             result,
             ref,
             equal_nan=True,
-            atol=0.01,
-            rtol=0.1,
+            atol=0.05,
+            rtol=0.15,
             msg=lambda m: (
                 f"co-opt K-split of coarse-tiled matmul produced wrong output\n\n{m}\n"
             ),
