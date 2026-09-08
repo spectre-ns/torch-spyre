@@ -4798,7 +4798,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             N_KV=8,
             with_mask=True,
         )
-        
+
     @config.patch(
         {
             "cpsat_time_limit_seconds": 30,
