@@ -2399,27 +2399,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         return [_view_for_div(op, dep, buf_name, cd, prep_cache) for cd in divs]
 
-    @staticmethod
-    def _prep_for_candidate(op, dep, buf_name, cd):
-        """The ``_prepare_per_core_view`` prep for one candidate.
-
-        Untiled: the committed layout, exactly as before. Tiled: the *predicted*
-        per-tile frame (``wsr.tile_prediction.predict_frame``) supplies the
-        divided iteration space, rescaled indices, and -- when ``buf_name`` is the
-        op's own output -- the resized layout, since the committed layout is
-        still untiled at solve time. Imported lazily so the solver-facing modules
-        stay free of the predictor.
-        """
-        if cd.tiling.is_untiled:
-            return _prepare_per_core_view(op, dep, buf_name)
-        from torch_spyre._inductor.wsr.tile_prediction import predict_frame
-
-        frame = predict_frame(op, cd.tiling)
-        override = frame.layout if buf_name == op.get_name() else None
-        return _prepare_per_core_view(
-            op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
-        )
-
 
 def _make_cpsat_solver(
     buffers: Sequence[LifetimeBoundBuffer], size: int

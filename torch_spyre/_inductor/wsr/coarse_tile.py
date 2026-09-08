@@ -63,7 +63,6 @@ import collections
 import dataclasses
 import enum
 import logging
-from enum import Enum
 from typing import NamedTuple
 
 import sympy
@@ -2742,51 +2741,6 @@ def _validate_planned_reduction_tiling(
                 f"reduction dims {red_dims} (tiling more than one reduction "
                 "dim per level is not yet implemented)."
             )
-
-
-class BoundaryRole(Enum):
-    """How a tiled op's own output buffer must be materialized.
-
-    This is the single source of truth for the classification that
-    :func:`_propagate_tiled_op` applies and that the stage-4 predictor
-    (``wsr.tile_prediction``) reads to price a candidate without applying it.
-    Extracting it keeps one copy of the rule (M6).
-    """
-
-    UNTILED = 0  # not tiled, or loop-invariant: nothing is materialized
-    LOOP_INTERNAL = 1  # per-tile scratch, reused in place -> LX-eligible
-    BOUNDARY = 2  # drained across a loop boundary: full_buf + a write copy
-    REDUCTION = 3  # reduction-tiled: accumulator + identity fill + combine op
-
-
-def decide_boundary_role(
-    op: ComputedBuffer,
-    operations: list[Operation],
-) -> BoundaryRole:
-    """Classify a tiled op's output-buffer role -- a pure predicate, no mutation.
-
-    Mirrors :func:`_propagate_tiled_op`'s branch structure exactly: the reduction
-    path (``_propagate_tiled_reduction_op``, which sets ``output_tiled_dims=[]``
-    unconditionally and materializes an accumulator/fill/combine) is
-    ``REDUCTION``; an untiled or loop-invariant op is ``UNTILED``; a tiled op
-    with no outside consumer and no graph output is ``LOOP_INTERNAL`` (per-tile
-    scratch); anything drained across a loop-group boundary is ``BOUNDARY``.
-    """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None:
-        return BoundaryRole.UNTILED
-    if isinstance(op.data, Reduction) and any(
-        dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
-    ):
-        return BoundaryRole.REDUCTION
-    if all(not dims for dims in loop_info.loop_tiled_dims):
-        return BoundaryRole.UNTILED
-    outside_consumers, is_graph_output = _find_outside_consumers(
-        op.get_name(), loop_info.loop_group_id, operations
-    )
-    if not outside_consumers and not is_graph_output:
-        return BoundaryRole.LOOP_INTERNAL
-    return BoundaryRole.BOUNDARY
 
 
 def _insert_all_write_copy_ops(operations: list[Operation]) -> None:

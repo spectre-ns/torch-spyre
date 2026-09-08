@@ -12,31 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Predict what applying a tiling *would* do, without applying it.
+"""Predict the frame a tiling *would* produce, without applying it.
 
-Stage 4 of the coarse-tiling optimization. The solver (stage 5) has to *price* a
-tiling against LX residency before choosing it, and a candidate it does not
-choose is never built -- so it needs the tiled frame (divided ranges, resized
-layout, rescaled indices) and the buffers a candidate materializes, computed as
-a pure prediction over the *un-applied* graph.
+A coarse tiling rewrites an op's iteration ranges, its output layout, and the
+indices its deps are written in. A per-core view taken on the committed
+(untiled) layout therefore describes the wrong op, and residency is gated on
+those views -- so a solver weighing a tiling it has not applied needs the
+*tiled* frame as a pure prediction over the un-applied graph.
 
 Every mutation coarse tiling performs already exists in ``coarse_tile.py``. What
-is missing, and what this module supplies, is the **inverse**: a pure predictor
-reporting what ``_apply_plan`` / ``_propagate_tiled_op`` *would* insert without
-inserting it. It composes the same arithmetic those paths use
-(``_planned_tile_extents_per_level`` via direct division, ``_post_tile_layout_for_splits``,
-``_rescale_index``) and reads the same classification (``decide_boundary_role``),
-so the prediction and the application share one rule and cannot drift.
+is missing, and what this module supplies, is the **inverse**: a pure reading of
+the frame ``_divide_ranges`` / ``_post_tile_layout_for_splits`` / ``_rescale_index``
+would leave behind, composed from those same helpers rather than restated, so
+prediction and application cannot drift.
 
-Dependencies stay one-way: ``tile_prediction -> coarse_tile`` and
-``tile_prediction -> span_overflow_hint_analysis``. Nothing here mutates IR
-(R7.1); the solver must not import this module -- the allocator calls the
+Scope is deliberately the frame alone. Predicting the *buffers* a candidate
+materializes (per-tile scratch, boundary ``full_buf``, reduction accumulator)
+belongs with an objective that prices them; coarse tiling carries no objective
+term of its own, so that predictor would be API with nothing to consume it and
+is not built here.
+
+Dependencies stay one-way (``tile_prediction -> coarse_tile``). Nothing here
+mutates IR; the solver must not import this module -- the allocator calls the
 predictor and hands results across, which is what keeps the solver IR-free.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import sympy
 from sympy import Expr
@@ -51,9 +54,6 @@ from ..pass_utils import (
 )
 from ..scratchpad.plan_solver import TileSpec
 from .coarse_tile import (
-    BoundaryRole,
-    _graph_output_names,
-    _reads_buffer,
     _rescale_index,
     _stick_host_dim,
     reduction_loop_vars,
@@ -210,99 +210,3 @@ def _predict_iter_space(
                 if sym in iter_space:
                     iter_space[sym] = _exact_div(iter_space[sym], count)
     return iter_space
-
-
-@dataclass(frozen=True)
-class PredictedBuffer:
-    """One buffer a candidate materializes, with the element count it occupies."""
-
-    kind: str  # tile_scratch | full_buf | accumulator | read_copy
-    size: int
-
-
-@dataclass
-class PredictedBufferSet:
-    """The buffers a candidate (op + tiling) would materialize, plus its role.
-
-    The op's own per-tile scratch is always present; a ``BOUNDARY`` op adds the
-    full-extent ``full_buf`` it drains into; a ``REDUCTION`` op adds the
-    full-extent accumulator. Read copies for out-of-group reads are listed
-    separately.
-    """
-
-    op_name: str
-    tiling: TileSpec
-    role: BoundaryRole
-    buffers: list[PredictedBuffer] = field(default_factory=list)
-
-
-def _extent_product(ranges) -> int:
-    total = 1
-    for r in ranges:
-        if isinstance(r, (int, sympy.Integer)):
-            total *= int(r)
-        else:
-            return 0  # symbolic extent: not a concrete size to price
-    return total
-
-
-def predict_boundary_role(
-    op: ComputedBuffer,
-    tiling: TileSpec,
-    group_op_names: set[str],
-    operations: list,
-) -> BoundaryRole:
-    """Predict the boundary role ``decide_boundary_role`` would assign, from a
-    *hypothesized* group membership rather than an applied ``loop_info``.
-
-    Groups are a solver output, so at prediction time the op carries no
-    ``loop_info``; ``group_op_names`` stands in for the loop group. Mirrors
-    ``decide_boundary_role``'s rule: untiled -> UNTILED; any reduction axis ->
-    REDUCTION; an output consumed outside the group or a graph output ->
-    BOUNDARY; otherwise LOOP_INTERNAL.
-    """
-    if tiling.is_untiled:
-        return BoundaryRole.UNTILED
-    if any(axis.is_reduction for axis in tiling.axes):
-        return BoundaryRole.REDUCTION
-    buf_name = op.get_name()
-    has_outside = any(
-        isinstance(o, ComputedBuffer)
-        and o.get_name() not in group_op_names
-        and _reads_buffer(o, buf_name)
-        for o in operations
-    )
-    is_graph_output = buf_name in _graph_output_names()
-    if not has_outside and not is_graph_output:
-        return BoundaryRole.LOOP_INTERNAL
-    return BoundaryRole.BOUNDARY
-
-
-def predict_buffer_set(
-    op: ComputedBuffer,
-    tiling: TileSpec,
-    group_op_names: set[str],
-    operations: list,
-) -> PredictedBufferSet:
-    """Predict the buffers ``op`` would materialize under ``tiling`` -- no IR
-    mutation.
-
-    The per-tile scratch is sized from the predicted frame; a ``BOUNDARY`` op
-    adds a full-extent ``full_buf`` and a ``REDUCTION`` op a full-extent
-    accumulator, both sized from the op's original (pre-tile) output extent.
-    """
-    frame = predict_frame(op, tiling)
-    role = predict_boundary_role(op, tiling, group_op_names, operations)
-    tile_size = _extent_product(frame.ranges)
-    full_size = _extent_product(list(op.data.ranges))
-    buffers = [PredictedBuffer(kind="tile_scratch", size=tile_size)]
-    if role is BoundaryRole.BOUNDARY:
-        buffers.append(PredictedBuffer(kind="full_buf", size=full_size))
-    elif role is BoundaryRole.REDUCTION:
-        buffers.append(PredictedBuffer(kind="accumulator", size=full_size))
-    return PredictedBufferSet(
-        op_name=op.get_name(),
-        tiling=tiling,
-        role=role,
-        buffers=buffers,
-    )
