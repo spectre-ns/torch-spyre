@@ -25,18 +25,13 @@ import sympy
 from unittest import TestCase
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.scratchpad.allocator import (
-    CoOptimizingAllocator,
-    _lx_planning_size,
-)
+from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
-    TileAxis,
-    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
