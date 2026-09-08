@@ -4816,6 +4816,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
         )
 
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_hint_flash_attention_kv_chunked_decode_8k(self):
         """Decode: one query token, batch 4, against a full 8k K/V cache.
 
@@ -4831,7 +4836,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_flash_attention_kv_chunked_unit_h_tile(self):
         """h_tiles == H (one head per tile) is numerically exact."""
         self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
-
+        
+    @config.patch(
+        {
+            "cpsat_time_limit_seconds": 30,
+        }
+    )
     def test_hint_flash_attention_kv_chunked_8_chunks(self):
         """8 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
         self._run_kv_chunked_flash(
