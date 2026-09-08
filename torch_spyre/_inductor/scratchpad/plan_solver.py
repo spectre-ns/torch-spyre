@@ -17,8 +17,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
+import itertools
 import math
+import sympy
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+
 from enum import Enum
 
 if TYPE_CHECKING:
@@ -63,7 +66,7 @@ class LifetimeBoundBuffer:
     is what makes ``read_count`` trustworthy: one entry per accessing op means
     that for a computed buffer ``read_count == 0`` is exactly "written, never
     read", which the in-place invariants rely on (see
-    :func:`assert_in_place_parent_is_read`).  A repeated index would describe a
+    :func:`check_in_place_parent_is_read`).  A repeated index would describe a
     buffer written and read by the same op, i.e. with a single live tick, and
     would let such a buffer pass as an in-place parent.
 
@@ -80,6 +83,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Optional exclusive lifetime end for storage reused by a counted loop.
+    # Keep this separate from ``uses``: it changes address overlap, but must not
+    # manufacture a read or inflate residency/spill benefit.
+    lifetime_end_override: Optional[int] = None
     # Buffers that must be placed atomically with this one. Despite the name,
     # this is one-to-many: only the group root carries the complete partner list.
     paired_with: list["LifetimeBoundBuffer"] = field(
@@ -104,6 +111,12 @@ class LifetimeBoundBuffer:
             f"buffer {self.name} has uses={self.uses}, which is not strictly "
             "increasing; uses carries one distinct index per accessing operation"
         )
+        if self.lifetime_end_override is not None and self.uses:
+            assert self.lifetime_end_override >= self.uses[-1] + 1, (
+                f"buffer {self.name} has lifetime_end_override="
+                f"{self.lifetime_end_override} before nominal exclusive end "
+                f"{self.uses[-1] + 1}"
+            )
 
     @property
     def read_count(self) -> int:
@@ -126,7 +139,8 @@ class LifetimeBoundBuffer:
 
     @property
     def end_time(self) -> int:
-        return self.uses[-1] + 1
+        nominal = self.uses[-1] + 1
+        return max(nominal, self.lifetime_end_override or nominal)
 
     @property
     def min_footprint(self) -> int:
@@ -136,6 +150,10 @@ class LifetimeBoundBuffer:
     def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
         """Returns true iff self and other overlap in time."""
         return self.start_time < other.end_time and other.start_time < self.end_time
+
+    @property
+    def sym_is_lx(self) -> sympy.Symbol:
+        return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
 
 
 @dataclass(frozen=True)
@@ -213,19 +231,17 @@ class TileSpec:
 class CoreDivision:
     """One permissible core-division of a buffer's producing op.
 
-    ``output_splits`` / ``reduction_splits`` are the stride/coeff-keyed encoding
-    produced by :func:`pass_utils.splits_by_index_coeff` -- exactly the shape
-    stored in ``op.op_it_space_splits``. Solvers are expected to use these to size
-    the buffer (per-core footprint = total / ``output_partition``).
+    ``output_splits`` / ``reduction_splits`` are keyed by the producer's
+    iteration symbols. Solvers use them to size the buffer (per-core footprint
+    = total / ``output_partition``); cross-operation compatibility is derived
+    through ``PerCoreView``, never by comparing these local symbols.
 
-    ``tiling`` pairs a coarse tiling onto this division as *one* candidate rather
-    than a parallel list. A division is only meaningful relative to a tiling
-    (the legal set and the coeff encoding both move with it), so the two must be
-    chosen together. The empty :class:`TileSpec` is untiled and inert.
+    ``tiling`` pairs a coarse tiling onto this division as one candidate. The
+    empty :class:`TileSpec` is untiled and inert.
     """
 
-    output_splits: dict[int, int] = field(default_factory=dict)
-    reduction_splits: dict[int, int] = field(default_factory=dict)
+    output_splits: dict[object, int] = field(default_factory=dict)
+    reduction_splits: dict[object, int] = field(default_factory=dict)
     tiling: TileSpec = field(default_factory=TileSpec)
 
     @property
@@ -248,13 +264,27 @@ class CoreDivision:
     def signature_key(self):
         """Per-core slicing signature, or ``None`` for a reduction-split division
         (a ``None`` never compares equal, so partial-reduction divisions never
-        match)."""
-        return tuple(sorted(self.output_splits.items())) if self.is_clean else None
+        match). Only used within one operation's symbol namespace."""
+        return (
+            tuple(sorted(self.output_splits.items(), key=lambda item: str(item[0])))
+            if self.is_clean
+            else None
+        )
 
     @property
     def label(self) -> str:
-        out = ",".join(f"s{s}/{f}" for s, f in sorted(self.output_splits.items()))
-        red = ",".join(f"~s{s}/{f}" for s, f in sorted(self.reduction_splits.items()))
+        out = ",".join(
+            f"s{s}/{f}"
+            for s, f in sorted(
+                self.output_splits.items(), key=lambda item: str(item[0])
+            )
+        )
+        red = ",".join(
+            f"~s{s}/{f}"
+            for s, f in sorted(
+                self.reduction_splits.items(), key=lambda item: str(item[0])
+            )
+        )
         return " ".join(p for p in (out, red) if p) or "whole"
 
 
@@ -298,11 +328,44 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
             for cd in self.core_divisions
         )
 
+    @property
+    def sym_cores(self) -> sympy.Symbol:
+        output, reduction = self.sym_core_divs
+        return math.prod(output.values()) * math.prod(reduction.values())
 
-def assert_in_place_parent_is_read(
+    @property
+    def sym_core_divs(self) -> tuple[dict, dict]:
+        """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
+        stride coefficient seen across this buffer's candidate divisions, so the
+        cost model can carry an undecided split as an unknown rather than a
+        concrete value."""
+        core_divs = self.core_divisions
+
+        def unique(args):
+            d = {arg: None for arg in args}
+            return list(d)
+
+        output_keys = unique(
+            itertools.chain.from_iterable(cd.output_splits for cd in core_divs)
+        )
+        reduction_keys = unique(
+            itertools.chain.from_iterable(cd.reduction_splits for cd in core_divs)
+        )
+
+        def sym(prefix, key):
+            return sympy.Symbol(
+                f"{prefix}_split_{self.name}_{key}", integer=True, positive=True
+            )
+
+        sym_output_splits = {key: sym("output", key) for key in output_keys}
+        sym_reduction_splits = {key: sym("reduction", key) for key in reduction_keys}
+        return (sym_output_splits, sym_reduction_splits)
+
+
+def check_in_place_parent_is_read(
     parent: "LifetimeBoundBuffer", child_name: str
 ) -> None:
-    """Assert an in-place parent's storage is read before it is handed over.
+    """Reject an in-place parent whose storage is never read before handover.
 
     The child takes the parent's storage over at the parent's last use, so that
     use has to be a read. For a computed buffer the first use is the write, so a
@@ -311,39 +374,45 @@ def assert_in_place_parent_is_read(
     and child come alive on the same tick while sharing storage. Graph inputs are
     exempt: all their uses are reads, so one use is enough.
 
-    Split out of :func:`_assert_in_place_relationships` because the
-    permutation-based layout solvers enforce this one invariant on its own. For
-    them the other two are placement-time gates rather than preconditions: a
-    child that outgrows its parent, or a pair whose lifetimes do not abut, is
-    simply not placed in-place (see ``_can_inplace``), so asserting either here
-    would reject inputs those solvers handle correctly.
+    Split out of :func:`_check_in_place_relationships` because the
+    permutation-based layout solvers call it directly, where they resolve
+    declared pairs (``_compute_inplace_partners``), alongside their own copy of
+    the abutment check -- their incremental machinery samples the contact
+    profiles at the single tick the pair overlaps and so cannot re-derive a
+    longer overlap. The size invariant is the one they do *not* take as a
+    precondition: an oversized child is simply not placed in-place (see
+    ``_can_inplace``), so checking it here would reject inputs they handle
+    correctly.
     """
     # Tested as "a use strictly after the first" rather than via ``read_count``:
     # the two agree whenever ``uses`` is strictly increasing, but ``uses`` is
     # validated at construction and can be mutated afterwards, and this way a
     # repeated index cannot pass as a read.
     has_read_after_write = len(parent.uses) > 1 and parent.uses[-1] > parent.uses[0]
-    assert parent.first_use_is_read or has_read_after_write, (
-        f"In-place parent {parent.name} is a computed buffer that is never read "
-        f"(uses={parent.uses}), so it cannot hand its storage to child "
-        f"{child_name}"
-    )
+    if not (parent.first_use_is_read or has_read_after_write):
+        raise ValueError(
+            f"In-place parent {parent.name} is a computed buffer that is never "
+            f"read (uses={parent.uses}), so it cannot hand its storage to child "
+            f"{child_name}"
+        )
 
 
-def _assert_in_place_relationships(
+def _check_in_place_relationships(
     buffers: Sequence["LifetimeBoundBuffer"],
 ) -> None:
-    """Assert that all declared in-place parent/child pairs satisfy required invariants."""
+    """Reject any declared in-place pair that violates a required invariant."""
     buf_by_name = {b.name: b for b in buffers}
     for child in buffers:
         for parent_name in child.in_place_parents:
             parent = buf_by_name.get(parent_name)
             if parent:
-                assert parent.end_time == child.start_time + 1, (
-                    f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
-                    f"child {child.name}.start_time+1={child.start_time + 1}"
-                )
-                assert_in_place_parent_is_read(parent, child.name)
+                if parent.end_time != child.start_time + 1:
+                    raise ValueError(
+                        f"In-place parent {parent_name}.end_time={parent.end_time} "
+                        f"must equal child {child.name}.start_time+1="
+                        f"{child.start_time + 1}"
+                    )
+                check_in_place_parent_is_read(parent, child.name)
                 # With core_divisions ``size`` is the *total* footprint, so a static
                 # size check doesn't apply; the per-core match is enforced against the
                 # chosen division in ``CpSatLayoutSolver._add_inplace_relaxation``. Only
@@ -353,10 +422,11 @@ def _assert_in_place_relationships(
                     getattr(parent, "core_divisions", None)
                     or getattr(child, "core_divisions", None)
                 ):
-                    assert child.size <= parent.size, (
-                        f"In-place child {child.name}.size={child.size} "
-                        f"must be <= parent {parent_name}.size={parent.size}"
-                    )
+                    if child.size > parent.size:
+                        raise ValueError(
+                            f"In-place child {child.name}.size={child.size} "
+                            f"must be <= parent {parent_name}.size={parent.size}"
+                        )
 
 
 class MemoryPlanSolver(ABC):
@@ -466,7 +536,9 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     """
 
     @abstractmethod
-    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(
+        self, cost_expr: sympy.Expr | None = None
+    ) -> list[CoreDivisionBuffer]:
         """Choose each buffer's core division and its LX placement together.
 
         On top of the :meth:`plan_layout` contract, implementations write the
