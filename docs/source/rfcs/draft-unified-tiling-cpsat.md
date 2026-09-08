@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft — pending issue number. **Two sections superseded; see the reconciliation note below.** |
+| Status | Draft — pending issue number. **Three sections superseded; see the reconciliation note below.** |
 | Area | Compiler |
 | Roadmap | Compiler Optimization Roadmap — collateral document 1, Phase 1 |
 | Target | `torch_spyre/_inductor` — `wsr`, `scratchpad`, and `padding.py` |
@@ -15,8 +15,9 @@
 > repository and gains a row plus a summary paragraph in
 > `docs/source/rfcs/index.md`.
 
-> **Reconciliation note (2026-09-04).** Two things in this document have been
-> overtaken by decisions made after it was written. The implementation plan
+> **Reconciliation note (2026-09-04, extended 2026-09-08).** Three things in this
+> document have been overtaken — two by decisions made after it was written, one
+> by an upstream refactor landed while the work sat unrebased. The implementation plan
 > (`draft-unified-tiling-implementation-plan.md`) carries the detail; the short
 > form is:
 >
@@ -35,6 +36,23 @@
 >    one-hot*. The change is measured (1.64x, objective-identical) and is
 >    mechanical for this RFC: same tables, different binding. See the plan's
 >    *Roadmap alignment* section.
+>
+> 3. **`CoreDivision` is symbol-keyed, not coeff-keyed (2026-09-08).** Where this
+>    document says its `output_splits`/`reduction_splits` carry "the coeff-keyed
+>    encoding from `pass_utils.splits_by_index_coeff`", upstream
+>    [#4228](https://github.com/torch-spyre/torch-spyre/pull/4228) migrated them
+>    to the producer's *iteration symbols*, with cross-operation compatibility
+>    derived through `PerCoreView` rather than by comparing local keys. This is
+>    the same conflation defect recorded against the ILP co-optimizer, fixed
+>    upstream. It **simplifies** the tiling design rather than complicating it:
+>    symbol keys are tiling-invariant (a tiling rescales indices without renaming
+>    loop symbols), so a division enumerated on a tiled frame needs no
+>    re-encoding to be compared against one enumerated on the untiled frame, and
+>    the per-option `splits_by_index_coeff` step this document assumes is gone.
+>    Read §"`CoreDivision` is generalized rather than forked" and the
+>    `_cd_parent_matches` discussion with that substitution. The argument they
+>    make — that a division is only meaningful relative to its tiling, so the two
+>    must be chosen together — is unaffected.
 >
 > The rest of the document — the enumeration, the `PartitionConfig` pairing, the
 > feasibility model, the hint and validator design — stands as written.
@@ -439,8 +457,10 @@ modular-constraint cost is not.
 
 `CoreDivision` (`scratchpad/plan_solver.py:94`) is generalized rather than
 forked. It carries just two stored fields — `output_splits` and
-`reduction_splits`, both the coeff-keyed encoding from
-`pass_utils.splits_by_index_coeff` — with `cores_used`, `output_partition`,
+`reduction_splits` (written here as the coeff-keyed encoding from
+`pass_utils.splits_by_index_coeff`; **since #4228 these are keyed by the
+producer's iteration symbols** — see reconciliation note 3) — with
+`cores_used`, `output_partition`,
 `is_clean`, and `signature_key()` all derived, so wrapping it costs nothing:
 
 ```python

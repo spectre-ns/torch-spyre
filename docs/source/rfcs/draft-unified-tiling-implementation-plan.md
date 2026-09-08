@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft — reconciled against the tree and the roadmap, 2026-09-04 (§0) |
+| Status | Draft — reconciled 2026-09-04; **stage 4/5/6 branches rebased onto current `main` 2026-09-08** (§0.2, §0.5) |
 | Implements | [`draft-unified-tiling-cpsat.md`](draft-unified-tiling-cpsat.md) (collateral doc 1, Phase 1 of the compiler-optimization roadmap) |
-| Branch | this document: `running-roadmap`; implementation: `upstream/main` (stages 1, 3) + `coarse-tiling-stage4/5/6` (stages 4, 5) |
+| Branch | this document: `running-roadmap`; implementation: `upstream/main` (stages 1, 3) + `coarse-tiling-stage4/5/6` (stages 4, 5), now stacked and current with `main` |
 | Scope | 59 numbered requirements (R1.1–R10.6) across `scratchpad`, `wsr`, `padding.py` |
 | Shape | 7 stages, one PR each. **2 landed, 2 withdrawn, 2 remain, 1 conditional** — see §0 |
 | Architecture | Tiling rides on a `LifetimeBoundBuffer` subclass and is applied inside the scratchpad planning pass — see *Architecture* below |
@@ -59,12 +59,14 @@ branch and has not come across.
 | `config.unified_tiling`, `config.auto_coarse_tiling` (both default off) | — | — | `stage5`, `stage6` |
 | Allocator solver seam (`_tiling_candidates`, `_chosen_tilings`, `_spec_contains`, `_spec_within_read_distance`, `_drop_read_distance_violations`) | — | — | `stage5`, `stage6` |
 
-**Those branches are stale.** `stage4`/`stage5`/`stage6` all sit on merge-base
-`fea0c4be` (2026-08-20/21), while `stage1` and `stage2` were rebuilt to
-`dcf86730` (2026-08-25 — and are now the *same commit*, stage 2 having been
-reconciled to equal stage 1) and `stage3` to `01a1c5ec` (2026-08-27). So the
-unlanded work is based on a tree two rebuilds behind, and rebasing it is the
-first task of the remaining plan, not an afterthought.
+**Those branches were stale; they are not any more.** `stage4`/`stage5`/`stage6`
+all sat on merge-base `fea0c4be` (2026-08-20/21) — 177 commits behind — while
+`stage1`/`stage2` were rebuilt to `dcf86730` (2026-08-25, and are now the *same
+commit*, stage 2 having been reconciled to equal stage 1) and `stage3` to
+`01a1c5ec` (2026-08-27). That rebase was the first task of the remaining plan
+and **it has been done** (2026-09-08, §0.5): the three branches are now a proper
+stack on `875ea166`, device-free green, with the diff cut from ~7,000 added
+lines to 747 / 1,023 / 1,761.
 
 ### 0.3 Branch numbering is not stage numbering
 
@@ -108,6 +110,67 @@ and from `upstream/main`.
 > produced was lost — neither committed draft mentioned it, which is why this
 > reconciliation was needed. If the intent was narrower than "stages 2 and 7 are
 > not deliverables", this is the place to correct it.
+
+### 0.5 The 2026-09-08 rebase — what moved upstream, and what it cost
+
+The rebase named as the first task in §0.2 was executed as a **stack**, not three
+independent merges: `upstream/main` (`875ea166`) → `stage4`, then `stage4` →
+`stage5`, then `stage5` → `stage6`, so each stage's resolutions are inherited
+rather than re-derived. Merge commits `c16977c9` / `b4cb745a` / `baf4c0a1`. All
+three are **unsigned** — the GPG agent timed out — and must be re-signed before
+they are pushed.
+
+**The seams this plan targets were rewritten upstream while the work sat.** This
+is the substance of the rebase; the conflict count (34 hunks) badly understates
+it, because most hunks were prose and the two that mattered were
+re-implementations:
+
+| Upstream change | What it did | Consequence for this plan |
+|---|---|---|
+| [#4228](https://github.com/torch-spyre/torch-spyre/pull/4228) | Work-division legality became a memoized `WorkDivisionContext`; `enumerate_work_division_candidates` reduced to a cross product over `factor_domain`/`is_legal` | Stage 5's `tiling=` kwarg no longer belongs on the enumerator. It is now threaded through `work_division_context_for_op(op, max_cores, tiling)`, which computes `it_space` from `_predict_iter_space` when the tiling is non-empty. **Cleaner than the original**: the tiled frame is a property of the context, not an argument to a loop. |
+| #4228 | `CoreDivision.output_splits` migrated coeff-keyed `dict[int, int]` → symbol-keyed `dict[object, int]`; cross-op compatibility moved to `PerCoreView` | **Deletes work from stage 5.** The original loop called `splits_by_index_coeff` against `predict_frame`'s rescaled write/read indices to re-encode each tiled candidate. Symbol keys are tiling-invariant (a tiling rescales indices without renaming loop symbols), so the encoding step is gone entirely; `_core_division(op, splits, tiling)` simply carries the tiling. This is the same conflation bug recorded separately against the ILP co-optimizer, fixed upstream in our favour. |
+| #4228 | `_prepare_per_core_view` / `_per_core_view_from_prep` split out of the per-candidate path, with a `parts=` kwarg | Stage 4's `buf_layout` override auto-merged onto it. The prep-cache tiling key was folded into main's `_view_for_div` rather than kept as a parallel `_prep_for_candidate` staticmethod. |
+| [#4119](https://github.com/torch-spyre/torch-spyre/pull/4119) | Deleted `scratchpad/passes.py`, folding `ScratchpadOptimizationPass` back into `allocator.py` | Stage 6's `from .passes import` retargeted to `.allocator`. |
+| stage 1/3 landing (#3971, #3969) | `coarse_tile` split into `coarse_tile_pre_stickify` / `coarse_tile_post_stickify`; RFC requirement numbers stripped from docstrings | Branch call sites renamed. `TestPredictFrame` uses `post_stickify`, matching what `CoarseTilingPass` actually calls — which is the consumer `predict_frame` predicts for. |
+
+**Two latent defects surfaced, both of which would have failed on the first run
+against landed code:**
+
+- **`enumerate_tile_options`'s `max_cores` was a dead parameter.** It was `del`'d
+  on the first line and documented as "advisory", existing only to match a
+  stage-5 caller signature. The version that actually landed (#3971) has no such
+  parameter and is **keyword-only after `op`**, so `enumerate_tile_options(op,
+  max_cores)` in `_tiling_candidates` was a latent `TypeError`, not a
+  no-op. Parameter dropped, caller fixed. (`max_cores` remains a real parameter
+  of `_tiling_candidates` itself — stage 6's `_drop_read_distance_violations`
+  uses it.)
+- **Stage 4's `_ftl_pointwise` fixture built loop symbols without
+  `integer=True`.** sympy therefore could not fold `floor(d)` away, and
+  `device_coordinates` rejected the stick expression, so `_prepare_per_core_view`
+  returned `None` for *every* shape, tiled or untiled. It was invisible before
+  #4228 because the older prep never called `try_device_coordinates`. One-line
+  fixture fix; the tiling-aware view assertions are real again.
+
+**Duplicate test classes had to be reconciled, not deleted wholesale.** Because
+stages 1 and 3 landed via #3971/#3969, the branches carry stale copies of tests
+that are now on `main`. The copies were removed, but three sets of tests were
+migrated into `main`'s same-named classes rather than lost: the
+`CoreDivision`-shape guard `test_tiling_rides_on_core_division_not_a_parallel_list`
+(main covers the positive half but not the negative "no parallel `tilings` list"
+assertion), and stage 6's seven `dim_hints_to_tile_spec` round-trip tests.
+
+**Scope removed from the code branches.** The two draft RFC documents (this file
+and the RFC, ~3,500 lines — they live here on `running-roadmap`, and RFC 1358 is
+published in `torch-spyre/rfcs`) and the orphaned `tests/inductor/test_cost_expr.py`
+(583 lines, no module behind it, superseded by §0.4) were the sole causes of the
+`Build docs` and `All test_*.py files wired into GHA CI` failures. Both checks
+pass locally now.
+
+**What the rebase does not establish.** Device suites have not been re-run —
+`Test Solver Auto Coarse Tiling` was 15/15 on the pre-rebase `stage6`
+(all nine model × hint-mode combos, `expected_unimplemented` removed), and that
+result is the thing the rebase must be shown not to have broken. Device
+verification, re-signing, and PR re-targeting are the remaining work.
 
 ## Architecture — where the tiling decision lives
 
@@ -303,20 +366,40 @@ relation without ever naming it.
 | **1** | Declarative tiling, applied | **landed** (`upstream/main`, unwired) | R2.1, R4.5, R7.3 (half) | met |
 | **2** | The cost-function seam | **landed by another route** (§0.4) | R3.1, R3.6, R8.5 | seam live at `allocator.py:2007` |
 | **3** | Tiling option enumeration, reductions included | **landed** (`upstream/main`, unwired) | R1.1–R1.9 | met |
-| **4** | Prediction and tiling-aware views | **built, unlanded, stale base** | R2.6, R6.3, R7.1 | predicted view equals the view recomputed after `coarse_tile` |
-| **5** | The solver: candidates, cuts, enablement | **built, unlanded, stale base** | R2.2–R2.5, R4.1–R4.10, R5.1–R5.8, R6.1, R6.2, R7.2–R7.5, R8.1–R8.4 | gate on ⇒ end-to-end correct; `INFEASIBLE` ⇒ today's behaviour |
+| **4** | Prediction and tiling-aware views | **built, rebased on `main`, unlanded** (§0.5) | R2.6, R6.3, R7.1 | predicted view equals the view recomputed after `coarse_tile` |
+| **5** | The solver: candidates, cuts, enablement | **built, rebased on `main`, unlanded** (§0.5) | R2.2–R2.5, R4.1–R4.10, R5.1–R5.8, R6.1, R6.2, R7.2–R7.5, R8.1–R8.4 | gate on ⇒ end-to-end correct; `INFEASIBLE` ⇒ today's behaviour |
 | **6** | Padding *(conditional)* | not started | R10.1–R10.6 | opened by R10.3's measurement **or** by a tileability blocker |
 | **7** | The M2 objective collapse | **not as specified** (§0.4) | R3.2–R3.5, R3.7 | — |
 
-**The remaining critical path is therefore short and specific:** rebase the
-stage 4/5 work off `fea0c4be` onto current `main`, reconcile it with the landed
-(and since-revised) `enumerate_tilings.py`, wire the caller that stage 1 still
-lacks, and land it behind `unified_tiling` / `auto_coarse_tiling`. Everything
-else in this document is either done, withdrawn, or conditional.
+**The remaining critical path is therefore short and specific.** The rebase and
+the reconciliation against the landed (and since-revised) `enumerate_tilings.py`
+are **done** (§0.5); the caller stage 1 still lacks is wired on `stage5`/`stage6`
+behind `unified_tiling` / `auto_coarse_tiling`. What is left is verification and
+delivery, not construction:
+
+1. **Re-run the device suites** on the rebased stack — `Test Solver Auto Coarse
+   Tiling` in particular, which was 15/15 before the rebase and is the result the
+   rebase must be shown not to have broken.
+2. **Re-sign** the three merge commits (§0.5) and re-target the PR bases so each
+   PR shows only its own delta: #3970 onto `coarse-tiling-stage4`, #3923 onto
+   `coarse-tiling-stage5`. As they stand all three target `main` and re-present
+   each other's content.
+3. **Fill in the PR bodies** (all three are unedited templates) and link
+   [#4233](https://github.com/torch-spyre/torch-spyre/issues/4233), the epic that
+   names this stack, or a CP-SAT-track epic if one is filed.
+4. **Fix the two blockers #4233 puts on this path**: `coarse_underfill_eff`
+   branching on a *symbolic* `is_lx`/`output_split` under
+   `co_optimizing_lx_planning`, and `BundleCostObjective` freeing a resident
+   buffer's reads but never its producing write. Residency is the channel tiling
+   pays off through, so the second must be fixed before the search is tuned
+   against the signal.
+
+Everything else in this document is either done, withdrawn, or conditional.
 
 ```text
 LANDED       stage 1 ──▶ stage 3        upstream/main, both unwired
-REMAINING              stage 4 ──▶ stage 5   on coarse-tiling-stage4/5/6, base fea0c4be (stale)
+REMAINING              stage 4 ──▶ stage 5   coarse-tiling-stage4/5/6, rebased on 875ea166,
+                                             stacked, device-free green, awaiting device CI
 NOT AS SPEC  stage 2, stage 7          seam landed by another route; see §0.4
 CONDITIONAL  stage 6 (padding)         opened by R10.3's measurement, not started
 ```
