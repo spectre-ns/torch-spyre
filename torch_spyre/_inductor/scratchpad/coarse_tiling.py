@@ -44,7 +44,7 @@ from ..wsr.coarse_tile import (
     _loop_var_to_ranges_pos,
     _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
-    reduction_loop_vars,
+    resolve_tile_axis_loop_vars,
     validate_coarse_tile_groups,
 )
 from .allocator import ScratchpadOptimizationPass
@@ -70,10 +70,12 @@ def tile_spec_to_dim_hints(
     rather than being relabelled as compiler-discovered -- the identity a
     consumer keying on the pin (debug output, the hint-preservation tests) reads.
 
-    The output-axis case is exactly ``_dims_to_hints`` (span overflow): resolve
-    the loop var from ``op_out_coords(op)[host_dim]``. The reduction-axis case is
-    the inverse of :func:`reduction_loop_vars` -- ``host_dim`` positionally
-    indexes the op's ordered reduction loop variables.
+    Axis resolution -- which loop var a ``host_dim`` names in each frame, and
+    every ``Unsupported`` a spec can earn -- belongs to
+    :func:`~..wsr.coarse_tile.resolve_tile_axis_loop_vars`, shared with
+    ``wsr.tile_prediction._rejection_reason`` so that what the predictor prices
+    is exactly what this function can lower. Only the ``hint_ids`` / ``dim_names``
+    pairing, which prediction has no analogue for, lives here.
     """
     if len(hint_ids) != len(spec.axes):
         raise ValueError(
@@ -85,52 +87,26 @@ def tile_spec_to_dim_hints(
             f"tile_spec_to_dim_hints: {len(dim_names)} dim_names for "
             f"{len(spec.axes)} axes on {op.get_name()}"
         )
-    out_coords = op_out_coords(op)
-    red_vars: list[sympy.Symbol] | None = None
-    hints: list[DimHint] = []
-    for i, (axis, hint_id) in enumerate(zip(spec.axes, hint_ids)):
-        if axis.is_reduction:
-            if not isinstance(op.data, Reduction):
-                raise Unsupported(
-                    f"coarse tiling: reduction axis host_dim={axis.host_dim} "
-                    f"requested on non-Reduction op {op.get_name()}."
-                )
-            if red_vars is None:
-                red_vars = reduction_loop_vars(op)
-            if axis.host_dim >= len(red_vars):
-                raise Unsupported(
-                    f"coarse tiling: reduction host_dim={axis.host_dim} is out "
-                    f"of bounds for {len(red_vars)} reduction loop variables on "
-                    f"{op.get_name()}."
-                )
-            loop_var = red_vars[axis.host_dim]
-        else:
-            if axis.host_dim >= len(out_coords):
-                raise Unsupported(
-                    f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
-                    f"for {len(out_coords)} output coordinates on {op.get_name()}."
-                )
-            coord = out_coords[axis.host_dim]
-            free_symbols = coord.free_symbols
-            if len(free_symbols) != 1:
-                raise Unsupported(
-                    f"coarse tiling: host_dim={axis.host_dim} output coordinate "
-                    f"{coord} on {op.get_name()} has {len(free_symbols)} free "
-                    "symbols; expected exactly one loop var."
-                )
-            loop_var = next(iter(free_symbols))
-        hints.append(
-            DimHint(
-                dim_names=(
-                    ["_coarse_tile"] if dim_names is None else list(dim_names[i])
-                ),
-                split_count=axis.count,
-                loop_var=loop_var,
-                is_reduction=axis.is_reduction,
-                hint_id=hint_id,
-            )
+    # One fresh list per axis -- a shared default would let a later mutation of
+    # one hint's dim_names reach every other hint built here.
+    names = (
+        [["_coarse_tile"] for _ in spec.axes]
+        if dim_names is None
+        else [list(n) for n in dim_names]
+    )
+    loop_vars = resolve_tile_axis_loop_vars(op, spec)
+    return [
+        DimHint(
+            dim_names=axis_names,
+            split_count=axis.count,
+            loop_var=loop_var,
+            is_reduction=axis.is_reduction,
+            hint_id=hint_id,
         )
-    return hints
+        for axis, loop_var, hint_id, axis_names in zip(
+            spec.axes, loop_vars, hint_ids, names
+        )
+    ]
 
 
 def dim_hints_to_tile_spec(

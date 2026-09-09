@@ -63,7 +63,6 @@ import collections
 import dataclasses
 import enum
 import logging
-from enum import Enum
 from typing import NamedTuple
 
 import sympy
@@ -97,6 +96,7 @@ from torch_spyre._C import SpyreTensorLayout
 from .. import config
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
+from ..scratchpad.plan_solver import TileSpec
 from ..logging_utils import get_inductor_logger
 from ..loop_info import (
     CarriedReductionRecord,
@@ -1810,8 +1810,8 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
 
     This is the single source of truth for that derivation. Both directions go
     through it: ``_loop_var_to_reduction_ranges_pos`` (loop_var -> position) and
-    coarse tiling's reduction-axis lowering (its inverse, position -> loop_var,
-    in ``scratchpad.coarse_tiling.tile_spec_to_dim_hints``).
+    :func:`resolve_tile_axis_loop_vars` (its inverse, position -> loop_var, for
+    every ``TileSpec`` axis that names a reduction dim).
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()
@@ -1819,6 +1819,95 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
     out_syms = out_dep.index.free_symbols
     in_dep = next(d for d in rw.reads if hasattr(d, "index"))
     return [s for s in in_dep.ranges if s not in out_syms]
+
+
+def try_resolve_tile_axis_loop_vars(
+    op: ComputedBuffer, tiling: TileSpec
+) -> tuple[list[sympy.Symbol] | None, str | None]:
+    """``(loop_vars, None)``, or ``(None, reason)`` if ``tiling`` cannot apply.
+
+    The single authority on whether a ``TileSpec`` can be applied to ``op`` and
+    on which loop var each axis names. Both callers go through it, so prediction
+    can never be more permissive than application -- a candidate the predictor
+    prices is one the applier will accept -- but they need the answer in
+    different forms, which is why the authority reports rather than raises:
+
+    * ``scratchpad.coarse_tiling.tile_spec_to_dim_hints`` lowers a spec the
+      planner has already committed to, so a rejection there is a compilation
+      failure. It calls :func:`resolve_tile_axis_loop_vars`, which turns a
+      ``reason`` into ``Unsupported``.
+    * ``wsr.tile_prediction`` prices candidates the solver has not chosen, so a
+      rejection is ordinary pruning, not an error. It reads the ``reason``
+      directly and drops the candidate.
+
+    ``TileAxis.host_dim`` is positional within one of two per-op frames, selected
+    by ``is_reduction``: ``op_out_coords(op)`` for an output axis,
+    :func:`reduction_loop_vars` for a reduction axis. The frames are disjoint and
+    each counts from zero, so one ``host_dim`` names different axes under the two
+    flags, and neither counts over the op's input rank. Bounds are therefore
+    checked per frame; ``reduction_ranges`` is *not* the reduction bound, since
+    ``reduction_loop_vars`` is squeezed (a size-1 dim carries no loop var) and can
+    be the shorter list.
+    """
+    out_coords = op_out_coords(op)
+    red_vars: list[sympy.Symbol] | None = None
+    loop_vars: list[sympy.Symbol] = []
+    for axis in tiling.axes:
+        if axis.is_reduction:
+            if not isinstance(op.data, Reduction):
+                return None, (
+                    f"coarse tiling: reduction axis host_dim={axis.host_dim} "
+                    f"requested on non-Reduction op {op.get_name()}."
+                )
+            if red_vars is None:
+                try:
+                    red_vars = reduction_loop_vars(op)
+                except StopIteration:
+                    return None, (
+                        f"coarse tiling: {op.get_name()} has no write dep or no "
+                        "indexed read dep to derive reduction loop variables from."
+                    )
+            if axis.host_dim >= len(red_vars):
+                return None, (
+                    f"coarse tiling: reduction host_dim={axis.host_dim} is out "
+                    f"of bounds for {len(red_vars)} reduction loop variables on "
+                    f"{op.get_name()}."
+                )
+            loop_vars.append(red_vars[axis.host_dim])
+        else:
+            if axis.host_dim >= len(out_coords):
+                return None, (
+                    f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
+                    f"for {len(out_coords)} output coordinates on "
+                    f"{op.get_name()}."
+                )
+            coord = out_coords[axis.host_dim]
+            free_symbols = coord.free_symbols
+            if len(free_symbols) != 1:
+                return None, (
+                    f"coarse tiling: host_dim={axis.host_dim} output coordinate "
+                    f"{coord} on {op.get_name()} has {len(free_symbols)} free "
+                    "symbols; expected exactly one loop var."
+                )
+            loop_vars.append(next(iter(free_symbols)))
+    return loop_vars, None
+
+
+def resolve_tile_axis_loop_vars(
+    op: ComputedBuffer, tiling: TileSpec
+) -> list[sympy.Symbol]:
+    """One loop variable per :class:`TileSpec` axis, or raise ``Unsupported``.
+
+    The raising face of :func:`try_resolve_tile_axis_loop_vars`, for the
+    lowering path: by the time ``tile_spec_to_dim_hints`` runs, the spec has
+    been chosen, so a spec that cannot resolve is a compilation failure rather
+    than a candidate to drop.
+    """
+    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, tiling)
+    if reason is not None:
+        raise Unsupported(reason)
+    assert loop_vars is not None
+    return loop_vars
 
 
 def _loop_var_to_reduction_ranges_pos(
@@ -2093,12 +2182,21 @@ def _divide_ranges(
     _clear_cache(op, _COMPUTED_BUF_SIZES_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
+    # The write dep's ``ranges`` are derived from ``data.ranges``, so the
+    # ``op_read_writes`` memo is stale the moment the line above runs.  Drop it
+    # unconditionally, not just on the paths below that go on to *observe* the
+    # new iteration space: a caller that needs no symbol remap still leaves the
+    # op behind for everyone else, and ``iteration_space_from_op`` would then
+    # report the untiled extents against tiled ``data.ranges``.  That
+    # disagreement is unreachable when coarse tiling runs pre-stickification
+    # (nothing has populated the memo yet), but the solver-driven path applies
+    # tilings *during* scratchpad planning, after the first solve has memoized
+    # every op -- where it surfaced as
+    # ``coarse_tile_local_dim_split_domains``'s extent assertion.
+    invalidate_op_read_writes(op)
+
     symbol_remap = None
     if before_symbols is not None or fused_before_symbols is not None:
-        # Both capture paths call the memoized iteration-space helper before
-        # ranges are rewritten.  Always invalidate it before observing the new
-        # iteration space, including the fused-dimension fallback.
-        invalidate_op_read_writes(op)
         if before_symbols is not None:
             symbol_remap = _order_preserving_symbol_remap(
                 op, before_symbols, _capture_logical_iteration_symbols(op)
@@ -2201,10 +2299,13 @@ def _divide_reduction_ranges(
             reduction_ranges[i] = sympy.sympify(r) / sympy.sympify(loop_count)
     # Reduction is a frozen dataclass; use object.__setattr__ to mutate it.
     object.__setattr__(data, "reduction_ranges", reduction_ranges)
+    # Unconditional for the same reason as in ``_divide_ranges``: a Reduction's
+    # iteration space takes its reduction extents from the read deps, so the
+    # memo is stale here whether or not this call needs a symbol remap.
+    invalidate_op_read_writes(op)
     if before_symbols is None and fused_before_symbols is None:
         return None
 
-    invalidate_op_read_writes(op)
     if before_symbols is not None:
         return _order_preserving_symbol_remap(
             op, before_symbols, _capture_logical_iteration_symbols(op)
@@ -2742,51 +2843,6 @@ def _validate_planned_reduction_tiling(
                 f"reduction dims {red_dims} (tiling more than one reduction "
                 "dim per level is not yet implemented)."
             )
-
-
-class BoundaryRole(Enum):
-    """How a tiled op's own output buffer must be materialized.
-
-    This is the single source of truth for the classification that
-    :func:`_propagate_tiled_op` applies and that the stage-4 predictor
-    (``wsr.tile_prediction``) reads to price a candidate without applying it.
-    Extracting it keeps one copy of the rule (M6).
-    """
-
-    UNTILED = 0  # not tiled, or loop-invariant: nothing is materialized
-    LOOP_INTERNAL = 1  # per-tile scratch, reused in place -> LX-eligible
-    BOUNDARY = 2  # drained across a loop boundary: full_buf + a write copy
-    REDUCTION = 3  # reduction-tiled: accumulator + identity fill + combine op
-
-
-def decide_boundary_role(
-    op: ComputedBuffer,
-    operations: list[Operation],
-) -> BoundaryRole:
-    """Classify a tiled op's output-buffer role -- a pure predicate, no mutation.
-
-    Mirrors :func:`_propagate_tiled_op`'s branch structure exactly: the reduction
-    path (``_propagate_tiled_reduction_op``, which sets ``output_tiled_dims=[]``
-    unconditionally and materializes an accumulator/fill/combine) is
-    ``REDUCTION``; an untiled or loop-invariant op is ``UNTILED``; a tiled op
-    with no outside consumer and no graph output is ``LOOP_INTERNAL`` (per-tile
-    scratch); anything drained across a loop-group boundary is ``BOUNDARY``.
-    """
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None:
-        return BoundaryRole.UNTILED
-    if isinstance(op.data, Reduction) and any(
-        dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
-    ):
-        return BoundaryRole.REDUCTION
-    if all(not dims for dims in loop_info.loop_tiled_dims):
-        return BoundaryRole.UNTILED
-    outside_consumers, is_graph_output = _find_outside_consumers(
-        op.get_name(), loop_info.loop_group_id, operations
-    )
-    if not outside_consumers and not is_graph_output:
-        return BoundaryRole.LOOP_INTERNAL
-    return BoundaryRole.BOUNDARY
 
 
 def _insert_all_write_copy_ops(operations: list[Operation]) -> None:
@@ -3662,21 +3718,19 @@ def _rescale_index(
     index: Expr,
     full_strides: list[Expr],
     tile_strides: list[Expr],
-    strict: bool = True,
     strip_constant: bool = False,
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
 
-    ``strict`` (default) requires every non-constant term to match a
-    ``full_strides`` entry -- correct for a *write* index, whose every term is
-    one of the output layout's own strides. A *read* index is rescaled against
-    the output strides too, but an input whose layout differs from the output
-    (a matmul operand, a broadcast/transpose) carries terms in its own stride
-    basis that no output stride matches; those are unaffected by an output-dim
-    tiling and must pass through unchanged, so predicted read indices call this
-    with ``strict=False``. (The real coarse_tile rescales a consumer read
-    against the dep's *own* coefficients -- see ``_patch_retiled_load_indexes``;
-    lenient pass-through is the prediction-time analogue.)
+    Every non-constant term must match a ``full_strides`` entry, which holds for
+    a *write* index -- its every term is one of the output layout's own strides.
+    A read index is not rescalable this way and is never passed here: terms are
+    paired to strides *by value*, so an input stride that merely coincides with
+    some other output dim's stride would be silently rescaled by that dim's tile
+    stride. ``tile_prediction`` therefore carries a predicted read index through
+    unchanged (coarse tiling resizes the op's own output buffer, never the
+    buffers it reads); the applier rescales a consumer read against the dep's
+    *own* coefficients in ``_patch_retiled_load_indexes``.
 
     `index` is affine in some set of loop variables, with one additive term
     per dimension whose coefficient equals the matching entry in
@@ -3775,14 +3829,10 @@ def _rescale_index(
                 del remaining[i]
                 break
         else:
-            if strict:
-                raise RuntimeError(
-                    f"_rescale_index: no matching full_stride for term {term} "
-                    f"in index {index}; full_strides={full_strides}"
-                )
-            # Lenient (read-index) mode: a term in the input's own stride basis
-            # is unaffected by an output-dim tiling -- keep it as is.
-            new_index += term
+            raise RuntimeError(
+                f"_rescale_index: no matching full_stride for term {term} "
+                f"in index {index}; full_strides={full_strides}"
+            )
     return new_index
 
 
