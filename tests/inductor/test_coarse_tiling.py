@@ -8303,17 +8303,62 @@ class TestValidateTiling(unittest.TestCase):
         spec = TileSpec((TileAxis(1, 2, is_reduction=True),))  # only 1 red var
         self.assertIsNone(predict_frame(op, spec))
 
-    def test_squeezed_reduction_dim_rejected(self):
-        """A size-1 reduction dim consumes no loop symbol.
+    def test_reduction_host_dim_is_an_unsqueezed_ranges_position(self):
+        """``host_dim`` indexes ``reduction_ranges``, not the squeezed loop vars.
 
-        ``reduction_loop_vars`` is the squeezed frame, so it is *shorter* than
-        ``reduction_ranges``: host_dim 1 names the extent-16 dim in
-        ``reduction_ranges`` but is out of bounds in the frame ``host_dim``
-        actually indexes.
+        A size-1 reduction dim still occupies a position even though
+        ``index_vars_squeeze`` mints it no loop symbol, so
+        ``reduction_loop_vars`` is the *shorter* list and the two frames do not
+        line up. host_dim 1 here names the extent-16 dim -- which is what
+        ``enumerate_tilings`` means by it (``range(len(reduction_ranges))``,
+        split drawn from ``reduction_ranges[red_pos]``) and what
+        ``predict_frame`` divides. Resolving it through the squeezed list
+        instead named a different dim entirely.
         """
         op = self._reduction_op([8], [1, 16], [8, 1, 16], [16, 16, 1], "val_red_sq")
         spec = TileSpec((TileAxis(1, 2, is_reduction=True),))
+        frame = predict_frame(op, spec)
+        self.assertIsNotNone(frame)
+        self.assertEqual([int(r) for r in frame.reduction_ranges], [1, 8])
+
+    def test_size_one_reduction_dim_rejected(self):
+        """A size-1 dim carries no loop variable, so it cannot be tiled.
+
+        In bounds for ``reduction_ranges`` but unresolvable, which is the one
+        rejection the unsqueezed frame adds. ``enumerate_tilings`` never
+        proposes it (a unit extent has no split above 1), so this guards against
+        another producer inventing one.
+        """
+        op = self._reduction_op([8], [1, 16], [8, 1, 16], [16, 16, 1], "val_red_unit")
+        spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
         self.assertIsNone(predict_frame(op, spec))
+
+    def test_unit_dim_does_not_shift_the_tiled_reduction_dim(self):
+        """The regression: divide the dim ``host_dim`` names, not another one.
+
+        With ``reduction_ranges=[1, 8, 16]`` the squeezed loop vars are
+        ``[d_8, d_16]``, so reading them positionally made host_dim 1 resolve to
+        the extent-16 symbol while ``_try_div_extents`` divided
+        ``reduction_ranges[1]`` -- the extent-8 dim. The frame then reported one
+        dim tiled in ``reduction_ranges`` and a different one in ``iter_space``.
+        Reachable from plain ``x.sum(dim=(1, 2, 3, 4))`` on ``[4, 1, 8, 16, 32]``.
+        """
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            reduction_loop_var_by_ranges_pos,
+        )
+
+        op = self._reduction_op(
+            [8], [1, 8, 16], [8, 1, 8, 16], [128, 128, 16, 1], "val_red_shift"
+        )
+        by_pos = reduction_loop_var_by_ranges_pos(op)
+        self.assertIsNone(by_pos[0])  # the size-1 dim carries no symbol
+        frame = predict_frame(op, TileSpec((TileAxis(1, 2, is_reduction=True),)))
+        self.assertIsNotNone(frame)
+        # position 1 (extent 8) halved; the extent-16 dim untouched ...
+        self.assertEqual([int(r) for r in frame.reduction_ranges], [1, 4, 16])
+        # ... and iter_space agrees about *which* dim moved.
+        self.assertEqual(int(frame.iter_space[by_pos[1]]), 4)
+        self.assertEqual(int(frame.iter_space[by_pos[2]]), 16)
 
     def test_output_host_dim_out_of_bounds_rejected(self):
         op = _ftl_pointwise((512, 256), name="val_out_oob")
