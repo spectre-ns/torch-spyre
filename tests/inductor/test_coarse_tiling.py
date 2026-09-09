@@ -8025,6 +8025,10 @@ class TestPredictFrame(unittest.TestCase):
         pred_ranges = [int(r) for r in frame.ranges]
         pred_devsize = list(frame.layout.device_layout.device_size)
         pred_stride = [int(s) for s in frame.layout.stride]
+        # stride_map too: it is the half of the device layout that carries the
+        # ``-1`` singleton sentinel, and two frames can agree on device_size
+        # while disagreeing on which dims are steppable.
+        pred_stridemap = list(frame.layout.device_layout.stride_map)
 
         # mutate the IR and check that the mutation matches the predicted values
         op.dim_hints = tile_spec_to_dim_hints(op, tiling, list(range(len(tiling.axes))))
@@ -8033,6 +8037,7 @@ class TestPredictFrame(unittest.TestCase):
         self.assertEqual(pred_ranges, [int(r) for r in op.data.ranges])
         self.assertEqual(pred_devsize, list(op.layout.device_layout.device_size))
         self.assertEqual(pred_stride, [int(s) for s in op.layout.stride])
+        self.assertEqual(pred_stridemap, list(op.layout.device_layout.stride_map))
 
     def test_single_output_axis(self):
         self._apply_and_compare(
@@ -8096,6 +8101,30 @@ class TestPredictFrame(unittest.TestCase):
         """
         self._apply_and_compare(
             (512, 256, 128), TileSpec((TileAxis(1, 256),)), [(0, Integer(256))]
+        )
+
+    def test_unit_extent_level_followed_by_another_level(self):
+        """A dim tiled to extent 1 by a *non-final* level.
+
+        The single-level cases above pass under a one-shot full->tile resize;
+        this one does not, which is why ``_predict_output_layout`` resizes once
+        per level. ``_resize_device_layout`` matches size-1 device dims to a
+        size-1 host dim by size alone (ir.py:236) -- no stride tiebreak, no
+        one-to-one constraint -- so once level 1 puts host dim 0 at extent 1,
+        level 2 re-matches the one-stick tile-count dim onto it and collapses
+        its stride to the ``-1`` sentinel.  A single resize never sees that
+        intermediate state and leaves the real stride there, predicting
+        stride_map [64, 64, -1, 1] against an applied [64, -1, -1, 1].
+
+        Needs all three: a dim tiled to extent 1, at a non-final level, with a
+        stick host dim of exactly one stick (64 elems at fp16) so a second
+        size-1 device dim exists to be mis-matched.  Drop any one and a
+        one-shot resize agrees.
+        """
+        self._apply_and_compare(
+            (2, 512, 64),
+            TileSpec((TileAxis(0, 2), TileAxis(1, 2))),
+            [(0, Integer(2)), (1, Integer(2))],
         )
 
 

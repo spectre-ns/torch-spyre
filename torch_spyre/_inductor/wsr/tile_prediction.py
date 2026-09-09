@@ -130,36 +130,54 @@ def _output_and_reduction_counts(tiling: TileSpec):
     return output_counts, reduction_counts
 
 
-def _predict_output_layout(op: ComputedBuffer, tiled_ranges: list) -> FixedTiledLayout:
+def _predict_output_layout(op: ComputedBuffer, tiling: TileSpec) -> FixedTiledLayout:
     """The per-tile output ``FixedTiledLayout``, built exactly as
-    ``_divide_ranges`` builds it: host strides from ``compute_tile_stride`` over
-    the committed size/stride, and ``_resize_device_layout`` from the
-    *authoritative* stick host dim (recovered by coordinate identity, so
-    transposed same-size dims resolve).
+    ``_divide_ranges`` builds it.
 
-    Host strides must come from ``compute_tile_stride``, not from
+    One resize **per tile level**, in ``TileSpec.axes`` order, chaining size,
+    stride and device layout -- mirroring ``_divide_ranges``, which runs once
+    per level and feeds each result to the next (coarse_tile.py:2211-2220).
+    The composition is not associative, so a single full->tile resize is not
+    equivalent: ``_resize_device_layout`` matches size-1 device dims to a size-1
+    host dim by size alone (ir.py:236, no stride tiebreak and no one-to-one
+    constraint), so once an earlier level drives a host dim to extent 1, a
+    later resize can re-match a one-stick tile-count dim onto it and collapse
+    its stride to the ``-1`` singleton sentinel. A single resize never sees
+    that intermediate state and leaves the real stride in place. Measured: 4
+    of 104 multi-level combinations diverge, all of that shape.
+
+    Host strides come from ``compute_tile_stride``, not from
     ``contiguous_strides(new_size)``: the latter agrees only when the committed
     layout is contiguous, and silently reorders a transposed or channels-last
     layout (e.g. size [4, 128, 128] stride [128, 1, 16384] tiled to
     [4, 64, 128] yields [64, 1, 8192] applied vs [8192, 128, 1] contiguous).
     ``predict_frame`` feeds these straight to ``_rescale_index`` as the tile
     strides, so a reordered stride mismatches the applied per-core view.
+
+    ``_stick_host_dim`` is re-resolved per level against the running device
+    layout, as the applier does -- it recovers the *authoritative* stick host
+    dim by coordinate identity, so transposed same-size dims resolve.
     """
-    new_size = [int(r) for r in tiled_ranges]
-    new_stride = list(
-        compute_tile_stride(list(op.layout.size), list(op.layout.stride), new_size)
-    )
-    dev = op.layout.device_layout
-    stick_hd = _stick_host_dim(op, dev)
-    new_dev = _resize_device_layout(
-        dev,
-        [int(s) for s in op.layout.size],
-        new_size,
-        stick_host_dim=stick_hd,
-    )
-    return FixedTiledLayout(
-        op.layout.device, op.layout.dtype, new_size, new_stride, new_dev
-    )
+    layout = op.layout
+    cur_size = [int(s) for s in layout.size]
+    cur_stride = [int(s) for s in layout.stride]
+    cur_dev = layout.device_layout
+    for axis in tiling.axes:
+        if axis.is_reduction:
+            continue
+        new_size = list(cur_size)
+        new_size[axis.host_dim] = int(_exact_div(cur_size[axis.host_dim], axis.count))
+        cur_stride = [
+            int(s) for s in compute_tile_stride(cur_size, cur_stride, new_size)
+        ]
+        cur_dev = _resize_device_layout(
+            cur_dev,
+            cur_size,
+            new_size,
+            stick_host_dim=_stick_host_dim(op, cur_dev),
+        )
+        cur_size = new_size
+    return FixedTiledLayout(layout.device, layout.dtype, cur_size, cur_stride, cur_dev)
 
 
 def _predict_iter_space(
@@ -301,7 +319,7 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame:
         reduction_ranges[d] = _exact_div(reduction_ranges[d], c)
 
     if output_counts:
-        layout = _predict_output_layout(op, ranges)
+        layout = _predict_output_layout(op, tiling)
     else:
         layout = op.layout
 
