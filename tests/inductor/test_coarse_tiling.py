@@ -88,6 +88,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _retile_load_index,
     _should_patch_retiled_load_indexes,
     _squeezed_retile_dims,
+    _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
     coarse_tile_pre_stickify,
     plan_coarse_tile_groups,
@@ -8132,6 +8133,138 @@ class TestPredictFrame(unittest.TestCase):
         )
 
 
+class TestPredictFrameReduction(unittest.TestCase):
+    """``predict_frame`` == what the applier does, for *reduction* axes.
+
+    ``TestPredictFrame`` covers only output axes, so until this class every
+    reduction assertion in the predictor suite compared the predictor against
+    itself and none against the applier. That is the gap the ``host_dim``
+    frame mismatch went through: prediction resolved a reduction ``host_dim``
+    against the squeezed ``reduction_loop_vars`` while dividing the unsqueezed
+    ``reduction_ranges``, and no test paired the two.
+
+    Applies via ``plan_coarse_tile_groups`` + ``_apply_plan`` rather than
+    ``coarse_tile_post_stickify``: the full entry point also runs
+    ``_insert_all_reduction_ops``, whose accumulator construction lowers a real
+    ``spyre.empty`` FX node that this harness cannot provide (see
+    ``TestApplyPlanTiledDims``' docstring). That is the right scope anyway --
+    ``predict_frame`` predicts the *frame*, and deliberately does not predict
+    the accumulator/fill/combine buffers.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    @staticmethod
+    def _op(ranges, reduction_ranges, shape, stride, name, hints):
+        return _make_real_reduction_op(
+            ranges=[Integer(r) for r in ranges],
+            reduction_ranges=[Integer(r) for r in reduction_ranges],
+            input_shape_stride=(shape, stride),
+            name=name,
+            hints=hints,
+        )
+
+    def _apply_and_compare(self, op, tiling, hint_id=1):
+        """Predict, apply, and require the two to agree on the whole frame.
+
+        The hints are lowered from ``tiling`` through ``tile_spec_to_dim_hints``
+        rather than taken from ``_make_real_reduction_op``'s ``hints``
+        parameter. That parameter mints ``d{len(ranges) + red_pos}``, which
+        assumes the reduction symbols are numbered densely over
+        ``reduction_ranges`` -- false as soon as a size-1 reduction dim is
+        squeezed away, and the hint then names a symbol the op does not carry,
+        so the applier silently tiles nothing. Going through the real lowering
+        is both faithful (it is what ``CoarseTilingPass`` does) and immune to
+        that, and it mirrors ``TestPredictFrame._apply_and_compare``.
+        """
+        ranges_before = list(op.data.ranges)
+        red_before = list(op.data.reduction_ranges)
+        frame = predict_frame(op, tiling)
+        self.assertIsNotNone(frame)
+        # prediction mutates nothing
+        self.assertEqual(list(op.data.ranges), ranges_before)
+        self.assertEqual(list(op.data.reduction_ranges), red_before)
+
+        pred_ranges = [int(r) for r in frame.ranges]
+        pred_red = [int(r) for r in frame.reduction_ranges]
+
+        op.dim_hints = tile_spec_to_dim_hints(op, tiling, [hint_id])
+        levels = [(hint_id, Integer(tiling.axes[0].count))]
+        plan = plan_coarse_tile_groups([op], [([op], levels)])
+        _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+
+        # the applier must actually have tiled something
+        self.assertNotEqual(
+            [int(r) for r in op.data.reduction_ranges],
+            [int(r) for r in red_before],
+            "the applier left reduction_ranges untouched -- the hint did not "
+            "resolve onto a reduction dim, so this compares nothing",
+        )
+        self.assertEqual(pred_red, [int(r) for r in op.data.reduction_ranges])
+        self.assertEqual(pred_ranges, [int(r) for r in op.data.ranges])
+        return frame
+
+    def test_reduction_axis_matches_the_applied_reduction_ranges(self):
+        # out[d0] = sum_{d1} in[d0, d1]; tile the reduction dim by 4.
+        op = self._op([8], [16], [8, 16], [16, 1], "pfr_basic", ((1, 1),))
+        self._apply_and_compare(op, TileSpec((TileAxis(0, 4, is_reduction=True),)))
+
+    def test_reduction_axis_leaves_output_ranges_alone(self):
+        """A reduction axis shrinks ``reduction_ranges`` only -- the op's own
+        output buffer is the accumulator and keeps its full output extent."""
+        op = self._op([8], [16], [8, 16], [16, 1], "pfr_outonly", ((1, 1),))
+        frame = self._apply_and_compare(
+            op, TileSpec((TileAxis(0, 2, is_reduction=True),))
+        )
+        self.assertEqual([int(r) for r in frame.ranges], [8])
+        self.assertEqual([int(r) for r in frame.reduction_ranges], [8])
+
+    def test_unit_reduction_dim_does_not_shift_which_dim_is_applied(self):
+        """The regression, checked against the applier rather than the predictor.
+
+        ``reduction_ranges=[1, 16]`` squeezes to a single loop var, so a
+        ``host_dim`` read positionally off ``reduction_loop_vars`` named the
+        wrong dim. Here the applier must divide the same position prediction
+        did -- position 1, the extent-16 dim.
+        """
+        op = self._op(
+            [8], [1, 16], [8, 1, 16], [16, 16, 1], "pfr_unit", ((1, 2),)
+        )
+        frame = self._apply_and_compare(
+            op, TileSpec((TileAxis(1, 4, is_reduction=True),))
+        )
+        self.assertEqual([int(r) for r in frame.reduction_ranges], [1, 4])
+
+    def test_applier_maps_the_lowered_hint_back_to_the_same_position(self):
+        """Closes the enumerator -> resolver -> applier loop.
+
+        ``enumerate_tilings`` mints ``host_dim`` as a ``reduction_ranges``
+        position; ``tile_spec_to_dim_hints`` lowers it to a loop var; the
+        applier maps that loop var back with
+        ``_loop_var_to_reduction_ranges_pos`` to decide which
+        ``reduction_ranges`` entry to divide. The round trip must be the
+        identity, and it was not when a size-1 dim preceded the tiled one.
+        """
+        op = self._op(
+            [8], [1, 8, 16], [8, 1, 8, 16], [128, 128, 16, 1], "pfr_roundtrip",
+            ((1, 2),),
+        )
+        for host_dim in (1, 2):
+            with self.subTest(host_dim=host_dim):
+                spec = TileSpec((TileAxis(host_dim, 2, is_reduction=True),))
+                hints = tile_spec_to_dim_hints(op, spec, [1])
+                self.assertEqual(
+                    _loop_var_to_reduction_ranges_pos(op, hints[0].loop_var),
+                    host_dim,
+                )
+
+
 class TestPredictIterSpaceNamespace(unittest.TestCase):
     """``_predict_iter_space`` reports the *pre-tiling* symbol namespace.
 
@@ -8304,17 +8437,62 @@ class TestValidateTiling(unittest.TestCase):
         spec = TileSpec((TileAxis(1, 2, is_reduction=True),))  # only 1 red var
         self.assertIsNone(predict_frame(op, spec))
 
-    def test_squeezed_reduction_dim_rejected(self):
-        """A size-1 reduction dim consumes no loop symbol.
+    def test_reduction_host_dim_is_an_unsqueezed_ranges_position(self):
+        """``host_dim`` indexes ``reduction_ranges``, not the squeezed loop vars.
 
-        ``reduction_loop_vars`` is the squeezed frame, so it is *shorter* than
-        ``reduction_ranges``: host_dim 1 names the extent-16 dim in
-        ``reduction_ranges`` but is out of bounds in the frame ``host_dim``
-        actually indexes.
+        A size-1 reduction dim still occupies a position even though
+        ``index_vars_squeeze`` mints it no loop symbol, so
+        ``reduction_loop_vars`` is the *shorter* list and the two frames do not
+        line up. host_dim 1 here names the extent-16 dim -- which is what
+        ``enumerate_tilings`` means by it (``range(len(reduction_ranges))``,
+        split drawn from ``reduction_ranges[red_pos]``) and what
+        ``predict_frame`` divides. Resolving it through the squeezed list
+        instead named a different dim entirely.
         """
         op = self._reduction_op([8], [1, 16], [8, 1, 16], [16, 16, 1], "val_red_sq")
         spec = TileSpec((TileAxis(1, 2, is_reduction=True),))
+        frame = predict_frame(op, spec)
+        self.assertIsNotNone(frame)
+        self.assertEqual([int(r) for r in frame.reduction_ranges], [1, 8])
+
+    def test_size_one_reduction_dim_rejected(self):
+        """A size-1 dim carries no loop variable, so it cannot be tiled.
+
+        In bounds for ``reduction_ranges`` but unresolvable, which is the one
+        rejection the unsqueezed frame adds. ``enumerate_tilings`` never
+        proposes it (a unit extent has no split above 1), so this guards against
+        another producer inventing one.
+        """
+        op = self._reduction_op([8], [1, 16], [8, 1, 16], [16, 16, 1], "val_red_unit")
+        spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
         self.assertIsNone(predict_frame(op, spec))
+
+    def test_unit_dim_does_not_shift_the_tiled_reduction_dim(self):
+        """The regression: divide the dim ``host_dim`` names, not another one.
+
+        With ``reduction_ranges=[1, 8, 16]`` the squeezed loop vars are
+        ``[d_8, d_16]``, so reading them positionally made host_dim 1 resolve to
+        the extent-16 symbol while ``_try_div_extents`` divided
+        ``reduction_ranges[1]`` -- the extent-8 dim. The frame then reported one
+        dim tiled in ``reduction_ranges`` and a different one in ``iter_space``.
+        Reachable from plain ``x.sum(dim=(1, 2, 3, 4))`` on ``[4, 1, 8, 16, 32]``.
+        """
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            reduction_loop_var_by_ranges_pos,
+        )
+
+        op = self._reduction_op(
+            [8], [1, 8, 16], [8, 1, 8, 16], [128, 128, 16, 1], "val_red_shift"
+        )
+        by_pos = reduction_loop_var_by_ranges_pos(op)
+        self.assertIsNone(by_pos[0])  # the size-1 dim carries no symbol
+        frame = predict_frame(op, TileSpec((TileAxis(1, 2, is_reduction=True),)))
+        self.assertIsNotNone(frame)
+        # position 1 (extent 8) halved; the extent-16 dim untouched ...
+        self.assertEqual([int(r) for r in frame.reduction_ranges], [1, 4, 16])
+        # ... and iter_space agrees about *which* dim moved.
+        self.assertEqual(int(frame.iter_space[by_pos[1]]), 4)
+        self.assertEqual(int(frame.iter_space[by_pos[2]]), 16)
 
     def test_output_host_dim_out_of_bounds_rejected(self):
         op = _ftl_pointwise((512, 256), name="val_out_oob")

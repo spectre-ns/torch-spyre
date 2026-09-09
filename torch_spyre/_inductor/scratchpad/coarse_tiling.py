@@ -38,6 +38,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
 from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
@@ -49,6 +50,8 @@ from ..wsr.coarse_tile import (
 )
 from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileAxis, TileSpec
+
+logger = get_inductor_logger("scratchpad.coarse_tiling")
 
 
 def tile_spec_to_dim_hints(
@@ -299,6 +302,17 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
 
     def apply_pass(self, graph: GraphLowering) -> None:
         groups_specs = derive_tiling_groups(graph, self._choices)
+        # The group partition is the whole shape of the plan -- which ops share
+        # one loop nest, and therefore where the boundaries (and their full
+        # buffers and copy ops) fall. Nothing else reports it before the tiling
+        # is already applied.
+        for idx, (group_ops, spec) in enumerate(groups_specs):
+            logger.debug(
+                "tiling group %d: spec=%s ops=[%s]",
+                idx,
+                spec.label,
+                ", ".join(op.get_name() for op in group_ops),
+            )
         if not groups_specs:
             return
         # Snapshot each op's carried pins before the loop below overwrites any

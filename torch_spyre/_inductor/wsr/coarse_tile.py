@@ -1800,18 +1800,20 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
 
 
 def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
-    """Return the op's reduction loop variables, ordered as in
-    ``op.data.reduction_ranges``.
+    """The op's reduction loop variables, in ``op.data.reduction_ranges`` order
+    but **squeezed** -- a size-1 reduction dim carries no loop variable, so this
+    list can be shorter than ``reduction_ranges`` and its indices do not line up
+    with it.
 
     Uses dep-tracking symbols (d0, d1, ...) rather than SymT.R0_INDEX symbols
     (r0_0, r0_1, ...) which are a different namespace.  Finds reduction symbols
     by set-subtracting output index symbols from input index symbols, in
-    dep.ranges order (which matches reduction_ranges order).
+    dep.ranges order (which matches the *relative* order of reduction_ranges).
 
-    This is the single source of truth for that derivation. Both directions go
-    through it: ``_loop_var_to_reduction_ranges_pos`` (loop_var -> position) and
-    :func:`resolve_tile_axis_loop_vars` (its inverse, position -> loop_var, for
-    every ``TileSpec`` axis that names a reduction dim).
+    Callers that hold a ``reduction_ranges`` position -- which is what
+    ``TileAxis.host_dim`` is -- must go through
+    :func:`reduction_loop_var_by_ranges_pos` instead, never index this list
+    directly. See that function for why.
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()
@@ -1819,6 +1821,76 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
     out_syms = out_dep.index.free_symbols
     in_dep = next(d for d in rw.reads if hasattr(d, "index"))
     return [s for s in in_dep.ranges if s not in out_syms]
+
+
+def reduction_loop_var_by_ranges_pos(
+    op: ComputedBuffer,
+) -> list[sympy.Symbol | None] | None:
+    """One entry per ``op.data.reduction_ranges`` position: the loop variable
+    that dim carries, or ``None`` for a size-1 dim that carries none.
+
+    The single authority for the reduction position <-> loop-variable mapping,
+    in the **unsqueezed** frame -- the frame every producer of a reduction
+    ``host_dim`` already counts in. ``enumerate_tilings`` mints
+    ``TileAxis(host_dim=red_pos)`` over ``range(len(reduction_ranges))`` and
+    picks the split from ``reduction_ranges[red_pos]``, and ``predict_frame``
+    divides ``reduction_ranges[host_dim]``; both are positions in this frame.
+
+    Indexing :func:`reduction_loop_vars` with such a position is a silent
+    off-by-N whenever a size-1 reduction dim precedes the tiled one, because
+    Inductor's ``index_vars_squeeze`` drops size-1 dims before minting loop
+    symbols. Concretely, ``x.sum(dim=(1, 2, 3, 4))`` on ``[4, 1, 8, 16, 32]``
+    gives ``reduction_ranges=[1, 8, 16, 32]`` and loop vars ``[d1, d2, d3]``:
+    ``host_dim=1`` means the extent-8 dim to the enumerator but resolves to
+    ``d2`` (extent 16) through the squeezed list, so the frame divides one dim
+    and reports the iteration extent of another.
+
+    The reconstruction is "each non-unit position consumes the next loop
+    variable, in order", verified against real compiles over leading, middle,
+    trailing and repeated unit dims.
+
+    Returns ``None`` -- and logs a warning -- when the two lists cannot
+    correspond, which happens in *both* directions:
+
+    * **Shorter.** A size-1 reduction dim is squeezed away, so
+      ``reduction_loop_vars`` has fewer entries than ``reduction_ranges``. This
+      is the ordinary case, and the ``None`` entries above express it, so it is
+      not itself a non-correspondence.
+    * **Longer.** ``reduction_loop_vars`` is really "input symbols absent from
+      the output *index*", which is not the same set as "reduction dims" when
+      the output is broadcast. A batch matmul whose batch dim is broadcast away
+      (out index ``m*64 + n`` over ranges ``(b, m, n)``) leaks ``b`` in
+      alongside ``k``, giving two loop variables for one reduction range. There
+      is no position to map either onto, so the answer is no mapping rather than
+      a guess -- resolving ``host_dim=0`` to ``b`` there would tile the batch
+      dim believing it to be the reduction dim.
+
+    Reported rather than asserted, for the two reasons this module's callers
+    already settled: ``wsr.tile_prediction`` contracts to report an unusable
+    candidate by value and never by raising, and an ``assert`` is dead under
+    ``python -O``, which is what made ``reduction_loop_vars``'s own
+    ``isinstance`` guard vacuous before it became a returned reason. A ``None``
+    here disables reduction tiling for the op instead of tiling the wrong dim.
+    """
+    ranges = list(getattr(op.data, "reduction_ranges", []))
+    loop_vars = reduction_loop_vars(op)
+    non_unit = [i for i, extent in enumerate(ranges) if str(extent) != "1"]
+    if len(non_unit) != len(loop_vars):
+        logger.warning(
+            "%s: %d reduction loop variables for %d non-unit dims in "
+            "reduction_ranges=%s; the squeeze is no longer 'drop extent-1 "
+            "dims', so the position -> loop-variable mapping is unavailable "
+            "and reduction tiling is disabled for this op.",
+            op.get_name(),
+            len(loop_vars),
+            len(non_unit),
+            ranges,
+        )
+        return None
+    by_pos: list[sympy.Symbol | None] = [None] * len(ranges)
+    for pos, sym in zip(non_unit, loop_vars):
+        by_pos[pos] = sym
+    return by_pos
 
 
 def try_resolve_tile_axis_loop_vars(
@@ -1842,15 +1914,26 @@ def try_resolve_tile_axis_loop_vars(
 
     ``TileAxis.host_dim`` is positional within one of two per-op frames, selected
     by ``is_reduction``: ``op_out_coords(op)`` for an output axis,
-    :func:`reduction_loop_vars` for a reduction axis. The frames are disjoint and
-    each counts from zero, so one ``host_dim`` names different axes under the two
-    flags, and neither counts over the op's input rank. Bounds are therefore
-    checked per frame; ``reduction_ranges`` is *not* the reduction bound, since
-    ``reduction_loop_vars`` is squeezed (a size-1 dim carries no loop var) and can
-    be the shorter list.
+    ``op.data.reduction_ranges`` for a reduction axis. The frames are disjoint
+    and each counts from zero, so one ``host_dim`` names different axes under
+    the two flags, and neither counts over the op's input rank. Bounds are
+    therefore checked per frame.
+
+    Both reduction frames are *unsqueezed* ``reduction_ranges`` positions, which
+    is what ``enumerate_tilings`` emits and what ``predict_frame`` divides. The
+    position -> loop-variable step goes through
+    :func:`reduction_loop_var_by_ranges_pos`, never through
+    :func:`reduction_loop_vars` directly: the latter is squeezed, so indexing it
+    with a ``reduction_ranges`` position silently names a different dim whenever
+    a size-1 dim precedes the tiled one.
+
+    A size-1 reduction dim carries no loop variable and so cannot be tiled; it
+    is rejected here rather than resolved. ``enumerate_tilings`` never proposes
+    one (a unit extent has no split count above 1), so this rejects only a spec
+    some other producer invented.
     """
     out_coords = op_out_coords(op)
-    red_vars: list[sympy.Symbol] | None = None
+    red_vars: list[sympy.Symbol | None] | None = None
     loop_vars: list[sympy.Symbol] = []
     for axis in tiling.axes:
         if axis.is_reduction:
@@ -1861,19 +1944,32 @@ def try_resolve_tile_axis_loop_vars(
                 )
             if red_vars is None:
                 try:
-                    red_vars = reduction_loop_vars(op)
+                    red_vars = reduction_loop_var_by_ranges_pos(op)
                 except StopIteration:
                     return None, (
                         f"coarse tiling: {op.get_name()} has no write dep or no "
                         "indexed read dep to derive reduction loop variables from."
                     )
+                if red_vars is None:
+                    return None, (
+                        f"coarse tiling: {op.get_name()}'s reduction loop "
+                        "variables no longer correspond to its reduction_ranges "
+                        "positions, so a reduction host_dim cannot be resolved."
+                    )
             if axis.host_dim >= len(red_vars):
                 return None, (
                     f"coarse tiling: reduction host_dim={axis.host_dim} is out "
-                    f"of bounds for {len(red_vars)} reduction loop variables on "
+                    f"of bounds for {len(red_vars)} reduction dims on "
                     f"{op.get_name()}."
                 )
-            loop_vars.append(red_vars[axis.host_dim])
+            red_var = red_vars[axis.host_dim]
+            if red_var is None:
+                return None, (
+                    f"coarse tiling: reduction host_dim={axis.host_dim} on "
+                    f"{op.get_name()} is a size-1 dim, which carries no loop "
+                    "variable and cannot be tiled."
+                )
+            loop_vars.append(red_var)
         else:
             if axis.host_dim >= len(out_coords):
                 return None, (
@@ -1913,9 +2009,21 @@ def resolve_tile_axis_loop_vars(
 def _loop_var_to_reduction_ranges_pos(
     op: ComputedBuffer, sym: sympy.Symbol
 ) -> int | None:
-    """Return position of loop variable sym in op.data.reduction_ranges, or None."""
+    """Position of loop variable ``sym`` in ``op.data.reduction_ranges``, or
+    ``None`` if it names no reduction dim of ``op``.
+
+    The inverse of :func:`reduction_loop_var_by_ranges_pos`, and it must resolve
+    through that function rather than through the squeezed
+    :func:`reduction_loop_vars`: callers feed the result straight back into
+    ``reduction_ranges`` (``loop_info.loop_tiled_reduction_dims`` ->
+    ``_divide_reduction_ranges``), so a squeezed index divides the wrong dim
+    whenever a size-1 reduction dim precedes the tiled one.
+    """
+    by_pos = reduction_loop_var_by_ranges_pos(op)
+    if by_pos is None:
+        return None
     try:
-        return reduction_loop_vars(op).index(sym)
+        return by_pos.index(sym)
     except ValueError:
         return None
 

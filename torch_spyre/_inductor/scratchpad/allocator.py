@@ -2032,6 +2032,30 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # kernel: bundle membership decides input dedup, the arity derate and the
         # underfill derate, so a graph that fuses into several kernels is
         # mispriced when scored flat.
+        if config.unified_tiling:
+            # The cost model is flat in both axes the tiling search moves along:
+            # it has no term for tile size and none for cut count, so every
+            # candidate tiling scores identically and the choice falls to
+            # whichever optimum the multi-worker portfolio reaches first (the
+            # same graph drew 1, 2, 3 or 4 cuts run to run at one identical
+            # objective value). Worse, it is not merely uninformative there --
+            # #3810 makes it raise on symbolic args once an op is output-tiled,
+            # so the re-plan silently loses the runtime term anyway, and it
+            # prices residency the scheduler later revokes. Hand the solver no
+            # cost expression at all and let its lexicographic ladder rank
+            # residency, cuts, parallelism and division shape instead. Off this
+            # path the expression is unchanged and still the objective.
+            logger.debug(
+                "cost objective skipped: unified_tiling makes tile size and cut "
+                "count decision axes the cost model cannot score"
+            )
+            cost_expr = None
+            result = solver.plan_layout_and_core_divisions(cost_expr)
+            assert not any(buffer.lx_relayout_plans for buffer in result), (
+                "CoOptimizingAllocator does not support LX relayout"
+            )
+            return result
+
         try:
             cost_expr = sympy.sympify(
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
@@ -2080,6 +2104,47 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        self._log_solver_decisions(graph, allocation)
+
+    def _log_solver_decisions(
+        self, graph: GraphLowering, allocation: Sequence[Any]
+    ) -> None:
+        """Dump what the joint solve actually decided, per buffer.
+
+        The solve's own output is otherwise invisible: the spill log reports
+        residency but not the chosen division or tiling, and nothing reports
+        whether that choice survived ``_commit_divisions`` -- which silently
+        skips any op lacking ``iteration_space_ownership``, i.e. every op
+        synthesised after the work-division pass ran. Pairing this against the
+        emitted ``OpSpec`` work slices is how a decided-but-discarded division
+        shows up.
+        """
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        op_by_name = {op.name: op for op in graph.operations}
+        for buf in allocation:
+            divisions = getattr(buf, "core_divisions", None) or []
+            chosen = getattr(buf, "chosen_division", None)
+            cd = divisions[chosen] if chosen is not None and divisions else None
+            op = op_by_name.get(buf.name)
+            info = getattr(op, "loop_info", None)
+            group = getattr(info, "loop_group_id", None)
+            propagation = getattr(info, "propagation", None)
+            logger.debug(
+                "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
+                "size=%s committed=%s",
+                buf.name,
+                group if group is not None else "-",
+                getattr(propagation, "kind", "-"),
+                getattr(info, "loop_count", "-"),
+                cd.label if cd is not None else "-",
+                cd.tiling.label if cd is not None else "-",
+                buf.address,
+                buf.size,
+                "yes"
+                if getattr(op, "iteration_space_ownership", None) is not None
+                else "NO(skipped)",
+            )
 
     def _materialize_selection(
         self,
@@ -2110,6 +2175,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         against the second solve's plan.
         """
         choices = self._chosen_tilings(graph, allocation)
+        if logger.isEnabledFor(logging.DEBUG):
+            for name, spec in choices.items():
+                logger.debug("chosen_tiling: %s -> %s", name, spec.label)
         if not choices:
             return solver, allocation
 

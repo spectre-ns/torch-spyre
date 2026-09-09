@@ -76,7 +76,7 @@ from ..scratchpad.plan_solver import TileSpec
 from .coarse_tile import (
     _rescale_index,
     _stick_host_dim,
-    reduction_loop_vars,
+    reduction_loop_var_by_ranges_pos,
     try_resolve_tile_axis_loop_vars,
 )
 from .tile import compute_tile_stride
@@ -237,8 +237,9 @@ def _predict_iter_space(
 
     An output axis's loop symbol is the sole free symbol of
     ``op_out_coords(op)[host_dim]``; a reduction axis's is
-    ``reduction_loop_vars(op)[host_dim]`` -- the same resolution
-    ``tile_spec_to_dim_hints`` uses.
+    ``reduction_loop_var_by_ranges_pos(op)[host_dim]`` -- the same resolution
+    ``tile_spec_to_dim_hints`` uses, in the same unsqueezed
+    ``reduction_ranges`` frame this function's caller divides.
 
     Resolves both unguarded: :func:`_rejection_reason` has already established
     that every ``host_dim`` here indexes in range and lands on exactly one loop
@@ -285,9 +286,18 @@ def _predict_iter_space(
         for host_dim, count in output_counts.items()
     ]
     if reduction_counts:
-        red_vars = reduction_loop_vars(op)
+        red_vars = reduction_loop_var_by_ranges_pos(op)
+        # Both established by :func:`_rejection_reason`, which rejects an op
+        # whose reduction positions do not map to loop variables and every
+        # host_dim that resolves to none -- the same precondition the output
+        # branch above relies on. Asserted rather than re-checked so a caller
+        # that skipped the gate fails here instead of silently reading a
+        # different dim.
+        assert red_vars is not None
         syms_and_counts += [
-            (red_vars[host_dim], count) for host_dim, count in reduction_counts.items()
+            (sym, count)
+            for host_dim, count in reduction_counts.items()
+            if (sym := red_vars[host_dim]) is not None
         ]
     for sym, count in syms_and_counts:
         extent = _try_exact_div(iter_space[sym], count)
@@ -367,10 +377,11 @@ def _rejection_reason(op: ComputedBuffer, tiling: TileSpec) -> str | None:
     layout say "tiled" while its ``iter_space`` still says "untiled", priced by
     the solver as though consistent and only refused much later, at apply time.
 
-    ``reduction_ranges`` is checked separately from the reduction loop variables
-    the resolver bounds against: ``reduction_loop_vars`` is squeezed (a size-1
-    dim carries no symbol) and can be the shorter list, so neither bound implies
-    the other.
+    The reduction bound is ``reduction_ranges`` on both sides: ``host_dim`` is
+    an unsqueezed position, and :func:`try_resolve_tile_axis_loop_vars` bounds
+    it against the same list (via ``reduction_loop_var_by_ranges_pos``), so the
+    check here is the resolver's, restated for the extents this module divides
+    rather than a second, differently-framed bound.
 
     Divisibility is deliberately not checked here. It is detected where it is
     computed instead -- ``_try_exact_div`` at each of the four division sites --

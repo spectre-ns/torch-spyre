@@ -607,7 +607,7 @@ class AutomatedCoarseTilingTests(
         """
         return _TilingCase(
             body=functools.partial(torch.softmax, dim=0),
-            args=(torch.rand((512, 1024), dtype=torch.float16, device=DEVICE_NAME),),
+            args=(torch.rand((512, 65536), dtype=torch.float16, device=DEVICE_NAME),),
             named_dims=(["R", "C"],),
             pins=(("C", 4),),  # Reduction axis is not tiled for now
             partial_pins=(("C", 4),),
@@ -631,7 +631,7 @@ class AutomatedCoarseTilingTests(
         magnitude off CPU.  The partial mode pins only S, leaving Dout for the
         compiler to find.
         """
-        seq_len, in_dim, hidden_dim, out_dim = 128, 256, 1024, 256
+        seq_len, in_dim, hidden_dim, out_dim = 4096, 128, 8192, 128
         fc1 = torch.nn.Linear(in_dim, hidden_dim).half()
         fc2 = torch.nn.Linear(hidden_dim, out_dim).half()
 
@@ -675,7 +675,7 @@ class AutomatedCoarseTilingTests(
         still compiles and is wrong by 300x the correctly-tiled error.  The
         partial mode pins only S.
         """
-        seq_len, in_dim, hidden_dim = 128, 256, 1024
+        seq_len, in_dim, hidden_dim = 4096, 128, 8192
         fc_gate = torch.nn.Linear(in_dim, hidden_dim).half()
         fc_up = torch.nn.Linear(in_dim, hidden_dim).half()
 
