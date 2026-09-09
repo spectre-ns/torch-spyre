@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft — reconciled 2026-09-04; **stage 4/5/6 branches rebased onto current `main` 2026-09-08** (§0.2, §0.5) |
+| Status | Draft — reconciled 2026-09-04; branches rebased onto `main` 2026-09-08 (§0.5); **stage 4's re-scope propagated into stage 5/6 on 2026-09-09, which moved work between stages and fixed four defects (§0.6)** |
 | Implements | [`draft-unified-tiling-cpsat.md`](draft-unified-tiling-cpsat.md) (collateral doc 1, Phase 1 of the compiler-optimization roadmap) |
 | Branch | this document: `running-roadmap`; implementation: `upstream/main` (stages 1, 3) + `coarse-tiling-stage4/5/6` (stages 4, 5), now stacked and current with `main` |
 | Scope | 59 numbered requirements (R1.1–R10.6) across `scratchpad`, `wsr`, `padding.py` |
@@ -53,11 +53,12 @@ branch and has not come across.
 
 | Artifact | Blob | Size | Only on |
 |---|---|---|---|
-| `wsr/tile_prediction.py` (stage 4's predictor) | `cb103b71` | 11952 B | `coarse-tiling-stage5`, `stage6` |
+| `wsr/tile_prediction.py` (stage 4's predictor) | `cb103b71` | 11952 B | `coarse-tiling-stage5`, `stage6` — **superseded, see §0.6**: the predictor was rewritten and re-scoped on `stage4` after `stage5` merged it |
 | `wsr/enumerate_tilings.py`, revised | `2d97f8aa` | 11433 B | `stage5`, `stage6` — 418 B beyond what landed |
 | `scratchpad/coarse_tiling.py`, extended (`dim_hints_to_tile_spec`, `_carried_pins`, `_find_carried_pin`) | `a6ada5ea` | 16872 B | `stage6` |
 | `config.unified_tiling`, `config.auto_coarse_tiling` (both default off) | — | — | `stage5`, `stage6` |
 | Allocator solver seam (`_tiling_candidates`, `_chosen_tilings`, `_spec_contains`, `_spec_within_read_distance`, `_drop_read_distance_violations`) | — | — | `stage5`, `stage6` |
+| Tiling-aware view wiring (`_prepare_per_core_view(buf_layout=)`, `_view_for_div`'s tiling-keyed prep cache, `_prep_for_division`) | — | — | `stage5`, `stage6` — **stage 5's, not stage 4's, since §0.6** |
 
 **Those branches were stale; they are not any more.** `stage4`/`stage5`/`stage6`
 all sat on merge-base `fea0c4be` (2026-08-20/21) — 177 commits behind — while
@@ -171,6 +172,152 @@ pass locally now.
 (all nine model × hint-mode combos, `expected_unimplemented` removed), and that
 result is the thing the rebase must be shown not to have broken. Device
 verification, re-signing, and PR re-targeting are the remaining work.
+
+### 0.6 The 2026-09-09 stage-4 propagation — the rebase was not the last step
+
+§0.5 left the stack as three merge commits and called what remained
+"verification, re-signing, and PR re-targeting". That was optimistic in one
+specific way: `stage4` kept moving after `stage5` merged it, and the fifteen
+commits it gained are not a refinement of the same code — they **re-scope the
+stage**. Propagating them into `stage5`/`stage6` is a design change, not a
+replay, and it exposed four defects that had to be fixed before `stage5`
+reached the result §0.5 wanted to verify.
+
+**Stage 4 is now the frame predictor and nothing else.** `predict_frame` is the
+whole public surface. `PredictedBuffer`, `PredictedBufferSet`,
+`predict_buffer_set` and `predict_boundary_role` are deleted, and with them
+`coarse_tile.BoundaryRole` / `decide_boundary_role`. The stated reason is the
+2026-08-25 decision (§0.4): predicting the *buffers* a candidate materializes
+only pays for an objective that prices them, and coarse tiling carries no
+objective term, so that predictor was API with nothing to consume it. Two
+consequences for this document:
+
+- **§4.2's work items are no longer all stage 4's.** `_prepare_per_core_view`'s
+  `buf_layout=` override, `_view_for_div`'s tiling-keyed prep cache and
+  `_prep_for_division` were reverted out of `stage4` ("Removed allocator
+  changes", `92a49c77`) on the grounds that the allocator is stage 5's caller.
+  They are stage-5 deliverables now. Stage 4 is `wsr/tile_prediction.py` plus
+  `coarse_tile.try_resolve_tile_axis_loop_vars` / `resolve_tile_axis_loop_vars`.
+- **Any requirement pinned to `predict_buffer_set` is unpinned.** The
+  traceability matrix must be re-read against the surviving surface before it
+  is used as a gate.
+
+**`predict_frame` reports rejection by value, not by exception.** A candidate
+the predictor cannot handle returns `None` and logs at debug; the lowering path
+keeps the raising contract through `resolve_tile_axis_loop_vars`, and both read
+the same authority, so prediction can never be more permissive than
+application. This is the right contract for a solver menu — an unpredictable
+spec is one to drop, not a compilation failure — and it gives R2.6 a second
+half that the plan does not currently state: not only "the predicted view
+equals the applied view", but **"a candidate with no predictable frame is never
+priced"**. Every consumer boundary now has to say what it does with `None`.
+
+**Merging stage 4 forward deletes stage 5's wiring silently.** Git auto-merges
+the revert, because `stage5` never edited those lines. The result compiles,
+runs, and prices *every tiled candidate on the untiled frame* — no error, just
+the wrong view, which is exactly risk #1 in "Highest risks" ("a wrong view
+grants residency"). Restoring the three pieces on `stage5` is the substance of
+the propagation. `CoOptimizingAllocator._prep_for_candidate` stays deleted: it
+duplicated `_prep_for_division` and had no callers on any branch.
+
+**One resolution is a wrong-code fix, not a merge choice.** `stage5` had
+`predict_frame` rescale the *read* index against the output's full/tile
+strides, and added a `strict=False` mode to `_rescale_index` so the terms that
+matched no output stride would pass through instead of raising. `_rescale_index`
+pairs terms to strides **by value**, so an input stride that merely coincided
+with some other output dim's stride was rescaled by that dim's tile stride —
+silently, on the path that decides residency. Stage 4 removes the rescale and
+pins the un-rescaled index against the *applied* op (`TestPredictReadIndex`).
+Take stage 4's side and delete `strict=`; it has no other caller.
+
+**Four defects surfaced, three of them latent in the rebase itself:**
+
+- **`CoOptimizingAllocator` called `self._solve(solver)`** after #4228 gave
+  `_solve` a `graph` parameter. The co-opt tiling path could not run at all —
+  so the 15/15 pre-rebase device result was not merely *unverified* after the
+  rebase, it was *unreproducible*. mypy had this statically
+  (`Missing positional argument "graph" in call to "_solve"`), on both branches.
+  **A mypy delta against the pre-merge branch is device-free and cheap, and it
+  belongs in the verification step this plan describes.**
+- **The `plan_allocation` override was a verbatim copy of the base template
+  method** with one insertion, and the copy is what missed the new parameter.
+  Folded back into the base as a `_materialize_selection(graph, solver,
+  allocation) -> (solver, allocation)` hook; the subclass now overrides only the
+  apply-and-re-plan step. The base's docstring already called itself a template
+  method with hooks, so this restores its own contract.
+- **`_divide_ranges` / `_divide_reduction_ranges` dropped the `op_read_writes`
+  memo only when they also needed a symbol remap**, leaving a stale write dep
+  for every other caller. Unreachable while coarse tiling ran
+  pre-stickification (nothing had populated the memo yet); reachable the moment
+  the solve applies a tiling *during* scratchpad planning, after the first solve
+  has memoized every op. It surfaced as
+  `coarse_tile_local_dim_split_domains`'s extent assertion — `data.ranges` said
+  32, the iteration space still said 128. **This is independent of the feature
+  and is a candidate standalone upstream fix.** `coarse_tiling_loops.md` already
+  documents the invariant ("dropping torch-spyre's own `op_read_writes` memo
+  first"); the code did not implement it unconditionally.
+- **The cost model raises `TypeError` on symbolic arguments once an op is
+  output-tiled.** `coarse_underfill_eff`'s result is compared with a plain
+  Python `min` / `>=`, and `tile_rows_per_core` becomes symbolic through
+  `out_is_lx`, so sympy raises "cannot determine truth value of Relational"
+  (#3810). This is **not new to stage 5** — it fires on the first solve for any
+  hinted graph under co-opt, and was already worked around on
+  `enable-default-cooptimization` by broadening `_solve`'s `except`. The same
+  workaround is applied here. The cost is real and should be recorded as a
+  dependency of plan stage 5 rather than left implicit: **the placement re-plan
+  of a coarse-tiled graph currently runs with no runtime cost term at all.** The
+  fix is symbol-safe comparisons in `cost_model.py`, not a wider `except`.
+
+**One documented invariant is now false.** `scratchpad_planning`'s `SolveError`
+fallback comment states that "the allocator has not mutated the state of the
+graph", which is what makes the greedy retry safe. A *second*-solve `SolveError`
+now falls back over a graph `CoarseTilingPass` has already tiled. Stage 5's own
+docstring accepts that ("a valid outcome"), but the comment at the fallback
+site contradicts it and should be corrected with the stage.
+
+**An inconsistency to settle in stage 6.** `_drop_read_distance_violations`
+deliberately raises `Unsupported` when no candidate tiling fits, mirroring
+`_search_min_cost_tile_plan`. It is called from `_enumerate_core_divisions`
+*outside* the `try` that converts an `Unsupported` from
+`enumerate_work_division_candidates` into `_legal_fixed_division` — so two
+`Unsupported`s raised two lines apart get opposite treatment, abort vs fall
+back. Whichever is right, the asymmetry should be intentional and stated.
+
+**An open question, not a defect.** `_chosen_tilings` applies the selected
+tiling for *every* buffer in the allocation, spilled included. A tiling on a
+spilled buffer buys no residency but does restructure the loop nest and add
+boundary copies. Group consistency may well require it (a group shares one
+spec), but the plan should say so rather than leave it to fall out.
+
+**One test reconciliation.** `TestTileSpecLoweringOutput` patches
+`op_out_coords` so its fixture ops need no real write dep. Stage 4 moved output-
+coordinate resolution into `wsr.coarse_tile.resolve_tile_axis_loop_vars` and
+repointed the patch there; stage 6's `dim_hints_to_tile_spec` round-trip tests,
+merged into the same class, read `op_out_coords` in
+`scratchpad.coarse_tiling`'s own namespace. Both namespaces are patched now.
+This is the shape of reconciliation to expect wherever the two branches' tests
+share a class — the patch target follows the authority, and stage 4 moved the
+authority.
+
+**What this establishes.** Device-free, on the propagated branches:
+
+| Suite | `stage5` | `stage6` |
+|---|---|---|
+| `test_solver_auto_coarse_tiling.py` | 6 passed, 3 xfailed (partial is stage 6's) | **15 passed** |
+| `test_coarse_tiling.py` + `test_enumerate_tilings.py` + `test_span_overflow_hint_analysis.py` | green | 551 passed, 4 xfailed |
+| `test_scratchpad_solver.py` + `test_work_division.py` | 455 passed, 4 xfailed | green |
+| mypy delta vs the branch's own pre-merge tip | −2 errors, none added | −2 errors, none added |
+
+`stage6`'s 15/15 is the pre-rebase result §0.5 named as the thing to
+re-establish, and it is re-established — but only *after* the four fixes above.
+The claim to retire is §0.5's framing that the rebase left nothing but
+verification: it left `stage5` unable to run its own tiling path at all.
+
+**Still not established.** A full `tests/inductor/` sweep has not completed on
+either branch; the targeted suites above cover every file the propagation
+touched, but `pass_utils._prepare_per_core_view` and `wsr.coarse_tile`'s two
+range dividers are shared with the whole pipeline, so the sweep is still owed.
+Re-signing and PR re-targeting are unchanged from §0.5.
 
 ## Architecture — where the tiling decision lives
 
