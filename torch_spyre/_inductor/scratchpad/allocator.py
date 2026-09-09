@@ -1238,44 +1238,16 @@ def _view_for_div(
     """One candidate division's per-core view of ``buf_name``.
 
     ``prep_cache`` holds the candidate-invariant (sympy-heavy) context, keyed by
-    ``(op name, dep, buf_name, tiling)``: a producer's write-dep and a consumer's
+    ``(op name, dep, buf_name)``: a producer's write-dep and a consumer's
     read-dep on the same buffer can be equal ``MemoryDep``s, so the op name
     keeps their preps distinct while a parent read by several consumers reuses
-    its write-view prep. The tiling is part of the key because a candidate's
-    view is taken on its *tiled* frame -- two candidates differing only in
-    tiling see different divided ranges and a different resized layout, so they
-    must not share a prep. Every ``division.tiling`` is the empty spec unless
-    the solver is choosing tilings, so the key is unchanged in effect otherwise.
+    its write-view prep.
     """
-    key = (op.get_name(), dep, buf_name, division.tiling)
+    key = (op.get_name(), dep, buf_name)
     if key not in prep_cache:
-        prep_cache[key] = _prep_for_division(op, dep, buf_name, division)
+        prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
     return _per_core_view_from_prep(
         prep_cache[key], _division_splits(op, division), division.reduction_splits
-    )
-
-
-def _prep_for_division(
-    op: Operation, dep: MemoryDep, buf_name: str, division: CoreDivision
-):
-    """The ``_prepare_per_core_view`` prep for one candidate division.
-
-    Untiled: the committed layout, exactly as an untiled candidate has always
-    been prepped. Tiled: the *predicted* per-tile frame
-    (``wsr.tile_prediction.predict_frame``) supplies the divided iteration
-    space and rescaled indices, and -- when ``buf_name`` is the op's own output
-    -- the resized layout, since the committed layout is still untiled at solve
-    time. Imported lazily so the solver-facing modules stay free of the
-    predictor.
-    """
-    if division.tiling.is_untiled:
-        return _prepare_per_core_view(op, dep, buf_name)
-    from torch_spyre._inductor.wsr.tile_prediction import predict_frame
-
-    frame = predict_frame(op, division.tiling)
-    override = frame.layout if buf_name == op.get_name() else None
-    return _prepare_per_core_view(
-        op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
     )
 
 
