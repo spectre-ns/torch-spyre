@@ -93,7 +93,10 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     plan_coarse_tile_groups,
     reduction_loop_vars,
 )
-from torch_spyre._inductor.wsr.tile_prediction import predict_frame
+from torch_spyre._inductor.wsr.tile_prediction import (
+    _rejection_reason,
+    predict_frame,
+)
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     CoarseTilingPass,
     _derive_group_idx_offset,
@@ -8257,14 +8260,17 @@ class TestPredictReadIndex(unittest.TestCase):
 
 
 class TestValidateTiling(unittest.TestCase):
-    """``_validate_tiling`` gates ``predict_frame`` on exactly the conditions
-    ``tile_spec_to_dim_hints`` refuses to lower.
+    """``_rejection_reason`` gates ``predict_frame`` on exactly the conditions
+    ``tile_spec_to_dim_hints`` refuses to lower, plus the ones only prediction
+    reaches.
 
     Before this gate the predictors skipped an unresolvable axis silently while
     ``predict_frame`` divided ``ranges`` and the output layout for it anyway --
     yielding a frame whose ranges said "tiled" and whose ``iter_space`` said
     "untiled", priced by the solver as if consistent and only refused later at
-    apply time. Each case below must raise instead of returning that frame.
+    apply time. Each case below must return ``None`` instead of that frame:
+    prediction rejects by value, since a caller enumerating candidates drops an
+    unpredictable one rather than failing the compile.
     """
 
     def setUp(self):
@@ -8290,14 +8296,12 @@ class TestValidateTiling(unittest.TestCase):
         # and the axis skipped -- which also made the guard dead under ``-O``.
         op = _ftl_pointwise((512, 256), name="val_pw_red")
         spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
-        with self.assertRaises(Unsupported):
-            predict_frame(op, spec)
+        self.assertIsNone(predict_frame(op, spec))
 
     def test_reduction_host_dim_out_of_bounds_rejected(self):
         op = self._reduction_op([8], [16], [8, 16], [16, 1], "val_red_oob")
         spec = TileSpec((TileAxis(1, 2, is_reduction=True),))  # only 1 red var
-        with self.assertRaises(Unsupported):
-            predict_frame(op, spec)
+        self.assertIsNone(predict_frame(op, spec))
 
     def test_squeezed_reduction_dim_rejected(self):
         """A size-1 reduction dim consumes no loop symbol.
@@ -8309,14 +8313,12 @@ class TestValidateTiling(unittest.TestCase):
         """
         op = self._reduction_op([8], [1, 16], [8, 1, 16], [16, 16, 1], "val_red_sq")
         spec = TileSpec((TileAxis(1, 2, is_reduction=True),))
-        with self.assertRaises(Unsupported):
-            predict_frame(op, spec)
+        self.assertIsNone(predict_frame(op, spec))
 
     def test_output_host_dim_out_of_bounds_rejected(self):
         op = _ftl_pointwise((512, 256), name="val_out_oob")
         spec = TileSpec((TileAxis(4, 2),))
-        with self.assertRaises(Unsupported):
-            predict_frame(op, spec)
+        self.assertIsNone(predict_frame(op, spec))
 
     def test_multi_symbol_output_coord_rejected(self):
         """A host coordinate that is a compound expression has no single loop
@@ -8327,14 +8329,12 @@ class TestValidateTiling(unittest.TestCase):
             "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
             return_value=[d0 * 4 + d1, d1],
         ):
-            with self.assertRaises(Unsupported):
-                predict_frame(op, TileSpec((TileAxis(0, 2),)))
+            self.assertIsNone(predict_frame(op, TileSpec((TileAxis(0, 2),))))
 
     def test_untiled_spec_accepted(self):
-        from torch_spyre._inductor.wsr.tile_prediction import _validate_tiling
-
         op = _ftl_pointwise((512, 256), name="val_untiled")
-        self.assertIsNone(_validate_tiling(op, TileSpec()))
+        self.assertIsNone(_rejection_reason(op, TileSpec()))
+        self.assertIsNotNone(predict_frame(op, TileSpec()))
 
     def test_accepted_frame_divides_ranges_and_iter_space_together(self):
         """The positive half: on a spec that validates, the two halves of the
@@ -8344,6 +8344,62 @@ class TestValidateTiling(unittest.TestCase):
         self.assertEqual([int(r) for r in frame.ranges], [128, 256])
         d0 = sympy_index_symbol("d0")
         self.assertEqual(int(frame.iter_space[d0]), int(frame.ranges[0]))
+
+    def test_non_tiled_output_layout_rejected(self):
+        """A plain ``FixedLayout`` output carries no ``device_layout``.
+
+        ``_divide_ranges`` skips the device-layout rebuild for one and tiles the
+        op anyway, so this is a case application accepts and prediction must
+        refuse. It used to escape as ``AttributeError: 'FixedLayout' object has
+        no attribute 'device_layout'``, which a caller pruning candidates on a
+        ``None`` return would not survive.
+        """
+        from torch._inductor.ir import FixedLayout
+
+        op = _ftl_pointwise((512, 256), name="val_plain_layout")
+        op.layout = FixedLayout(
+            torch.device("spyre:0"), torch.float16, [512, 256], [256, 1]
+        )
+        self.assertIsNone(predict_frame(op, TileSpec((TileAxis(0, 4),))))
+
+    def test_indivisible_extent_returns_none(self):
+        """Coarse tiling emits equal-sized tiles, so an extent that is not a
+        multiple of its count has no per-tile frame.
+
+        Divisibility is the one rejection ``_rejection_reason`` does not screen
+        -- it is detected at each division site instead, so that the gate need
+        not restate the level-by-level layout walk. Those sites must drop the
+        candidate the same way the gate does, by value.
+        """
+        op = _ftl_pointwise((300, 256), name="val_indivisible")
+        self.assertIsNone(_rejection_reason(op, TileSpec((TileAxis(0, 8),))))
+        self.assertIsNone(predict_frame(op, TileSpec((TileAxis(0, 8),))))
+        # ... and the divisible neighbour on the same op still predicts.
+        frame = predict_frame(op, TileSpec((TileAxis(0, 4),)))
+        self.assertIsNotNone(frame)
+        self.assertEqual([int(r) for r in frame.ranges], [75, 256])
+
+    def test_layout_gate_is_scoped_to_output_axes(self):
+        """The gate mirrors ``_divide_ranges``: only an output axis rebuilds the
+        layout, so a reduction-only spec must still predict on a plain
+        ``FixedLayout``.
+
+        ``_make_real_reduction_op`` builds exactly that, which is why gating
+        every tiled spec on ``FixedTiledLayout`` would reject ops that predict
+        fine today. The frame's ``layout`` is then whatever the op committed --
+        untouched, and never read as a per-tile layout, since a reduction axis
+        leaves the output buffer at full extent.
+        """
+        from torch._inductor.ir import FixedLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        op = self._reduction_op([8], [16], [8, 16], [16, 1], "val_red_plain")
+        self.assertIsInstance(op.layout, FixedLayout)
+        self.assertNotIsInstance(op.layout, FixedTiledLayout)
+
+        frame = predict_frame(op, TileSpec((TileAxis(0, 2, is_reduction=True),)))
+        self.assertIs(frame.layout, op.layout)
+        self.assertEqual([int(r) for r in frame.reduction_ranges], [8])
 
 
 class TestTileHelpers(unittest.TestCase):

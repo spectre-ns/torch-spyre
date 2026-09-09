@@ -1821,17 +1821,24 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
     return [s for s in in_dep.ranges if s not in out_syms]
 
 
-def resolve_tile_axis_loop_vars(
+def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, tiling: TileSpec
-) -> list[sympy.Symbol]:
-    """One loop variable per :class:`TileSpec` axis, or raise ``Unsupported``.
+) -> tuple[list[sympy.Symbol] | None, str | None]:
+    """``(loop_vars, None)``, or ``(None, reason)`` if ``tiling`` cannot apply.
 
     The single authority on whether a ``TileSpec`` can be applied to ``op`` and
-    on which loop var each axis names.
-    ``scratchpad.coarse_tiling.tile_spec_to_dim_hints`` lowers the result to
-    ``DimHint``s and ``wsr.tile_prediction._validate_tiling`` gates the predictor
-    on it, so prediction can never be more permissive than application -- a
-    candidate the predictor prices is one the applier will accept.
+    on which loop var each axis names. Both callers go through it, so prediction
+    can never be more permissive than application -- a candidate the predictor
+    prices is one the applier will accept -- but they need the answer in
+    different forms, which is why the authority reports rather than raises:
+
+    * ``scratchpad.coarse_tiling.tile_spec_to_dim_hints`` lowers a spec the
+      planner has already committed to, so a rejection there is a compilation
+      failure. It calls :func:`resolve_tile_axis_loop_vars`, which turns a
+      ``reason`` into ``Unsupported``.
+    * ``wsr.tile_prediction`` prices candidates the solver has not chosen, so a
+      rejection is ordinary pruning, not an error. It reads the ``reason``
+      directly and drops the candidate.
 
     ``TileAxis.host_dim`` is positional within one of two per-op frames, selected
     by ``is_reduction``: ``op_out_coords(op)`` for an output axis,
@@ -1848,20 +1855,20 @@ def resolve_tile_axis_loop_vars(
     for axis in tiling.axes:
         if axis.is_reduction:
             if not isinstance(op.data, Reduction):
-                raise Unsupported(
+                return None, (
                     f"coarse tiling: reduction axis host_dim={axis.host_dim} "
                     f"requested on non-Reduction op {op.get_name()}."
                 )
             if red_vars is None:
                 try:
                     red_vars = reduction_loop_vars(op)
-                except StopIteration as exc:
-                    raise Unsupported(
+                except StopIteration:
+                    return None, (
                         f"coarse tiling: {op.get_name()} has no write dep or no "
                         "indexed read dep to derive reduction loop variables from."
-                    ) from exc
+                    )
             if axis.host_dim >= len(red_vars):
-                raise Unsupported(
+                return None, (
                     f"coarse tiling: reduction host_dim={axis.host_dim} is out "
                     f"of bounds for {len(red_vars)} reduction loop variables on "
                     f"{op.get_name()}."
@@ -1869,7 +1876,7 @@ def resolve_tile_axis_loop_vars(
             loop_vars.append(red_vars[axis.host_dim])
         else:
             if axis.host_dim >= len(out_coords):
-                raise Unsupported(
+                return None, (
                     f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
                     f"for {len(out_coords)} output coordinates on "
                     f"{op.get_name()}."
@@ -1877,12 +1884,29 @@ def resolve_tile_axis_loop_vars(
             coord = out_coords[axis.host_dim]
             free_symbols = coord.free_symbols
             if len(free_symbols) != 1:
-                raise Unsupported(
+                return None, (
                     f"coarse tiling: host_dim={axis.host_dim} output coordinate "
                     f"{coord} on {op.get_name()} has {len(free_symbols)} free "
                     "symbols; expected exactly one loop var."
                 )
             loop_vars.append(next(iter(free_symbols)))
+    return loop_vars, None
+
+
+def resolve_tile_axis_loop_vars(
+    op: ComputedBuffer, tiling: TileSpec
+) -> list[sympy.Symbol]:
+    """One loop variable per :class:`TileSpec` axis, or raise ``Unsupported``.
+
+    The raising face of :func:`try_resolve_tile_axis_loop_vars`, for the
+    lowering path: by the time ``tile_spec_to_dim_hints`` runs, the spec has
+    been chosen, so a spec that cannot resolve is a compilation failure rather
+    than a candidate to drop.
+    """
+    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, tiling)
+    if reason is not None:
+        raise Unsupported(reason)
+    assert loop_vars is not None
     return loop_vars
 
 
