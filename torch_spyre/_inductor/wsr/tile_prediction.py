@@ -287,12 +287,6 @@ def _predict_iter_space(
     ]
     if reduction_counts:
         red_vars = reduction_loop_var_by_ranges_pos(op)
-        # Both established by :func:`_rejection_reason`, which rejects an op
-        # whose reduction positions do not map to loop variables and every
-        # host_dim that resolves to none -- the same precondition the output
-        # branch above relies on. Asserted rather than re-checked so a caller
-        # that skipped the gate fails here instead of silently reading a
-        # different dim.
         assert red_vars is not None
         syms_and_counts += [
             (sym, count)
@@ -478,6 +472,8 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
 
     rw = op.get_read_writes()
     write_index = next(iter(rw.writes)).index
+    
+    # reads indexes are unaffected by current op tiling
     read_index = next((d.index for d in rw.reads if hasattr(d, "index")), write_index)
     if output_counts:
         full_strides = [sympy.sympify(s) for s in op.layout.stride]
