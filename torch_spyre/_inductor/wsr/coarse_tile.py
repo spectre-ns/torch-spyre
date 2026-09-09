@@ -96,6 +96,7 @@ from torch_spyre._C import SpyreTensorLayout
 from .. import config
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
+from ..scratchpad.plan_solver import TileSpec
 from ..logging_utils import get_inductor_logger
 from ..loop_info import (
     CarriedReductionRecord,
@@ -1809,8 +1810,8 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
 
     This is the single source of truth for that derivation. Both directions go
     through it: ``_loop_var_to_reduction_ranges_pos`` (loop_var -> position) and
-    coarse tiling's reduction-axis lowering (its inverse, position -> loop_var,
-    in ``scratchpad.coarse_tiling.tile_spec_to_dim_hints``).
+    :func:`resolve_tile_axis_loop_vars` (its inverse, position -> loop_var, for
+    every ``TileSpec`` axis that names a reduction dim).
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()
@@ -1818,6 +1819,71 @@ def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
     out_syms = out_dep.index.free_symbols
     in_dep = next(d for d in rw.reads if hasattr(d, "index"))
     return [s for s in in_dep.ranges if s not in out_syms]
+
+
+def resolve_tile_axis_loop_vars(
+    op: ComputedBuffer, tiling: TileSpec
+) -> list[sympy.Symbol]:
+    """One loop variable per :class:`TileSpec` axis, or raise ``Unsupported``.
+
+    The single authority on whether a ``TileSpec`` can be applied to ``op`` and
+    on which loop var each axis names.
+    ``scratchpad.coarse_tiling.tile_spec_to_dim_hints`` lowers the result to
+    ``DimHint``s and ``wsr.tile_prediction._validate_tiling`` gates the predictor
+    on it, so prediction can never be more permissive than application -- a
+    candidate the predictor prices is one the applier will accept.
+
+    ``TileAxis.host_dim`` is positional within one of two per-op frames, selected
+    by ``is_reduction``: ``op_out_coords(op)`` for an output axis,
+    :func:`reduction_loop_vars` for a reduction axis. The frames are disjoint and
+    each counts from zero, so one ``host_dim`` names different axes under the two
+    flags, and neither counts over the op's input rank. Bounds are therefore
+    checked per frame; ``reduction_ranges`` is *not* the reduction bound, since
+    ``reduction_loop_vars`` is squeezed (a size-1 dim carries no loop var) and can
+    be the shorter list.
+    """
+    out_coords = op_out_coords(op)
+    red_vars: list[sympy.Symbol] | None = None
+    loop_vars: list[sympy.Symbol] = []
+    for axis in tiling.axes:
+        if axis.is_reduction:
+            if not isinstance(op.data, Reduction):
+                raise Unsupported(
+                    f"coarse tiling: reduction axis host_dim={axis.host_dim} "
+                    f"requested on non-Reduction op {op.get_name()}."
+                )
+            if red_vars is None:
+                try:
+                    red_vars = reduction_loop_vars(op)
+                except StopIteration as exc:
+                    raise Unsupported(
+                        f"coarse tiling: {op.get_name()} has no write dep or no "
+                        "indexed read dep to derive reduction loop variables from."
+                    ) from exc
+            if axis.host_dim >= len(red_vars):
+                raise Unsupported(
+                    f"coarse tiling: reduction host_dim={axis.host_dim} is out "
+                    f"of bounds for {len(red_vars)} reduction loop variables on "
+                    f"{op.get_name()}."
+                )
+            loop_vars.append(red_vars[axis.host_dim])
+        else:
+            if axis.host_dim >= len(out_coords):
+                raise Unsupported(
+                    f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
+                    f"for {len(out_coords)} output coordinates on "
+                    f"{op.get_name()}."
+                )
+            coord = out_coords[axis.host_dim]
+            free_symbols = coord.free_symbols
+            if len(free_symbols) != 1:
+                raise Unsupported(
+                    f"coarse tiling: host_dim={axis.host_dim} output coordinate "
+                    f"{coord} on {op.get_name()} has {len(free_symbols)} free "
+                    "symbols; expected exactly one loop var."
+                )
+            loop_vars.append(next(iter(free_symbols)))
+    return loop_vars
 
 
 def _loop_var_to_reduction_ranges_pos(

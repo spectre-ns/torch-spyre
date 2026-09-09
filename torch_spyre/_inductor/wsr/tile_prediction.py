@@ -32,6 +32,16 @@ belongs with an objective that prices them; coarse tiling carries no objective
 term of its own, so that predictor would be API with nothing to consume it and
 is not built here.
 
+The frame is stated in the op's *pre-tiling* iteration-symbol namespace, not
+the one the tiled op will carry. Applying a tiling re-runs Inductor's
+``extract_read_writes -> index_vars_squeeze``, which drops every dim whose
+per-tile extent is 1 and renumbers the survivors from a fresh ``d0`` -- names
+that do not exist yet at prediction time, and that a prediction could not use
+anyway because it is paired with the op's still-committed deps. So the
+symbol-carrying fields (``iter_space``, ``write_index``, ``read_index``) are
+valid only against *untiled* deps, while the symbol-free ones (``ranges``,
+``layout``) are exact against the applied op. See ``_predict_iter_space``.
+
 Dependencies stay one-way (``tile_prediction -> coarse_tile``). Nothing here
 mutates IR; the solver must not import this module -- the allocator calls the
 predictor and hands results across, which is what keeps the solver IR-free.
@@ -44,7 +54,7 @@ from dataclasses import dataclass
 import sympy
 from sympy import Expr
 
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout
+from torch._inductor.ir import ComputedBuffer
 
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout, _resize_device_layout
@@ -57,7 +67,9 @@ from .coarse_tile import (
     _rescale_index,
     _stick_host_dim,
     reduction_loop_vars,
+    resolve_tile_axis_loop_vars,
 )
+from .tile import compute_tile_stride
 
 
 @dataclass
@@ -66,9 +78,18 @@ class PredictedFrame:
 
     ``ranges`` / ``reduction_ranges`` are the per-tile extents; ``layout`` is the
     per-tile output ``FixedTiledLayout`` (the op's own layout when untiled);
-    ``write_index`` / ``read_index`` are rescaled to the tile strides; and
+    ``write_index`` is rescaled to the tile strides while ``read_index`` is the
+    op's committed read index unchanged (see ``predict_frame`` -- coarse tiling
+    resizes the op's own output buffer, never the buffers it reads); and
     ``iter_space`` maps each loop symbol to its per-tile extent. These are
     exactly the pieces ``_prepare_per_core_view`` consumes via ``view_parts``.
+
+    ``iter_space``, ``write_index`` and ``read_index`` are keyed by the op's
+    *pre-tiling* loop symbols (see ``_predict_iter_space``), so they pair only
+    with the committed, untiled ``MemoryDep`` that ``_prepare_per_core_view``
+    reads. ``ranges``, ``reduction_ranges`` and ``layout`` carry no symbols and
+    match the applied op exactly, including when a tiled dim divides to a
+    per-tile extent of 1.
     """
 
     op_name: str
@@ -111,12 +132,23 @@ def _output_and_reduction_counts(tiling: TileSpec):
 
 def _predict_output_layout(op: ComputedBuffer, tiled_ranges: list) -> FixedTiledLayout:
     """The per-tile output ``FixedTiledLayout``, built exactly as
-    ``_divide_ranges`` builds it: contiguous host strides over the tiled size,
-    and ``_resize_device_layout`` from the *authoritative* stick host dim
-    (recovered by coordinate identity, so transposed same-size dims resolve).
+    ``_divide_ranges`` builds it: host strides from ``compute_tile_stride`` over
+    the committed size/stride, and ``_resize_device_layout`` from the
+    *authoritative* stick host dim (recovered by coordinate identity, so
+    transposed same-size dims resolve).
+
+    Host strides must come from ``compute_tile_stride``, not from
+    ``contiguous_strides(new_size)``: the latter agrees only when the committed
+    layout is contiguous, and silently reorders a transposed or channels-last
+    layout (e.g. size [4, 128, 128] stride [128, 1, 16384] tiled to
+    [4, 64, 128] yields [64, 1, 8192] applied vs [8192, 128, 1] contiguous).
+    ``predict_frame`` feeds these straight to ``_rescale_index`` as the tile
+    strides, so a reordered stride mismatches the applied per-core view.
     """
     new_size = [int(r) for r in tiled_ranges]
-    new_stride = list(FlexibleLayout.contiguous_strides(new_size))
+    new_stride = list(
+        compute_tile_stride(list(op.layout.size), list(op.layout.stride), new_size)
+    )
     dev = op.layout.device_layout
     stick_hd = _stick_host_dim(op, dev)
     new_dev = _resize_device_layout(
@@ -141,27 +173,107 @@ def _predict_iter_space(
     ``op_out_coords(op)[host_dim]``; a reduction axis's is
     ``reduction_loop_vars(op)[host_dim]`` -- the same resolution
     ``tile_spec_to_dim_hints`` uses.
+
+    Resolves both unguarded: ``_validate_tiling`` has already established that
+    every ``host_dim`` here indexes in range and lands on exactly one loop symbol
+    present in the iteration space. Any caller other than ``predict_frame`` must
+    validate first -- these counts are positions in two different frames, and an
+    unvalidated one reads the wrong dim or raises ``IndexError``/``KeyError``
+    rather than being rejected.
+
+    Keys stay the op's *pre-tiling* symbols; only extents move. That is
+    deliberate. The applied op's symbols do not exist yet, and the caller pairs
+    this dict with the op's committed (untiled) ``MemoryDep`` --
+    ``_prepare_per_core_view`` builds ``dep_coeff`` as
+    ``{sym: dep.index.coeff(sym) for sym in iter_space}``. Renaming the keys to
+    what the tiled op will carry would break that pairing outright.
+
+    The two namespaces are not interchangeable, and they overlap, so a mismatch
+    reads the wrong dim rather than raising. Applying a tiling re-runs
+    ``extract_read_writes -> index_vars_squeeze``, whose ``SqueezeView.squeezer``
+    drops every dim of size 1 and mints ``d0, d1, ...`` from a fresh counter over
+    the survivors; a dim tiled to per-tile extent 1 therefore loses its symbol
+    and everything after it renumbers. Ranges ``[4, 128, 256]`` tiled on dim 1 by
+    128 predicts ``{d0: 4, d1: 1, d2: 256}`` while the applied op carries
+    ``{d0: 4, d1: 256}`` -- ``d1`` in both, meaning different dims. Never match a
+    predicted frame against a post-apply dep by symbol. This is confined to the
+    dep view: ``_divide_ranges`` keeps the unit dim at full rank, so ``ranges``,
+    ``stride`` and ``device_size`` are unaffected.
+
+    The surviving ``sym -> 1`` entry is inert in every consumer -- nothing splits
+    a unit dim, and ``_per_core_view_from_prep`` skips ``split <= 1`` before
+    device placement. Its one order-sensitive site is that function's
+    ``contiguous_dim = len(dim_splits) - 1`` k-fast matmul reorder, which would
+    select the phantom instead of the real trailing dim. That is unreachable
+    rather than handled: it needs a ``Reduction`` (for ``is_matmul``), and both
+    ``TileSpec`` producers reject Reduction unit tiles
+    (``enumerate_tilings._reduction_split_counts`` and
+    ``span_overflow_hint_analysis._split_candidates_for_host_dim``). If either
+    filter is relaxed to admit them, drop the unit entry here instead.
     """
     iter_space = dict(iteration_space_from_op(op))
     out_coords = op_out_coords(op)
     for host_dim, count in output_counts.items():
-        if host_dim < len(out_coords):
-            syms = out_coords[host_dim].free_symbols
-            if len(syms) == 1:
-                sym = next(iter(syms))
-                if sym in iter_space:
-                    iter_space[sym] = _exact_div(iter_space[sym], count)
+        sym = next(iter(out_coords[host_dim].free_symbols))
+        iter_space[sym] = _exact_div(iter_space[sym], count)
     if reduction_counts:
-        try:
-            red_vars = reduction_loop_vars(op)
-        except (AssertionError, StopIteration):
-            red_vars = []
+        red_vars = reduction_loop_vars(op)
         for host_dim, count in reduction_counts.items():
-            if host_dim < len(red_vars):
-                sym = red_vars[host_dim]
-                if sym in iter_space:
-                    iter_space[sym] = _exact_div(iter_space[sym], count)
+            sym = red_vars[host_dim]
+            iter_space[sym] = _exact_div(iter_space[sym], count)
     return iter_space
+
+
+def _validate_tiling(op: ComputedBuffer, tiling: TileSpec) -> None:
+    """Reject a ``TileSpec`` that could not be lowered onto ``op``.
+
+    ``predict_frame``'s single gate, and the reason the private predictors it
+    calls resolve each axis unguarded. Axis legality itself is not restated here:
+    :func:`resolve_tile_axis_loop_vars` is the shared authority, so this raises
+    on exactly what ``tile_spec_to_dim_hints`` raises on when it lowers the same
+    spec. What is added is the extra reach *prediction* has -- the two positional
+    lists and the iteration space it divides, which lowering never touches.
+
+    The symmetry with lowering is the point. ``predict_frame`` divides
+    ``ranges``, ``reduction_ranges`` and the output layout for *every* axis
+    unconditionally, so an axis that quietly failed to resolve downstream would
+    not drop out of the prediction -- it would return a frame whose ranges and
+    layout say "tiled" while its ``iter_space`` still says "untiled", priced by
+    the solver as though consistent and only refused much later, at apply time.
+
+    ``reduction_ranges`` is checked separately from the reduction loop variables
+    the resolver bounds against: ``reduction_loop_vars`` is squeezed (a size-1
+    dim carries no symbol) and can be the shorter list, so neither bound implies
+    the other.
+
+    Divisibility is deliberately not checked here: ``_exact_div`` already raises
+    ``Unsupported`` at the point of division, which is loud rather than silent.
+    """
+    if tiling.is_untiled:
+        return
+    loop_vars = resolve_tile_axis_loop_vars(op, tiling)
+    iter_space = iteration_space_from_op(op)
+    ranges = list(op.data.ranges)
+    reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+    for axis, sym in zip(tiling.axes, loop_vars):
+        if axis.is_reduction:
+            if axis.host_dim >= len(reduction_ranges):
+                raise Unsupported(
+                    f"tile prediction: reduction host_dim={axis.host_dim} is out "
+                    f"of bounds for reduction ranges {reduction_ranges} on "
+                    f"{op.get_name()}."
+                )
+        elif axis.host_dim >= len(ranges):
+            raise Unsupported(
+                f"tile prediction: host_dim={axis.host_dim} is out of bounds for "
+                f"data ranges {ranges} on {op.get_name()}."
+            )
+        if sym not in iter_space:
+            raise Unsupported(
+                f"tile prediction: host_dim={axis.host_dim} on {op.get_name()} "
+                f"resolves to loop var {sym}, which is absent from its iteration "
+                f"space {dict(iter_space)}."
+            )
 
 
 def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame:
@@ -172,7 +284,12 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame:
     ``_post_tile_layout_for_splits``, the same resize real tiling uses); reduction
     axes shrink ``op.data.reduction_ranges`` only, since the op's own output
     buffer is the accumulator and keeps its full output extent.
+
+    Raises ``Unsupported`` for a tiling ``tile_spec_to_dim_hints`` could not
+    lower onto ``op`` -- see ``_validate_tiling``, which gates everything below
+    so no partially-divided frame can be returned.
     """
+    _validate_tiling(op, tiling)
     output_counts, reduction_counts = _output_and_reduction_counts(tiling)
 
     ranges = list(op.data.ranges)
@@ -192,12 +309,9 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame:
     write_index = next(iter(rw.writes)).index
     read_index = next((d.index for d in rw.reads if hasattr(d, "index")), write_index)
     if output_counts:
-        # _rescale_index matches by coefficient value and needs sympy strides
-        # (it reads ``.is_number``); the mock/host layouts can carry plain ints.
         full_strides = [sympy.sympify(s) for s in op.layout.stride]
         tile_strides = [sympy.sympify(s) for s in layout.stride]
         write_index = _rescale_index(write_index, full_strides, tile_strides)
-        read_index = _rescale_index(read_index, full_strides, tile_strides)
 
     iter_space = _predict_iter_space(op, output_counts, reduction_counts)
     return PredictedFrame(
