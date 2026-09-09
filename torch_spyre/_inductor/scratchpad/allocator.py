@@ -267,11 +267,18 @@ class ScratchpadAllocator:
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
 
         This is a template method: the skeleton (pre-passes ->
-        generate buffers -> solve -> commit -> record reasons -> push -> log ->
-        post-passes) is fixed, while subclasses override the ``_prepare_buffers``
-        / ``_solve`` / ``_post_solve`` / ``_record_spill_reasons`` hooks to swap
-        in their buffer type, solver call, and post-solve commit. The base hooks
-        implement the fixed-division, placement-only flow.
+        generate buffers -> solve -> materialize -> commit -> record reasons ->
+        push -> log -> post-passes) is fixed, while subclasses override the
+        ``_prepare_buffers`` / ``_solve`` / ``_materialize_selection`` /
+        ``_post_solve`` / ``_record_spill_reasons`` hooks to swap in their buffer
+        type, solver call, and post-solve commit. The base hooks implement the
+        fixed-division, placement-only flow.
+
+        Subclasses override hooks, never this body. A solve that must act on its
+        own result -- coarse tiling applies the tilings it selected and re-plans
+        the mutated graph -- does so through ``_materialize_selection`` rather
+        than by copying the skeleton: a copy silently misses every later change
+        to the shared steps (it already did, on ``_solve``'s arity).
 
         Args:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
@@ -281,6 +288,7 @@ class ScratchpadAllocator:
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
         allocation = self._solve(solver, graph)
+        solver, allocation = self._materialize_selection(graph, solver, allocation)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
@@ -318,6 +326,24 @@ class ScratchpadAllocator:
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         return solver.plan_layout(log_lx_usage=True)
+
+    def _materialize_selection(
+        self,
+        graph: GraphLowering,
+        solver: MemoryPlanSolver,
+        allocation: Sequence[Any],
+    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
+        """Act on what the solve *chose* before the choice is committed.
+
+        Returns the ``(solver, allocation)`` the rest of :meth:`plan_allocation`
+        commits, so an override that mutates the graph and re-plans hands back
+        the second solve's pair -- ``_get_spill_reasons`` must be asked about the
+        solver that produced the allocation it is passed.
+
+        Base: a placement-only solve selects nothing to materialize, so the first
+        solve stands.
+        """
+        return solver, allocation
 
     def _finalize_lx_relayout_allocation(
         self,
@@ -1283,12 +1309,21 @@ def _prep_for_division(
     -- the resized layout, since the committed layout is still untiled at solve
     time. Imported lazily so the solver-facing modules stay free of the
     predictor.
+
+    ``predict_frame`` reports an unpredictable candidate by returning ``None``
+    rather than raising, so that a spec the solver merely *enumerated* is
+    pruned instead of failing the compile. ``None`` is forwarded here as the
+    prep, which ``_per_core_view_from_prep`` already maps to the
+    unrepresentable view -- the same sink an unviewable buffer takes -- so such
+    a candidate can never be priced as though it had a frame.
     """
     if division.tiling.is_untiled:
         return _prepare_per_core_view(op, dep, buf_name)
     from torch_spyre._inductor.wsr.tile_prediction import predict_frame
 
     frame = predict_frame(op, division.tiling)
+    if frame is None:
+        return None
     override = frame.layout if buf_name == op.get_name() else None
     return _prepare_per_core_view(
         op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
@@ -1879,7 +1914,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             cost_expr = sympy.sympify(
                 predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
             )
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError, TypeError):
+            # ``TypeError`` covers the symbolic-argument gap in the cost model
+            # (#3810): the output-dim coarse-tiling underfill derate compares
+            # ``coarse_underfill_eff``'s result with a plain Python ``min`` /
+            # ``>=``, which raises "cannot determine truth value of Relational"
+            # as soon as an argument carries a solver variable (``is_lx_*``).
+            # That is reachable only once an op is output-tiled, i.e. on the
+            # re-plan after ``CoarseTilingPass``, so it did not exist before the
+            # solver could choose tilings.  Dropping the objective is the
+            # documented best-effort fallback, but it is a real loss -- the
+            # re-plan then optimizes placement with no runtime term at all --
+            # so the cost model should be made symbol-safe rather than left to
+            # this catch.
             cost_expr = None
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
@@ -1912,55 +1959,55 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
 
-    def plan_allocation(self, graph: GraphLowering):
-        """Joint solve, then -- if the solve selected any coarse tiling --
-        materialize it and re-plan the tiled graph placement-only.
+    def _materialize_selection(
+        self,
+        graph: GraphLowering,
+        solver: MemoryPlanSolver,
+        allocation: Sequence[Any],
+    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
+        """Apply the coarse tilings the joint solve selected, then re-plan.
 
         The first solve chooses core divisions *and* tilings jointly, pricing the
-        tiled candidates through their predicted (stage-4) views. If it picks a
-        non-empty tiling for any op, ``CoarseTilingPass`` applies exactly those
-        choices (mutating the IR the same way a pre-stickification hint would),
-        and the allocation is redone over the materialized graph so new boundary
-        buffers get placed and the applied ops get their final divisions. The
-        second pass enumerates no further tilings (``_suppress_tiling``), so it
-        terminates, and it mirrors the hint path (allocate an already-tiled
-        graph).
+        tiled candidates through their predicted (``wsr.tile_prediction``) views.
+        If it picks a non-empty tiling for any op, ``CoarseTilingPass`` applies
+        exactly those choices (mutating the IR the same way a pre-stickification
+        hint would), and the allocation is redone over the materialized graph so
+        new boundary buffers get placed and the applied ops get their final
+        divisions. The second pass enumerates no further tilings
+        (``_suppress_tiling``), so it terminates, and it mirrors the hint path
+        (allocate an already-tiled graph).
 
         Ordering is solve-before-apply: a ``SolveError`` from the first solve
         propagates over the *unmutated* graph, so ``scratchpad_planning``'s greedy
         fallback never runs on a half-tiled graph (a second-solve ``SolveError``
         falls back over the fully-tiled graph, which is a valid outcome).
+
+        Both the second solver and its allocation are returned: the caller reads
+        spill reasons off the solver that produced the allocation it commits, so
+        returning one without the other would report the first solve's reasons
+        against the second solve's plan.
         """
-        self._run_passes(self.pre_optimization_passes, graph)
-        buffers = self._prepare_buffers(graph)
-        solver = self._build_solver(buffers)
-        allocation = self._solve(solver)
-
         choices = self._chosen_tilings(graph, allocation)
-        if choices:
-            from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+        if not choices:
+            return solver, allocation
 
-            op_count = len(graph.operations)
-            CoarseTilingPass(choices).apply_pass(graph)
-            assert len(graph.operations) >= op_count, (
-                "coarse tiling apply must not drop operations"
-            )
-            # Re-plan over the materialized tiling. Pre-passes are empty for this
-            # allocator; suppress further tiling so the second solve only places.
-            self._suppress_tiling = True
-            try:
-                buffers = self._prepare_buffers(graph)
-                solver = self._build_solver(buffers)
-                allocation = self._solve(solver)
-            finally:
-                self._suppress_tiling = False
+        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 
-        accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
-        self._post_solve(graph, allocation)
-        reasons = self._get_spill_reasons(solver, allocation)
-        self._push_allocation(graph, allocation, accepted_lx_relayouts)
-        self._log_lx_pinning(graph, reasons)
-        self._run_passes(self.post_optimization_passes, graph)
+        op_count = len(graph.operations)
+        CoarseTilingPass(choices).apply_pass(graph)
+        assert len(graph.operations) >= op_count, (
+            "coarse tiling apply must not drop operations"
+        )
+        # Re-plan over the materialized tiling. Pre-passes are empty for this
+        # allocator; suppress further tiling so the second solve only places.
+        self._suppress_tiling = True
+        try:
+            buffers = self._prepare_buffers(graph)
+            solver = self._build_solver(buffers)
+            allocation = self._solve(solver, graph)
+        finally:
+            self._suppress_tiling = False
+        return solver, allocation
 
     def _chosen_tilings(
         self, graph: GraphLowering, allocation: Sequence[Any]
@@ -2556,27 +2603,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         count.
         """
         return [_view_for_div(op, dep, buf_name, cd, prep_cache) for cd in divs]
-
-    @staticmethod
-    def _prep_for_candidate(op, dep, buf_name, cd):
-        """The ``_prepare_per_core_view`` prep for one candidate.
-
-        Untiled: the committed layout, exactly as before. Tiled: the *predicted*
-        per-tile frame (``wsr.tile_prediction.predict_frame``) supplies the
-        divided iteration space, rescaled indices, and -- when ``buf_name`` is the
-        op's own output -- the resized layout, since the committed layout is
-        still untiled at solve time. Imported lazily so the solver-facing modules
-        stay free of the predictor.
-        """
-        if cd.tiling.is_untiled:
-            return _prepare_per_core_view(op, dep, buf_name)
-        from torch_spyre._inductor.wsr.tile_prediction import predict_frame
-
-        frame = predict_frame(op, cd.tiling)
-        override = frame.layout if buf_name == op.get_name() else None
-        return _prepare_per_core_view(
-            op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
-        )
 
 
 def _make_cpsat_solver(
