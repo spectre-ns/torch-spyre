@@ -2655,7 +2655,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                                 for sym, split in per_sym.items()
                                 if split > 1 and sym in read_syms
                             },
-                            reduction_splits={},
+                            reduction_splits={}, 
                         )
                     )  # a clone op cannot have a reduction split
                     clone_views.append(view)
