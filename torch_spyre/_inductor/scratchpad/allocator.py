@@ -2641,13 +2641,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 if k is None:
                     cd = consumer_divs[j]
                     per_sym = _division_splits(consumer, cd)
+                    # Project onto the input: a consumer split on an axis the
+                    # input lacks (e.g. a matmul's free dim) does not slice the
+                    # input, so it must not count toward the clone's cores.
+                    # Otherwise the cores_used check below cannot reject a
+                    # broadcast read.
+                    read_syms = read_dep.index.free_symbols
                     k = len(clone_divs)
                     clone_divs.append(
                         CoreDivision(
                             output_splits={
                                 sym: split
                                 for sym, split in per_sym.items()
-                                if split > 1
+                                if split > 1 and sym in read_syms
                             },
                             reduction_splits={},
                         )
