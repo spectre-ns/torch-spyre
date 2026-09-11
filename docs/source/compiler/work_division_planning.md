@@ -639,13 +639,14 @@ the resulting per-core span exceeds the hardware limit.
 Set `SPYRE_INDUCTOR_IGNORE_HINTS=1` to ignore `spyre_hint(work_div={...})`
 annotations and use the automatic work-distribution planner.
 
-:::{warning}
-Work-division hints are authoritative **within this pass only**. They are not
-yet preserved through co-optimization, which is on by default: the joint solver
-re-chooses each op's core division from its own candidate set and can discard
-the hinted split. The compiler logs a warning naming the affected ops when this
-can happen. Until hint preservation lands, set `CO_OPTIMIZING_LX_PLANNING=0`
-when a `work_div` hint must be honoured.
+:::{note}
+Work-division hints also hold under co-optimization, which is on by default. An
+op whose hint resolves onto its own dimensions is pinned to the division this
+pass committed, so the joint solver cannot re-slice it. The pin covers the whole
+op: dimensions the hint does not name stay unsplit even when that leaves cores
+idle, and a neighbouring buffer whose division no longer matches the hinted op
+may be kept out of LX. Ops in the hint scope that have none of the hinted
+dimensions are not pinned.
 :::
 
 ## Limitations and Future Work

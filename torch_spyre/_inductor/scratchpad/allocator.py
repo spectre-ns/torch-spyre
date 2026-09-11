@@ -53,7 +53,7 @@ from torch_spyre._inductor.pass_utils import (
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
     enumerate_work_division_candidates,
-    has_work_div_hint,
+    has_resolved_work_div_hint,
     work_division_splits_are_legal,
 )
 from torch_spyre._inductor.errors import Unsupported
@@ -2176,6 +2176,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         work-division constraints. Otherwise LX planning raises ``Unsupported``
         rather than committing an illegal division. See
         ``utils.ops_in_offset_mutation_component``.
+
+        Ops whose user ``work_div`` hint resolves are pinned the same way: the
+        hint already decided their division, so co-optimization must not
+        override it.
         """
         max_cores = config.sencores
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
@@ -2183,8 +2187,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Ops pinned to their committed (work-division) division: each guard
         # detects a distinct wrong-code or scheduling hazard the joint solver
         # would hit by re-slicing the op, and all share the one remedy -- keep the
-        # fixed division. The graph-level group sets are loop-invariant, so build
-        # them once here rather than rescanning graph.operations for every op.
+        # fixed division. A resolved user work_div hint takes the same remedy,
+        # last so a hazard guard's reason is the one logged: work division
+        # already committed the hint, and the pin is whole-op -- unhinted dims
+        # keep their committed split of 1. The graph-level group sets are
+        # loop-invariant, so build them once here rather than rescanning
+        # graph.operations for every op.
         offset_mutation_ops = ops_in_offset_mutation_component(graph)
         layout_group_reason = _fused_layout_group_ops(
             graph,
@@ -2194,7 +2202,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             },
         )
         result = {}
-        hinted_unpinned: list[str] = []
         for op in graph.operations:
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
@@ -2209,6 +2216,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 reason = "indirect access entry split"
             elif _reads_offset_slice(op):
                 reason = "offset slice read"
+            elif (
+                not config.ignore_work_division_hints
+                and isinstance(op, ComputedBuffer)
+                and has_resolved_work_div_hint(op)
+            ):
+                reason = "user work_div hint"
 
             if reason is not None:
                 divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
@@ -2233,30 +2246,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _drop_reduction_splits_in_coarse_group(op, divs)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
-            if (
-                reason is None
-                and len(divs) > 1
-                and not config.ignore_work_division_hints
-                and isinstance(op, ComputedBuffer)
-                and has_work_div_hint(op)
-            ):
-                # Hint preservation under co-optimization is not implemented yet:
-                # this op carries a user ``work_div`` hint that work division
-                # committed, but it is not pinned by any guard above and has more
-                # than one candidate, so the joint solver may pick a different
-                # division. Warn rather than pin -- pinning every hinted op would
-                # silently disable co-optimization for hinted graphs, and the
-                # solver's choice is correct, just not the one asked for.
-                hinted_unpinned.append(op.name)
             result[op.name] = divs
-
-        if hinted_unpinned:
-            logger.warning(
-                "work_division_hint: co-optimization may override the hinted core "
-                "division for %s. Hint preservation under co-optimization is not "
-                "supported yet; set CO_OPTIMIZING_LX_PLANNING=0 to honour the hint.",
-                ", ".join(sorted(hinted_unpinned)),
-            )
 
         return result
 
