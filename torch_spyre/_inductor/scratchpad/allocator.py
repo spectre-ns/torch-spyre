@@ -1640,9 +1640,9 @@ def build_residency_edge(
         None,
     )
 
-    def wrapped_hasattr(obj, str):
+    def wrapped_hasattr(obj, attr):
         try:
-            return hasattr(obj, "index")
+            return hasattr(obj, attr)
         except NotImplementedError:
             return False
 
