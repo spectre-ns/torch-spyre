@@ -409,15 +409,12 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self.assertIn("sympify('c0'): (sympify('128'), 2)", source_codes[0])
         self.assertIn("sympify('c2'): (sympify('256'), 4)", source_codes[0])
 
-    @config.patch({"sencores": 8})
-    def test_partial_work_div_hint_survives_co_optimization(self):
-        source = self._compile_partially_hinted_add()
-        self.assertIn("sympify('c0'): (sympify('8'), 2)", source)
-
-    @config.patch({"sencores": 8})
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": True})
     def test_partial_work_div_hint_leaves_unhinted_dims_unsplit(self):
-        # The hint pins the op's whole committed division, so M stays unsplit
-        # even though 6 cores are idle. A per-dim pin would split M by 4 here.
+        # The hint survives co-optimization (unpinned, the joint solve would take
+        # M:8 and leave B whole) and pins the op's whole committed division, so M
+        # stays unsplit even though 6 cores are idle. A per-dim pin would split M
+        # by 4 here.
         source = self._compile_partially_hinted_add()
         self.assertIn("sympify('c0'): (sympify('8'), 2)", source)
         self.assertIn("sympify('c1'): (sympify('128'), 1)", source)
