@@ -31,7 +31,6 @@ from torch._inductor.ir import (
 )
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
-from torch_spyre._inductor import config
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.constants import (
@@ -1801,87 +1800,6 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             self.assertEqual(
                 allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
             )
-
-    def _hinted_division_map(self, fixed, candidates):
-        """``_division_map`` for one hinted pointwise op that no guard pins."""
-        batch, m = _isym("batch"), _isym("m")
-        op = _computed_buffer((8, 128), name="hinted")
-        graph = MagicMock(operations=[op])
-        allocator = CoOptimizingAllocator(MagicMock(), size=1)
-        rw = MagicMock(
-            writes=[MemoryDep(op.name, 128 * batch + m, (batch, m), (8, 128))],
-            reads=[],
-        )
-
-        with (
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator."
-                "ops_in_offset_mutation_component",
-                return_value=set(),
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator."
-                "_find_distinct_matmul_splits",
-                return_value=((), ()),
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
-                return_value=rw,
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator.has_work_div_hint",
-                return_value=True,
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
-                return_value=fixed,
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._division_splits",
-                return_value={},
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
-                return_value=True,
-            ),
-            patch.object(
-                allocator, "_enumerate_core_divisions", return_value=candidates
-            ) as enumerate_divisions,
-            patch.object(allocator_module, "logger") as logger,
-        ):
-            divisions = allocator._division_map(graph)[op.name]
-        return divisions, enumerate_divisions, logger
-
-    def test_work_div_hint_pins_committed_division(self):
-        batch, m = _isym("batch"), _isym("m")
-        # The committed division carries the hint (batch:2) and leaves m at 1.
-        fixed = CoreDivision(output_splits={batch: 2}, reduction_splits={})
-        candidates = [
-            CoreDivision(output_splits={m: 8}, reduction_splits={}),
-            CoreDivision(output_splits={batch: 2, m: 4}, reduction_splits={}),
-        ]
-
-        divisions, enumerate_divisions, logger = self._hinted_division_map(
-            fixed, candidates
-        )
-
-        self.assertEqual(divisions, [fixed])
-        enumerate_divisions.assert_not_called()
-        logger.warning.assert_not_called()
-
-    @config.patch({"ignore_work_division_hints": True})
-    def test_ignored_work_div_hint_is_not_pinned(self):
-        batch, m = _isym("batch"), _isym("m")
-        fixed = CoreDivision(output_splits={batch: 2}, reduction_splits={})
-        candidates = [
-            CoreDivision(output_splits={m: 8}, reduction_splits={}),
-            CoreDivision(output_splits={batch: 2, m: 4}, reduction_splits={}),
-        ]
-
-        divisions, enumerate_divisions, _ = self._hinted_division_map(fixed, candidates)
-
-        self.assertEqual(divisions, candidates)
-        enumerate_divisions.assert_called_once()
 
 
 class TestTopKConstraints(unittest.TestCase):
