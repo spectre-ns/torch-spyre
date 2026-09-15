@@ -389,6 +389,47 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self.assertIn("sympify('c0'): (sympify('128'), 2)", source_codes[0])
         self.assertIn("sympify('c2'): (sympify('256'), 4)", source_codes[0])
 
+    def _declare_k_split_matmul_inputs(self):
+        """(B=3, M=11, K=192) activation and (K, N=128) weight, named."""
+        B, M, K, N = 3, 11, 192, 128
+        x = torch.randn(B, M, K, dtype=torch.float16).to("spyre")
+        w = torch.randn(K, N, dtype=torch.float16).to("spyre")
+        for name, size in (("B", B), ("M", M), ("K", K), ("N", N)):
+            _declare_tensor_dim(name, size)
+        _name_tensor_dims(x, ["B", "M", "K"])
+        _name_tensor_dims(w, ["K", "N"])
+        return x, w
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
+    def test_matmul_k_split_hint_rejected_for_reordered_view_operand(self):
+        # x.view(33, K) keeps x's 3D device order [M, K-stick, B] while mm writes
+        # a fresh [N-stick, B*M] buffer. A K-split across that order mismatch is
+        # lowered to wrong results (~29% of elements here), so the hint must be
+        # rejected rather than silently applied.
+        x, w = self._declare_k_split_matmul_inputs()
+
+        def fn(x, w):
+            with spyre_hint(work_div={"K": 3}):
+                return x.view(33, 192).mm(w)
+
+        with self.assertRaisesRegex(Exception, "legal splits are"):
+            torch.compile(fn, dynamic=False)(x, w)
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
+    def test_matmul_k_split_hint_kept_when_operand_order_matches_output(self):
+        # The same operands through a 3D matmul share the output's [M, stick, B]
+        # order, so the K-split stays legal and computes the right values.
+        x, w = self._declare_k_split_matmul_inputs()
+
+        def fn(x, w):
+            with spyre_hint(work_div={"K": 3}):
+                return torch.matmul(x, w)
+
+        result, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
+        self.assertIn("(sympify('192'), 3)", source_codes[0])
+        expected = torch.matmul(x.cpu().float(), w.cpu().float()).half()
+        torch.testing.assert_close(result.cpu(), expected, atol=5e-2, rtol=5e-2)
+
     @pytest.mark.xfail(
         strict=True,
         reason=(
