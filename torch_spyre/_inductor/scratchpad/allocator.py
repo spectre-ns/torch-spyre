@@ -2267,21 +2267,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 divs = _drop_reduction_splits_in_coarse_group(op, divs)
             if not divs:
                 raise Unsupported(f"{op.name}: no legal core-division candidates.")
-            if (
-                reason is None
-                and len(divs) > 1
-                and not config.ignore_work_division_hints
-                and isinstance(op, ComputedBuffer)
-                and has_work_div_hint(op)
-            ):
-                # Hint preservation under co-optimization is not implemented yet:
-                # this op carries a user ``work_div`` hint that work division
-                # committed, but it is not pinned by any guard above and has more
-                # than one candidate, so the joint solver may pick a different
-                # division. Warn rather than pin -- pinning every hinted op would
-                # silently disable co-optimization for hinted graphs, and the
-                # solver's choice is correct, just not the one asked for.
-                hinted_unpinned.append(op.name)
             # The core budget is an invariant of the MENU, not of its consumers: both
             # engines pin an op's split symbols to one enumerated candidate, so nothing
             # downstream re-checks the product -- and `_matmul_split_cost`'s own budget
