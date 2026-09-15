@@ -33,24 +33,41 @@ deadcode_elimination -> decompositions -> propagate_named_dims -> assign_dim_hin
   -> dedup_and_promote_constants
   -> _maybe_coarse_tile_span_overflow    (post-stickify tiling)
   -> span_reduction
-  -> _distribute_work                    (work division committed here)
-  -> _maybe_scratchpad_planning          (LX planning; co-opt re-decides division)
+  -> _distribute_work                    (division committed; final only if pinned)
+  -> _maybe_scratchpad_planning          (LX planning; joint solve decides the rest)
   -> elide_proven_read_copies
 ```
 
 Two facts about that spine drive most of this plan.
 
-**Work division is decided twice.** `_distribute_work` commits a division per op;
-`_maybe_scratchpad_planning` then re-opens it, because `co_optimizing_lx_planning`
-defaults on. `CoOptimizingAllocator._commit_divisions` (`allocator.py:1964-1990`)
-overwrites `iteration_space_ownership` for *every* buffer, resident or spilled.
-Anything the first pass established and the joint solve does not know about is
-silently discarded. That is why user work-division hints do not survive, and why
-the pin ladder exists.
+**Work division is decided once per op, and a hint is a pin.** `_distribute_work`
+runs for every op and commits a division, but with `co_optimizing_lx_planning` on by
+default that commit is final only for the ops the joint solve may not re-slice. For
+every other op it is not an input. The default CP-SAT allocator is built without
+`prune` (`allocator.py:2826-2830`), so `_division_map` enumerates through
+`enumerate_work_division_candidates`, whose context is built with
+`committed_splits={}` (`work_division.py:970`) and whose only upstream floors are
+span reduction's (`_span_min_splits`, `work_division.py:180-182`). The solve picks,
+and `CoOptimizingAllocator._commit_divisions` (`allocator.py:2303-2330`) writes the
+choice into `iteration_space_ownership`. The pruned path used with the non-CP-SAT
+solvers is the one place the commit feeds the menu — `_enum_split_options` always
+keeps it as the seed (`allocator.py:1957-1970`) — but even there it is one candidate
+among several, not a decision. Line numbers in this fact are from `4ae07699`.
 
-**Coarse tiling is applied before either decision.** Both live tiling paths mutate
-the graph in the pre-scheduling pipeline, so by the time the solver runs, a tiled
-op simply presents a smaller footprint. Tiling is not something the solve chooses.
+The ops the solver may not re-slice are the pin ladder: each is offered
+`_distribute_work`'s commit as its single candidate, so its division is decided there
+and only there. A work-division hint belongs in that set — the user has already made
+the decision and `_apply_user_hint` has already validated it — so a hinted op is
+decided once, by the hint, and reaches the solver as a pin. The tree does not do that
+yet: a hinted op is not in the ladder, so it is enumerated like any other op, the
+hint is written over, and the only trace is a warning naming the op
+(`allocator.py:2237-2259`). N9 closes that gap. With co-optimization off,
+`_distribute_work` is the only decision for every op and hints already hold.
+
+**Coarse tiling is applied before the division is decided.** Both live tiling paths
+mutate the graph in the pre-scheduling pipeline, so by the time the solver runs, a
+tiled op simply presents a smaller footprint. Tiling is not something the solve
+chooses.
 
 ### 1.2 Defaults now in force
 
@@ -297,6 +314,79 @@ co-optimization is opt-in; `config.py:23-25` defaults it on. While there,
 at INFO (`work_division.py:1030`), and `:627-632` describes the divisibility gate
 as the span floor.
 
+**N9 — Make a partially specified work-division hint a pin.** Per §1.1, a hinted op
+should be decided once, by the hint, and reach the joint solve with that division as
+its only candidate. Line numbers in this item are from `4ae07699`; the rest of this
+plan is numbered against `dcd8a184`, 80 commits back, and `allocator.py` has drifted
+roughly 340 lines since.
+
+`_division_map` already detects the case and then declines it: a hinted
+`ComputedBuffer` with more than one candidate and no correctness pin is appended to
+`hinted_unpinned` and warned about once per graph (`allocator.py:2237-2259`).
+Delete the warning and give the case an eighth ladder entry instead:
+
+```python
+elif isinstance(op, ComputedBuffer) and has_work_div_hint(op):
+    reason = "user work_div hint"
+```
+
+which takes the same action the seven correctness pins take —
+`_legal_fixed_division(op, [_fixed_core_division(op)], reason)`
+(`allocator.py:2213-2214`), a one-element candidate list read straight out of
+`iteration_space_ownership`. `has_work_div_hint` is already imported at
+`allocator.py:56`. That is the whole change: for a hinted op the enumeration set
+becomes the division the previous pass committed, and the solver has nothing left to
+choose.
+
+Three facts make this the cheap version rather than the careful one, and each is
+better stated than discovered.
+
+*The pin is whole-op, not per-dim, because the committed division cannot be
+anything else.* `make_iteration_space_ownership` (`pass_utils.py:1714-1747`) writes
+`work_slices = {sym: int(splits.get(sym, 1)) for sym in iter_space}`, so committing
+a hint fills *every* iteration symbol and keeps no record of which ones the user
+named. Reading it back therefore pins the unhinted dims to 1 as well — and
+unhinted-at-1 is an artifact of `work_distribution_pass` returning early after
+`_commit_user_splits` (`work_division.py:1387-1399` ends in a bare `return`), not a
+user statement. A one-dim hint under `sencores=32` consequently uses as many cores as
+it names and leaves the rest idle, where today's unpinned path fills them. That is
+the performance hit this step accepts on purpose; §6 is the refinement that recovers
+those dims, and it is a strict generalization of this entry, not a redesign of it.
+
+*The re-validation cannot reject a hint the previous pass accepted.*
+`_legal_fixed_division` re-checks through `work_division_splits_are_legal`
+(`work_division.py:1009-1025`), whose docstring says it asks nothing about a core
+budget or per-core spans — only `obeys_op_constraints` and `meets_span_floors`.
+`_apply_user_hint` has already enforced the same `blocked` set, the same
+`allowed_splits` domains and the same `_span_min_splits` floors before committing
+(`work_division.py:1095-1108`). So unlike N1's coarse-tile pin, this entry should
+not be able to raise `Unsupported: fixed split violates hard domain`. The one
+asymmetry to watch is that the two derive their constraint set from different
+`committed_splits` — span reduction's on the hint path, the hint's own on
+re-validation — so a device run should still look for new `Unsupported` raises and
+not only for numerical deltas.
+
+*Placement in the ladder is a logging decision with one exception.* All eight
+branches share one action, and `_fixed_core_division` returns the division
+`_apply_user_hint` committed, so a hinted op that also trips a correctness pin gets
+the same division either way and only the logged reason differs; put the hint entry
+last, after N1's coarse-tile entry. The exception is
+`_drop_reduction_splits_in_coarse_group`, which runs only when `reason is None`.
+Setting a reason skips it — but it is a no-op on a one-element list anyway
+(`safe or divs`, `allocator.py:1369-1372`), so a user K-split on a matmul inside a
+coarse-tile counted loop is neither newly protected nor newly broken here. It stays
+the ~86%-wrong case that function's docstring names, reachable only by hinting it.
+
+Land it with the two workarounds deleted. `test_pointwise_work_div_hint_applied`
+and `test_matmul_work_div_hint_maps_by_name`
+(`tests/inductor/test_work_division_hint.py:348-396`) patch
+`co_optimizing_lx_planning=False` under a comment that says "partial hinting is not
+currently supported for work division" and a TODO that this step closes. Neither
+test demonstrates the property once the patch is gone — §6's closing paragraph
+explains why both are degenerate — so add the missing case in the same commit: a
+free, splittable, non-stick dim, a hint consuming only part of the budget, and an
+assertion on the committed division rather than on core count.
+
 ## 3. Execution order
 
 The priority order is a statement about value and it is the shape of this plan.
@@ -317,6 +407,11 @@ priority 2 — is promoted to a genuine prerequisite: it turns contested `elif`
 insertions into independent table entries, and its exhaustiveness test is the
 mechanism that catches the next dead guard.
 
+N9 is the deliberate exception: its hint entry lands in phase 0, ahead of the
+registry, and is one more `elif` to migrate later. Three lines against leaving a
+user hint unhonoured until phase 2 is not a close trade, and the entry has exactly
+the shape the registry will absorb.
+
 **Coarse tiling's integration step is gated on three things that do not exist yet**
 — the restored pin, the shared footprint function, and a test harness that actually
 compiles (§1.9). Landing it before the harness is fixed ships the headline behavior
@@ -330,11 +425,11 @@ encapsulation work.
 
 | Phase | Contents | Gate to leave it |
 | --- | --- | --- |
-| 0 | N1-N8, plus coarse tiling A (§4) — inert today, a silent LX over-commit later | Hinted coarse-tiled graphs reach the solver pinned; corpus solve deterministic and ~2.5-3x faster; 240 orphaned tests running |
+| 0 | N1-N9, plus coarse tiling A (§4) — inert today, a silent LX over-commit later | Hinted coarse-tiled graphs reach the solver pinned; a partially specified `work_div` hint reaches the SDSC unchanged with co-optimization on, its two test workarounds deleted; corpus solve deterministic and ~2.5-3x faster; 240 orphaned tests running |
 | 1 | Substrate (§9): device-free inner loop, solver bench over all three corpora with division diffs, pass-order contract, off-device graph-builder fixture | A planner change is evaluable in ~30 s with no card, reporting time, spilled traffic, and a per-op `chosen_division` diff |
 | 2 | Encapsulation A-D (§5): layout accessors, `SpyreGraph`+lifetimes, `SpyreOp`, `legal_core_divisions` registry | Exhaustiveness test passes; O(N²) rescan gone; LX pin set byte-identical |
 | 2' | Coarse tiling B-C (§4) in parallel: fail-closed guards, tiled-frame predictor | Guards fail closed with a measured e2e diff; predictor round-trips against the applicator |
-| 3 | Division hints (§6) and division pruning (§7) | Hint survives co-optimization with the two test workarounds deleted; one table encoding exists; budget regression-free at every k tested or shipped off |
+| 3 | Division hints (§6) and division pruning (§7) | The hinted dims survive while the unhinted ones stay free (partial pin), on a case where the two differ measurably; the perimeter eviction the pin causes is reported rather than absorbed; one table encoding exists; budget regression-free at every k tested or shipped off |
 | 4 | Coarse tiling D-G (§4): harness fix, solver integration, tiling pruning, logical grouping, then the group constraint | `hinted` and `partial` rows green on device at `SENCORES` 32 and 2; both gates off proven bit-identical, not assumed |
 | 5 | Restickification (§8) and op reordering (§10), each gated on its own measurement | Abandonment is an acceptable outcome for either |
 
@@ -841,28 +936,57 @@ list, and `_gate_divisions` forces non-residency when that list is empty. Narrow
 a hinted op's candidate list shrinks its neighbours' pair lists, and whatever no
 longer matches is spilled at `(reads_served + write) * size` bytes.
 
-Today the question is moot, because hints do not reach the solver at all:
-`work_distribution_pass` commits the hinted splits and `_commit_divisions`
-overwrites them one pass later. Every end-to-end hint test hides this by patching
-`co_optimizing_lx_planning=False`, with a TODO saying so.
+Until N9 the question is moot, because a hint never reaches the solver as a
+constraint: `work_distribution_pass` commits the hinted splits, `_division_map`
+enumerates the hinted op like any unpinned one without reading that commit, and
+`_commit_divisions` writes the solver's choice over it (§1.1). Every end-to-end hint
+test hides this by patching `co_optimizing_lx_planning=False`, with a TODO saying so.
 
-**Shape: partial pin by default, full pin as opt-in.** A partial pin — fix the
-hinted symbols, leave the rest to the solver — is a strict generalization of the
-existing contract, because `_apply_user_hint` only ever validates and returns the
-symbols the user named; the unhinted dims sitting at 1 is an artifact of
+**N9 settles the shape: the whole-op pin ships first, and it ships unconditionally.**
+Read the core division the previous pass committed, offer the solver exactly that
+one value, take whatever performance loss follows. Everything below is the
+refinement that follows that entry rather than an alternative to it, and two of §6's
+original claims change with it. There is no `work_div_exact` opt-in to design,
+because the whole-op pin is what the committed division can express — the escalation
+and the default are now the same code path. And the partial pin stops being a
+question of default semantics and becomes an optimization with a measurable target:
+the cores a one-dim hint currently leaves idle.
+
+**The partial pin, as the refinement.** Fixing only the hinted symbols and leaving
+the rest to the solver is a strict generalization of N9, because `_apply_user_hint`
+only ever validates and returns the symbols the user named
+(`work_division.py:1059-1165`); the unhinted dims sitting at 1 is an artifact of
 `work_distribution_pass` returning early, not a user statement. It also keeps the
 perimeter eviction *bounded and optimizable*: several candidates that all agree on
 the hinted dims still let a neighbour find a matching pair, whereas one candidate
-makes the eviction structural. But "lock down critical kernels" is a real
-requirement, so `work_div_exact=True` escalates to the whole-op pin.
+makes the eviction structural. N9 takes the structural version on purpose — a hint
+that survives beats a hint that is silently outvoted — so this is a later
+optimization, not a prerequisite.
 
-Reject the third option — a hint term in the objective. The CP-SAT objective is
-strictly lexicographic (residency, then parallelism, then balance), so a preference
-has to become a new *level*, and where it goes is the entire semantics: above
-residency it is a hard pin with extra steps, below it the hint loses to any spill.
-Level 1 is denominated in HBM bytes; a hint has no byte value.
+**Recovering which dims the user named.** The committed division cannot answer that:
+`make_iteration_space_ownership` (`pass_utils.py:1723`) fills every iteration symbol,
+so a dim hinted to 1, a dim pruned for exceeding `SENCORES`, and a dim never
+mentioned are indistinguishable after the commit. This does not need new
+persistence, though. `_resolve_work_div_hint` (`work_division.py:1039-1056`) already
+maps hint *names* onto this op's symbols through `work_div_loop_info`, and the
+post-prune subset is recoverable by dropping any symbol whose committed value
+differs from its raw hint value — precisely the set `_apply_user_hint` skipped at
+`work_division.py:1110-1121`. A hint of `1` is the single ambiguous case and is a
+no-op either way. Persisting the post-prune map explicitly is still the cleaner
+answer; it is a choice about where the logic lives, not about whether the
+information survives.
 
-**Mechanism: the `allowed_splits` channel, not a new parameter.** The enumerator
+Reject the remaining option — a hint term in the objective — for either version.
+The CP-SAT objective is strictly lexicographic (residency, then parallelism, then
+balance), so a preference has to become a new *level*, and where it goes is the
+entire semantics: above residency it is a hard pin with extra steps, below it the
+hint loses to any spill. Level 1 is denominated in HBM bytes; a hint has no byte
+value.
+
+**Mechanism for the partial pin: the `allowed_splits` channel, not a new
+parameter.** N9 needs none of this — a one-element list validated by
+`_legal_fixed_division` is self-consistent by construction. The moment the unhinted
+dims come back, it matters again. The enumerator
 already accepts a partial assignment, and `carried_reduction_pinned_row`
 (`work_division_constraints.py:165-190`) is a working precedent that pins a split to
 `frozenset({n})`. A `pinned=` parameter would constrain only the candidate list at
@@ -891,20 +1015,29 @@ Persist the **post-prune** map: `_apply_user_hint` silently drops a hinted dim t
 would exceed `SENCORES`, and pinning a dim the pass deliberately abandoned would be
 a bug.
 
-**An infeasible hint is currently silent, and the obvious diagnostic targets dead
-code.** The `Unsupported: no legal core-division candidates` raise at
-`allocator.py:1925` is unreachable from all three `_division_map` branches — each
-falls back to `_legal_fixed_division`, and the existing test at
-`test_work_division.py:1240-1268` proves it by patching the enumerator to return
-`[]` and asserting the result is `[fixed]`. So when a hint pin empties the
-enumeration, the real behavior is a silent fall back to the hinted division with
-every unhinted dim at 1, logged at DEBUG — the serial behavior the partial pin
-exists to avoid. Make that path raise with the op name, the pinned pairs and which
-filter emptied the set. Note the enumerator's filters are strictly stronger than
-`_apply_user_hint`'s: it also enforces the 256 MB per-core span and
-`prod(splits) <= max_cores`, neither of which the hint validator checks. Add a
-fourth cause the naive taxonomy misses: a pin whose value divides the concretized
-size but not the *granularity* yields an empty factor list for symbolic dims.
+**An infeasible hint has no usable diagnostic on either path.** Under N9 the
+failure is a raise, not a silence — `_legal_fixed_division` re-validates and throws
+`Unsupported: {op.name}: fixed split violates hard domain` — but that message names
+neither the hint, nor the offending dim, nor which predicate rejected it, and it is
+shared with the seven correctness pins, so the user cannot tell a bad hint from a
+bad coarse-tile commit. Give the raise the op name, the committed pairs, the reason
+string that selected the branch, and which of `obeys_op_constraints` /
+`meets_span_floors` failed.
+
+Under the partial pin the failure mode moves and gets quieter again. The
+`Unsupported: no legal core-division candidates` raise at `allocator.py:1925` is
+unreachable from all three `_division_map` branches — each falls back to
+`_legal_fixed_division`, and the existing test at `test_work_division.py:1240-1268`
+proves it by patching the enumerator to return `[]` and asserting the result is
+`[fixed]`. So when a partial pin empties the enumeration, the real behavior is a
+silent fall back to the hinted division with every unhinted dim at 1 — N9's
+behavior, logged at DEBUG, arrived at by accident. Make that path raise too, with
+the same four fields. Note the enumerator's filters are strictly stronger than both
+`_apply_user_hint`'s and `work_division_splits_are_legal`'s: it also enforces the
+256 MB per-core span and `prod(splits) <= max_cores`, which is why a pin can be
+feasible for N9 and infeasible for the partial version. Add a fourth cause the naive
+taxonomy misses: a pin whose value divides the concretized size but not the
+*granularity* yields an empty factor list for symbolic dims.
 
 **Report the perimeter eviction rather than absorbing it.** Compute
 `cd_parent_matches` twice for a hinted op's edges — pinned and unpinned — and record
@@ -921,21 +1054,27 @@ to `None` in `cd_parent_matches`, so the hinted op's output can never be LX-resi
 precisely this case. Warn loudly at `_apply_user_hint`; do not refuse — a K-split is
 often the right call for a critical matmul.
 
-**Precedence.** The `work_div_exact` entry goes last in the ladder, after the seven
-correctness pins. Each of those encodes a cited wrong-code or scheduler-abort
-incident and a user hint must not override one. The interaction is milder than it
-looks — all eight branches share the same remedy and `_fixed_core_division` returns
-the division `_apply_user_hint` committed, so when a safety pin fires on a hinted op
-it pins to the hinted division anyway and only the logged reason differs. What does
-matter is that a *partially* hinted op tripping a safety guard gets the full pin and
-loses its unhinted freedom; that must show up in the eviction report.
+**Precedence.** The hint entry goes last in the ladder, after the seven correctness
+pins. Each of those encodes a cited wrong-code or scheduler-abort incident and a user
+hint must not override one. For N9 the interaction is nil — all eight branches share
+the same remedy and `_fixed_core_division` returns the division `_apply_user_hint`
+committed, so when a safety pin fires on a hinted op it pins to the hinted division
+anyway and only the logged reason differs. It becomes real the moment the partial pin
+lands: a partially hinted op that trips a safety guard silently reverts to N9's
+whole-op pin and loses its unhinted freedom. That is a correct outcome and a
+surprising one, so it must show up in the eviction report rather than only in a DEBUG
+line.
 
-Finally, note the existing tests cannot demonstrate the headline claim.
+Finally, note that the existing tests cannot demonstrate either claim, which is why
+N9 carries a new case rather than only a patch deletion.
 `test_pointwise_work_div_hint_applied` is M=128 x N=64 fp16, and N is exactly one
 stick, so nothing is left for the solver to split;
 `test_matmul_work_div_hint_maps_by_name` hints K=4 and M=2 under `sencores=8`,
-consuming the whole budget. A new case with a free, splittable, non-stick dim and a
-hint consuming only part of the budget is required.
+consuming the whole budget. Both therefore pass under N9 and under the partial pin
+identically, and would keep passing if the pin were dropped again. The case that
+separates the three states — no pin, whole-op pin, partial pin — needs a free,
+splittable, non-stick dim and a hint consuming only part of the budget, and must
+assert on the committed division per op, not on a core count.
 
 ## 7. Core-division pruning
 
@@ -1364,14 +1503,22 @@ of the pipeline.
 2. **Does the registry land before coarse-tiling's solver integration?**
    Recommendation: yes (§3). The alternative is doing the integration twice.
 
-3. **Partial pin or full pin as the default hint semantics?** Recommendation: partial
-   by default, `work_div_exact=True` for the lock-down case. Both are reachable; only
-   the default is in question.
+3. ~~**Partial pin or full pin as the default hint semantics?**~~ **Decided: the
+   whole-op pin, unconditionally** (N9). A partially specified hint pins the op to
+   the division the previous pass committed — hinted dims at the user's values,
+   unhinted dims at 1 — and the idle cores that leaves are accepted rather than
+   traded against the objective. `work_div_exact` is withdrawn: with the whole-op pin
+   as the default there is nothing left for it to escalate to. The partial pin
+   remains on the plan as §6's refinement, and its case is now quantitative (the
+   cores N9 gives up) rather than semantic.
 
 4. **Do we reject unknown `spyre_hint` kwargs?** `spyre_hint(**kwargs)` does no key
-   validation, so `work_div_strict=True` is silently dropped and the user gets the
-   partial pin believing they got the full one. Rejecting unknown keys fixes that but
-   could break any downstream consumer of an unlisted key.
+   validation, so a misspelled or invented key is silently dropped and the user is
+   told nothing. N9 makes this less dangerous — every accepted `work_div` key is now
+   honoured exactly, so a dropped key is the only way to get a division you did not
+   ask for — and correspondingly more worth fixing, since it is the last silent path
+   left in the hint contract. Rejecting unknown keys fixes it but could break any
+   downstream consumer of an unlisted key.
 
 5. **Does the candidate budget ship at all?** Recommendation: opt-in, default off,
    until a keep rule survives all three corpora. The worker fix is unconditional.
