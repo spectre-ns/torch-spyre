@@ -1419,6 +1419,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         # solver sets supports_paired_buffers. Pin it explicitly so this test
         # keeps exercising relayout regardless of the default layout_solver.
         "layout_solver": "greedy",
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize(
