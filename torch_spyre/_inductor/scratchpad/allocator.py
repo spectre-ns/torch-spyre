@@ -54,7 +54,6 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
-    _has_work_div_hint,
     enumerate_work_division_candidates,
     has_work_div_hint,
     work_division_splits_are_legal,
@@ -1786,13 +1785,6 @@ def build_residency_edge(
         parent_is_matmul=_is_matmul_op(parent_op),
         prep_cache=prep_cache,
     )
-
-
-def _op_has_work_div_hint(op: Operation) -> bool:
-    """True when a user work_div hint governs ``op``'s division."""
-    if not isinstance(op, ComputedBuffer):
-        return False
-    return _has_work_div_hint(op)
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
