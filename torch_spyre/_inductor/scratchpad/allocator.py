@@ -14,6 +14,7 @@
 
 import functools
 import logging
+import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -1406,27 +1407,21 @@ def _lx_planning_size() -> int:
     return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
 
 
-def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
-    """Classify one symbol-keyed candidate for its producing operation."""
+def _reduction_syms(
+    op: Operation, splits: dict[sympy.Symbol, int]
+) -> frozenset[sympy.Symbol]:
+    """Get reduction symbols for an operation."""
     rw = op_read_writes(op)
     write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
     if write is None:
-        return CoreDivision()
-    output = {
-        s: int(v) for s, v in splits.items() if write.index.coeff(s) != 0 and v > 1
-    }
-    reduction = {
-        s: int(v) for s, v in splits.items() if write.index.coeff(s) == 0 and v > 1
-    }
-    return CoreDivision(output_splits=output, reduction_splits=reduction)
+        return frozenset()
+    return frozenset(s for s in splits if write.index.coeff(s) == 0)
 
 
-def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol, int]:
-    """Restore a complete symbol-keyed split map from a sparse division."""
-    return {
-        sym: int(division.output_splits.get(sym, division.reduction_splits.get(sym, 1)))
-        for sym in iteration_space_from_op(op)
-    }
+def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
+    """Classify one symbol-keyed candidate for its producing operation."""
+    sparse = {s: v for s, v in splits.items() if v > 1}
+    return CoreDivision(splits=sparse, reduction_syms=_reduction_syms(op, sparse))
 
 
 def _is_cpu_host_buffer(op: Operation) -> bool:
@@ -1597,7 +1592,7 @@ def _view_for_div(
     op: Operation,
     dep: MemoryDep,
     buf_name: str,
-    division: CoreDivision,
+    splits: dict[sympy.Symbol, int],
     prep_cache: dict,
 ):
     """One candidate division's per-core view of ``buf_name``.
@@ -1611,8 +1606,11 @@ def _view_for_div(
     key = (op.get_name(), dep, buf_name)
     if key not in prep_cache:
         prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
+    syms = _reduction_syms(op, splits)
     return _per_core_view_from_prep(
-        prep_cache[key], _division_splits(op, division), division.reduction_splits
+        prep_cache[key],
+        splits,
+        {k: v for k, v in splits.items() if k in syms},
     )
 
 
@@ -1672,13 +1670,13 @@ class ResidencyEdge:
     parent_is_matmul: bool
     prep_cache: dict
 
-    def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+    def parent_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
         candidate cannot host a readable residency: a partial-reduction write
         (output not final), an unrepresentable slicing, or a matmul output
         split across more than one device dim."""
         view, partial, repr_ok = _view_for_div(
-            self.parent_op, self.write_dep, self.buf_name, division, self.prep_cache
+            self.parent_op, self.write_dep, self.buf_name, splits, self.prep_cache
         )
         if not repr_ok or partial:
             return None
@@ -1686,34 +1684,23 @@ class ResidencyEdge:
             return None
         return view
 
-    def consumer_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+    def consumer_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
         """The consumer's read-view under ``division``, or ``None`` when its
         slicing of the buffer is unrepresentable -- we never pin on a slicing
         we cannot verify."""
         view, _partial, repr_ok = _view_for_div(
-            self.consumer_op, self.read_dep, self.buf_name, division, self.prep_cache
+            self.consumer_op, self.read_dep, self.buf_name, splits, self.prep_cache
         )
         return view if repr_ok else None
 
-    def compatible(
-        self, parent_division: CoreDivision, consumer_division: CoreDivision
-    ) -> bool:
-        """Whether the two candidates induce the same per-core slicing of the
-        buffer on the same total core count. Equal views alone are not enough:
-        a producer on N and a consumer on M > N cores can share a slicing while
-        the consumer's extra (broadcast-axis) cores hold no copy and would read
-        stale LX."""
-        if parent_division.cores_used != consumer_division.cores_used:
-            return False
-        parent_view = self.parent_view(parent_division)
-        return parent_view is not None and parent_view.same_partition(
-            self.consumer_view(consumer_division)
-        )
+    @staticmethod
+    def _cores_used(splits: dict[sympy.Symbol, int]):
+        return math.prod(splits.values())
 
     def match_pairs(
         self,
-        parent_divisions: Sequence[CoreDivision],
-        consumer_divisions: Sequence[CoreDivision],
+        parent_divisions: Sequence[dict[sympy.Symbol, int]],
+        consumer_divisions: Sequence[dict[sympy.Symbol, int]],
     ) -> list[tuple[int, int]]:
         """Compatible ``(parent index, consumer index)`` pairs, with each side's
         view computed once per candidate rather than once per pair."""
@@ -1726,7 +1713,8 @@ class ResidencyEdge:
             for j, consumer_view in enumerate(consumer_views)
             if consumer_view is not None
             and parent_view.same_partition(consumer_view)
-            and parent_divisions[i].cores_used == consumer_divisions[j].cores_used
+            and self._cores_used(parent_divisions[i])
+            == self._cores_used(consumer_divisions[j])
         ]
 
 
@@ -1792,7 +1780,7 @@ def _legal_fixed_division(
     """Return upstream division when it satisfies hard constraints."""
     division = fixed[0]
     if not isinstance(op, ComputedBuffer) or _split_option_is_legal(
-        op, _division_splits(op, division)
+        op, division.splits
     ):
         logger.debug("keep upstream division for %s: %s", op.name, reason)
         return fixed
@@ -2282,9 +2270,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
-        sym_core_divs = buffers[output_name].sym_core_divs
         op = graph.get_buffer(output_name)
-        ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
+        division = CoreDivision(splits=buffers[output_name].sym_core_divs)
+        ws = _work_slices(op, division)
         return extract_op_features(op, ws, is_lx)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
@@ -2458,18 +2446,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         seen: set[tuple] = set()
         for candidate in candidates:
             division = _core_division(op, candidate)
-            key = (
-                tuple(
-                    sorted(
-                        division.output_splits.items(), key=lambda item: str(item[0])
-                    )
-                ),
-                tuple(
-                    sorted(
-                        division.reduction_splits.items(), key=lambda item: str(item[0])
-                    )
-                ),
-            )
+            key = tuple(sorted(division.splits.items(), key=lambda item: str(item[0])))
             if key not in seen:
                 seen.add(key)
                 cds.append(division)
@@ -2500,9 +2477,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if not hasattr(op, "iteration_space_ownership"):
                 continue
             cd = buf.core_divisions[buf.chosen_division]
-            if not _split_option_is_legal(op, _division_splits(op, cd)):
+            if not _split_option_is_legal(op, cd.splits):
                 raise Unsupported(f"{op.name}: chosen split violates hard domain.")
-            commit_iteration_space_ownership(op, _division_splits(op, cd))
+            commit_iteration_space_ownership(op, cd.splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
@@ -2815,7 +2792,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 )
                 if k is None:
                     cd = consumer_divs[j]
-                    per_sym = _division_splits(consumer, cd)
+                    per_sym = cd.splits
                     # Project onto the input: a consumer split on an axis the
                     # input lacks (e.g. a matmul's free dim) does not slice the
                     # input, so it must not count toward the clone's cores.
@@ -2825,12 +2802,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     k = len(clone_divs)
                     clone_divs.append(
                         CoreDivision(
-                            output_splits={
+                            splits={
                                 sym: split
                                 for sym, split in per_sym.items()
                                 if split > 1 and sym in read_syms
-                            },
-                            reduction_splits={},
+                            }
                         )
                     )  # a clone op cannot have a reduction split
                     clone_views.append(view)
@@ -2880,18 +2856,21 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             if edge is None:
                 continue
-            matches[parent] = edge.match_pairs(divisions[parent], consumer_divs)
+            matches[parent] = edge.match_pairs(
+                [cd.splits for cd in divisions[parent]],
+                [cd.splits for cd in consumer_divs],
+            )
         return matches
 
     @staticmethod
-    def _views_for_divs(op, dep, buf_name, divs, prep_cache: dict):
+    def _views_for_divs(op, dep, buf_name, divs: list[CoreDivision], prep_cache: dict):
         """Per-core views of ``buf_name`` for each candidate division of ``op``.
 
         The candidate-invariant prep is computed once and shared through
         ``prep_cache``, so cost scales with the op rather than its candidate
         count.
         """
-        return [_view_for_div(op, dep, buf_name, cd, prep_cache) for cd in divs]
+        return [_view_for_div(op, dep, buf_name, cd.splits, prep_cache) for cd in divs]
 
 
 def _make_cpsat_solver(
