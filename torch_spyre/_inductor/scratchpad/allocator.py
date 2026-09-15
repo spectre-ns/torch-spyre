@@ -1778,11 +1778,27 @@ def _split_fits_sticks(op: Operation, splits: dict[sympy.Symbol, int]) -> bool:
         return False
     sizes = _output_stride_to_device_size(op)
     for sym, factor in splits.items():
-        stride = int(write.index.coeff(sym))
+        stride = concretize_expr(write.index.coeff(sym))
         size = sizes.get(stride, 0)
         if factor > 1 and stride and (not size or size % factor):
             return False
     return True
+
+
+def _output_axis_symbols(
+    write: sympy.Expr, iter_syms: dict[sympy.Symbol, sympy.Expr]
+) -> dict[int, sympy.Symbol]:
+    """Map each output stride in ``write`` to the iteration symbol it scales.
+
+    Only iteration symbols are axes. Under dynamic shapes the index also carries
+    size symbols (``d0*s20 + d1``), whose coefficients are loop variables rather
+    than strides, so ``write.free_symbols`` cannot be used directly.
+    """
+    return {
+        concretize_expr(write.coeff(sym)): sym
+        for sym in iter_syms
+        if sym in write.free_symbols
+    }
 
 
 def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]]:
@@ -1797,8 +1813,10 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     rw = op_read_writes(op)
     write = next(iter(rw.writes)).index
     read = next((dep.index for dep in rw.reads), write)
-    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
-    k_syms = read.free_symbols - write.free_symbols
+    iter_syms = iteration_space_from_op(op)
+    out_syms = _output_axis_symbols(write, iter_syms)
+    k_syms = {sym for sym in iter_syms if sym in read.free_symbols}
+    k_syms -= write.free_symbols
     if not k_syms:
         raise ValueError(f"matmul {op.get_name()} has no reduction axis")
     sizes = _output_stride_to_device_size(op)
@@ -1810,7 +1828,7 @@ def _matmul_axis_parse(op: Operation) -> dict[str, tuple[sympy.Symbol, int, int]
     k_sym = min(k_syms, key=str)
     roles["K"] = (
         k_sym,
-        concretize_expr(iteration_space_from_op(op)[k_sym]),
+        concretize_expr(iter_syms[k_sym]),
         seed[k_sym],
     )
     return roles
@@ -1834,7 +1852,7 @@ def _reduction_bm_axes(
     M. Reductions with fewer than two output axes cannot use this factorization.
     """
     write = next(iter(op_read_writes(op).writes)).index
-    out_syms = {int(write.coeff(sym)): sym for sym in write.free_symbols}
+    out_syms = _output_axis_symbols(write, iteration_space_from_op(op))
     if len(out_syms) < 2:
         return None
     m_stride, b_stride = sorted(out_syms)[-2:]
@@ -1878,7 +1896,7 @@ def _output_profile(op: Operation, splits: dict[sympy.Symbol, int]) -> dict[int,
     """
     write = next(iter(op_read_writes(op).writes)).index
     return {
-        int(write.coeff(sym)): factor
+        concretize_expr(write.coeff(sym)): factor
         for sym, factor in splits.items()
         if factor > 1 and write.coeff(sym) != 0
     }
@@ -1890,7 +1908,9 @@ def _from_output_profile(
     """Apply a transient physical output profile as a symbol-keyed candidate."""
     write = next(iter(op_read_writes(op).writes)).index
     return {
-        sym: profile.get(int(write.coeff(sym)), 1) if write.coeff(sym) != 0 else 1
+        sym: profile.get(concretize_expr(write.coeff(sym)), 1)
+        if write.coeff(sym) != 0
+        else 1
         for sym in iteration_space_from_op(op)
     }
 
