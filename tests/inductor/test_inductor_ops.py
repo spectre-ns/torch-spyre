@@ -6541,7 +6541,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_tuple_reduce_keepdim1_cpu(self, op, dim, x):
         _compare_op_with_cpu(lambda x: op(x, dim=dim, keepdim=True), op, x)
 
-    @config.patch({"co_optimization_enabled": False})
+    @config.patch({"co_optimizing_lx_planning": False})
     def test_shared_input_two_reductions_base(self, op, dim, x):
         """Two or more reductions over one shared input, reducing a non-trailing dim.
 
