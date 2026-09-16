@@ -429,6 +429,46 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         source = self._compile_partially_hinted_add()
         self.assertIn("sympify('c0'): (sympify('8'), 2)", source)
         self.assertIn("sympify('c1'): (sympify('128'), 1)", source)
+    def _declare_k_split_matmul_inputs(self):
+        """(B=3, M=11, K=192) activation and (K, N=128) weight, named."""
+        B, M, K, N = 3, 11, 192, 128
+        x = torch.randn(B, M, K, dtype=torch.float16).to("spyre")
+        w = torch.randn(K, N, dtype=torch.float16).to("spyre")
+        for name, size in (("B", B), ("M", M), ("K", K), ("N", N)):
+            _declare_tensor_dim(name, size)
+        _name_tensor_dims(x, ["B", "M", "K"])
+        _name_tensor_dims(w, ["K", "N"])
+        return x, w
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
+    def test_matmul_k_split_hint_rejected_for_reordered_view_operand(self):
+        # x.view(33, K) keeps x's 3D device order [M, K-stick, B] while mm writes
+        # a fresh [N-stick, B*M] buffer. A K-split across that order mismatch is
+        # lowered to wrong results (~29% of elements here), so the hint must be
+        # rejected rather than silently applied.
+        x, w = self._declare_k_split_matmul_inputs()
+
+        def fn(x, w):
+            with spyre_hint(work_div={"K": 3}):
+                return x.view(33, 192).mm(w)
+
+        with self.assertRaisesRegex(Exception, "legal splits are"):
+            torch.compile(fn, dynamic=False)(x, w)
+
+    @config.patch({"sencores": 8, "co_optimizing_lx_planning": False})
+    def test_matmul_k_split_hint_kept_when_operand_order_matches_output(self):
+        # The same operands through a 3D matmul share the output's [M, stick, B]
+        # order, so the K-split stays legal and computes the right values.
+        x, w = self._declare_k_split_matmul_inputs()
+
+        def fn(x, w):
+            with spyre_hint(work_div={"K": 3}):
+                return torch.matmul(x, w)
+
+        result, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
+        self.assertIn("(sympify('192'), 3)", source_codes[0])
+        expected = torch.matmul(x.cpu().float(), w.cpu().float()).half()
+        torch.testing.assert_close(result.cpu(), expected, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.xfail(
         strict=True,
@@ -1759,7 +1799,7 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     solver = allocator._build_solver(buffers)
     with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
         allocation = allocator._solve(solver, graph)
-        allocator._finalize_lx_relayout_allocation(allocation)
+        allocator._finalize_lx_relayout_allocation(allocation, graph)
 
     by_name = {buffer.name: buffer for buffer in allocation}
     assert by_name["ordinary"].address == 0
@@ -1779,7 +1819,8 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
 def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
     # The first layout is the actual restickified K page from serving prefill.
     # Its old HOST-stride measurement reserved only 256 / 2176 bytes. The
-    # device-storage bound is 8192 / 245760 regardless of the host permutation.
+    # Packed device storage is 8192 / 131072 regardless of the host permutation.
+    # The replicated consumer cannot be sized by dividing the tensor by 32.
     layout = object.__new__(FixedTiledLayout)
     layout.device_layout = SpyreTensorLayout(
         [8, 1, 2, 128, 64], list(host_strides), DataFormats.SEN169_FP16
@@ -1797,7 +1838,7 @@ def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
         ((2, 2),), ((2, Mod(floor(_CORE_ID / 16), 2)),), num_cores=32
     )
     assert lx_relayout_module.partition_footprint(layout, source) == 8192
-    assert lx_relayout_module.partition_footprint(layout, destination) == 245760
+    assert lx_relayout_module.partition_footprint(layout, destination) == 131072
 
 
 def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):
