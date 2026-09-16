@@ -7728,6 +7728,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, x, diagonal)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    # The prefill shapes here are large enough that the co-optimizing CP-SAT
+    # solve can run its full per-phase budget in every lexicographic phase,
+    # which pushed the suite past CI's 300s no-output stall watchdog (the kill
+    # then orphans the VFIO card, so the stall retry fails to open the device).
+    # Same bound the other large attention tests already pin; see
+    # test_building_blocks.py and test_coarse_tile_e2e.py.
+    @inductor_config.patch({"cpsat_time_limit_seconds": 30})
     def test_sdpa_cpu(self, q, k, v, attn_mask, is_causal, enable_gqa):
         def fn(q, k, v, attn_mask, is_causal, enable_gqa):
             return torch.nn.functional.scaled_dot_product_attention(

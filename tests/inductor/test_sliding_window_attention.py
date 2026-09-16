@@ -32,6 +32,8 @@ import torch
 import torch._dynamo
 import torch.nn.functional as F
 
+from torch_spyre._inductor import config
+
 from utils_inductor import cached_randn, compare_with_cpu
 
 
@@ -259,6 +261,11 @@ class TestSlidingWindowAttention(unittest.TestCase):
         query, key, value = _inputs(1, 8, 8, 256, 256, head_dim=128)
         _compare_attention(query, key, value, 64)
 
+    # 2048x2048 over 32 blocks is the largest graph in this file, and under the
+    # co-optimizing solver it went silent long enough for CI's 300s stall
+    # watchdog to kill the suite. Same bound the other large attention tests
+    # already pin; see test_building_blocks.py and test_coarse_tile_e2e.py.
+    @config.patch({"cpsat_time_limit_seconds": 30})
     def test_prefill_long(self):
         # 32 blocks — a long unrolled loop rather than a handful.
         query, key, value = _inputs(1, 8, 8, 2048, 2048)
