@@ -143,9 +143,7 @@ class TestLxContextSwitching(unittest.TestCase):
         # for in one configuration. The offset is a solver output, so re-tuning
         # the vehicle instead would only hold until the next cost-model change
         # -- this canary has already drifted twice (see _run_launch_diff).
-        self._coopt_off = ts_inductor_config.patch(
-            {"co_optimizing_lx_planning": False}
-        )
+        self._coopt_off = ts_inductor_config.patch({"co_optimizing_lx_planning": False})
         self._coopt_off.__enter__()
 
     def tearDown(self):

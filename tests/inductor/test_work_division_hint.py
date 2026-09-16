@@ -1561,7 +1561,7 @@ def test_lx_relayout_consumers_share_destination_view(second_consumer):
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
         "layout_solver": "greedy",
-        "co_optimizing_lx_planning" : False,
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize(
@@ -1627,7 +1627,7 @@ def test_grouped_lx_relayout_device(broadcast):
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
-        "co_optimizing_lx_planning" : False,
+        "co_optimizing_lx_planning": False,
     }
 )
 @pytest.mark.parametrize("reader", ["pointwise", "split_matmul", "restickify"])
@@ -1706,7 +1706,7 @@ def test_lx_relayout_read_expansion_device(reader, enabled):
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
-        "co_optimizing_lx_planning" : False,
+        "co_optimizing_lx_planning": False,
     }
 )
 def test_unhinted_moe_down_route_uses_the_production_hbm_fallback():

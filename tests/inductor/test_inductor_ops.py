@@ -21,6 +21,7 @@ import pytest
 import unittest
 import torch
 import torch.nn.functional as F
+from torch_spyre._inductor import config
 
 
 from utils_inductor import (
