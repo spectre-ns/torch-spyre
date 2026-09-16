@@ -429,6 +429,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         source = self._compile_partially_hinted_add()
         self.assertIn("sympify('c0'): (sympify('8'), 2)", source)
         self.assertIn("sympify('c1'): (sympify('128'), 1)", source)
+
     def _declare_k_split_matmul_inputs(self):
         """(B=3, M=11, K=192) activation and (K, N=128) weight, named."""
         B, M, K, N = 3, 11, 192, 128
