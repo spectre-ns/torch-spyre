@@ -219,6 +219,22 @@ def _compute_dim_order(stick_dim, size, coords):
     return dim_order
 
 
+def _project_pointwise_dim_order(
+    dim_order: list[int], output_rank: int, input_rank: int
+) -> list[int]:
+    """Project a pointwise output order onto a trailing-aligned input."""
+    rank_diff = output_rank - input_rank
+    if rank_diff >= 0:
+        return [d - rank_diff for d in dim_order if d >= rank_diff]
+
+    # A loop tile can be a rank-preserving view of a higher-rank backing
+    # buffer. Its extra leading axes are fixed by the loop, while the body
+    # operates on the trailing axes. Keep those backing axes in the layout
+    # permutation and shift the body's order onto the trailing dimensions.
+    leading = list(range(-rank_diff))
+    return leading + [d - rank_diff for d in dim_order]
+
+
 def _pick_stick_dim(stick_expr, out_coords) -> int:
     """Map a stick expression to an output dimension index, or -1 if it doesn't survive."""
     maybe = matching_dim(out_coords, stick_expr)
@@ -430,7 +446,7 @@ def _qfp8wt_stl(
         in_layout: Inductor ``FixedLayout`` for the op's input tensor.
     """
     in_eps = get_elem_in_stick(in_layout.dtype)
-    stick_dim_size = in_layout.size[-1]
+    stick_dim_size = concretize_expr(in_layout.size[-1])
     unaligned = stick_dim_size % in_eps
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
@@ -715,9 +731,7 @@ def _clone_layout(
     data = op.data
 
     assert isinstance(data, Pointwise)
-    origin_node = next(iter(data.origins))
-    aten_op = origin_node.target
-    assert aten_op == aten.clone.default
+    assert any(origin.target == aten.clone.default for origin in data.origins)
 
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
@@ -1549,9 +1563,9 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
-            rank_diff = len(output.size) - len(arg.layout.size)
-            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
+            projected_dim_order = _project_pointwise_dim_order(
+                dim_order, len(output.size), len(arg.layout.size)
+            )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
             in_stl = SpyreTensorLayout(
@@ -1944,7 +1958,7 @@ def compute_layouts(
     if aten_op == spyreop.compact.default:
         return _compact_layout(op, output, output_dep, args)
 
-    if aten_op == aten.clone.default:
+    if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.
@@ -2649,7 +2663,7 @@ def propagate_spyre_tensor_layouts(
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the non-target inputs.
                     # This enforces input-compatibility and slice constraints,
-                    # so the backend DDL slice check passes.
+                    # so the backend slice check passes.
                     rw = op.get_read_writes()
                     output_dep = next(iter(rw.writes))
                     all_args = _get_prop_args(rw.reads)
