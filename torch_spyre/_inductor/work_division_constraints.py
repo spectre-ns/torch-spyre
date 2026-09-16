@@ -116,7 +116,6 @@ def collect_work_division_constraints(
         restickify_padding_blocked_vars,
         qfp8wt_split_domains,
         qfp8wt_matmul_k_split_domains,
-        matmul_k_split_layout_order_domains,
         topk_split_domains,
         keep_by_index_k_split_constraint,
         keep_by_index_pinned_search_space_vars,

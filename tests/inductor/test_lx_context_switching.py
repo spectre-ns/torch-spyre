@@ -131,10 +131,27 @@ class TestLxContextSwitching(unittest.TestCase):
         # test_scratchpad_use.py's BaseTestScratchpadUsage.setUp.
         self._caches_disabled = t_inductor_config.patch("force_disable_caches", True)
         self._caches_disabled.__enter__()
+        # Pin the whole class to the placement this vehicle is calibrated
+        # against. `r` is LX-resident either way, but the co-optimizing solver
+        # puts it at LX offset 32768 where the nested launch (which plans from
+        # address 0, 256x256 fp16) never reaches it, instead of 1024 where it
+        # does. That silences the canary
+        # (test_neither_mechanism_reproduces_the_bug), and a silent canary is
+        # not a local problem: the two mechanism tests assert `diff == 0.0`, so
+        # without a reproducing baseline they pass whether or not the mechanism
+        # works. Pinning the class keeps the canary and the tests it vouches
+        # for in one configuration. The offset is a solver output, so re-tuning
+        # the vehicle instead would only hold until the next cost-model change
+        # -- this canary has already drifted twice (see _run_launch_diff).
+        self._coopt_off = ts_inductor_config.patch(
+            {"co_optimizing_lx_planning": False}
+        )
+        self._coopt_off.__enter__()
 
     def tearDown(self):
         global _launch
         _launch = False
+        self._coopt_off.__exit__(None, None, None)
         self._caches_disabled.__exit__(None, None, None)
         torch.compiler.reset()
 
