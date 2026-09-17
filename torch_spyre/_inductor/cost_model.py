@@ -273,8 +273,7 @@ class ArgTraffic:
             and self.owns_boundary_charge
         ):
             return 0
-        is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
-        return self.elems * is_lx
+        return self.elems * self.is_lx
 
     def replicated_hbm_elems(self):
         """The share of :meth:`hbm_elems` that is a per-core replica load: all of a
@@ -283,8 +282,7 @@ class ArgTraffic:
         from ``hbm_elems`` unconditionally."""
         if isinstance(self.replication, int) and self.replication == 1:
             return 0
-        is_lx = int(self.is_lx) if isinstance(self.is_lx, bool) else self.is_lx
-        return self.elems * self.loop_factor * self.replication * (1 - is_lx)
+        return self.elems * self.loop_factor * self.replication * (1 - self.is_lx)
 
     @property
     def mem(self) -> str:
