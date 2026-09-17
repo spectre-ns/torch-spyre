@@ -562,14 +562,6 @@ def elide_proven_read_copies(graph: GraphLowering) -> None:
                 validation_error,
             )
             continue
-        if "lx" in getattr(copy_op.get_layout(), "allocation", {}):
-            # LX planning chose to keep this copy resident; eliding it would
-            # discard that slot after other buffers were spilled for it.
-            logger.debug(
-                "read-copy elision declined for %s: copy is LX-resident",
-                record.consumer_name,
-            )
-            continue
 
         replacement = replace_computed_buffer_body(
             consumer,
