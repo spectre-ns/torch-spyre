@@ -2108,6 +2108,10 @@ def test_carried_reduction_after_tiled_pointwise_producer():
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "layout_solver": "greedy",
+        # Greedy only emits relayout copies without co-optimization: under
+        # co-optimization select_allocator drops relayout for solvers that do
+        # not decide it, so enabled=True would count zero copies.
+        "co_optimizing_lx_planning": False,
         "core_id_k_fast_emission": True,
     }
 )

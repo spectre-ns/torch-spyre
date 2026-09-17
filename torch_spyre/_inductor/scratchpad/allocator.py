@@ -648,6 +648,11 @@ class ScratchpadAllocator:
                 return "graph output (no clone)"
             if name in reinterpret_output_names:
                 return "graph output is a ReinterpretView"
+            if name in mutated_buffers:
+                # The output clone is inserted after the producer, so it would
+                # copy the value from before a later in-place update (e.g. a
+                # loop carry returned from the graph).
+                return "graph output mutated after production"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
         if division_is_fixed and ncores.get(name, -1) < 0:
@@ -3295,6 +3300,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     if grouped_gather_rejection(consumer_op, ncores, cv):
                         continue
                     if _projected(pv, prod_coords, prod_space, "prod") is None:
+                        continue
+                    # The relayout copy iterates the producer's shape, so the
+                    # destination view must also project on the producer frame
+                    # (materialize_lx_relayouts commits it there and raises).
+                    if _projected(cv, prod_coords, prod_space, "prod") is None:
                         continue
                     src_division = _projected(pv, cons_coords, cons_space, "cons")
                     dst_division = _projected(cv, cons_coords, cons_space, "cons")
