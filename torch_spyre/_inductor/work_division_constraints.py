@@ -335,28 +335,26 @@ def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRes
 
 
 def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Block output image dims that cannot be split per-core for direct convs.
+    """Block output image dims for strided direct convolutions.
 
-    The output write's last two dims are the spatial (H/W) output axes. Two
-    distinct cases make splitting one of them across cores produce silent wrong
-    output; span-limit commitments win, handled uniformly by
-    ``collect_work_division_constraints``:
+    The output write's last two dims are the spatial (H/W) output axes.
+    Splitting a strided one across cores gives each core an incorrect per-core
+    DSM input address, so both axes are blocked whenever either stride > 1
+    (applies to both direct-conv paths). Span-limit commitments win, handled
+    uniformly by ``collect_work_division_constraints``.
 
-    * **Strided convolutions.** Splitting a strided spatial dim gives each core
-      an incorrect per-core DSM input address, so both spatial axes are blocked
-      whenever either stride > 1 (applies to both direct-conv paths).
+    Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
+    conv2d (#3284) records it as stride_h/stride_w. Accept either spelling so
+    the block covers both direct-conv paths.
 
-    * **Collapsed (kernel-extent-1) windows on the depthwise path.** A 1-tap
-      axis has no conv window, so ``superdsc`` leaves its per-core padding
-      variant unassigned (see ``build_padding_sizes_variant``); a spatial split
-      of that axis then mis-addresses each core's slice. This was latent because
-      the old work-division algorithm never split it, but co-optimization does
-      (it split the H axis of a stride-1 1x1 depthwise conv and produced ~8%
-      wrong elements). A real (extent > 1) window splits correctly per-core, so
-      only the collapsed axis is blocked -- e.g. a 3x3 depthwise conv keeps its
-      spatial parallelism. Depthwise conv2d (#3510) records stride as
-      stride_i/stride_j and kernel as kernel_h/kernel_w; forward conv2d (#3284)
-      records stride as stride_h/stride_w.
+    A collapsed (kernel-extent-1) axis on the depthwise path used to be blocked
+    here too, because a spatial split of it mis-addressed each core's slice
+    (~8% wrong elements on a stride-1 1x1 depthwise conv). That split is
+    correct as of 2026-09-17: measured over the 1x1, 1xN and Nx1 depthwise
+    shapes in ``test_dwise_conv2d``, with the split forced onto each spatial
+    axis in turn, the results are numerically identical to the unsplit runs.
+    The block cost up to 32x the spatial parallelism on those shapes (it drove
+    them to a single core), so it was removed.
     """
     if not config.disable_conv2d_spatial_split:
         return ConstraintResult()
@@ -370,28 +368,16 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
 
     stride_i = conv_params.get("stride_i", conv_params.get("stride_h", 1))
     stride_j = conv_params.get("stride_j", conv_params.get("stride_w", 1))
-    strided = (stride_i or 1) > 1 or (stride_j or 1) > 1
-
-    # Collapsed-window block is depthwise-only (the direct forward path handles
-    # its own collapsed windows). The last two write dims are (H, W) == (i, j),
-    # matched to kernel_h / kernel_w. Discriminate the two direct-conv paths by
-    # reduction_type, as ``reduction_window_blocked_vars`` does -- the stride key
-    # spelling is only a naming convention and would silently mis-classify a
-    # forward conv that later adopted stride_i/stride_j.
-    is_depthwise = getattr(ctx.op.data, "reduction_type", None) == DEPTHWISE_CONV2D_OP
-    kernel_extents = (
-        conv_params.get("kernel_h", 1),
-        conv_params.get("kernel_w", 1),
-    )
+    if (stride_i or 1) <= 1 and (stride_j or 1) <= 1:
+        return ConstraintResult()
 
     write = typing.cast(MemoryDep, next(iter(op_read_writes(ctx.op).writes)))
     blocked = {
         sym
-        for sym, kernel_extent in zip(list(write.ranges)[-2:], kernel_extents)
+        for sym in list(write.ranges)[-2:]
         if isinstance(sym, Symbol)
         and sym in ctx.it_space
         and concretize_expr(ctx.it_space[sym]) > 1
-        and (strided or (is_depthwise and kernel_extent <= 1))
     }
     return ConstraintResult(blocked=blocked)
 
