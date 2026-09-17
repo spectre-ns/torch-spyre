@@ -2152,21 +2152,10 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
     @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
     def test_input_clone_inplace_shares_lx_slot_in_cooptimizing_path(self):
-        """Peak-LX: the joint CP-SAT co-optimizer also fires the reverse-parent
-        merge (#3212), reusing the input clone's slot rather than adding one.
-
-        Unlike greedy, the co-optimizer can *avoid* an in-place merge by choosing
-        a larger core division: a finer split shrinks every per-core footprint
-        until all buffers fit in their own slot, so with a roomy LX it never needs
-        to reuse a slot (and this test would be vacuous). To exercise the merge we
-        shrink the LX budget to two per-core slots while the graph has three
-        LX-eligible buffers at the maximum 32-way split (the input clone plus
-        ``x*2`` and ``x*3``). Keeping all three resident then costs strictly less
-        HBM traffic than spilling one, and the only 2-slot plan that holds all
-        three merges ``x*3`` onto the input clone's slot -- so the co-optimizer
-        picks it. We assert the input clone shares its LX address (merge fired)
-        and values are unchanged. Mirrors ``test_input_clone_inplace_shares_lx_slot``
-        on the joint (co-optimizing) allocator."""
+        """
+        Tests that the co-optimizing path correctly prices input cloning
+        and in-place operations after PR4596
+        """
         from torch_spyre._inductor.pass_utils import op_short_name
         from torch_spyre._inductor.scratchpad import allocator as alloc_mod
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
