@@ -367,17 +367,7 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
 
 
 def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Keep pooling and convolution kernel windows local to each core.
-
-    For ``POOL_OPS`` (avgpoolfwd) the whole reduction space is the window: the
-    pool is a single datapath instruction whose ``scaling_factor``
-    (1/(kH*kW)) is applied to the full-window sum, and there is no cross-core
-    accumulation of a partial-window pool. Splitting a window axis therefore
-    makes each core pool only part of the window -- silent wrong output (the
-    generic reduction-split path assumes a summable partial, which the pool
-    datapath does not provide). Splitting the *output* spatial dims stays legal:
-    each output pixel's window is wholly local to the core that owns it.
-    """
+    """Keep pooling and convolution kernel windows local to each core."""
 
     if not isinstance(ctx.op.data, Reduction):
         return ConstraintResult()
