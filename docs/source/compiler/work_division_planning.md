@@ -638,11 +638,7 @@ Aligned splits (LX reuse possible)        Mismatched splits (DDR round-trip)
 ```
 
 A graph-aware co-optimisation pass runs by default
-(`CO_OPTIMIZING_LX_PLANNING=0` opts out). It aligns splits across adjacent
-ops to grow the LX planner's legal-reuse set. Ops whose per-core addressing
-the joint solver cannot safely re-slice — windowed pools, `keep_by_index`
-and fp8-matmul layout groups, indirect-access ops, offset-slice reads and
-sliced in-place mutations — keep the division this pass chose. See the
+(`CO_OPTIMIZING_LX_PLANNING=0` opts out). See the
 [scratchpad planning](scratchpad_planning.md) doc for details.
 
 ## User Work-Division Hints

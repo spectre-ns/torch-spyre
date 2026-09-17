@@ -4887,6 +4887,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             with_mask=True,
         )
 
+    # patch the cpsat time to bypass the CI job stall timeout
     @config.patch(
         {
             "cpsat_time_limit_seconds": 30,
@@ -4909,6 +4910,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
         )
 
+    # patch the cpsat time to bypass the CI job stall timeout
     @config.patch(
         {
             "cpsat_time_limit_seconds": 30,
@@ -4930,6 +4932,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """h_tiles == H (one head per tile) is numerically exact."""
         self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
 
+    # patch the cpsat time to bypass the CI job stall timeout
     @config.patch(
         {
             "cpsat_time_limit_seconds": 30,
