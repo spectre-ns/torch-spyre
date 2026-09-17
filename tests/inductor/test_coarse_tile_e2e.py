@@ -4012,7 +4012,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     def test_loop_invariant_op_write_does_not_advance_in_sdsc(self):
         """A loop-invariant ComputedBuffer's own write inside a coarse-tile
-        group must never get a device_tile_advance_expr, so the unroller does
+        group must never get a device_tile_advance_expr, so the compiler does
         not advance its address.
 
         torch.full lowers to a scalar-fill ComputedBuffer with no loop var matching
@@ -6828,7 +6828,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
     def test_nested_matmul_accum_tile_write_does_not_advance_in_sdsc(self):
         """Accumulator tile buffer in nested outer-M + inner-K reduction must never
         get a device_tile_advance_expr referencing the inner K-loop, so the
-        unroller does not advance its base address across inner iterations.
+        compiler does not advance its base address across inner iterations.
 
         The accum_tile buffer is loop-internal to the inner K-loop: it is read
         and written every inner iteration by the combine op, but must stay at a
