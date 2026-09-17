@@ -335,26 +335,10 @@ def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRes
 
 
 def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Block output image dims for strided direct convolutions.
+    """Block output image dims for strided convolutions.
 
-    The output write's last two dims are the spatial (H/W) output axes.
-    Splitting a strided one across cores gives each core an incorrect per-core
-    DSM input address, so both axes are blocked whenever either stride > 1
-    (applies to both direct-conv paths). Span-limit commitments win, handled
-    uniformly by ``collect_work_division_constraints``.
-
-    Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
-    conv2d (#3284) records it as stride_h/stride_w. Accept either spelling so
-    the block covers both direct-conv paths.
-
-    A collapsed (kernel-extent-1) axis on the depthwise path used to be blocked
-    here too, because a spatial split of it mis-addressed each core's slice
-    (~8% wrong elements on a stride-1 1x1 depthwise conv). That split is
-    correct as of 2026-09-17: measured over the 1x1, 1xN and Nx1 depthwise
-    shapes in ``test_dwise_conv2d``, with the split forced onto each spatial
-    axis in turn, the results are numerically identical to the unsplit runs.
-    The block cost up to 32x the spatial parallelism on those shapes (it drove
-    them to a single core), so it was removed.
+    Splitting spatial dims produces incorrect per-core DSM addressing. Span-limit
+    commitments win, handled uniformly by ``collect_work_division_constraints``.
     """
     if not config.disable_conv2d_spatial_split:
         return ConstraintResult()
