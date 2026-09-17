@@ -265,7 +265,7 @@ class ArgTraffic:
         boundary charge (``owns_boundary_charge``), and zero for every other arg.
 
         The clone is one untiled pass, so neither ``replication`` nor ``loop_factor``
-        scales it: the replicas and the loop iterations ar./..e what its readers would
+        scales it: the replicas and the loop iterations are what its readers would
         otherwise load, and they read from LX instead. Linear in ``is_lx``."""
         if not (
             self.role == "input"
