@@ -3765,7 +3765,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Nested hints: outer K=2, inner M=4 on a single op
     # ------------------------------------------------------------------
 
-    @config.patch({"sencores": 4})
+    # direct matches shouldn't rely on a particular outcome of the cost model
+    @config.patch({"sencores": 4, "co_optimizing_lx_planning": False})
     def test_hint_nested_loop_with_scratchpad(self):
         """Design-doc small example: y=a+b; z=y*c with nested K=2×M=4 hints.
 
