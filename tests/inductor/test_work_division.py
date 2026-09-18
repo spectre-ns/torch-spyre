@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import sympy
 import torch
 from sympy import Symbol
-from torch._inductor.dependencies import MemoryDep
+from torch._inductor.dependencies import MemoryDep, StarDep, WeakDep
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -200,6 +200,81 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
                 self.allocator._buffer_residency_reason(op=carry, **common),
                 "mutation target",
             )
+
+
+class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
+    """Issue #4655: the restickify barrier tests one committed division
+
+    (``op.iteration_space_ownership``) that reflects whatever a prior pass
+    happened to leave on the op, not any division the joint solver could
+    actually pick. On the joint path (``division_is_fixed=False``) that
+    committed division may disagree with a perfectly compatible candidate the
+    solver's own ``cd_parent_matches``/``constrain_residency`` gate would
+    later select, permanently barring a buffer the solver would otherwise
+    place. The fixed-division (placement) path has no such downstream gate,
+    so it must still apply the barrier up front.
+    """
+
+    def setUp(self):
+        self.allocator = CoOptimizingAllocator(lambda buffers, size: None, 2**20)
+        self.op = _computed_buffer((64, 64), name="buf")
+        self.common = dict(
+            graph=SimpleNamespace(operations=[]),
+            name="buf",
+            uses=[0, 1],
+            op=self.op,
+            mutated_buffers=set(),
+            graph_output_names=set(),
+            reinterpret_output_names=set(),
+            ncores={},
+            ncores_reasons={},
+            buf_user_deps={},
+        )
+
+    def test_joint_path_does_not_consult_the_barrier(self):
+        with (
+            patch.object(
+                self.allocator, "_op_output_good_for_lx_reuse", return_value=True
+            ),
+            patch.object(allocator_module, "is_empty_tiled_layout", return_value=False),
+            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(
+                allocator_module, "_is_read_advancing_anywhere", return_value=False
+            ),
+            patch.object(
+                allocator_module,
+                "_multi_output_extern_kernel_in_live_range",
+                return_value=False,
+            ),
+            patch.object(
+                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+            ),
+            patch.object(
+                allocator_module, "buffer_not_read_in_full", return_value=False
+            ),
+            patch.object(
+                allocator_module, "_would_produce_lx_back_gap", return_value=False
+            ),
+            patch.object(
+                self.allocator,
+                "_restickify_barrier",
+                return_value="read by restickify (local-read proof failed)",
+            ) as barrier,
+        ):
+            self.assertIsNone(
+                self.allocator._buffer_residency_reason(
+                    division_is_fixed=False, **self.common
+                )
+            )
+            barrier.assert_not_called()
+
+            self.assertEqual(
+                self.allocator._buffer_residency_reason(
+                    division_is_fixed=True, **self.common
+                ),
+                "read by restickify (local-read proof failed)",
+            )
+            barrier.assert_called_once()
 
 
 class TestEmptyLxEligibility(unittest.TestCase):
@@ -1628,8 +1703,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         # Consumer: a 4-core slicing, a 2-core one, an 8-core one that slices
         # the buffer the same way as the first (the stale-LX case), and a
         # 4-core one slicing two device dims -- the only consumer the wide
-        # parent candidate could pair with, so the matmul guard is what
-        # rejects it rather than a view mismatch.
+        # parent candidate can pair with.
         self.consumer_divs = [
             _div({x: 4}),
             _div({x: 2}),
@@ -1658,8 +1732,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 [False, True],
                 False,
             ),
-            # A matmul split across >1 device dim: only the primary split is
-            # carried, so the wide candidate drops out and the narrow stays.
+            # A matmul split across two device dims uses the same complete
+            # ownership comparison as every other producer.
             "matmul": (
                 [self.view_wide, self.view_b],
                 [False, False],
@@ -1674,6 +1748,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.divisions = {
             name: self.parent_divs for name in list(self.parents) + ["spilled", "clone"]
         }
+        self.divisions["matmul"] = [self.consumer_divs[3], self.parent_divs[1]]
         self.residency = dict.fromkeys(self.op_by_name, None)
         self.residency["spilled"] = "no room"
         self.parent_names = list(self.parents) + ["spilled", "clone", "not_a_buffer"]
@@ -1693,8 +1768,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 for name, op in self.op_by_name.items()
             },
         }
-        # A clone whose write carries a dim its reads do not: it broadcasts,
-        # so no per-core slice of it is produced core-locally.
+        # Expanding a clone's input does not make its finished output partial.
+        # Check input ownership separately from this output-consumer edge.
         self.rw[self.op_by_name["clone"]] = MagicMock(
             writes=[MemoryDep("clone", 16 * x + y, (x, y), (8, 16))],
             reads=[MemoryDep("src", x, (x,), (8,))],
@@ -1714,7 +1789,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         views, partial, repr_ok, _matmul = self.parents.get(
             name, ([self.view_a, self.view_b], [False, False], [True, True], False)
         )
-        index = [cd.splits for cd in self.parent_divs].index(splits)
+        index = [cd.splits for cd in self.divisions[name]].index(splits)
         return (views[index], partial[index], repr_ok[index])
 
     def _patches(self):
@@ -1758,8 +1833,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
         with self._patches():
             actual = self._table(allocator)
-        # Producers excluded outright ("spilled", "clone") get no entry at all;
-        # "plain" is the only one keeping the wide parent candidate. Consumer
+        # A rejected producer ("spilled") gets no entry. The wide matmul
+        # matches only the same two-axis consumer. Consumer
         # index 2 slices the buffer like index 0 but on 8 cores, so the
         # cores_used guard drops it everywhere.
         self.assertEqual(
@@ -1768,9 +1843,23 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 "plain": [(0, 0), (1, 1)],
                 "partial": [(1, 1)],
                 "unrepr": [(1, 1)],
-                "matmul": [(1, 1)],
+                "matmul": [(0, 3), (1, 1)],
+                "clone": [(0, 0), (1, 1)],
             },
         )
+
+    def test_multi_axis_matmul_requires_a_representable_finished_write(self):
+        allocator = CoOptimizingAllocator(MagicMock(), size=1)
+        for partial, representable in ((True, True), (False, False)):
+            with self.subTest(partial=partial, representable=representable):
+                self.parents["matmul"] = (
+                    [self.view_wide, self.view_b],
+                    [partial, False],
+                    [representable, True],
+                    True,
+                )
+                with self._patches():
+                    self.assertEqual(self._table(allocator)["matmul"], [(1, 1)])
 
     def test_loop_carry_update_is_a_storage_ownership_edge(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
@@ -1824,7 +1913,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                     self.residency[parent],
                     {},
                 )
-                for i, parent_div in enumerate(self.parent_divs):
+                for i, parent_div in enumerate(self.divisions[parent]):
                     for j, consumer_div in enumerate(self.consumer_divs):
                         self.assertEqual(
                             self._compatible(edge, parent_div, consumer_div),
@@ -1832,11 +1921,28 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                             f"{parent} ({i}, {j})",
                         )
 
+    def test_expanding_clone_cannot_read_an_unreplicated_lx_input(self):
+        producer = self.op_by_name["plain"]
+        clone = self.op_by_name["clone"]
+        self.divisions["clone"] = [self.consumer_divs[2]]
+        read = self.rw[clone].reads[0].rename({"src": "plain"})
+        with self._patches():
+            edge = allocator_module.build_residency_edge(
+                "plain", producer, clone, [read], None, {}
+            )
+            self.assertIsNotNone(edge)
+            # Four owners cannot directly serve eight consumer cores.
+            self.assertEqual(
+                edge.match_pairs(
+                    [self.parent_divs[0].splits], [self.consumer_divs[2].splits]
+                ),
+                [],
+            )
+
     def test_excluded_edges_have_no_edge_object(self):
         with self._patches():
             for parent, reason in [
                 ("spilled", "residency"),
-                ("clone", "frame-changing clone"),
             ]:
                 self.assertIsNone(
                     allocator_module.build_residency_edge(
@@ -1849,6 +1955,26 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                     ),
                     reason,
                 )
+
+    def test_residency_edge_requires_coordinate_dependencies(self):
+        producer = self.op_by_name["plain"]
+        memory = self.rw[producer].writes[0]
+        for dependency in (StarDep("plain"), WeakDep("plain", "consumer")):
+            for reads in ([dependency], [dependency, memory]):
+                for writes in ([dependency], [dependency, memory]):
+                    with self.subTest(reads=reads, writes=writes):
+                        with (
+                            self._patches(),
+                            patch.object(self.rw[producer], "writes", writes),
+                        ):
+                            edge = allocator_module.build_residency_edge(
+                                "plain", producer, self.consumer_op, reads, None, {}
+                            )
+                        if memory in reads and memory in writes:
+                            self.assertIs(edge.read_dep, memory)
+                            self.assertIs(edge.write_dep, memory)
+                        else:
+                            self.assertIsNone(edge)
 
     def test_no_consumer_op_matches_nothing(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)

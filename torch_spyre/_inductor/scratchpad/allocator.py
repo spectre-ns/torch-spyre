@@ -611,11 +611,24 @@ class ScratchpadAllocator:
             # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
             # copied into a nested tile every outer iteration).
             return "tiled (advancing)"
-        restickify = self._restickify_barrier(
-            graph, name, uses, lx_relayout_plans=lx_relayout_plans
-        )
-        if restickify is not None:
-            return restickify
+        if division_is_fixed:
+            # On the joint path this same geometric check runs again per
+            # candidate division pair, as part of the solver's own residency
+            # gate (``_cd_parent_matches`` / ``constrain_residency``): a
+            # restickify reader is an ordinary consumer edge there, and an
+            # edge with no compatible pair already forces ``in_buffer`` false
+            # (see ``constrain_residency``'s docstring). Applying the barrier
+            # here too would instead test the read against whatever division
+            # the op happens to carry on ``iteration_space_ownership`` before
+            # the solver has chosen anything -- stale, provisional, and
+            # unrelated to any candidate the solver could actually pick -- and
+            # can reject a buffer the solver would otherwise place correctly
+            # (issue #4655).
+            restickify = self._restickify_barrier(
+                graph, name, uses, lx_relayout_plans=lx_relayout_plans
+            )
+            if restickify is not None:
+                return restickify
         # PR3683's guard: reject residency outright rather than let LX context
         # switching (dump/restore around the risky call) handle it. Kept behind
         # the flag, not deleted, so the old (conservative) and new (context
@@ -711,9 +724,13 @@ class ScratchpadAllocator:
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
             return "partial/offset read"
-        restickify = self._restickify_barrier(graph, name, uses)
-        if restickify is not None:
-            return restickify
+        if division_is_fixed:
+            # See the matching comment in _buffer_residency_reason: on the
+            # joint path this is redundant with (and less accurate than) the
+            # solver's own per-candidate residency gate.
+            restickify = self._restickify_barrier(graph, name, uses)
+            if restickify is not None:
+                return restickify
         if division_is_fixed and (ncores or {}).get(name, -1) < 0:
             reason = (ncores_reasons or {}).get(name, "core div mismatch")
             return f"core div mismatch: {reason}"
@@ -817,9 +834,16 @@ class ScratchpadAllocator:
         *is* this buffer's producer) is a normal core-local write and takes the
         ordinary residency path. ``is_restickify_op`` shares the coordinate
         predicate used by codegen, so residency never depends on an operation's
-        display name. Both placement and joint allocators use this gate; the
-        joint solver still checks the selected producer/consumer views before
-        allowing residency.
+        display name.
+
+        Only the placement path (``division_is_fixed=True``) calls this: it
+        has one committed division per op and no other mechanism to catch a
+        cross-core restickify read. The joint path skips it -- the solver's
+        own per-candidate residency gate (``_cd_parent_matches`` /
+        ``constrain_residency``) subsumes it there, correctly, over every
+        division the solver could actually choose (see the call sites for
+        why testing it here, against whatever division the op happens to
+        carry pre-solve, is not just redundant but wrong; issue #4655).
         """
         readers = [
             graph.operations[u]
@@ -1630,29 +1654,6 @@ def _view_for_div(
     )
 
 
-def _is_frame_changing_clone(op: Operation, buf_name: str) -> bool:
-    """True if ``op`` is a clone whose output ``buf_name`` has an iteration
-    dimension that none of its inputs carry -- i.e. it broadcasts a dim
-    (e.g. GQA broadcasting K/V over the query-group axis). Such a clone reads
-    its input in a different frame than it writes its output, so a per-core
-    slice of the output cannot be produced from a core-local slice of the
-    input; pinning the output mis-addresses (cf. the restickify barrier)."""
-    if op_short_name(op) != "clone":
-        return False
-    rw = op_read_writes(op)
-    write = next(
-        (w for w in rw.writes if w.name == buf_name and hasattr(w, "index")), None
-    )
-    if write is None:
-        return False
-    read_syms: set = set()
-    for r in rw.reads:
-        if hasattr(r, "index"):
-            read_syms |= set(r.index.free_symbols)
-    # A write-only free symbol means the clone expands (broadcasts) that dim.
-    return bool(set(write.index.free_symbols) - read_syms)
-
-
 @dataclass
 class ResidencyEdge:
     """One producer-buffer -> consumer edge, with its residency policy applied.
@@ -1666,11 +1667,10 @@ class ResidencyEdge:
     candidates instead of enumerating them cannot apply the geometry and forget
     the filters.
 
-    Excluded outright (the producer then falls back to HBM, always correct): a
-    producer that can never be resident, and a frame-changing (broadcasting)
-    clone, whose per-core slice cannot be produced core-locally at all -- the
-    single-frame view comparison misses that, and the broadcast read from HBM
-    is globally correct. Excluded per candidate: see :meth:`parent_view` and
+    A producer rejected for LX is excluded outright. Otherwise, check each
+    producer-consumer edge independently. A broadcasting clone may read its
+    input from HBM and still keep its completed output in LX for a matching
+    consumer. Candidate-specific checks are in :meth:`parent_view` and
     :meth:`consumer_view`.
     """
 
@@ -1679,24 +1679,17 @@ class ResidencyEdge:
     consumer_op: Operation
     write_dep: MemoryDep
     read_dep: MemoryDep
-    # An SDSC carries only a matmul's primary split, so a multi-dim-split matmul
-    # output cannot be coherently LX-pinned even when views match -- a consumer
-    # would read per-core LX holding only a fragment. (Mirrors #2745's
-    # ``get_ncores_for_buffers`` matmul guard for the greedy path.)
-    parent_is_matmul: bool
     prep_cache: dict
 
     def parent_view(self, splits: dict[sympy.Symbol, int]) -> Optional[PerCoreView]:
         """The producer's write-view under ``division``, or ``None`` when that
         candidate cannot host a readable residency: a partial-reduction write
-        (output not final), an unrepresentable slicing, or a matmul output
-        split across more than one device dim."""
+        (output not final) or an unrepresentable slicing. Matching compares
+        the complete per-core views, including all split dimensions."""
         view, partial, repr_ok = _view_for_div(
             self.parent_op, self.write_dep, self.buf_name, splits, self.prep_cache
         )
         if not repr_ok or partial:
-            return None
-        if self.parent_is_matmul and len(view.work_slice_dims) > 1:
             return None
         return view
 
@@ -1746,13 +1739,11 @@ def build_residency_edge(
     when the edge can never host a residency."""
     if residency_reason is not None:
         return None
-    if _is_frame_changing_clone(parent_op, buf_name):
-        return None
     write_dep = next(
         (
             w
             for w in op_read_writes(parent_op).writes
-            if w.name == buf_name and hasattr(w, "index")
+            if w.name == buf_name and isinstance(w, MemoryDep)
         ),
         None,
     )
@@ -1764,11 +1755,15 @@ def build_residency_edge(
             return False
 
     read_dep = next(
+<<<<<<< HEAD
         (
             r
             for r in consumer_reads
             if r.name == buf_name and wrapped_hasattr(r, "index")
         ),
+=======
+        (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
+>>>>>>> upstream/main
         None,
     )
     if write_dep is None or read_dep is None:
@@ -1779,7 +1774,6 @@ def build_residency_edge(
         consumer_op=consumer_op,
         write_dep=write_dep,
         read_dep=read_dep,
-        parent_is_matmul=_is_matmul_op(parent_op),
         prep_cache=prep_cache,
     )
 
@@ -2913,15 +2907,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if record.update_name != update_op.get_name():
             return None
         storage_op = op_by_name.get(record.storage_name)
-        if storage_op is None or _is_frame_changing_clone(
-            storage_op, record.storage_name
-        ):
+        if storage_op is None:
             return None
         storage_write = next(
             (
                 dep
                 for dep in op_read_writes(storage_op).writes
-                if dep.name == record.storage_name and hasattr(dep, "index")
+                if dep.name == record.storage_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2929,7 +2921,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             (
                 dep
                 for dep in op_read_writes(update_op).writes
-                if dep.name == record.update_name and hasattr(dep, "index")
+                if dep.name == record.update_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2941,7 +2933,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             consumer_op=update_op,
             write_dep=storage_write,
             read_dep=update_write.rename({record.update_name: record.storage_name}),
-            parent_is_matmul=_is_matmul_op(storage_op),
             prep_cache=prep_cache,
         )
 
@@ -3053,10 +3044,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             consumer_divs = divisions[cname]
             rw = op_read_writes(consumer)
             read_dep = next(
-                (r for r in rw.reads if r.name == input_name and hasattr(r, "index")),
+                (
+                    r
+                    for r in rw.reads
+                    if r.name == input_name and isinstance(r, MemoryDep)
+                ),
                 None,
             )
-            write = next((w for w in rw.writes if hasattr(w, "index")), None)
+            write = next((w for w in rw.writes if isinstance(w, MemoryDep)), None)
             if read_dep is None or write is None:
                 matches[cname] = []
                 continue
@@ -3247,16 +3242,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # Same per-candidate view screens as _cd_parent_matches: the source
             # gets LX-pinned exactly like a matched producer, so the same
             # coherence bars apply (partial-reduction write, unrepresentable
-            # slicing, multi-dim-split matmul output).
-            parent_is_matmul = _is_matmul_op(parent_op)
+            # slicing). Movement is checked on the complete per-core views.
             prod_views: list[Optional[PerCoreView]] = [
-                view
-                if (
-                    repr_ok
-                    and not partial
-                    and not (parent_is_matmul and len(view.work_slice_dims) > 1)
-                )
-                else None
+                view if repr_ok and not partial else None
                 for view, partial, repr_ok in self._views_for_divs(
                     parent_op, write_dep, parent, parent_divs, prep_cache
                 )
