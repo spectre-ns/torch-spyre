@@ -152,6 +152,8 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 _CORE_LOG_SCALE = 32.0
 # constant to scale inverse of core split. error ~1%
 _CORE_INV_SCALE = 1024
+# constant limit on product terms to avoid int32 overflow in CP-SAT
+_MAX_PRODUCT_BOUND = 2**30
 
 
 @dataclass
@@ -747,7 +749,6 @@ class _SympyExprToCpSat(Printer):
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
-        bounds = [self._affine_bounds(arg) for arg in ints]
         # The product is multilinear (degree 1 in each factor), so its
         # extrema over the box of bounds occur at the box's vertices. Rather
         # than enumerating all 2**len(ints) vertices, fold the bounds
@@ -755,14 +756,47 @@ class _SympyExprToCpSat(Printer):
         # the partial product over its factors (a continuous function over a
         # connected box), so it can be treated as one more independent
         # interval factor and combined via standard interval multiplication.
-        (lb, ub), *rest = bounds
-        for a, b in rest:
-            candidates = (lb * a, lb * b, ub * a, ub * b)
-            lb, ub = min(candidates), max(candidates)
+        def find_bounds(bounds):
+            (lb, ub), *rest = bounds
+            for a, b in rest:
+                candidates = (lb * a, lb * b, ub * a, ub * b)
+                lb, ub = min(candidates), max(candidates)
+            return lb, ub
+
+        def shifted_bounds(shifts):
+            # Floor the lower bound and ceil the upper so each domain covers
+            # the truncated quotient add_division_equality produces.
+            return [(lb >> s, -(-ub >> s)) for (lb, ub), s in zip(bounds, shifts)]
+
+        bounds = [self._affine_bounds(arg) for arg in ints]
+        lb, ub = find_bounds(bounds)
+
+        # Renormalize a product that would exceed _MAX_PRODUCT_BOUND: divide
+        # its factors by powers of two, one bit per step until it fits, so the
+        # total shift grows with the overflow. Each bit comes from the factor
+        # with the widest lower bound, which bounds the relative rounding
+        # error and leaves small factors such as split counts exact.
+        shifts = [0] * len(ints)
+        while max(abs(lb), abs(ub)) > _MAX_PRODUCT_BOUND:
+            scaled = shifted_bounds(shifts)
+            widest = max(
+                range(len(ints)),
+                key=lambda i: (abs(scaled[i][0]), abs(scaled[i][1])),
+            )
+            shifts[widest] += 1
+            lb, ub = find_bounds(shifted_bounds(shifts))
+
+        factors = list(ints)
+        for i, ((f_lb, f_ub), s) in enumerate(zip(shifted_bounds(shifts), shifts)):
+            if s:
+                factors[i] = self._model.new_int_var(f_lb, f_ub, f"{name}_renorm{i}")
+                self._model.add_division_equality(factors[i], ints[i], 1 << s)
+
         product = self._model.new_int_var(int(lb), int(ub), name)
-        self._model.AddMultiplicationEquality(product, ints)
-        self._sym_map[name] = product
-        return self._print_multiply_two(math.prod(nonints), product)
+        self._model.add_multiplication_equality(product, factors)
+        # Scale back up so callers see the full product, less the low bits.
+        self._sym_map[name] = product * (1 << sum(shifts)) if any(shifts) else product
+        return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
