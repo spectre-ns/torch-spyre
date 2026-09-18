@@ -42,6 +42,7 @@ try:
     from ortools.sat.python import cp_model  # noqa: F401
 
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _MAX_PRODUCT_BOUND,
         CpSatLayoutSolver,
         _SympyExprToCpSat,
     )
@@ -1468,6 +1469,62 @@ class TestSympyExprToCpSatPrinter(TestCase):
 
     def test_multiply_four_int_vars_mixed_sign(self):
         self._check_multiply([(-2, 3), (1, 4), (-1, 2), (2, 3)], ["x", "y", "z", "w"])
+
+    def _check_renormalized_product(self, var_domains, values):
+        # Pin every factor so the objective is exactly the printer's lowering
+        # of this one product. The pins do not narrow the declared domains the
+        # printer bounds the product with, so renormalization still triggers.
+        model = cp_model.CpModel()
+        sym_map = {
+            name: model.new_int_var(lo, hi, name)
+            for name, (lo, hi) in var_domains.items()
+        }
+        for name, value in values.items():
+            model.add(sym_map[name] == value)
+        expr = sympy.Mul(*[sympy.Symbol(n, integer=True) for n in var_domains])
+        model.minimize(_SympyExprToCpSat(model, dict(sym_map), {}).convert(expr))
+        solver = cp_model.CpSolver()
+        status = solver.Solve(model)
+        self.assertEqual(status, cp_model.OPTIMAL, solver.StatusName(status))
+
+        # Every product handed to CP-SAT fits the bound...
+        proto = model.proto
+        products = [ct.int_prod for ct in proto.constraints if ct.has_int_prod()]
+        self.assertTrue(products)
+        for product in products:
+            (target,) = product.target.vars
+            domain = proto.variables[target].domain
+            self.assertLessEqual(max(abs(v) for v in domain), _MAX_PRODUCT_BOUND)
+
+        # ...yet the lowered expression keeps the full product's magnitude, so
+        # its weight against the other objective terms is unchanged. Dropping
+        # low bits of the ~2**20 factors costs ~1e-4; dropping a single bit of
+        # the split count d=3 costs >= 33%.
+        exact = math.prod(values.values())
+        self.assertLess(abs(solver.ObjectiveValue() - exact) / abs(exact), 1e-3)
+
+    def test_multiply_renormalizes_overflowing_product(self):
+        # 2**20 * 2**20 * 32 overflows the bound; the bits must come from the
+        # two wide factors, leaving the split count exact.
+        self._check_renormalized_product(
+            {"a": (1, 2**20), "b": (1, 2**20), "d": (1, 32)},
+            {"a": 1000003, "b": 777777, "d": 3},
+        )
+
+    def test_multiply_renormalizes_chained_product(self):
+        # A chained product lowers to an earlier product's variable, already
+        # capped at the bound, times the next factor -- here a split count.
+        self._check_renormalized_product(
+            {"a": (1, 2**30), "d": (1, 32)}, {"a": 123456789, "d": 3}
+        )
+
+    def test_multiply_renormalizes_mixed_sign_product(self):
+        # A negative factor exercises the floor/ceil domain rounding around the
+        # truncating division.
+        self._check_renormalized_product(
+            {"a": (-(2**20), 2**20), "b": (1, 2**20), "d": (1, 32)},
+            {"a": -1000003, "b": 777777, "d": 3},
+        )
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")

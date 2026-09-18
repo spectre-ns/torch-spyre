@@ -870,10 +870,10 @@ class _SympyExprToCpSat(Printer):
                 lb, ub = min(candidates), max(candidates)
             return lb, ub
 
-        def shifted_bounds(shifts):
+        def shifted_bounds(shift):
             # Floor the lower bound and ceil the upper so each domain covers
             # the truncated quotient add_division_equality produces.
-            return [(lb >> s, -(-ub >> s)) for (lb, ub), s in zip(bounds, shifts)]
+            return [(lb >> shift, -(-ub >> shift)) for (lb, ub) in bounds]
 
         bounds = [self._affine_bounds(arg) for arg in ints]
         lb, ub = find_bounds(bounds)
@@ -883,26 +883,21 @@ class _SympyExprToCpSat(Printer):
         # total shift grows with the overflow. Each bit comes from the factor
         # with the widest lower bound, which bounds the relative rounding
         # error and leaves small factors such as split counts exact.
-        shifts = [0] * len(ints)
+        shift = 0
         while max(abs(lb), abs(ub)) > _MAX_PRODUCT_BOUND:
-            scaled = shifted_bounds(shifts)
-            widest = max(
-                range(len(ints)),
-                key=lambda i: (abs(scaled[i][0]), abs(scaled[i][1])),
-            )
-            shifts[widest] += 1
-            lb, ub = find_bounds(shifted_bounds(shifts))
+            shift += 1
+            lb, ub = find_bounds(shifted_bounds(shift))
 
         factors = list(ints)
-        for i, ((f_lb, f_ub), s) in enumerate(zip(shifted_bounds(shifts), shifts)):
-            if s:
+        if shift:
+            for i, (f_lb, f_ub) in enumerate(shifted_bounds(shift)):
                 factors[i] = self._model.new_int_var(f_lb, f_ub, f"{name}_renorm{i}")
-                self._model.add_division_equality(factors[i], ints[i], 1 << s)
+                self._model.add_division_equality(factors[i], ints[i], 1 << shift)
 
         product = self._model.new_int_var(int(lb), int(ub), name)
         self._model.add_multiplication_equality(product, factors)
         # Scale back up so callers see the full product, less the low bits.
-        self._sym_map[name] = product * (1 << sum(shifts)) if any(shifts) else product
+        self._sym_map[name] = product * (1 << shift) if shift else product
         return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
     def _print_Symbol(self, expr):
