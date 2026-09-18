@@ -60,6 +60,7 @@ from torch_spyre._inductor.work_division import (
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    cost_expr_record,
     CoreDivision,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
@@ -2230,7 +2231,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 graph, output_name, bufmap, is_lx
             )
 
-        from torch_spyre._inductor.cost_model import predict_by_bundle
+        from torch_spyre._inductor.cost_model import predict_bundles
 
         # Logged, not asserted: dropping a buffer from the objective changes what
         # the solver optimizes without failing anything, so it has to be visible,
@@ -2263,10 +2264,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
+        bundle_terms: list = []
         try:
-            cost_expr = sympy.sympify(
-                predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS)
+            bundle_terms = predict_bundles(
+                graph.operations, op_features, params=_COST_PARAMS
             )
+            cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
         except (ValueError, RuntimeError, TypeError) as e:
             logger.warning(
                 "cost objective unavailable (%s: %s); the solver falls back to its "
@@ -2277,6 +2280,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
             if not config._cpsat_warn_on_cost_expr:
                 raise
+            # Both the terms and the objective are the failed build's output, so
+            # neither is dumpable. ``cost_expr = None`` already skips the dump;
+            # clearing the terms too keeps that a local invariant rather than
+            # something a reader has to chase to the dump call below.
+            bundle_terms = []
             cost_expr = None
 
         # One price term per relayout copy (a source and one destination view,
@@ -2297,6 +2305,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
         )
+        if config.dump_cost_expr_file and cost_expr is not None:
+            # The objective as solved: its terms, the chosen symbol values and
+            # the evaluated prices, for the summarize-sdsc skill.
+            from torch_spyre._inductor.dump_common import emit_json_line
+
+            emit_json_line(
+                config.dump_cost_expr_file,
+                cost_expr_record(cost_expr, bundle_terms, result, _COST_PARAMS),
+            )
         return result
 
     def _extract_op_features(self, graph, output_name, buffers, is_lx):

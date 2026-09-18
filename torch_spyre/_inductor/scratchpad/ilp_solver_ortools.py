@@ -614,10 +614,7 @@ class _SympyExprToCpSat(Printer):
             lambda e: e.func == sympy.Mul,
             lambda e: self._min_piecewise_expand(e),
         )
-        cost_expr = cost_expr.replace(
-            lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
-            lambda e: self._truncate_floats_min(e),
-        )
+        cost_expr = self._integerize_minmax(cost_expr)
         return cost_expr
 
     @classmethod
@@ -794,6 +791,21 @@ class _SympyExprToCpSat(Printer):
                 * sympy.Mul(*(expr.args[1:idx] + expr.args[idx + 1 :]))
             )
         return expr
+
+    @classmethod
+    def _integerize_minmax(cls, expr):
+        # Only Min/Max constraints require integer operands. A conditional
+        # objective supports float values directly; rounding its coefficients
+        # can erase a large cost multiplied by scaled reciprocal variables.
+        # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            return expr.replace(
+                lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
+                cls._truncate_floats_min,
+            )
+        if not expr.has(sympy.Min, sympy.Max):
+            return expr
+        return expr.func(*(cls._integerize_minmax(arg) for arg in expr.args))
 
     @staticmethod
     def _truncate_floats_min(expr):

@@ -2132,16 +2132,47 @@ def charge_boundary_reads_once(bundles: list) -> list:
     return out
 
 
+def predict_bundles(
+    operations: Sequence,
+    features_by_buffer: Mapping[str, OpFeatures],
+    params: CostParams | None = None,
+) -> list[tuple[list[str], float]]:
+    """The terms :func:`predict_by_bundle` sums: one ``(buffer names, latency)``
+    per estimated bundle, in schedule order; the names are the buffers the
+    bundle's ops store (the ``features_by_buffer`` keys). The latency is a number for
+    concrete features and a sympy expression over the solver's residency and
+    split symbols for the co-optimizing allocator's symbolic features; the
+    cost-expression dump (``SPYRE_DUMP_COST_EXPR_FILE``) records these terms."""
+    grouped = group_features_by_bundle(operations, features_by_buffer)
+    priced = charge_boundary_reads_once(grouped)
+    # Name each op by the buffer it was looked up under (``features_by_buffer``
+    # key), falling back to its own display name.
+    #
+    # Names come from GROUPED and prices from PRICED, because
+    # ``charge_boundary_reads_once`` rebuilds any op whose boundary read an
+    # earlier bundle already paid for (``dataclasses.replace``). That gives the
+    # copy a new ``id()``, so an identity lookup against it misses and falls back
+    # to ``OpFeatures.name`` -- the op KIND ("sub"), not the buffer. The dump's
+    # whole join key is the buffer name, and the rewrite fires on exactly the
+    # shape the dump is most wanted for: several bundles reading one graph input
+    # (softmax reads its input in both ``amax`` and ``sub``). The rewrite
+    # preserves bundle and op order, so the two lists zip positionally.
+    buffer_of = {id(feat): name for name, feat in features_by_buffer.items()}
+    return [
+        ([buffer_of.get(id(o), o.name) for o in names], predict_ops(bundle, params))
+        for names, bundle in zip(grouped, priced)
+    ]
+
+
 def predict_by_bundle(
     operations: Sequence,
     features_by_buffer: Mapping[str, OpFeatures],
     params: CostParams | None = None,
 ) -> float:
     """Predicted latency (ns) for ``operations``, scored one bundle at a time."""
-    bundles = charge_boundary_reads_once(
-        group_features_by_bundle(operations, features_by_buffer)
+    return sum(
+        term for _, term in predict_bundles(operations, features_by_buffer, params)
     )
-    return sum(predict_ops(bundle, params) for bundle in bundles)
 
 
 def explain(ops: list, params: CostParams | None = None) -> str:

@@ -1442,6 +1442,44 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 10)
         self.assertEqual(solver.Value(sym_map["x"]), 2)
 
+    def test_conditional_cost_keeps_small_coefficients(self):
+        x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
+        # Rounding a small coefficient to zero erases a large total cost.
+        expression = sympy.Piecewise((1e-6 * x**2, sympy.Eq(enabled, 1)), (0, True))
+        for flag in (0, 1):
+            solver, _ = self._optimize(
+                expression, {"x": (10000, 10000), "enabled": (flag, flag)}, False
+            )
+            self.assertAlmostEqual(solver.ObjectiveValue(), 100.0 * flag, places=6)
+        solver, _ = self._optimize(
+            expression + sympy.Min(0.5 * x, 3.25),
+            {"x": (10000, 10000), "enabled": (1, 1)},
+            False,
+        )
+        self.assertAlmostEqual(solver.ObjectiveValue(), 103.25, places=6)
+        solver, variables = self._optimize(
+            expression + 50 * (1 - enabled),
+            {"x": (10000, 10000), "enabled": (0, 1)},
+            False,
+        )
+        self.assertEqual(solver.Value(variables["enabled"]), 0)
+        self.assertAlmostEqual(solver.ObjectiveValue(), 50.0, places=6)
+
+    def test_conditional_minmax_operands_still_lower(self):
+        x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
+        conditional = sympy.Piecewise((0.5 * x, sympy.Eq(enabled, 1)), (1.5 * x, True))
+        for operation in (sympy.Min, sympy.Max):
+            expression = operation(1 + sympy.Min(conditional, 3.25), 7)
+            for flag in (0, 1):
+                solver, _ = self._optimize(
+                    expression, {"x": (4, 4), "enabled": (flag, flag)}, False
+                )
+                self.assertAlmostEqual(
+                    solver.ObjectiveValue(),
+                    float(expression.subs({x: 4, enabled: flag})),
+                    places=6,
+                )
+
     @staticmethod
     def _brute_force_product_bounds(domains):
         best_min = best_max = None
