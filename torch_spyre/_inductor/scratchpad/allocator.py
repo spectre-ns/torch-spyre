@@ -1755,15 +1755,7 @@ def build_residency_edge(
             return False
 
     read_dep = next(
-<<<<<<< HEAD
-        (
-            r
-            for r in consumer_reads
-            if r.name == buf_name and wrapped_hasattr(r, "index")
-        ),
-=======
         (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
->>>>>>> upstream/main
         None,
     )
     if write_dep is None or read_dep is None:
