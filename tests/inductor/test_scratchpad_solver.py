@@ -20,6 +20,7 @@ import math
 import os
 import subprocess
 import sys
+import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -42,6 +43,7 @@ try:
     from ortools.sat.python import cp_model  # noqa: F401
 
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
         CpSatLayoutSolver,
         _SympyExprToCpSat,
@@ -1470,61 +1472,111 @@ class TestSympyExprToCpSatPrinter(TestCase):
     def test_multiply_four_int_vars_mixed_sign(self):
         self._check_multiply([(-2, 3), (1, 4), (-1, 2), (2, 3)], ["x", "y", "z", "w"])
 
-    def _check_renormalized_product(self, var_domains, values):
-        # Pin every factor so the objective is exactly the printer's lowering
-        # of this one product. The pins do not narrow the declared domains the
-        # printer bounds the product with, so renormalization still triggers.
+    def test_multiply_refuses_product_past_bound(self):
+        # A product whose interval bound passes _MAX_PRODUCT_BOUND needs more
+        # dynamic range than the model carries. Lowering raises instead of
+        # rescaling factors, which could round a small one such as d to 0.
+        # _minimize_cost_expr turns the ValueError into its fallback policy.
+        for domains in (
+            {"a": (1, 2**20), "b": (1, 2**20), "d": (1, 32)},
+            {"a": (1, 2**30), "d": (1, 32)},
+            {"a": (-(2**20), 2**20), "b": (1, 2**20), "d": (1, 32)},
+        ):
+            with self.subTest(domains=domains):
+                expr = sympy.Mul(*[sympy.Symbol(n, integer=True) for n in domains])
+                with self.assertRaisesRegex(ValueError, "CP-SAT bound"):
+                    self._optimize(expr, domains, maximize=True)
+
+    def test_multiply_at_bound_lowers_exactly(self):
+        # The bound itself is inclusive: 2**15 * 2**15 lowers unscaled.
+        a, b = sympy.symbols("a b", integer=True)
+        solver, _ = self._optimize(
+            a * b, {"a": (1, 2**15), "b": (1, 2**15)}, maximize=True
+        )
+        self.assertEqual(solver.ObjectiveValue(), _MAX_PRODUCT_BOUND)
+
+    def _pinned_split_cost(self, expr, menus, candidate, full_product=False):
+        # One buffer whose split symbols take ``menus[name][i]`` under candidate
+        # division i, wired the way ``_minimize_cost_expr`` wires a real buffer,
+        # with the division pinned. Returns the objective and the model.
         model = cp_model.CpModel()
-        sym_map = {
-            name: model.new_int_var(lo, hi, name)
-            for name, (lo, hi) in var_domains.items()
-        }
-        for name, value in values.items():
-            model.add(sym_map[name] == value)
-        expr = sympy.Mul(*[sympy.Symbol(n, integer=True) for n in var_domains])
-        model.minimize(_SympyExprToCpSat(model, dict(sym_map), {}).convert(expr))
+        n = len(next(iter(menus.values())))
+        division = model.new_int_var(0, n - 1, "div")
+        model.add(division == candidate)
+        buf = types.SimpleNamespace(division=division)
+        columns = dict(menus)
+        if full_product:
+            # The product over ALL of a buffer's splits is its core count.
+            columns["_product_" + "_".join(sorted(menus))] = [
+                math.prod(splits) for splits in zip(*menus.values())
+            ]
+        sym_map, buffer_map = {}, {}
+        for name, raw in columns.items():
+            sym_map[name] = model.new_int_var(min(raw), max(raw), name)
+            model.add_element(division, raw, sym_map[name])
+            buffer_map[name] = (buf, raw)
+        model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
         solver = cp_model.CpSolver()
         status = solver.Solve(model)
         self.assertEqual(status, cp_model.OPTIMAL, solver.StatusName(status))
+        return solver.ObjectiveValue(), model
 
-        # Every product handed to CP-SAT fits the bound...
-        proto = model.proto
-        products = [ct.int_prod for ct in proto.constraints if ct.has_int_prod()]
-        self.assertTrue(products)
-        for product in products:
-            (target,) = product.target.vars
-            domain = proto.variables[target].domain
-            self.assertLessEqual(max(abs(v) for v in domain), _MAX_PRODUCT_BOUND)
+    @staticmethod
+    def _domain_of(model, name):
+        (var,) = [v for v in model.proto.variables if v.name == name]
+        return min(var.domain), max(var.domain)
 
-        # ...yet the lowered expression keeps the full product's magnitude, so
-        # its weight against the other objective terms is unchanged. Dropping
-        # low bits of the ~2**20 factors costs ~1e-4; dropping a single bit of
-        # the split count d=3 costs >= 33%.
-        exact = math.prod(values.values())
-        self.assertLess(abs(solver.ObjectiveValue() - exact) / abs(exact), 1e-3)
+    def test_inverse_scale_is_lcm_of_candidate_splits(self):
+        # Each inv_ variable is scaled by the LCM of its own candidates -- 8
+        # for a power-of-two menu, 6 for one with a 3 in it -- so its domain
+        # needs only log2(LCM) bits and every candidate's value is exact, even
+        # though the two factors of the product carry different scales.
+        a, b, k = sympy.symbols("split_a split_b split_k", integer=True, positive=True)
+        menus = {
+            "split_a": [1, 2, 4, 8],
+            "split_b": [1, 3, 6, 2],
+            "split_k": [2, 1, 1, 4],
+        }
+        for i in range(4):
+            got, model = self._pinned_split_cost(1000 * k / (a * b), menus, i)
+            k_i, a_i, b_i = (menus[n][i] for n in ("split_k", "split_a", "split_b"))
+            exact = 1000 * k_i / (a_i * b_i)
+            self.assertAlmostEqual(got, exact, delta=1e-6 * exact)
+        self.assertEqual(self._domain_of(model, "inv_split_a"), (1, 8))
+        self.assertEqual(self._domain_of(model, "inv_split_b"), (1, 6))
 
-    def test_multiply_renormalizes_overflowing_product(self):
-        # 2**20 * 2**20 * 32 overflows the bound; the bits must come from the
-        # two wide factors, leaving the split count exact.
-        self._check_renormalized_product(
-            {"a": (1, 2**20), "b": (1, 2**20), "d": (1, 32)},
-            {"a": 1000003, "b": 777777, "d": 3},
+    def test_inverse_scale_keeps_magnitude_through_full_product(self):
+        # Three or more inverses covering every split of a buffer collapse into
+        # one inverse of its core count, scaled by the LCM of the core counts;
+        # the coefficient must trade the factors' scales for that one.
+        a, b, c = sympy.symbols("split_a split_b split_c", integer=True, positive=True)
+        menus = {
+            "split_a": [1, 2, 4, 1],
+            "split_b": [1, 3, 1, 2],
+            "split_c": [1, 1, 2, 3],
+        }
+        for i in range(4):
+            got, model = self._pinned_split_cost(
+                1000 / (a * b * c), menus, i, full_product=True
+            )
+            cores = menus["split_a"][i] * menus["split_b"][i] * menus["split_c"][i]
+            self.assertAlmostEqual(got, 1000 / cores, delta=1e-6 * 1000 / cores)
+        # Core counts [1, 6, 8, 6] -> LCM 24, values 24 // cores.
+        name = "inv__product_split_a_split_b_split_c"
+        self.assertEqual(self._domain_of(model, name), (3, 24))
+
+    def test_inverse_scale_falls_back_past_cap(self):
+        # 7 * 11 * 13 = 1001 fits under the cap and stays exact; 7 * 11 * 17 =
+        # 1309 does not, so the default scale and its rounding return.
+        a = sympy.Symbol("split_a", integer=True, positive=True)
+        _, model = self._pinned_split_cost(1 / a, {"split_a": [1, 7, 11, 13]}, 0)
+        self.assertEqual(self._domain_of(model, "inv_split_a"), (77, 1001))
+        got, model = self._pinned_split_cost(1000 / a, {"split_a": [1, 7, 11, 17]}, 1)
+        self.assertEqual(
+            self._domain_of(model, "inv_split_a"),
+            (_CORE_INV_SCALE // 17, _CORE_INV_SCALE),
         )
-
-    def test_multiply_renormalizes_chained_product(self):
-        # A chained product lowers to an earlier product's variable, already
-        # capped at the bound, times the next factor -- here a split count.
-        self._check_renormalized_product(
-            {"a": (1, 2**30), "d": (1, 32)}, {"a": 123456789, "d": 3}
-        )
-
-    def test_multiply_renormalizes_mixed_sign_product(self):
-        # A negative factor exercises the floor/ceil domain rounding around the
-        # truncating division.
-        self._check_renormalized_product(
-            {"a": (-(2**20), 2**20), "b": (1, 2**20), "d": (1, 32)},
-            {"a": -1000003, "b": 777777, "d": 3},
-        )
+        self.assertAlmostEqual(got, 1000 * (_CORE_INV_SCALE // 7) / _CORE_INV_SCALE)
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
