@@ -1302,10 +1302,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
-        # Relayout copies whose source is in the solve are free to become
-        # resident; CP-SAT's presolve scales super-linearly in their number
-        # (see config.lx_solver_relayout_presolve_max_copies), so past the
-        # threshold search runs on the raw model instead.
+        # Priced relayout models couple division tables, optional copies and
+        # variable-sized placements. Their first presolve pass can consume the
+        # budget before search starts, even below the copy-count threshold.
+        # Search the same model directly; do not change its objective or budget.
+        # Keep the existing threshold for models without a cost objective.
         free_copies = sum(
             isinstance(
                 tensors.get(copy_w.buffer.relayout_parent),
@@ -1314,13 +1315,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for copy_w in copies.values()
         )
         max_copies = config.lx_solver_relayout_presolve_max_copies
-        if max_copies > 0 and free_copies > max_copies:
+        if (cost_expr is not None and free_copies) or (
+            max_copies > 0 and free_copies > max_copies
+        ):
             solver.parameters.cp_model_presolve = False
             logger.info(
-                "[CP-SAT layout solver] %d relayout copies exceed the presolve "
-                "threshold of %d; solving without presolve",
+                "[CP-SAT layout solver] %d free relayout copies, priced=%s; "
+                "solving without presolve",
                 free_copies,
-                max_copies,
+                cost_expr is not None,
             )
         solver.parameters.num_search_workers = (
             1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()

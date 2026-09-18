@@ -149,6 +149,27 @@ def _disjoint(a_addr, b_addr, footprint=_PER_CORE) -> bool:
     return not (a_addr < b_addr + footprint and b_addr < a_addr + footprint)
 
 
+@pytest.mark.parametrize("priced", [False, True])
+def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, priced):
+    from ortools.sat.python import cp_model
+
+    p = _producer([0, 1])
+    c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
+    buffers = _with_copies(p, c)
+    original = cp_model.CpSolver.Solve
+    parameters = []
+
+    def solve(solver, model, *args, **kwargs):
+        parameters.append(solver.parameters.cp_model_presolve)
+        assert solver.parameters.max_time_in_seconds == 120
+        return original(solver, model, *args, **kwargs)
+
+    monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
+    result = _solve(buffers, expr=_objective(buffers) if priced else None)
+    assert parameters and all(value == (not priced) for value in parameters)
+    assert (_copy(result).address is not None) == priced
+
+
 # ---------------------------------------------------------------------------
 # The copy buffer and its generic price term
 # ---------------------------------------------------------------------------
