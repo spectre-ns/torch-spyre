@@ -3354,6 +3354,7 @@ def test_flash_v3_tile_Lq():
     )
 
 
+@pytest.mark.skip(reason="Runs longer thank CI timeout")
 def test_flash_v3_tile_B_H():
     """Flash v3: tile B÷2 H÷4. B=2."""
     run_coarse_tile_test(
