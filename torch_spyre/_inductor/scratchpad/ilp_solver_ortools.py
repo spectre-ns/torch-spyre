@@ -150,7 +150,9 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
 # constant to scale log of core split. error ~0.5%
 _CORE_LOG_SCALE = 32.0
-# constant to scale inverse of core split. error ~1%
+# fallback scale for the inverse of a core split, used when the LCM of the
+# split's candidate values (see _SympyExprToCpSat._inv_scale) exceeds it.
+# error <= ~2.5%
 _CORE_INV_SCALE = 1024
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
@@ -643,6 +645,16 @@ class _SympyExprToCpSat(Printer):
     def _is_split_sym(expr):
         return expr.is_Symbol and expr.name.startswith("split_")
 
+    def _inv_scale(self, name: str) -> int:
+        """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
+        across the candidate divisions, so every ``scale // v`` is exact and the
+        variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
+        are no values or their LCM exceeds it."""
+        _, raw = self._buffer_map.get(name, (None, ()))
+        if not raw or min(raw) < 1:
+            return _CORE_INV_SCALE
+        return min(math.lcm(*map(int, raw)), _CORE_INV_SCALE)
+
     def _inv_log_sym(self, expr):
         # replaces log(sym) with log2_sym and 1/sym with inv_sym
         arg = expr.args[0]
@@ -675,10 +687,9 @@ class _SympyExprToCpSat(Printer):
                     (0.0287191888771944 * arg + 1.45940018593522, True),
                 )
             if expr.exp == -1:
-                return (
-                    sympy.Symbol(f"inv_{arg.name}", integer=True, nonnegative=True)
-                    / _CORE_INV_SCALE
-                )
+                return sympy.Symbol(
+                    f"inv_{arg.name}", integer=True, nonnegative=True
+                ) / self._inv_scale(arg.name)
         elif expr.func == sympy.Mul:
             symbols = [
                 arg
@@ -691,8 +702,13 @@ class _SympyExprToCpSat(Printer):
                 sorted([symbol.name[4:] for symbol in symbols])
             )
             if product in self._sym_map:
+                # The coefficient already divides by each factor's own scale;
+                # swap those for the product's scale to keep the magnitude.
                 result = sympy.Symbol(f"inv_{product}", integer=True, nonnegative=True)
-                result *= _CORE_INV_SCALE ** (len(symbols) - 1)
+                result *= sympy.Rational(
+                    math.prod(self._inv_scale(s.name[4:]) for s in symbols),
+                    self._inv_scale(product),
+                )
                 result *= math.prod([arg for arg in expr.args if arg not in symbols])
                 return result
         return expr
@@ -863,42 +879,25 @@ class _SympyExprToCpSat(Printer):
         # the partial product over its factors (a continuous function over a
         # connected box), so it can be treated as one more independent
         # interval factor and combined via standard interval multiplication.
-        def find_bounds(bounds):
-            (lb, ub), *rest = bounds
-            for a, b in rest:
-                candidates = (lb * a, lb * b, ub * a, ub * b)
-                lb, ub = min(candidates), max(candidates)
-            return lb, ub
+        (lb, ub), *rest = [self._affine_bounds(arg) for arg in ints]
+        for a, b in rest:
+            candidates = (lb * a, lb * b, ub * a, ub * b)
+            lb, ub = min(candidates), max(candidates)
 
-        def shifted_bounds(shift):
-            # Floor the lower bound and ceil the upper so each domain covers
-            # the truncated quotient add_division_equality produces.
-            return [(lb >> shift, -(-ub >> shift)) for (lb, ub) in bounds]
-
-        bounds = [self._affine_bounds(arg) for arg in ints]
-        lb, ub = find_bounds(bounds)
-
-        # Renormalize a product that would exceed _MAX_PRODUCT_BOUND: divide
-        # its factors by powers of two, one bit per step until it fits, so the
-        # total shift grows with the overflow. Each bit comes from the factor
-        # with the widest lower bound, which bounds the relative rounding
-        # error and leaves small factors such as split counts exact.
-        shift = 0
-        while max(abs(lb), abs(ub)) > _MAX_PRODUCT_BOUND:
-            shift += 1
-            lb, ub = find_bounds(shifted_bounds(shift))
-
-        factors = list(ints)
-        if shift:
-            for i, (f_lb, f_ub) in enumerate(shifted_bounds(shift)):
-                factors[i] = self._model.new_int_var(f_lb, f_ub, f"{name}_renorm{i}")
-                self._model.add_division_equality(factors[i], ints[i], 1 << shift)
+        # A product past _MAX_PRODUCT_BOUND needs more dynamic range than the
+        # model can carry. Rescaling its factors would trade the overflow for
+        # rounding that can zero a small factor such as a split count, so
+        # refuse it and let _minimize_cost_expr apply its fallback policy.
+        if max(abs(lb), abs(ub)) > _MAX_PRODUCT_BOUND:
+            raise ValueError(
+                f"product {' * '.join(arg.name for arg in ints)} spans "
+                f"[{lb}, {ub}], past the {_MAX_PRODUCT_BOUND} CP-SAT bound"
+            )
 
         product = self._model.new_int_var(int(lb), int(ub), name)
-        self._model.add_multiplication_equality(product, factors)
-        # Scale back up so callers see the full product, less the low bits.
-        self._sym_map[name] = product * (1 << shift) if shift else product
-        return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
+        self._model.add_multiplication_equality(product, ints)
+        self._sym_map[name] = product
+        return self._print_multiply_two(math.prod(nonints), product)
 
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
@@ -914,11 +913,10 @@ class _SympyExprToCpSat(Printer):
             cp_var = self._model.new_int_var_from_domain(domain, expr.name)
             self._model.add_element(b.division, values, cp_var)
         else:
-            values = [int(round(_CORE_INV_SCALE // v)) for v in raw]
+            scale = self._inv_scale(name)
+            values = [scale // v for v in raw]
             cp_var = self._model.new_int_var(min(values), max(values), expr.name)
-            self._model.AddDivisionEquality(
-                cp_var, int(_CORE_INV_SCALE), self._sym_map[name]
-            )
+            self._model.AddDivisionEquality(cp_var, scale, self._sym_map[name])
         self._sym_map[expr.name] = cp_var
         return cp_var
 
@@ -1261,8 +1259,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
             return status
-        except (RuntimeError, TypeError, ValueError):
-            logger.warning("[CP-SAT layout solver] cannot linearize the sympy expr")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[CP-SAT layout solver] cannot linearize the sympy expr: %s", exc
+            )
             if not config._cpsat_warn_on_cost_expr:
                 raise
             return None
