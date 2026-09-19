@@ -3582,12 +3582,24 @@ def scratchpad_planning(
         allocator = select_allocator()
     try:
         allocator.plan_allocation(graph, lx_relayout_plans=lx_relayout_plans)
-    except SolveError:
-        # When a solve error arises we assume a strong excpetion guarentee
-        # meaning despite the solver failing. The allocator has not mutated
-        # the state of the graph allowing a second attempt with a
-        # greedy approach.
-        logger.debug("solve error detected. falling back to greedy solver.")
+    except SolveError as error:
+        # Strong exception guarantee: SolveError comes from the solve, before the
+        # allocator commits divisions, relayouts or addresses, and select_allocator
+        # configures no pre-passes. The graph is unchanged, so greedy placement
+        # replans it with the work divisions already committed and recollects
+        # relayout plans itself.
+        # Keep the failed allocator's post-allocation passes: select_allocator
+        # adds LxContextSwitchingPass under the same flag that lets residency skip
+        # the extern-kernel liveness guard, so dropping it would leave LX buffers
+        # unprotected across FallbackKernel calls.
+        logger.info(
+            "LX layout solve failed with layout_solver=%s (%s); falling back to "
+            "greedy LX placement with the committed work divisions",
+            config.layout_solver,
+            error,
+        )
         ScratchpadAllocator(
-            GreedyLayoutSolver, size=_lx_planning_size()
+            GreedyLayoutSolver,
+            size=_lx_planning_size(),
+            post_optimization_passes=allocator.post_optimization_passes,
         ).plan_allocation(graph)
