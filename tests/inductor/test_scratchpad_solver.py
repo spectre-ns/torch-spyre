@@ -1616,6 +1616,58 @@ class TestSympyExprToCpSatPrinter(TestCase):
         )
         self.assertAlmostEqual(got, 1000 * (_CORE_INV_SCALE // 7) / _CORE_INV_SCALE)
 
+    @staticmethod
+    def _lin_max_operand_sizes(model):
+        return [
+            len(e.vars)
+            for c in model.proto.constraints
+            if c.has_lin_max()
+            for e in c.lin_max.exprs
+        ]
+
+    def test_minmax_multi_term_operands_get_their_own_var(self):
+        # The cost model's alpha * min(R, W) turnaround term compares two
+        # weighted sums of residency literals. Presolve reasons about a lin_max
+        # operand through its exact domain -- for such a sum the set of its
+        # subset sums, exponential in its distinct coefficients (4 s of
+        # PresolveToFixPoint on a Granite 4.0 decode block). Every
+        # multi-variable operand must reach lin_max as a single variable, and
+        # the optimum must not move.
+        lits = sympy.symbols("b0:6", integer=True, nonnegative=True)
+        reads = 3 * (1 - lits[0]) + 5 * (1 - lits[1]) + 7 * lits[2] + 2 * lits[3]
+        writes = 4 * lits[0] + 6 * (1 - lits[3]) + 11 * lits[4] + 9 * (1 - lits[5])
+        for minmax, maximize in ((sympy.Min, True), (sympy.Max, False)):
+            expr = minmax(reads, writes)
+            model = cp_model.CpModel()
+            sym_map = {x.name: model.new_int_var(0, 1, x.name) for x in lits}
+            cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
+            sizes = self._lin_max_operand_sizes(model)
+            self.assertTrue(sizes)
+            self.assertLessEqual(max(sizes), 1, sizes)
+            if maximize:
+                model.maximize(cp_expr)
+            else:
+                model.minimize(cp_expr)
+            solver = cp_model.CpSolver()
+            self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
+            values = [
+                int(expr.subs(dict(zip(lits, bits))))
+                for bits in itertools.product((0, 1), repeat=len(lits))
+            ]
+            best = max(values) if maximize else min(values)
+            self.assertEqual(solver.ObjectiveValue(), best)
+
+    def test_minmax_single_variable_operands_are_not_wrapped(self):
+        # A constant or a single affine variable is already cheap for lin_max;
+        # only multi-variable sums get a variable of their own.
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {n: model.new_int_var(0, 9, n) for n in ("x", "y")}
+        _SympyExprToCpSat(model, dict(sym_map), {}).convert(sympy.Min(x, 2 * y + 1))
+        self.assertFalse(
+            any(v.name.startswith("minmax_arg_") for v in model.proto.variables)
+        )
+
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
 class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
