@@ -42,6 +42,7 @@ import sympy
 
 pytest.importorskip("ortools")
 
+from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
@@ -161,7 +162,7 @@ def test_priced_relayout_search_does_not_depend_on_copy_count(monkeypatch, price
 
     def solve(solver, model, *args, **kwargs):
         parameters.append(solver.parameters.cp_model_presolve)
-        assert solver.parameters.max_time_in_seconds == 120
+        assert solver.parameters.max_time_in_seconds == config.cpsat_time_limit_seconds
         return original(solver, model, *args, **kwargs)
 
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)

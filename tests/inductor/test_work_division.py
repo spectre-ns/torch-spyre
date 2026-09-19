@@ -30,6 +30,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
+from torch.utils._sympy.functions import ModularIndexing
 
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
@@ -67,6 +68,7 @@ from torch_spyre._inductor.work_division import (
 from torch_spyre._inductor.work_division_constraints import (
     ConstraintResult,
     WorkDivConstraintContext,
+    aligned_ownership_split_domains,
     collect_work_division_constraints,
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
@@ -354,6 +356,42 @@ def _make_context(
         reduction_vars=list(reduction_vars),
         committed_splits=committed_splits or {},
     )
+
+
+class TestAlignedOwnershipSplitDomains(unittest.TestCase):
+    def _context(self, source_shape, source_index):
+        rows, cols = _isym("d0"), _isym("d1")
+        op = _computed_buffer((6, 128), name="repeat")
+        output_td = _tensor_dep("repeat", (6, 128), (rows, cols))
+        source = TensorDep(
+            dep=MemoryDep("x", source_index(rows, cols), (rows, cols), (6, 128)),
+            layout=_fixed_tiled_layout(source_shape),
+        )
+        ctx = _make_context(
+            op,
+            output_td,
+            [source],
+            it_space={rows: 6, cols: 128},
+            it_space_adjusted={rows: 6, cols: 2},
+            stick_vars={cols: 64},
+        )
+        return ctx, rows
+
+    def test_repeat_rows_split_only_into_whole_blocks(self):
+        # x.repeat(3, 2) over x of shape (2, 64): a 2-way row split would give
+        # core 0 output rows {0, 2, 4} after alignment.
+        ctx, rows = self._context(
+            (2, 64),
+            lambda d0, d1: 64 * ModularIndexing(d0, 1, 2) + ModularIndexing(d1, 1, 64),
+        )
+        result = aligned_ownership_split_domains(ctx)
+        self.assertEqual(result.allowed_splits[rows], frozenset({1, 3, 6}))
+        self.assertFalse(result.blocked)
+
+    def test_affine_read_leaves_rows_unconstrained(self):
+        ctx, rows = self._context((6, 128), lambda d0, d1: 128 * d0 + d1)
+        result = aligned_ownership_split_domains(ctx)
+        self.assertNotIn(rows, result.allowed_splits)
 
 
 class TestDirectReadSourceStickSplitDomains(unittest.TestCase):

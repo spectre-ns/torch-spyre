@@ -27,6 +27,7 @@ every rule.
 """
 
 import dataclasses
+import math
 import typing
 
 import sympy
@@ -57,9 +58,12 @@ from .constants import (
     TOPK_MAX_K_PER_CORE,
     TOPK_OPS,
 )
+from .core_mapping import aligned_split_keeps_blocks
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
+    AlignmentAccess,
+    build_operation_alignment_inputs,
     concretize_expr,
     device_coordinates,
     indirect_forbidden_split_syms,
@@ -68,6 +72,7 @@ from .pass_utils import (
 )
 from .logging_utils import get_inductor_logger
 from .propagate_hints import get_op_hints
+from .views import align_tensors_pure
 from .wsr.coarse_tile import _raw_to_squeezed_pos
 from . import config
 
@@ -134,6 +139,7 @@ def collect_work_division_constraints(
         reduction_window_blocked_vars,
         coarse_tile_local_dim_split_domains,
         direct_read_source_stick_split_domains,
+        aligned_ownership_split_domains,
         plain_reduction_k_split_domains,
         restickify_padding_blocked_vars,
         qfp8wt_split_domains,
@@ -285,6 +291,58 @@ def direct_read_source_stick_split_domains(
             factor
             for factor in divisors(extent)
             if factor == 1 or (extent // factor) % eps == 0
+        )
+
+    return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def aligned_ownership_split_domains(
+    ctx: WorkDivConstraintContext,
+) -> ConstraintResult:
+    """Keep every core's share of a dimension one contiguous block in codegen.
+
+    Tensor alignment cuts a loop dimension at each boundary an operand's
+    coordinates put on it, and codegen distributes the dimension's split over
+    the resulting segments outermost first (``distribute_aligned_split``). A
+    split that does not line up with those segments lands on an inner one and
+    interleaves the owners, while the scratchpad planner still assumes
+    contiguous blocks. ``x.repeat(3, 2)`` with ``x`` of shape (2, 64) reads
+    ``x`` at ``Mod(d0, 2)`` over ``d0 < 6``; a 2-way split of ``d0`` gives
+    core 0 output rows {0, 2, 4}, so an LX-resident consumer on the same
+    division reads the wrong rows (1 and 4). Admit only the factors
+    ``aligned_split_keeps_blocks`` accepts.
+    """
+    tensor_deps = [*ctx.input_tds, ctx.output_td]
+    accesses = [
+        AlignmentAccess(td.layout.device_layout, td.dep.index) for td in tensor_deps
+    ]
+    try:
+        alignment_inputs = build_operation_alignment_inputs(
+            ctx.it_space,
+            accesses,
+            {symbol: (extent, 1) for symbol, extent in ctx.it_space.items()},
+        )
+        _, _, segments = align_tensors_pure(alignment_inputs)
+    except Exception:
+        # The alignment input is rebuilt ahead of codegen. Codegen reports its
+        # own alignment failures; this rule only narrows splits it can prove bad.
+        return ConstraintResult()
+
+    allowed_splits: dict[Symbol, frozenset[int]] = {}
+    for symbol, parts in segments.items():
+        if len(parts) < 2 or symbol not in ctx.it_space_adjusted:
+            continue
+        try:
+            extent = concretize_expr(ctx.it_space_adjusted[symbol])
+        except Exception:
+            continue
+        bases = [int(basis) for _, basis in parts]
+        if math.prod(bases) != extent:
+            continue
+        allowed_splits[symbol] = frozenset(
+            factor
+            for factor in divisors(extent)
+            if aligned_split_keeps_blocks(factor, bases)
         )
 
     return ConstraintResult(allowed_splits=allowed_splits)
