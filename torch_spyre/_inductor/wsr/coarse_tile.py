@@ -2520,9 +2520,8 @@ def resolve_tile_axis_loop_vars(
     than a candidate to drop.
     """
     loop_vars, reason = try_resolve_tile_axis_loop_vars(op, tiling)
-    if reason is not None:
+    if loop_vars is None:
         raise Unsupported(reason)
-    assert loop_vars is not None
     return loop_vars
 
 
