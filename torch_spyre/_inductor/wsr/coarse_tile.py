@@ -2910,18 +2910,10 @@ def _divide_ranges(
     # get_read_writes() result (pass_utils.op_read_writes) is stale
     # regardless of which capture path (if any) runs below -- invalidate
     # unconditionally rather than only inside the symbol-remap branch.
-    invalidate_op_read_writes(op)
-
-    # The write dep's ``ranges`` are derived from ``data.ranges``, so the
-    # ``op_read_writes`` memo is stale the moment the line above runs.  Drop it
-    # unconditionally, not just on the paths below that go on to *observe* the
-    # new iteration space: a caller that needs no symbol remap still leaves the
-    # op behind for everyone else, and ``iteration_space_from_op`` would then
-    # report the untiled extents against tiled ``data.ranges``.  That
-    # disagreement is unreachable when coarse tiling runs pre-stickification
-    # (nothing has populated the memo yet), but the solver-driven path applies
-    # tilings *during* scratchpad planning, after the first solve has memoized
-    # every op -- where it surfaced as
+    # That disagreement is unreachable when coarse tiling runs
+    # pre-stickification (nothing has populated the memo yet), but the
+    # solver-driven path applies tilings *during* scratchpad planning, after
+    # the first solve has memoized every op -- where it surfaced as
     # ``coarse_tile_local_dim_split_domains``'s extent assertion.
     invalidate_op_read_writes(op)
 

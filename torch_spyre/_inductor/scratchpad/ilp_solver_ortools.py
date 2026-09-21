@@ -1328,6 +1328,88 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 raise
             return None
 
+    def _cut_literals(
+        self,
+        model: "cp_model.CpModel",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+        children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
+    ) -> list["cp_model.IntVar"]:
+        """One bool per buffer, true when that buffer is a coarse-tiling *cut*.
+
+        A cut is a tiled op whose value has to be published into a full-sized
+        buffer because some consumer does not share its tiling -- exactly the
+        ``kind="copy_out"`` classification ``_plan_tiling_propagation`` makes
+        later, expressed over the solver's own division variables so it can be
+        ranked *while* the tiling is being chosen rather than discovered after.
+
+        Each candidate ``TileSpec`` is interned to a small integer id (the empty
+        spec is always 0, so ``tile_id != 0`` means "tiled"), and ``add_element``
+        ties a buffer's id to its chosen division exactly as ``eff_size`` and
+        ``cores`` are already tied. A tiled buffer with no modelled consumer --
+        a graph output, or one read only by an extern kernel -- is a cut
+        unconditionally, since its value must reach HBM either way.
+
+        Returns an empty list when nothing carries a non-empty spec, which is
+        every path except the joint solve with ``unified_tiling`` on, so the
+        cut stage below vanishes there.
+        """
+        spec_ids: dict[object, int] = {}
+        divided = {
+            name: sb
+            for name, sb in tensors.items()
+            if getattr(sb.buffer, "core_divisions", None)
+        }
+        for sb in divided.values():
+            for cd in sb.buffer.core_divisions:
+                if cd.tiling.is_untiled:
+                    spec_ids.setdefault(cd.tiling, 0)
+                elif cd.tiling not in spec_ids:
+                    spec_ids[cd.tiling] = len(spec_ids) + 1
+        if not any(i for i in spec_ids.values()):
+            return []
+
+        max_id = max(spec_ids.values())
+        tile_id = {}
+        for name, sb in divided.items():
+            ids = [spec_ids[cd.tiling] for cd in sb.buffer.core_divisions]
+            var = model.new_int_var(0, max_id, f"tile_id_{name}")
+            model.add_element(sb.division, ids, var)
+            tile_id[name] = var
+
+        cuts = []
+        for name, var in tile_id.items():
+            is_tiled = model.new_bool_var(f"tiled_{name}")
+            model.add(var != 0).only_enforce_if(is_tiled)
+            model.add(var == 0).only_enforce_if(is_tiled.negated())
+
+            diffs: list["cp_model.IntVar"] = []
+            # A consumer with no divisions of its own (placement-only) cannot
+            # share a tiling, so reading it is always a cut.
+            unshareable = False
+            for child, _ in children_of.get(name, []):
+                child_var = tile_id.get(child)
+                if child_var is None:
+                    unshareable = True
+                    break
+                d = model.new_bool_var(f"tilediff_{name}_{child}")
+                model.add(var != child_var).only_enforce_if(d)
+                model.add(var == child_var).only_enforce_if(d.negated())
+                diffs.append(d)
+
+            cut = model.new_bool_var(f"cut_{name}")
+            if unshareable or not diffs:
+                # No modelled consumer that could share the tiling: tiled => cut.
+                model.add(cut == is_tiled)
+            else:
+                any_diff = model.new_bool_var(f"anydiff_{name}")
+                model.add_max_equality(any_diff, diffs)
+                model.add_bool_and([is_tiled, any_diff]).only_enforce_if(cut)
+                model.add_bool_or(
+                    [is_tiled.negated(), any_diff.negated()]
+                ).only_enforce_if(cut.negated())
+            cuts.append(cut)
+        return cuts
+
     def _run(
         self,
         model: "cp_model.CpModel",
@@ -1376,21 +1458,55 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 
+        # Loop-group boundaries the tiling implies, as solver variables, so the
+        # ladder below can rank them. Empty unless the joint solve is actually
+        # choosing tilings, which makes the cut stage inert.
+        cut_terms = (
+            self._cut_literals(model, tensors, children_of)
+            if config.coarse_tile_cut_tiebreak
+            else []
+        )
+        if cut_terms:
+            logger.debug(
+                "[CP-SAT layout solver] cut tiebreak over %d candidate cut(s)",
+                len(cut_terms),
+            )
+
         status = None
         core_terms = None
         occupancy: Optional[int] = None
 
+        def _solve_stage(stage: str) -> int:
+            result = solver.Solve(model)
+            if result not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                raise SolveError(
+                    f"CP-SAT returned {solver.StatusName(result)} without a plan "
+                    f"after {solver.WallTime():.2f}s ({stage})"
+                )
+            return result
+
         if cost_expr is not None:
+            # Only reached with unified_tiling off: the allocator withholds the
+            # expression when tiling is a solver axis, because the cost model is
+            # flat in tile size and cut count. Unchanged behaviour otherwise --
+            # a successful cost solve returns here and the ladder is skipped.
             status = self._minimize_cost_expr(model, solver, tensors, cost_expr)
 
         if status is None:
             # TODO: Update objective to a maxmin optimization to optimize overall
             # throughput.
             #
-            # The objective is a lexicographic solve: residency first, then
-            # parallelism, then division balance. Each step locks the prior optimum
-            # as a constraint before optimizing the next, so a later step only
-            # breaks ties the earlier ones leave open.
+            # One lexicographic ladder, in priority order:
+            #
+            #   1. LX residency   -- minimize total HBM transfer traffic.
+            #   2. cut count      -- fewest coarse-tiling loop-group boundaries.
+            #   3. parallelism    -- maximize total core usage.
+            #   4. division shape -- minimize summed squared split factors.
+            #
+            # Each stage pins the previous optimum as a constraint before
+            # optimizing the next, so a later stage only breaks ties the earlier
+            # ones leave open: never trade a spill for fewer cuts, nor cuts for
+            # parallelism.
 
             # Fallback discipline: the traffic objective below knows no relayout
             # price, and an unpriced shuffle looks free - the exact degeneracy
@@ -1398,47 +1514,50 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # under this objective, so every copy is pinned out.
             for copy_w in copies.values():
                 model.add(copy_w.in_buffer == 0)
-            # Residency (the hard priority): minimize total HBM transfer traffic so
-            # as much as possible stays resident in LX.
+
+            # -- 1. LX residency ------------------------------------------------
             hbm_terms = [
                 sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
             ]
             status = cp_model.INFEASIBLE
             if hbm_terms:
                 model.minimize(sum(hbm_terms))
-                status = solver.Solve(model)
-                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError(
-                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
-                        f"after {solver.WallTime():.2f}s"
-                    )
+                status = _solve_stage("residency")
                 # Lock in the residency optimum (the traffic value, not just the
-                # count) so the parallelism step can never trade a spill for
-                # parallelism. Rounding avoids loss of precision as the objective is
-                # a sum/product of ints.
-                model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
+                # count) so no later stage can trade a spill for its own metric.
+                # Rounding avoids loss of precision as the objective is a
+                # sum/product of ints.
+                if cut_terms or any(sb.cores is not None for sb in tensors.values()):
+                    model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
 
-            # Parallelism: holding the residency optimum, maximize total core usage
-            # so every buffer (resident or spilled) takes its most parallel
-            # division. Placement-only buffers have no division to choose and so
-            # contribute no term; with none at all there is nothing to maximize, so
-            # we skip the re-solve and the extract below reads the residency
-            # assignment still held by ``solver``.
+            # -- 2. cut count ---------------------------------------------------
+            if cut_terms:
+                model.minimize(sum(cut_terms))
+                status = _solve_stage("cut tiebreak")
+                cuts = round(solver.ObjectiveValue())
+                logger.debug(
+                    "[CP-SAT layout solver] cut tiebreak: %d cut(s) at the "
+                    "residency optimum",
+                    cuts,
+                )
+
+            # -- 3. parallelism, then 4. division shape -------------------------
+            # Placement-only buffers have no division to choose and so contribute
+            # no term; with none at all there is nothing to rank, so we skip the
+            # re-solve and the extract below reads the assignment the last solve
+            # still holds.
             core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
             # A core_cost term exists for exactly the same buffers as a core term
-            # (both are set only on division-carrying buffers), so phase 3 runs
-            # whenever phase 2 does.
+            # (both are set only on division-carrying buffers), so stage 4 runs
+            # whenever stage 3 does.
             core_cost_terms = [
                 sb.core_cost for sb in tensors.values() if sb.core_cost is not None
             ]
             if core_terms:
+                if cut_terms:
+                    model.add(sum(cut_terms) <= cuts)
                 model.maximize(sum(core_terms))
-                status = solver.Solve(model)
-                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError(
-                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
-                        f"after {solver.WallTime():.2f}s"
-                    )
+                status = _solve_stage("parallelism")
                 occupancy = round(solver.ObjectiveValue())
 
                 # Shape balance: holding the parallelism optimum (the objective is
@@ -1449,12 +1568,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 # spill a buffer or lower its core count.
                 model.add(sum(core_terms) >= occupancy)
                 model.minimize(sum(core_cost_terms))
-                status = solver.Solve(model)
-                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError(
-                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
-                        f"after {solver.WallTime():.2f}s"
-                    )
+                status = _solve_stage("division shape")
 
         final_tensors = self._extract(solver, tensors)
 
