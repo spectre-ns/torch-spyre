@@ -472,7 +472,7 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
 
     rw = op.get_read_writes()
     write_index = next(iter(rw.writes)).index
-    
+
     # reads indexes are unaffected by current op tiling
     read_index = next((d.index for d in rw.reads if hasattr(d, "index")), write_index)
     if output_counts:
