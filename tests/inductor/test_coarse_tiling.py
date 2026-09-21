@@ -265,6 +265,61 @@ def _make_hinted_op(data, name="op0", hints=((0, 0),)):
     return op
 
 
+def _real_pointwise_core(name, ranges, input_layouts, out_layout, *, device, dtype):
+    """Build a genuine ComputedBuffer(Pointwise) over real InputBuffers.
+
+    The construction both ``_make_real_pointwise_op`` and ``_ftl_pointwise``
+    share, with the parts that genuinely differ between them -- device, dtype and
+    every layout -- passed in already built. One ``InputBuffer`` per entry of
+    ``input_layouts`` (named ``in{i}_{name}``); the op's ``inner_fn`` sums a load
+    from each at the op's own iteration index, so every input's
+    ``MemoryDep.index`` reflects that input's own stride and carries Inductor's
+    real dep symbols. Inputs and the op are registered on
+    ``V.graph.name_to_buffer``, and ``operation_name`` is set directly rather
+    than through ``GraphLowering.register_operation``, which would mint its own
+    ``op{N}`` name instead of ``name``.
+
+    Requires an active graph handler: ``InputBuffer.make_loader()`` reads
+    ``V.graph.sizevars`` lazily, at every later ``get_read_writes()`` as well as
+    here.
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        InputBuffer,
+        Pointwise,
+        StorageBox,
+        TensorBox,
+    )
+
+    input_boxes = []
+    for i, layout in enumerate(input_layouts):
+        inp = InputBuffer(name=f"in{i}_{name}", layout=layout)
+        V.graph.name_to_buffer[inp.get_name()] = inp
+        input_boxes.append(TensorBox(StorageBox(inp)))
+
+    def inner_fn(index):
+        loaders = [box.make_loader()(index) for box in input_boxes]
+        result = loaders[0]
+        for loader in loaders[1:]:
+            result = result + loader
+        return result
+
+    pw = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=list(ranges),
+    )
+    buf = ComputedBuffer(
+        name=name,
+        layout=out_layout,
+        data=pw.data.data,  # TensorBox -> StorageBox -> Pointwise
+    )
+    buf.operation_name = name
+    V.graph.name_to_buffer[name] = buf
+    return buf
+
+
 def _make_real_pointwise_op(
     ranges,
     input_shapes_strides,
@@ -300,46 +355,21 @@ def _make_real_pointwise_op(
     ``coarse_tile()`` entry point -- see
     ``TestCoarseTileTileAdvanceExprs``'s docstring).
     """
-    from torch._inductor.ir import (
-        ComputedBuffer,
-        FixedLayout,
-        InputBuffer,
-        Pointwise,
-        StorageBox,
-        TensorBox,
-    )
+    from torch._inductor.ir import FixedLayout
     from torch_spyre._inductor.propagate_hints import DimHint
 
-    input_boxes = []
-    for i, (shape, stride) in enumerate(input_shapes_strides):
-        inp = InputBuffer(
-            name=f"in{i}_{name}",
-            layout=FixedLayout(torch.device("cpu"), torch.float32, shape, stride),
-        )
-        V.graph.name_to_buffer[inp.get_name()] = inp
-        input_boxes.append(TensorBox(StorageBox(inp)))
-
-    def inner_fn(index):
-        loaders = [box.make_loader()(index) for box in input_boxes]
-        result = loaders[0]
-        for loader in loaders[1:]:
-            result = result + loader
-        return result
-
-    pw = Pointwise.create(
-        device=torch.device("cpu"),
+    cpu = torch.device("cpu")
+    buf = _real_pointwise_core(
+        name,
+        ranges,
+        [
+            FixedLayout(cpu, torch.float32, shape, stride)
+            for shape, stride in input_shapes_strides
+        ],
+        FixedLayout(cpu, torch.float32, list(ranges), None),
+        device=cpu,
         dtype=torch.float32,
-        inner_fn=inner_fn,
-        ranges=list(ranges),
     )
-    pw_data = pw.data.data  # TensorBox -> StorageBox -> Pointwise
-    buf = ComputedBuffer(
-        name=name,
-        layout=FixedLayout(torch.device("cpu"), torch.float32, list(ranges), None),
-        data=pw_data,
-    )
-    buf.operation_name = name
-    V.graph.name_to_buffer[name] = buf
     n_ranges = len(ranges)
     buf._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(n_ranges)]
     buf.dim_hints = [
@@ -8982,14 +9012,7 @@ def _ftl_pointwise(
     reported ``reads=set()``, so ``read_index`` fell back to the write index and
     the read path went untested.
     """
-    from torch._inductor.ir import (
-        ComputedBuffer,
-        FlexibleLayout,
-        InputBuffer,
-        Pointwise,
-        StorageBox,
-        TensorBox,
-    )
+    from torch._inductor.ir import FlexibleLayout
     from torch_spyre._C import SpyreTensorLayout
     from torch_spyre._inductor.ir import FixedTiledLayout
 
@@ -8999,41 +9022,31 @@ def _ftl_pointwise(
     else:
         stride = [int(s) for s in host_stride]
     read_stride = stride if in_stride is None else [int(s) for s in in_stride]
-
-    inp = InputBuffer(
-        name=f"in0_{name}",
-        layout=FixedTiledLayout(
-            "spyre:0",
-            dtype,
-            size,
-            read_stride,
-            SpyreTensorLayout(size, read_stride, dtype, list(range(len(size)))),
-        ),
-    )
-    V.graph.name_to_buffer[inp.get_name()] = inp
-    box = TensorBox(StorageBox(inp))
-    pw = Pointwise.create(
-        device=torch.device("spyre:0"),
-        dtype=dtype,
-        inner_fn=lambda index: box.make_loader()(index),
-        ranges=list(size),
-    )
     within_stick = stride.index(min(stride))
     dim_order = [i for i in range(len(size)) if i != within_stick] + [within_stick]
-    op = ComputedBuffer(
-        name=name,
-        layout=FixedTiledLayout(
+
+    return _real_pointwise_core(
+        name,
+        size,
+        [
+            FixedTiledLayout(
+                "spyre:0",
+                dtype,
+                size,
+                read_stride,
+                SpyreTensorLayout(size, read_stride, dtype, list(range(len(size)))),
+            )
+        ],
+        FixedTiledLayout(
             "spyre:0",
             dtype,
             size,
             stride,
             SpyreTensorLayout(size, stride, dtype, dim_order),
         ),
-        data=pw.data.data,
+        device=torch.device("spyre:0"),
+        dtype=dtype,
     )
-    op.operation_name = name
-    V.graph.name_to_buffer[name] = op
-    return op
 
 
 class TestPredictFrame(unittest.TestCase):
