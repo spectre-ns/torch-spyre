@@ -91,50 +91,6 @@ def expected_unimplemented(fn):
     return wrapper
 
 
-# The one failure ``expected_lx_ownership_gap`` is allowed to absorb. Upstream
-# #4284 (c0d8818c) requires every LX-resident buffer to carry an accepted
-# ``PerCoreView``, and enforces it both in ``_post_solve`` and in
-# ``_set_one_allocation``; either wording below is that invariant firing.
-_LX_OWNERSHIP_GAP_SIGNS = (
-    "has no accepted physical ownership",
-    "coarse_tile_copy",
-)
-
-
-def expected_lx_ownership_gap(fn):
-    """Expect a test to fail *only* by hitting upstream #4284's LX-view invariant.
-
-    The solver-driven tile search commits a tiled op's output to LX, then
-    ``CoarseTilingPass`` materializes a ``coarse_tile_copy_*`` that reads that
-    buffer whole (``num_cores=1``) while the source is divided across cores. The
-    re-plan leaves the buffer resident, and #4284's check then rejects it -- the
-    residency was priced before the consumer that invalidates it existed.
-
-    Same discipline as :func:`expected_unimplemented`, and for the same reason:
-    ``unittest.expectedFailure`` would absorb *any* exception, so a genuine
-    regression in this path -- wrong numerics, a solver crash -- would sit here
-    looking expected. This narrows the expectation to the one declared cause and
-    fails on anything else, including a clean pass, which is the signal to delete
-    the marker.
-
-    The fix belongs in the solve's residency model, not at either check: making
-    ``_post_solve`` lenient only moves the failure to ``_set_one_allocation``.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        try:
-            fn(self, *args, **kwargs)
-        except Exception as exc:
-            if not any(sign in str(exc) for sign in _LX_OWNERSHIP_GAP_SIGNS):
-                raise
-            pytest.xfail(f"blocked on #4284's LX-view invariant: {exc}")
-        else:
-            self.fail(f"{fn.__name__} passed -- remove @expected_lx_ownership_gap")
-
-    return wrapper
-
-
 # One buffer's coarse-tile fingerprint: the trip counts of the loop nest it
 # sits in, outermost level first.  An op at an outer level of a deeper nest
 # carries a prefix of its group's counts -- a drain left outside a two-level
@@ -776,22 +732,18 @@ class AutomatedCoarseTilingTests(
     def case_decorators(params):
         """Per-combo decorators.
 
-        The ``unhinted``/``partial`` combos were ``@expected_unimplemented`` while
-        the solver-driven tile search was unbuilt; that marker retired itself the
-        moment those modes passed (it fails a clean run). Both modes are built at
-        this stage -- ``partial`` included -- and both are blocked against
-        current upstream by #4284's LX-view invariant, a different cause, so
-        they carry ``expected_lx_ownership_gap`` rather than being folded back
-        into "not built yet". It is self-retiring the same way: when the gap
-        closes these fail on the clean pass and the marker comes off.
+        The ``unhinted``/``partial`` combos were ``@expected_unimplemented``
+        while the solver-driven tile search was unbuilt, and briefly
+        ``@expected_lx_ownership_gap`` while _commit_divisions dropped the
+        division the solve had chosen for each ``coarse_tile_copy_*``. Both
+        markers retired themselves the moment those modes passed (each fails a
+        clean run), so only the ortools skip for the cpsat solver remains.
         """
         decorators = []
         if params["solver_method"] == "cpsat":
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["hint_mode"] in ("partial", "unhinted"):
-            decorators.append(expected_lx_ownership_gap)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:

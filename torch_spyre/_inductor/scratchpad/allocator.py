@@ -3053,9 +3053,28 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op = op_by_name.get(buf.name)
             if op is None or buf.chosen_division is None:
                 continue
-            if not hasattr(op, "iteration_space_ownership"):
-                continue
             cd = buf.core_divisions[buf.chosen_division]
+            if not hasattr(op, "iteration_space_ownership"):
+                # The guard (#4062) means "only refine a division the
+                # work-division pass established", and its real subjects are the
+                # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
+                # they carry no iteration space to own, and the solver leaves
+                # their splits empty, so both tests below skip them.
+                #
+                # An op ``CoarseTilingPass`` synthesises is a different case. It
+                # is created *after* the work-division pass, so it was never
+                # offered ownership -- not deliberately denied it -- yet the
+                # joint solve still enumerates candidates for it, gates it
+                # through ``cd_parent_matches`` against its producer, and picks
+                # a division consistent with that producer's. Skipping it here
+                # drops a decision the solve made: the copy stays undivided
+                # while its producer commits divided, and ``_post_solve``'s
+                # ownership check then rejects a pair the solver never made
+                # inconsistent ("op 'bufN' ref PerCoreView(... num_cores=32) !=
+                # 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
+                # Mint ownership for it so the choice lands.
+                if not isinstance(op, ComputedBuffer) or not cd.splits:
+                    continue
             if not _split_option_is_legal(op, cd.splits):
                 raise Unsupported(f"{op.name}: chosen split violates hard domain.")
             commit_iteration_space_ownership(op, cd.splits)
