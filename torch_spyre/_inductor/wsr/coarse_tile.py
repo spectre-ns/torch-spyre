@@ -98,7 +98,7 @@ from torch_spyre._C import SpyreTensorLayout
 from .. import config
 from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
-from ..scratchpad.plan_solver import TileSpec
+from ..scratchpad.plan_solver import TileAxis, TileSpec
 from ..logging_utils import get_inductor_logger
 from ..loop_info import (
     CarriedReductionRecord,
@@ -2448,26 +2448,41 @@ def reduction_loop_var_by_ranges_pos(
     return by_pos
 
 
-def _get_red_var(op, red_vars, axis):
+def _get_red_var(
+    op: ComputedBuffer, axis: TileAxis
+) -> tuple[sympy.Symbol | None, str | None]:
+    """``(loop_var, None)``, or ``(None, reason)`` if ``axis`` cannot apply.
+
+    The reduction-axis step of :func:`try_resolve_tile_axis_loop_vars`, which
+    owns the contract -- call that, not this. ``axis.host_dim`` is an
+    *unsqueezed* ``op.data.reduction_ranges`` position, so it resolves through
+    :func:`reduction_loop_var_by_ranges_pos`, never by indexing the squeezed
+    :func:`reduction_loop_vars`.
+
+    Rejects, in order: an op that is not a ``Reduction``; an op with no write
+    dep to derive loop variables from; an op whose loop variables no longer
+    correspond to its ``reduction_ranges``; a ``host_dim`` past the end of
+    ``reduction_ranges``; and a size-1 dim, which carries no loop variable to
+    tile.
+    """
     if not isinstance(op.data, Reduction):
         return None, (
             f"coarse tiling: reduction axis host_dim={axis.host_dim} "
             f"requested on non-Reduction op {op.get_name()}."
         )
+    try:
+        red_vars = reduction_loop_var_by_ranges_pos(op)
+    except StopIteration:
+        return None, (
+            f"coarse tiling: {op.get_name()} has no write dep or no "
+            "indexed read dep to derive reduction loop variables from."
+        )
     if red_vars is None:
-        try:
-            red_vars = reduction_loop_var_by_ranges_pos(op)
-        except StopIteration:
-            return None, (
-                f"coarse tiling: {op.get_name()} has no write dep or no "
-                "indexed read dep to derive reduction loop variables from."
-            )
-        if red_vars is None:
-            return None, (
-                f"coarse tiling: {op.get_name()}'s reduction loop "
-                "variables no longer correspond to its reduction_ranges "
-                "positions, so a reduction host_dim cannot be resolved."
-            )
+        return None, (
+            f"coarse tiling: {op.get_name()}'s reduction loop "
+            "variables no longer correspond to its reduction_ranges "
+            "positions, so a reduction host_dim cannot be resolved."
+        )
     if axis.host_dim >= len(red_vars):
         return None, (
             f"coarse tiling: reduction host_dim={axis.host_dim} is out "
@@ -2484,7 +2499,20 @@ def _get_red_var(op, red_vars, axis):
     return red_var, None
 
 
-def _get_out_var(op, out_coords, axis):
+def _get_out_var(
+    op: ComputedBuffer, out_coords: list[sympy.Expr], axis: TileAxis
+) -> tuple[sympy.Symbol | None, str | None]:
+    """``(loop_var, None)``, or ``(None, reason)`` if ``axis`` cannot apply.
+
+    The output-axis step of :func:`try_resolve_tile_axis_loop_vars`, which owns
+    the contract -- call that, not this. ``axis.host_dim`` indexes
+    ``out_coords``, the ``op_out_coords(op)`` the caller computes once for all
+    of a spec's axes.
+
+    Rejects a ``host_dim`` past the end of ``out_coords``, and a coordinate that
+    is not a function of exactly one loop variable -- a constant, or several
+    vars folded into one host dim -- since there is then no single loop to tile.
+    """
     if axis.host_dim >= len(out_coords):
         return None, (
             f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
@@ -2499,7 +2527,7 @@ def _get_out_var(op, out_coords, axis):
             f"{coord} on {op.get_name()} has {len(free_symbols)} free "
             "symbols; expected exactly one loop var."
         )
-    return next(iter(free_symbols))
+    return next(iter(free_symbols)), None
 
 
 def try_resolve_tile_axis_loop_vars(
@@ -2526,7 +2554,9 @@ def try_resolve_tile_axis_loop_vars(
     ``op.data.reduction_ranges`` for a reduction axis. The frames are disjoint
     and each counts from zero, so one ``host_dim`` names different axes under
     the two flags, and neither counts over the op's input rank. Bounds are
-    therefore checked per frame.
+    therefore checked per frame: :func:`_get_out_var` resolves an output axis,
+    :func:`_get_red_var` a reduction axis, each in the same
+    ``(loop_var, None)`` / ``(None, reason)`` form this returns per spec.
 
     A reduction ``host_dim`` is an *unsqueezed* ``reduction_ranges`` position,
     which is what ``enumerate_tilings`` emits. The
@@ -2542,19 +2572,15 @@ def try_resolve_tile_axis_loop_vars(
     some other producer invented.
     """
     out_coords = op_out_coords(op)
-    red_vars: list[sympy.Symbol | None] | None = None
     loop_vars: list[sympy.Symbol] = []
     for axis in tiling.axes:
         if axis.is_reduction:
-            red_var, reason = _get_red_var(op, red_vars, axis)
-            if reason or not red_var:
-                return None, reason
-            loop_vars.append(red_var)
+            loop_var, reason = _get_red_var(op, axis)
         else:
-            out_var, reason = _get_out_var(op, out_coords, axis)
-            if reason or not out_var:
-                return None, reason
-            loop_vars.append(out_var)
+            loop_var, reason = _get_out_var(op, out_coords, axis)
+        if loop_var is None:
+            return None, reason
+        loop_vars.append(loop_var)
     return loop_vars, None
 
 
