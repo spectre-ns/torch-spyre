@@ -2329,32 +2329,25 @@ def _hint_ranges_pos(
 
 
 def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
-    """The op's reduction loop variables, in ``op.data.reduction_ranges`` order
-    but **squeezed** -- a size-1 reduction dim carries no loop variable, so this
-    list can be shorter than ``reduction_ranges`` and its indices do not line up
-    with it.
+    """Return the op's reduction loop variables, ordered as in
+    ``op.data.reduction_ranges``.
 
     Uses dep-tracking symbols (d0, d1, ...) rather than SymT.R0_INDEX symbols
     (r0_0, r0_1, ...) which are a different namespace.  Finds reduction symbols
     by set-subtracting output index symbols from input index symbols, in
-    dep.ranges order (which matches the *relative* order of reduction_ranges).
+    dep.ranges order (which matches reduction_ranges order).
+
+    This is the single source of truth for that derivation. Both directions go
+    through it: ``_loop_var_to_reduction_ranges_pos`` (loop_var -> position) and
+    coarse tiling's reduction-axis lowering (its inverse, position -> loop_var,
+    in ``scratchpad.coarse_tiling.tile_spec_to_dim_hints``).
 
     A fused pointwise prologue can make the reduction read more than one
     operand (e.g. ``(x * bias[:, None]).sum(1)``), and a broadcast operand
     carries a strict subset of the reduction symbols (often none).  Pick the
     read dep that indexes the *most* reduction symbols, so a leading broadcast
-    operand neither yields an empty result nor a short list.
-
-    This is the single source of truth for the derivation, but it is not the
-    frame callers count in. Callers that hold a ``reduction_ranges`` position
-    -- which is what ``TileAxis.host_dim`` is -- must go through
-    :func:`reduction_loop_var_by_ranges_pos` instead, never index this list
-    directly. Both directions do: ``_loop_var_to_reduction_ranges_pos``
-    (loop_var -> position) and coarse tiling's reduction-axis lowering
-    (position -> loop_var, in
-    ``scratchpad.coarse_tiling.tile_spec_to_dim_hints``, via
-    :func:`resolve_tile_axis_loop_vars`). See
-    :func:`reduction_loop_var_by_ranges_pos` for why.
+    operand neither yields an empty result nor a short, mis-positioned list
+    (consumers index this positionally by reduction-range position).
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()

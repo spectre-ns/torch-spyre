@@ -9299,13 +9299,7 @@ class TestTileSpecLoweringOutput(unittest.TestCase):
 
 
 class TestTileSpecLoweringReduction(unittest.TestCase):
-    """The reduction-axis lowering resolves an unsqueezed ``reduction_ranges``
-    position to its loop var.
-
-    These cases have a single reduction dim and no unit dims, where the
-    squeezed ``reduction_loop_vars`` and the unsqueezed ``reduction_ranges``
-    coincide; ``TestReductionHostDimFrame`` covers the case where they do not.
-    """
+    """The reduction-axis lowering is the inverse of reduction_loop_vars."""
 
     def setUp(self):
         gm = fx.symbolic_trace(lambda: None)
@@ -9346,7 +9340,7 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
             name="buf0",
             hints=((1, 0),),
         )
-        spec = TileSpec((TileAxis(3, 4, is_reduction=True),))  # 1 reduction dim
+        spec = TileSpec((TileAxis(3, 4, is_reduction=True),))  # only 1 red var
         with self.assertRaises(Unsupported):
             tile_spec_to_dim_hints(op, spec, [0])
 
