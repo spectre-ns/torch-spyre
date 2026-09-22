@@ -2412,6 +2412,57 @@ def reduction_loop_var_by_ranges_pos(
         by_pos[pos] = sym
     return by_pos
 
+def _get_red_var(op, red_vars, axis):
+    if not isinstance(op.data, Reduction):
+        return None, (
+            f"coarse tiling: reduction axis host_dim={axis.host_dim} "
+            f"requested on non-Reduction op {op.get_name()}."
+        )
+    if red_vars is None:
+        try:
+            red_vars = reduction_loop_var_by_ranges_pos(op)
+        except StopIteration:
+            return None, (
+                f"coarse tiling: {op.get_name()} has no write dep or no "
+                "indexed read dep to derive reduction loop variables from."
+            )
+        if red_vars is None:
+            return None, (
+                f"coarse tiling: {op.get_name()}'s reduction loop "
+                "variables no longer correspond to its reduction_ranges "
+                "positions, so a reduction host_dim cannot be resolved."
+            )
+    if axis.host_dim >= len(red_vars):
+        return None, (
+            f"coarse tiling: reduction host_dim={axis.host_dim} is out "
+            f"of bounds for {len(red_vars)} reduction dims on "
+            f"{op.get_name()}."
+        )
+    red_var = red_vars[axis.host_dim]
+    if red_var is None:
+        return None, (
+            f"coarse tiling: reduction host_dim={axis.host_dim} on "
+            f"{op.get_name()} is a size-1 dim, which carries no loop "
+            "variable and cannot be tiled."
+        )
+    return red_var, None
+
+def _get_out_var(op, out_coords, axis):
+    if axis.host_dim >= len(out_coords):
+        return None, (
+            f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
+            f"for {len(out_coords)} output coordinates on "
+            f"{op.get_name()}."
+        )
+    coord = out_coords[axis.host_dim]
+    free_symbols = coord.free_symbols
+    if len(free_symbols) != 1:
+        return None, (
+            f"coarse tiling: host_dim={axis.host_dim} output coordinate "
+            f"{coord} on {op.get_name()} has {len(free_symbols)} free "
+            "symbols; expected exactly one loop var."
+        )
+    return next(iter(free_symbols))
 
 def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, tiling: TileSpec
@@ -2457,55 +2508,15 @@ def try_resolve_tile_axis_loop_vars(
     loop_vars: list[sympy.Symbol] = []
     for axis in tiling.axes:
         if axis.is_reduction:
-            if not isinstance(op.data, Reduction):
-                return None, (
-                    f"coarse tiling: reduction axis host_dim={axis.host_dim} "
-                    f"requested on non-Reduction op {op.get_name()}."
-                )
-            if red_vars is None:
-                try:
-                    red_vars = reduction_loop_var_by_ranges_pos(op)
-                except StopIteration:
-                    return None, (
-                        f"coarse tiling: {op.get_name()} has no write dep or no "
-                        "indexed read dep to derive reduction loop variables from."
-                    )
-                if red_vars is None:
-                    return None, (
-                        f"coarse tiling: {op.get_name()}'s reduction loop "
-                        "variables no longer correspond to its reduction_ranges "
-                        "positions, so a reduction host_dim cannot be resolved."
-                    )
-            if axis.host_dim >= len(red_vars):
-                return None, (
-                    f"coarse tiling: reduction host_dim={axis.host_dim} is out "
-                    f"of bounds for {len(red_vars)} reduction dims on "
-                    f"{op.get_name()}."
-                )
-            red_var = red_vars[axis.host_dim]
-            if red_var is None:
-                return None, (
-                    f"coarse tiling: reduction host_dim={axis.host_dim} on "
-                    f"{op.get_name()} is a size-1 dim, which carries no loop "
-                    "variable and cannot be tiled."
-                )
+            red_var, reason = _get_red_var(op, red_vars, axis)
+            if reason or not red_var:
+                return None, reason
             loop_vars.append(red_var)
         else:
-            if axis.host_dim >= len(out_coords):
-                return None, (
-                    f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
-                    f"for {len(out_coords)} output coordinates on "
-                    f"{op.get_name()}."
-                )
-            coord = out_coords[axis.host_dim]
-            free_symbols = coord.free_symbols
-            if len(free_symbols) != 1:
-                return None, (
-                    f"coarse tiling: host_dim={axis.host_dim} output coordinate "
-                    f"{coord} on {op.get_name()} has {len(free_symbols)} free "
-                    "symbols; expected exactly one loop var."
-                )
-            loop_vars.append(next(iter(free_symbols)))
+            out_var, reason = _get_out_var(op, out_coords, axis)
+            if reason or not out_var:
+                return None, reason
+            loop_vars.append(out_var)
     return loop_vars, None
 
 
