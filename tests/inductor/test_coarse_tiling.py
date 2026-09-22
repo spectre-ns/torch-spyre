@@ -9364,7 +9364,8 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
 
 class TestReductionHostDimFrame(unittest.TestCase):
     """A reduction ``TileAxis.host_dim`` is an *unsqueezed* ``reduction_ranges``
-    position, and lowering resolves it in that frame.
+    position, on both sides of the contract: lowering resolves it in that frame,
+    and the enumerator sizes and stick-checks it in that frame.
 
     Inductor squeezes size-1 dims before minting loop symbols, so
     ``reduction_loop_vars`` is shorter than ``reduction_ranges`` whenever the
@@ -9439,6 +9440,194 @@ class TestReductionHostDimFrame(unittest.TestCase):
             tile_spec_to_dim_hints(
                 unit, TileSpec((TileAxis(0, 2, is_reduction=True),)), [1]
             )
+
+    def test_leading_unit_dim_does_not_change_reduction_splits(self):
+        # The producer side of the same contract: _reduction_split_counts reads
+        # the extent at an unsqueezed position, so it must resolve that
+        # position's loop var in the same frame. Mixing them stick-checks a
+        # different dim, and on the last dim indexes past the squeezed list --
+        # which it caught and reported as "no legal splits".
+        from torch_spyre._inductor.wsr.enumerate_tilings import (
+            _reduction_split_counts,
+        )
+
+        control = self._sum_op([8, 16, 32], "ctl_split")
+        unit = self._sum_op([1, 8, 16, 32], "unit_split")
+        self.assertEqual(_reduction_split_counts(unit, 0), [])  # unit dim
+        for pos in range(3):
+            with self.subTest(pos=pos):
+                self.assertEqual(
+                    _reduction_split_counts(unit, pos + 1),
+                    _reduction_split_counts(control, pos),
+                )
+
+
+def _make_real_tiled_op(name, ranges, reduction_ranges=()):
+    """A genuine Pointwise or Reduction ComputedBuffer carrying device layouts.
+
+    ``_make_real_pointwise_op``/``_make_real_reduction_op`` give their buffers a
+    plain ``FixedLayout``, which ``enumerate_tile_options`` cannot read: its
+    stick checks need ``device_layout``. Here the output and its one input carry
+    a ``FixedTiledLayout`` with the stick on the last host dim, as
+    stickification leaves them, so the enumerator runs its real output and input
+    stick checks. With ``reduction_ranges`` the op is ``out[i] = sum(in[i, r])``;
+    without, ``out[i] = in[i]``. The caller must hold a graph handler, as for
+    ``_make_real_pointwise_op``.
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FlexibleLayout,
+        InputBuffer,
+        Pointwise,
+        Reduction,
+        StorageBox,
+        TensorBox,
+    )
+
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    dtype = torch.float16
+
+    def tiled_layout(shape):
+        stride = [int(s) for s in FlexibleLayout.contiguous_strides(shape)]
+        device_layout = SpyreTensorLayout(
+            list(shape), stride, dtype, list(range(len(shape)))
+        )
+        return FixedTiledLayout(
+            torch.device("cpu"),
+            dtype,
+            [Integer(s) for s in shape],
+            [Integer(s) for s in stride],
+            device_layout,
+        )
+
+    inp = InputBuffer(
+        name=f"in0_{name}", layout=tiled_layout([*ranges, *reduction_ranges])
+    )
+    V.graph.name_to_buffer[inp.get_name()] = inp
+    load = TensorBox(StorageBox(inp)).make_loader()
+    if reduction_ranges:
+        node = Reduction.create(
+            device=torch.device("cpu"),
+            dst_dtype=dtype,
+            src_dtype=dtype,
+            inner_fn=lambda index, rindex: load([*index, *rindex]),
+            ranges=[Integer(r) for r in ranges],
+            reduction_ranges=[Integer(r) for r in reduction_ranges],
+            reduction_type="sum",
+        )
+    else:
+        node = Pointwise.create(
+            device=torch.device("cpu"),
+            dtype=dtype,
+            inner_fn=load,
+            ranges=[Integer(r) for r in ranges],
+        )
+    buf = ComputedBuffer(
+        name=name,
+        layout=tiled_layout(ranges),
+        data=node.data.data,  # TensorBox -> StorageBox -> Pointwise/Reduction
+    )
+    buf.operation_name = name
+    V.graph.name_to_buffer[name] = buf
+    return buf
+
+
+class TestEnumeratedOptionsLower(unittest.TestCase):
+    """Every option ``enumerate_tile_options`` offers is one lowering accepts.
+
+    The solver will pick among these options and hand its pick to
+    ``tile_spec_to_dim_hints``, which raises on anything
+    ``try_resolve_tile_axis_loop_vars`` rejects. So each option must resolve, and
+    must resolve to the dim it was sized for: every axis's loop variable must
+    range over exactly the extent the enumerator read at that ``host_dim``, and
+    the axis count must divide it. The second check is what catches a split
+    sized in one frame and applied in another. Resolving every finished spec --
+    where the enumerator checks one axis per dim -- is also what fails if
+    resolution ever starts to depend on an axis's count.
+
+    Real IR throughout, with no MagicMock: the ops come from ``Pointwise.create``
+    and ``Reduction.create``, so loop variables are squeezed exactly as Inductor
+    squeezes them.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        self.addCleanup(self._graph_ctx.__exit__, None, None, None)
+        self.enterContext(patch.object(config, "enable_reduction_tiling", True))
+
+    def _assert_every_option_lowers(self, op):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            resolve_tile_axis_loop_vars,
+        )
+        from torch_spyre._inductor.wsr.enumerate_tilings import (
+            enumerate_tile_options,
+        )
+
+        options = enumerate_tile_options(op)
+        extents = iteration_space_from_op(op)
+        for spec in options:
+            with self.subTest(op=op.get_name(), spec=spec):
+                loop_vars = resolve_tile_axis_loop_vars(op, spec)
+                for axis, loop_var in zip(spec.axes, loop_vars):
+                    frame = (
+                        op.data.reduction_ranges
+                        if axis.is_reduction
+                        else op.data.ranges
+                    )
+                    extent = int(extents[loop_var])
+                    self.assertEqual(extent, int(frame[axis.host_dim]))
+                    self.assertEqual(extent % axis.count, 0)
+        return options
+
+    def test_pointwise_options_lower(self):
+        options = self._assert_every_option_lowers(
+            _make_real_tiled_op("pw", [6, 4, 128])
+        )
+        # Not vacuous: single and nested output tilings were both offered.
+        self.assertTrue(any(spec.depth == 1 for spec in options))
+        self.assertTrue(any(spec.depth == 2 for spec in options))
+
+    def test_pointwise_with_unit_dim_options_lower(self):
+        # The unit dim's output coordinate carries no loop variable; the dims
+        # after it must still resolve to their own.
+        options = self._assert_every_option_lowers(
+            _make_real_tiled_op("pw_unit", [4, 1, 6, 128])
+        )
+        self.assertEqual(
+            {axis.host_dim for spec in options for axis in spec.axes}, {0, 2}
+        )
+
+    def test_reduction_with_unit_dims_options_lower(self):
+        # Leading and middle unit reduction dims: the squeezed loop variables
+        # and the unsqueezed positions disagree from the first dim on.
+        options = self._assert_every_option_lowers(
+            _make_real_tiled_op("red_unit", [4, 64], [1, 8, 1, 128])
+        )
+        reduction_positions = {
+            axis.host_dim for spec in options for axis in spec.axes if axis.is_reduction
+        }
+        self.assertEqual(reduction_positions, {1, 3})
+
+    def test_lowering_accepts_consults_the_lowering(self):
+        # _lowering_accepts rejects exactly what the lowering's resolver
+        # rejects, so an axis it passes is one tile_spec_to_dim_hints accepts.
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+
+        pw = _make_real_tiled_op("pw_acc", [6, 128])
+        red = _make_real_tiled_op("red_acc", [4, 64], [1, 8])
+        self.assertTrue(_lowering_accepts(pw, TileAxis(0, 2)))
+        self.assertTrue(_lowering_accepts(red, TileAxis(1, 2, is_reduction=True)))
+        # Out of bounds for the output frame.
+        self.assertFalse(_lowering_accepts(pw, TileAxis(2, 2)))
+        # A reduction axis on an op with no reduction.
+        self.assertFalse(_lowering_accepts(pw, TileAxis(0, 2, is_reduction=True)))
+        # A size-1 reduction dim carries no loop variable to tile.
+        self.assertFalse(_lowering_accepts(red, TileAxis(0, 2, is_reduction=True)))
 
 
 def _loop_var_to_reduction_ranges_pos_public(op, sym):
