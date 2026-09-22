@@ -2447,6 +2447,7 @@ def reduction_loop_var_by_ranges_pos(
         by_pos[pos] = sym
     return by_pos
 
+
 def _get_red_var(op, red_vars, axis):
     if not isinstance(op.data, Reduction):
         return None, (
@@ -2482,6 +2483,7 @@ def _get_red_var(op, red_vars, axis):
         )
     return red_var, None
 
+
 def _get_out_var(op, out_coords, axis):
     if axis.host_dim >= len(out_coords):
         return None, (
@@ -2498,6 +2500,7 @@ def _get_out_var(op, out_coords, axis):
             "symbols; expected exactly one loop var."
         )
     return next(iter(free_symbols))
+
 
 def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, tiling: TileSpec
