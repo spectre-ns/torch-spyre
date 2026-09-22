@@ -55,10 +55,6 @@ raises ``Unsupported``. Both read the same authority,
 Dependencies stay one-way (``tile_prediction -> coarse_tile``). Nothing here
 mutates IR; the solver must not import this module -- the allocator calls the
 predictor and hands results across, which is what keeps the solver IR-free.
-
-Nothing calls it yet: the allocator seam that prices candidates through it --
-per-tiling division enumeration, and ``_prepare_per_core_view`` taking
-``view_parts()`` and the predicted layout -- arrives separately.
 """
 
 from __future__ import annotations
