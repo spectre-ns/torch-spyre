@@ -39,7 +39,6 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo, LoopCarryRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     CONV2D_FWD_OP,
-    DEPTHWISE_CONV2D_OP,
 )
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
@@ -1439,24 +1438,6 @@ class TestFinalMappingConstraints(unittest.TestCase):
         )
 
         self.assertEqual(result.blocked, {ki})
-
-    def test_depthwise_conv_does_not_block_trailing_group_dim(self):
-        kh, kw, group = (_isym(name) for name in ("kh", "kw", "group"))
-        op = _computed_buffer(
-            (8,),
-            name="depthwise_conv",
-            reduction_type=DEPTHWISE_CONV2D_OP,
-            reduction_ranges=(3, 3, 4),
-        )
-        result = reduction_window_blocked_vars(
-            _make_context(
-                op,
-                self._PLACEHOLDER_TD,
-                reduction_vars=[kh, kw, group],
-            )
-        )
-
-        self.assertEqual(result.blocked, {kh, kw})
 
     def test_conv_spatial_and_window_blocks_compose(self):
         mb, out, i, j, channel, ki = (

@@ -487,10 +487,6 @@ def reduction_window_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
             int(conv_params.get(name, 1)) > 1 for name in ("kernel_h", "kernel_w")
         )
         window_dims = ctx.reduction_vars[-kernel_dims:] if kernel_dims else []
-    elif op == DEPTHWISE_CONV2D_OP:
-        # Depthwise reduction order is kh, kw, then optional group. Unlike the
-        # forward-conv path, a group dimension may therefore follow the window.
-        window_dims = ctx.reduction_vars[:2]
     else:
         return ConstraintResult()
 
