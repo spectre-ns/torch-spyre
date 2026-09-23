@@ -1419,6 +1419,20 @@ class TestSympyExprToCpSatPrinter(TestCase):
         self.assertEqual(solver.ObjectiveValue(), 20)
         self.assertEqual(solver.Value(sym_map["x"]), 10)
 
+    def test_shared_load_penalty_lowers_for_product_degrees(self):
+        from torch_spyre._inductor.work_division import _matmul_multicast_penalty
+
+        x, y, resident = sympy.symbols("x y resident", integer=True)
+        expression = (
+            8192 / 150 * (_matmul_multicast_penalty(x * y) - 1) * (1 - resident)
+        )
+        for a, b, lx in ((2, 4, 0), (3, 4, 0), (4, 8, 0), (4, 8, 1)):
+            solver, _ = self._optimize(
+                expression, {"x": (a, a), "y": (b, b), "resident": (lx, lx)}, False
+            )
+            expected = 8192 / 150 * (_matmul_multicast_penalty(a * b) - 1) * (1 - lx)
+            self.assertAlmostEqual(solver.ObjectiveValue(), expected, places=5)
+
     def test_piecewise_and_or_condition_lowering(self):
         # Exercises _print_And and _print_Or as Piecewise conditions.
         x, y = sympy.symbols("x y", integer=True)
@@ -1464,6 +1478,40 @@ class TestSympyExprToCpSatPrinter(TestCase):
         )
         self.assertEqual(solver.Value(variables["enabled"]), 0)
         self.assertAlmostEqual(solver.ObjectiveValue(), 50.0, places=6)
+
+    def test_unreplicated_choice_in_a_product_of_splits(self):
+        from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, predict_ops
+
+        b, m = sympy.symbols("b m", integer=True, positive=True)
+
+        def price(replication):
+            return predict_ops(
+                [
+                    OpFeatures(
+                        "bmm",
+                        True,
+                        64,
+                        8,
+                        2,
+                        [
+                            ArgTraffic(
+                                "buf0", "input", False, 4096, replication=replication
+                            ),
+                            ArgTraffic("buf1", "output", False, 64),
+                        ],
+                        is_matmul=True,
+                    )
+                ]
+            )
+
+        expression = price(b * m)
+        for batch, rows in ((1, 1), (1, 2), (2, 1)):
+            solver, _ = self._optimize(
+                expression, {"b": (batch, batch), "m": (rows, rows)}, False
+            )
+            self.assertAlmostEqual(
+                solver.ObjectiveValue(), price(batch * rows), delta=1
+            )
 
     def test_conditional_minmax_operands_still_lower(self):
         x, enabled = sympy.symbols("x enabled", integer=True, nonnegative=True)
@@ -1616,6 +1664,58 @@ class TestSympyExprToCpSatPrinter(TestCase):
         )
         self.assertAlmostEqual(got, 1000 * (_CORE_INV_SCALE // 7) / _CORE_INV_SCALE)
 
+    @staticmethod
+    def _lin_max_operand_sizes(model):
+        return [
+            len(e.vars)
+            for c in model.proto.constraints
+            if c.has_lin_max()
+            for e in c.lin_max.exprs
+        ]
+
+    def test_minmax_multi_term_operands_get_their_own_var(self):
+        # The cost model's alpha * min(R, W) turnaround term compares two
+        # weighted sums of residency literals. Presolve reasons about a lin_max
+        # operand through its exact domain -- for such a sum the set of its
+        # subset sums, exponential in its distinct coefficients (4 s of
+        # PresolveToFixPoint on a Granite 4.0 decode block). Every
+        # multi-variable operand must reach lin_max as a single variable, and
+        # the optimum must not move.
+        lits = sympy.symbols("b0:6", integer=True, nonnegative=True)
+        reads = 3 * (1 - lits[0]) + 5 * (1 - lits[1]) + 7 * lits[2] + 2 * lits[3]
+        writes = 4 * lits[0] + 6 * (1 - lits[3]) + 11 * lits[4] + 9 * (1 - lits[5])
+        for minmax, maximize in ((sympy.Min, True), (sympy.Max, False)):
+            expr = minmax(reads, writes)
+            model = cp_model.CpModel()
+            sym_map = {x.name: model.new_int_var(0, 1, x.name) for x in lits}
+            cp_expr = _SympyExprToCpSat(model, dict(sym_map), {}).convert(expr)
+            sizes = self._lin_max_operand_sizes(model)
+            self.assertTrue(sizes)
+            self.assertLessEqual(max(sizes), 1, sizes)
+            if maximize:
+                model.maximize(cp_expr)
+            else:
+                model.minimize(cp_expr)
+            solver = cp_model.CpSolver()
+            self.assertEqual(solver.Solve(model), cp_model.OPTIMAL)
+            values = [
+                int(expr.subs(dict(zip(lits, bits))))
+                for bits in itertools.product((0, 1), repeat=len(lits))
+            ]
+            best = max(values) if maximize else min(values)
+            self.assertEqual(solver.ObjectiveValue(), best)
+
+    def test_minmax_single_variable_operands_are_not_wrapped(self):
+        # A constant or a single affine variable is already cheap for lin_max;
+        # only multi-variable sums get a variable of their own.
+        x, y = sympy.symbols("x y", integer=True)
+        model = cp_model.CpModel()
+        sym_map = {n: model.new_int_var(0, 9, n) for n in ("x", "y")}
+        _SympyExprToCpSat(model, dict(sym_map), {}).convert(sympy.Min(x, 2 * y + 1))
+        self.assertFalse(
+            any(v.name.startswith("minmax_arg_") for v in model.proto.variables)
+        )
+
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
 class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
@@ -1711,6 +1811,56 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class SolveStatsTest(TestCase):
+    """``CpSatLayoutSolver.last_solve_stats``: what the solve cost and returned.
+
+    Nothing else in the pipeline records this, and the cost-expression dump
+    reports it as the provenance of the plan it describes -- so a reader can
+    tell an OPTIMAL plan from one that hit a time limit, and a plan the
+    objective chose from one the fallback did.
+    """
+
+    @staticmethod
+    def _bufs():
+        return [
+            CoreDivisionBuffer("b0", 128, [0, 2], core_divisions=[CoreDivision()]),
+            CoreDivisionBuffer("b1", 128, [1, 3], core_divisions=[CoreDivision()]),
+        ]
+
+    def test_nothing_is_recorded_before_a_solve(self):
+        """Empty, so a reader distinguishes "not recorded" from "no solve"."""
+        self.assertEqual(CpSatLayoutSolver(self._bufs(), 1 << 20).last_solve_stats, {})
+
+    def test_an_objective_solve_is_recorded_as_one(self):
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        solver.plan_layout_and_core_divisions(4000 * (1 - solver.buffers[0].sym_is_lx))
+        stats = solver.last_solve_stats
+        self.assertEqual(stats["status"], "OPTIMAL")
+        self.assertTrue(stats["objective_used"])
+        self.assertGreater(stats["variables"], 0)
+        self.assertGreater(stats["constraints"], 0)
+
+    def test_the_fallback_passes_record_too(self):
+        """``_run`` solves in its own occupancy passes when no objective status
+        comes back. Recording only the objective solve would leave those plans
+        described by an earlier call's numbers."""
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        solver.plan_layout_and_core_divisions()
+        stats = solver.last_solve_stats
+        self.assertEqual(stats["status"], "OPTIMAL")
+        self.assertFalse(stats["objective_used"], "no objective was minimized")
+
+    def test_an_unlowerable_objective_is_not_reported_as_used(self):
+        """The fallback records over the NOT_LINEARIZABLE entry, because it is
+        the solve that produced the plan -- but the flag must not claim the
+        objective chose it."""
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        unlowerable = sympy.Function("NoSuchNode")(solver.buffers[0].sym_is_lx)
+        with config.patch({"_cpsat_warn_on_cost_expr": True}):
+            solver.plan_layout_and_core_divisions(unlowerable)
+        self.assertFalse(solver.last_solve_stats["objective_used"])
+
+
 class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.

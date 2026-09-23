@@ -153,8 +153,13 @@ logger = get_inductor_logger("scratchpad.allocator")
 # * ``MemTrackBundle::initializeMemoryTrackers`` uses one 128-byte stick as the
 #   LX allocation granularity (``sharedtools/mem_track_bundle.cpp``).
 #
-# Torch and DXP independently consume ``DXP_LX_FRAC_AVAIL``.  These constants
-# define the fixed part of that cross-compiler ownership contract.
+# Torch and the backend compiler independently consume ``DXP_LX_FRAC_AVAIL``:
+# dbo reads it in ``dbo/src/Transforms/ProgramLayout.cpp`` with the same 0.2
+# default.  The ``DXP_`` prefix is historical -- the variable is a cross-compiler
+# contract, so it cannot be renamed from this side alone without silently
+# reintroducing the ownership mismatch of issue #3222 (Torch would read the new
+# name while the backend kept defaulting the old one).  These constants define
+# the fixed part of that contract.
 _LX_PHYSICAL_CAPACITY_BYTES = 2 << 20
 _LX_PROGRAM_DEBUG_RESERVATION_BYTES = 64 << 10
 _LX_TRACKER_CAPACITY_BYTES = (
@@ -2213,7 +2218,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
         bufmap = {buf.name: buf for buf in solver.buffers}
-        is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
+        # Built once here, not per op inside the loop below: every op's residency
+        # lookup is against this same whole-graph map, and rebuilding it per op
+        # turns an O(buffers) cost into O(ops * buffers) on the full graph.
+        default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
 
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
         # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
@@ -2228,7 +2236,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if output_name not in bufmap:
                 continue
             op_features[output_name] = self._extract_op_features(
-                graph, output_name, bufmap, is_lx
+                graph, output_name, bufmap, default_is_lx
             )
 
         from torch_spyre._inductor.cost_model import predict_bundles
@@ -2308,11 +2316,47 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if config.dump_cost_expr_file and cost_expr is not None:
             # The objective as solved: its terms, the chosen symbol values and
             # the evaluated prices, for the summarize-sdsc skill.
-            from torch_spyre._inductor.dump_common import emit_json_line
+            from torch_spyre._inductor.dump_common import (
+                emit_json_line,
+                origin_op_name,
+            )
 
+            # No graph identity: the kernel name and directory hash are
+            # assigned at codegen, and `get_output_names()` is empty here. A
+            # reader pairs records to kernels by position -- they are appended
+            # in solve order -- so a counter would add only process-global state.
+            #
+            # Ops are named twice because the numeric cost dump names them
+            # twice: `op_names` matches its block heading and is what a human
+            # reads, `op_ids` matches its `output opN` line and is unique, so it
+            # is the key that joins the two dumps.
+            op_names, op_ids = {}, {}
+            for op in graph.operations or ():
+                # All three names or none: a half-written pair would leave the
+                # two maps disagreeing about which ops exist.
+                try:
+                    named = (op.get_name(), origin_op_name(op), op.get_operation_name())
+                except Exception:  # pragma: no cover - naming is best-effort
+                    continue
+                op_names[named[0]], op_ids[named[0]] = named[1], named[2]
+            context = {
+                "op_names": op_names,
+                "op_ids": op_ids,
+                "env": {
+                    # Per SOLVE, not per run: the head-major attention path
+                    # caps it for its own compile and leaves the rest at 32.
+                    "sencores": config.sencores,
+                    "lx_capacity": self.size,
+                    "solver": type(solver).__name__,
+                    "allocator": type(self).__name__,
+                },
+                "solve": dict(getattr(solver, "last_solve_stats", {}) or {}),
+            }
             emit_json_line(
                 config.dump_cost_expr_file,
-                cost_expr_record(cost_expr, bundle_terms, result, _COST_PARAMS),
+                cost_expr_record(
+                    cost_expr, bundle_terms, result, _COST_PARAMS, context=context
+                ),
             )
         return result
 
@@ -2323,17 +2367,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         each buffer's *symbolic* core-division vars (sym_core_divs) instead of
         concrete values, so the resulting OpFeatures can be fed to
         predict_ops() to build a cost expression over the solver's own
-        decision variables. Residency is likewise symbolic: ``is_lx`` (the
-        name -> ``sym_is_lx`` map) is passed straight into the extractor so
-        every arg is stamped with its symbolic placement as it is built.
+        decision variables. The extractor reads each arg's symbolic residency
+        from ``is_lx`` (built once by the caller over all of ``buffers``, not
+        per op); ``buffers`` itself supplies this op's own candidate divisions.
         """
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
         op = graph.get_buffer(output_name)
-        division = CoreDivision(splits=buffers[output_name].sym_core_divs)
+        buffer = buffers[output_name]
+        division = CoreDivision(splits=buffer.sym_core_divs)
         ws = _work_slices(op, division)
-        return extract_op_features(op, ws, is_lx)
+        return extract_op_features(op, ws, is_lx=is_lx)
 
     def _finalize_lx_relayout_allocation(
         self,
@@ -3164,16 +3209,19 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         consumer: str,
         candidates: list[RelayoutCandidate],
         consumer_divs: list[CoreDivision],
+        consumer_costs: dict[int, float] | None = None,
     ) -> list[RelayoutCandidate]:
         """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
         cheapest destination views of one (source, consumer) edge.
 
-        Every consumer division with a distinct read partition is its own
+        Each distinct consumer read partition is its own
         relayout group, and every group becomes a copy buffer the solver must
         place, though the consumer will read through at most one of them. A
-        group is ranked by its cheapest candidate (the best source division
-        that lands on it), ties toward the consumer division using more cores,
-        the solver's own preference. Dropping a group only removes an option:
+        group is ranked by copy plus consumer execution cost, not copy cost
+        alone: a cheap copy can feed an expensive matmul division. This is a
+        shortlist estimate, not the whole-graph objective. Ties favor more
+        consumer cores, the solver's existing preference. Dropping a group only
+        removes an option:
         a consumer division without a copy is treated exactly like an unpriced
         pair (match for free or spill), and every fired relayout is still
         certified at materialization.
@@ -3189,7 +3237,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         def rank(item: tuple[int, list[RelayoutCandidate]]) -> tuple:
             group, members = item
-            best = min(c.cost_ns for c in members)
+            best = min(
+                c.cost_ns
+                + (
+                    consumer_costs[c.consumer_division]
+                    if consumer_costs is not None
+                    else 0.0
+                )
+                for c in members
+            )
             cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
             return (best, -cores, group)
 
@@ -3202,6 +3258,37 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             len(by_group),
         )
         return [c for c in candidates if c.group in kept]
+
+    @staticmethod
+    def _relayout_consumer_costs(consumer_op, consumer_divs, parent, candidates):
+        """Reuse the execution model to shortlist copies feeding this consumer.
+
+        Price this input in LX and the remaining arguments in HBM. The solver
+        still decides their actual placement and prices complete bundles.
+        Extract once per consumer division, not once per source/destination pair.
+        """
+        from torch_spyre._inductor.cost_model import predict_ops
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}
+        is_lx[consumer_op.get_name()] = False
+        is_lx[parent] = True
+        return {
+            j: float(
+                predict_ops(
+                    [
+                        extract_op_features(
+                            consumer_op,
+                            _work_slices(consumer_op, consumer_divs[j]),
+                            is_lx=is_lx,
+                        )
+                    ],
+                    params=_COST_PARAMS,
+                )
+            )
+            for j in sorted({c.consumer_division for c in candidates})
+        }
 
     def _cd_parent_relayouts(
         self,
@@ -3393,7 +3480,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     if cost is None:
                         continue
                     source_span, destination_span = _span(pv), _span(cv)
-                    if source_span is None or destination_span is None:
+                    if (
+                        source_span is None
+                        or destination_span is None
+                        or destination_span > self.size
+                    ):
                         continue
                     candidates.append(
                         RelayoutCandidate(
@@ -3409,8 +3500,26 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                             destination_footprint_bytes=destination_span,
                         )
                     )
+            consumer_costs = None
+            cap = config.lx_solver_relayout_groups_per_edge
+            if cap > 0 and len({c.group for c in candidates}) > cap:
+                try:
+                    consumer_costs = self._relayout_consumer_costs(
+                        consumer_op, consumer_divs, parent, candidates
+                    )
+                except (ValueError, RuntimeError, TypeError) as exc:
+                    logger.warning(
+                        "relayout shortlist consumer cost unavailable for %s: %s; "
+                        "using copy cost only",
+                        consumer_op.get_name(),
+                        exc,
+                    )
             candidates = self._cap_relayout_groups(
-                parent, consumer_op.get_name(), candidates, consumer_divs
+                parent,
+                consumer_op.get_name(),
+                candidates,
+                consumer_divs,
+                consumer_costs,
             )
             if candidates:
                 relayouts[parent] = candidates
