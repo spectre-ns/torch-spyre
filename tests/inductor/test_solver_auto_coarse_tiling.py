@@ -388,8 +388,11 @@ class AutomatedCoarseTilingTests(
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
         # enable_spyre_context re-imports per compile, so it is swapped with
-        # patch.object rather than a config knob.
+        # patch.object rather than a config knob.  no_grad because the Linear
+        # weights require grad, and scan cannot trace an autograd graph for a
+        # nested for_each_tile.
         with (
+            torch.no_grad(),
             t_inductor_config.patch(force_disable_caches=True),
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
