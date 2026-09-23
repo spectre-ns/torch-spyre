@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Automated coarse tiling: hint preservation and hint-free tile discovery."""
+"""Automated coarse tiling: explicit ``for_each_tile`` loops and tile discovery."""
 
 import dataclasses
 import functools
@@ -141,7 +141,7 @@ def _group_hints(ops: Sequence) -> tuple[DimHint, ...]:
     """One hint per compiler-added level of a loop group, outermost first.
 
     Only hint scopes count here; ``for_each_tile`` levels are labelled by
-    ``_for_each_tile_levels`` instead, and the filters below already drop
+    ``_pin_order`` instead, and the filters below already drop
     them (their hints carry ``split_count=1``).
 
     The group, not the op, is the unit here.  ``loop_count`` is a group-level
@@ -174,31 +174,45 @@ def _group_hints(ops: Sequence) -> tuple[DimHint, ...]:
     )
 
 
-def _for_each_tile_levels(op) -> int:
-    """How many ``for_each_tile`` levels ``op`` sits in.
+def _splice_hints(op) -> list[DimHint]:
+    """``op``'s ``for_each_tile`` hints, outermost level first.
 
-    ``splice_while_loops`` appends one ``DimHint`` with ``loop_var_range``
-    set to every op of each level it stamps, outermost level first, and no
-    hint scope sets that field.  Counting them is therefore enough: the
-    *i*-th such hint on an op is the *i*-th ``for_each_tile`` of the model,
-    and an op outside the inner levels carries a prefix of them.
+    ``_stamp_direct_loop_info`` appends one ``DimHint`` with ``loop_var_range``
+    set to every op of each level it stamps, outermost level first, and no hint
+    scope sets that field.
     """
-    return sum(
-        1
+    return [
+        h
         for h in getattr(op, "dim_hints", None) or []
-        if getattr(h, "loop_var_range", None) is not None
-    )
+        if h.loop_var is not None and getattr(h, "loop_var_range", None) is not None
+    ]
 
 
-def _label_nest(op, group_hints: tuple[DimHint, ...]) -> _Nest:
+def _pin_order(operations: Sequence) -> dict:
+    """Each ``for_each_tile`` loop variable, mapped to its pin index.
+
+    Every level has its own loop variable, so the variable is what identifies
+    a pin.  Pins nest outermost first and every op lists its levels outermost
+    first, so the order in which the variables first appear over the operation
+    list is the nesting order.  ``hint_id`` cannot key a pin: the splice leaves
+    it at its default of 0 on every level.
+    """
+    order: dict = {}
+    for op in operations:
+        for h in _splice_hints(op):
+            order.setdefault(h.loop_var, len(order))
+    return order
+
+
+def _label_nest(op, group_hints: tuple[DimHint, ...], pin_of: dict) -> _Nest:
     """Pair ``op``'s trip counts with the loops and hints that produced them.
 
-    The labels are the op's ``for_each_tile`` levels, outermost first,
-    followed by the group's compiler-added hint levels, and the pairing is
-    positional.  Putting the pinned levels outermost is an assumption about
-    where the tile search nests its own levels; equal lengths are what make
-    the pairing unambiguous, and a mismatch leaves the whole nest unlabelled
-    rather than guessed at.
+    The labels are the op's ``for_each_tile`` levels, outermost first, each
+    named by its loop variable's pin index, followed by the group's
+    compiler-added hint levels, and the pairing is positional.  Putting the
+    pinned levels outermost is an assumption about where the tile search nests
+    its own levels; equal lengths are what make the pairing unambiguous, and a
+    mismatch leaves the whole nest unlabelled rather than guessed at.
 
     The group's hints, not the op's, label the compiler-added levels -- the
     op's own being a subset, they can only agree on length by being the same
@@ -212,11 +226,10 @@ def _label_nest(op, group_hints: tuple[DimHint, ...]) -> _Nest:
     unlabelled rather than guessed at from a subset that merely fits.  That
     is safe as long as nothing keys on them: a pin still shows up labelled on
     the ops that carry the untrimmed nest, and the count-only checks in
-    ``_check_hints_preserved`` cover the trimmed op.  A reduction-tiled case
-    is what would make a real handler for them worth writing.
+    ``_check_loops_preserved`` cover the trimmed op.
     """
     counts = tuple(int(count) for count in op.loop_info.loop_count)
-    labels = [_Level(count=0, pin=i) for i in range(_for_each_tile_levels(op))]
+    labels = [_Level(count=0, pin=pin_of[h.loop_var]) for h in _splice_hints(op)]
     labels += [
         _Level(count=0, hint_id=h.hint_id, dim=h.dim_names[0] if h.dim_names else None)
         for h in group_hints
@@ -242,58 +255,76 @@ def _label_tiling(operations: Sequence) -> dict[str, _Nest]:
     for op in tiled:
         by_group.setdefault(group_key(op), []).append(op)
     group_hints = {key: _group_hints(ops) for key, ops in by_group.items()}
-    return {op.get_name(): _label_nest(op, group_hints[group_key(op)]) for op in tiled}
+    pin_of = _pin_order(operations)
+    return {
+        op.get_name(): _label_nest(op, group_hints[group_key(op)], pin_of)
+        for op in tiled
+    }
 
 
 @dataclasses.dataclass(frozen=True)
 class _TilingCase:
     """One model plus the tiling contract asserted against it.
 
-    body:
-        The untiled model.  Pins are wrapped around it at compile time as
-        ``for_each_tile`` loops, so the same callable serves all three hint
-        modes.
+    inner:
+        The part of the model the pins wrap in ``for_each_tile`` loops, untiled
+        as written.  It takes the first ``len(named_dims)`` arguments.
+    outer:
+        The rest of the model, run on ``inner``'s result and the remaining
+        arguments, outside every loop, or ``None`` when the loops cover the
+        whole model.  It is what automatic tiling may add loops to: a loop the
+        user wrote is never re-tiled.
     args:
-        Device tensors passed to the compiled model.
+        Device tensors passed to the compiled model, ``inner``'s first.
     named_dims:
-        Per-argument axis labels, positionally aligned with ``args``, and
-        ``out_dims`` the same for the model's output.  They are local to the
-        test: a pin names an axis, and these say which axis of each operand
-        (``None`` where it has none) and of the output that is.  Nothing is
-        declared to the compiler -- ``for_each_tile`` states its tiling in the
-        program itself.
+        Per-argument axis labels for ``inner``'s arguments, and ``out_dims``
+        the same for its result.  They are local to the test: a pin names an
+        axis, and these say which axis of each operand (``None`` where it has
+        none) and of the result that is.  Nothing is declared to the compiler
+        -- ``for_each_tile`` states its tiling in the program itself.
     pins:
-        The ``for_each_tile`` loops the *hinted* mode wraps around ``body``,
+        The ``for_each_tile`` loops the *explicit* mode wraps around ``inner``,
         outermost first, and the whole of that mode's expectation: a pin is a
         ``(dim, count)`` and the nest it prescribes is those counts in that
         order, so a separate ``expected`` beside it could only restate them or
         contradict them.
-    partial_pins:
-        The same for the *partial* mode, where the caller pins a strict subset
-        of the tiling and leaves the rest to the compiler.  What must survive
-        is again each pin's own count, on whatever level the compiler ends up
-        giving it.
+    explicit_auto_pins:
+        The loops for the *explicit_auto* mode, where automatic tiling is on
+        as well.  What must survive is each loop exactly as written.
     """
 
-    body: Callable[..., torch.Tensor]
+    inner: Callable[..., torch.Tensor]
+    outer: Optional[Callable[..., torch.Tensor]]
     args: tuple[torch.Tensor, ...]
     named_dims: tuple[Sequence[str], ...]
     out_dims: Sequence[str]
     pins: tuple[tuple[str, int], ...]
-    partial_pins: tuple[tuple[str, int], ...]
+    explicit_auto_pins: tuple[tuple[str, int], ...]
     atol: float
     rtol: float
 
     @property
-    def hinted_nest(self) -> _Counts:
+    def explicit_nest(self) -> _Counts:
         """The loop nest ``pins`` prescribes: their counts, outermost first."""
         return tuple(count for _, count in self.pins)
+
+    def model(self, pins: tuple[tuple[str, int], ...]) -> Callable[..., torch.Tensor]:
+        """The whole model, with ``pins`` wrapped around ``inner``."""
+        n_inner = len(self.named_dims)
+
+        def run(*args: torch.Tensor) -> torch.Tensor:
+            result = _apply_pins(self, pins, *args[:n_inner])
+            if self.outer is None:
+                return result
+            return self.outer(result, *args[n_inner:])
+
+        return run
 
 
 def _apply_pins(
     case: _TilingCase, pins: tuple[tuple[str, int], ...], *args: torch.Tensor
 ) -> torch.Tensor:
-    """Run ``case.body`` inside one ``for_each_tile`` per pin, outermost first.
+    """Run ``case.inner`` inside one ``for_each_tile`` per pin, outermost first.
 
     Each pin slices every operand that has its axis into ``count`` tiles along
     it, passes the rest whole, and lays the result tiles back along the same
@@ -302,7 +333,7 @@ def _apply_pins(
     nesting order is the loop-nest order.
     """
     if not pins:
-        return case.body(*args)
+        return case.inner(*args)
     (dim, count), rest = pins[0], pins[1:]
     axes = tuple(
         list(names).index(dim) if dim in names else None for names in case.named_dims
@@ -346,7 +377,7 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
 class AutomatedCoarseTilingTests(
     unittest.TestCase, metaclass=_ParameterizedScratchpadMeta
 ):
-    """model x hint_mode x solver, one generated method per combination.
+    """model x tiling_mode x solver, one generated method per combination.
 
     The metaclass expands ``parameter_models`` against ``parameter_axes`` and
     routes each generated method through ``run_case``; ``case_decorators``
@@ -375,14 +406,8 @@ class AutomatedCoarseTilingTests(
             # TODO: Implement coarse tiling configuration
             raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
 
-        cpu_result = case.body(*(arg.to("cpu") for arg in case.args))
+        cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
-        if pins:
-
-            def model(*args):
-                return _apply_pins(case, pins, *args)
-        else:
-            model = case.body
         CollectTilingPasses.tiling = {}
         # TODO: Patch coarse tiling config here
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
@@ -400,7 +425,8 @@ class AutomatedCoarseTilingTests(
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
         ):
-            device_result = torch.compile(model, fullgraph=True)(*case.args).to("cpu")
+            compiled = torch.compile(case.model(pins), fullgraph=True)
+            device_result = compiled(*case.args).to("cpu")
 
         return cpu_result, device_result, CollectTilingPasses.tiling
 
@@ -424,16 +450,13 @@ class AutomatedCoarseTilingTests(
         ``pins[i]`` is the ``(dim, count)`` of the caller's *i*-th
         ``for_each_tile``, outermost first, and a level labelled ``pin=i`` is
         the loop that call became.  Every level labelled with a ``hint_id``
-        instead was added by the compiler -- including a *second* level on an
-        axis the caller already pinned (a finer division of it), which is a
-        discovered level, not a broken pin.
+        instead was added by the compiler.
 
-        Asserts each pinned level still divides by the count it named,
-        wherever in the nest it ended up.  The axis needs no check: a
-        ``for_each_tile`` names it in the program, so unlike a hint scope it
-        has nothing to bind to the wrong one.  Returns the ``(pinned,
-        discovered)`` levels, keyed by pin index and hint id respectively, so
-        the caller can say which of the two it expected.
+        Asserts each pinned level still divides by the count it named.  The
+        axis needs no check: a ``for_each_tile`` names it in the program, so
+        unlike a hint scope it has nothing to bind to the wrong one.  Returns
+        the ``(pinned, discovered)`` levels, keyed by pin index and hint id
+        respectively, so the caller can say which of the two it expected.
         """
         seen_pinned: dict[int, _Level] = {}
         discovered: dict[int, _Level] = {}
@@ -456,12 +479,12 @@ class AutomatedCoarseTilingTests(
     # ------------------------------------------------------------------
     # The three contracts
     # ------------------------------------------------------------------
-    def _check_hints_preserved(self, case: _TilingCase, solver: str) -> None:
-        """Pins are applied exactly: every loop written, no level invented."""
+    def _check_loops_preserved(self, case: _TilingCase, solver: str) -> None:
+        """The loops are applied exactly: every loop written, no level invented."""
         cpu, device, tiling = self._compile_and_collect(
             case, case.pins, layout_solver=solver, auto_tiling=False
         )
-        expected = case.hinted_nest
+        expected = case.explicit_nest
         self.assertTrue(
             tiling,
             "no op was coarse-tiled: the for_each_tile loops were not spliced "
@@ -474,13 +497,13 @@ class AutomatedCoarseTilingTests(
         for name, counts in sorted(nests.items()):
             self.assertTrue(
                 _is_subsequence(counts, expected),
-                f"{name} is tiled {counts}, which is not the hinted nest "
+                f"{name} is tiled {counts}, which is not the explicit nest "
                 f"{expected} with levels left out",
             )
         self.assertIn(
             expected,
             set(nests.values()),
-            f"no op carries the full hinted nest {expected}; "
+            f"no op carries the full explicit nest {expected}; "
             f"the applied tiling was {nests}",
         )
         # The rest is keyed on the loops themselves: with the tile search off
@@ -496,59 +519,59 @@ class AutomatedCoarseTilingTests(
         self.assertFalse(
             discovered,
             f"levels {list(discovered.values())} were invented by the "
-            f"compiler, but only the {len(case.pins)} hinted ones were "
-            f"asked for (the applied tiling was {tiling})",
+            f"compiler, but only the {len(case.pins)} explicit ones were "
+            f"written (the applied tiling was {tiling})",
         )
         self._assert_matches_cpu(case, device, cpu)
 
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
-        """With no hints at all, the compiler picks a tiling by itself."""
+        """With no loops at all, the compiler picks a tiling by itself."""
         cpu, device, tiling = self._compile_and_collect(
             case, (), layout_solver=solver, auto_tiling=True
         )
         self.assertTrue(
             tiling,
-            "Auto tiling is on and no hints were given, but no op was "
+            "Auto tiling is on and no loops were written, but no op was "
             "coarse-tiled -- the tile search found nothing to do",
         )
         self._assert_matches_cpu(case, device, cpu)
 
-    def _check_partial_hints_preserved(self, case: "_TilingCase", solver: str) -> None:
-        """Pinned levels survive verbatim; the compiler fills in the rest.
+    def _check_loops_preserved_with_auto(
+        self, case: "_TilingCase", solver: str
+    ) -> None:
+        """The written loops survive verbatim; the compiler tiles around them.
 
-        Both halves are checked by label, not by position, so the contract is
-        the one a pin actually carries -- *this dimension, divided this many
-        ways* -- and not "and outside everything the tile search adds".  Where
-        the compiler nests its own levels relative to a pin is its choice to
-        make: it may put them inside a pin, outside one, or in a separate loop
-        group over ops the pins never covered, and only the numerics
-        (``_assert_matches_cpu``) can call any of those wrong.
+        A ``for_each_tile`` loop is authoritative, so automatic tiling may only
+        add loops over ops outside it, never re-tile an op inside it.  Checked
+        by label, not by position: where the compiler puts its own loops is
+        its choice, and only the numerics (``_assert_matches_cpu``) can call
+        that choice wrong.
         """
         cpu, device, tiling = self._compile_and_collect(
             case,
-            case.partial_pins,
+            case.explicit_auto_pins,
             layout_solver=solver,
             auto_tiling=True,
         )
-        self.assertTrue(tiling, "no op was coarse-tiled: the pins were dropped")
-        seen_pinned, discovered = self._classify_levels(tiling, case.partial_pins)
+        self.assertTrue(tiling, "no op was coarse-tiled: the loops were dropped")
+        seen_pinned, discovered = self._classify_levels(tiling, case.explicit_auto_pins)
         self.assertEqual(
             sorted(seen_pinned),
-            list(range(len(case.partial_pins))),
-            f"the applied tiling {tiling} lost a pinned level: the pins "
-            f"{list(case.partial_pins)} should all still be there",
+            list(range(len(case.explicit_auto_pins))),
+            f"the applied tiling {tiling} lost a written loop: the loops "
+            f"{list(case.explicit_auto_pins)} should all still be there",
         )
         self.assertTrue(
             discovered,
-            f"the pins {list(case.partial_pins)} survived but nothing was "
-            f"added: the tile search left every unpinned dimension untiled "
+            f"the loops {list(case.explicit_auto_pins)} survived but nothing "
+            f"was added: the tile search left every op outside them untiled "
             f"({tiling})",
         )
         self._assert_matches_cpu(case, device, cpu)
 
     # ------------------------------------------------------------------
     # Models.  Each returns the model, its axis labels and the tiling contract,
-    # defined once and reused across every hint_mode and solver.
+    # defined once and reused across every tiling_mode and solver.
     # ------------------------------------------------------------------
     def _softmax_case(self) -> "_TilingCase":
         """softmax(dim=0) over (512, 1024), dims R (reduced) x C.
@@ -556,17 +579,18 @@ class AutomatedCoarseTilingTests(
         One level: C divided 4 ways, each tile a whole-column softmax.  The
         other axis, R, is the reduced one: a map loop over it would softmax
         each row block on its own and change the result, and a reduction loop
-        is a different model, so C is the whole prescribed plan.  The partial
-        mode pins that same single level; what it leaves to the compiler is R,
-        plus any finer division of C.
+        is a different model, so C is the whole prescribed plan.  The loop
+        covers the whole model, so the explicit_auto mode leaves the compiler
+        nothing outside it to tile.
         """
         return _TilingCase(
-            body=functools.partial(torch.softmax, dim=0),
+            inner=functools.partial(torch.softmax, dim=0),
+            outer=None,
             args=(torch.rand((512, 1024), dtype=torch.float16, device=DEVICE_NAME),),
             named_dims=(["R", "C"],),
             out_dims=["R", "C"],
             pins=(("C", 4),),  # Reduction axis is not tiled for now
-            partial_pins=(("C", 4),),
+            explicit_auto_pins=(("C", 4),),
             # A good run lands at 2e-5 on outputs of order 1/512; the
             # reduction-tiled one lands at 3e-3, and this has to separate them.
             atol=5e-4,
@@ -576,20 +600,22 @@ class AutomatedCoarseTilingTests(
     def _mlp_case(self) -> "_TilingCase":
         """Two-layer MLP (Linear -> silu -> Linear), dims S x Din x Dh x Dout.
 
-        Two levels: S divided 2 ways outside Dout divided 2 ways.  Both are
-        free (output) axes -- Din is the first GEMM's reduction and Dh the
-        second's, so neither can be a map loop.  The Dout loop wraps the whole
-        body, so the first Linear and silu run once per Dout tile.  The partial
-        mode pins only S, leaving Dout for the compiler to find.
+        The loops cover the first Linear and silu: S divided 2 ways outside
+        Dh divided 4 ways.  Both are free (output) axes there -- Din is the
+        first GEMM's reduction -- and the second Linear, which reduces over
+        Dh, runs outside every loop on the assembled activation.  That second
+        Linear is what automatic tiling may add a loop to; the explicit_auto
+        mode writes only the S loop.
         """
         seq_len, in_dim, hidden_dim, out_dim = 128, 256, 1024, 256
         fc1 = torch.nn.Linear(in_dim, hidden_dim).half()
         fc2 = torch.nn.Linear(hidden_dim, out_dim).half()
 
-        def mlp(x, w1, b1, w2, b2):
-            return torch.nn.functional.linear(
-                torch.nn.functional.silu(torch.nn.functional.linear(x, w1, b1)), w2, b2
-            )
+        def up_proj(x, w1, b1):
+            return torch.nn.functional.silu(torch.nn.functional.linear(x, w1, b1))
+
+        def down_proj(h, w2, b2):
+            return torch.nn.functional.linear(h, w2, b2)
 
         args = (
             torch.randn(seq_len, in_dim, dtype=torch.float16).to(DEVICE_NAME),
@@ -599,41 +625,39 @@ class AutomatedCoarseTilingTests(
             fc2.bias.to(DEVICE_NAME),
         )
         return _TilingCase(
-            body=mlp,
+            inner=up_proj,
+            outer=down_proj,
             args=args,
-            named_dims=(
-                ["S", "Din"],
-                ["Dh", "Din"],
-                ["Dh"],
-                ["Dout", "Dh"],
-                ["Dout"],
-            ),
-            out_dims=["S", "Dout"],
-            pins=(("S", 2), ("Dout", 2)),
-            partial_pins=(("S", 2),),
+            named_dims=(["S", "Din"], ["Dh", "Din"], ["Dh"]),
+            out_dims=["S", "Dh"],
+            pins=(("S", 2), ("Dh", 4)),
+            explicit_auto_pins=(("S", 2),),
             atol=0.02,
             rtol=0.05,
         )
 
     def _swiglu_case(self) -> "_TilingCase":
-        """SwiGLU (two parallel Linears -> silu(gate) * up), dims S x Din x Dh.
+        """SwiGLU FFN (silu(gate) * up, then a down projection), dims S x Din x Dh.
 
-        Two levels: S divided 2 ways outside Dh divided 4 ways.  Unlike the
-        MLP's, this Dh is a free axis the whole way through -- it is the N
-        dimension of both GEMMs and the layout of every activation -- so the
-        entire chain, both restickified weights included, lands in one
-        two-level nest.  Both weights carry the ``Dh`` label, so the inner loop
-        slices the gate and up branches together.  The partial mode pins only
-        S.
+        The loops cover the gated half: S divided 2 ways outside Dh divided 4
+        ways.  Dh is a free axis the whole way through it -- the N dimension of
+        both GEMMs and the layout of every activation -- and both weights
+        carry the ``Dh`` label, so the inner loop slices the gate and up
+        branches together.  The down projection reduces over Dh and runs
+        outside every loop; the explicit_auto mode writes only the S loop.
         """
         seq_len, in_dim, hidden_dim = 128, 256, 1024
         fc_gate = torch.nn.Linear(in_dim, hidden_dim).half()
         fc_up = torch.nn.Linear(in_dim, hidden_dim).half()
+        fc_down = torch.nn.Linear(hidden_dim, in_dim, bias=False).half()
 
-        def swiglu(x, w_gate, b_gate, w_up, b_up):
+        def gated(x, w_gate, b_gate, w_up, b_up):
             gate = torch.nn.functional.linear(x, w_gate, b_gate)
             up = torch.nn.functional.linear(x, w_up, b_up)
             return torch.nn.functional.silu(gate) * up
+
+        def down_proj(h, w_down):
+            return torch.nn.functional.linear(h, w_down)
 
         args = (
             torch.randn(seq_len, in_dim, dtype=torch.float16).to(DEVICE_NAME),
@@ -641,9 +665,11 @@ class AutomatedCoarseTilingTests(
             fc_gate.bias.to(DEVICE_NAME),
             fc_up.weight.to(DEVICE_NAME),
             fc_up.bias.to(DEVICE_NAME),
+            fc_down.weight.to(DEVICE_NAME),
         )
         return _TilingCase(
-            body=swiglu,
+            inner=gated,
+            outer=down_proj,
             args=args,
             named_dims=(
                 ["S", "Din"],
@@ -654,7 +680,7 @@ class AutomatedCoarseTilingTests(
             ),
             out_dims=["S", "Dh"],
             pins=(("S", 2), ("Dh", 4)),
-            partial_pins=(("S", 2),),
+            explicit_auto_pins=(("S", 2),),
             atol=0.02,
             rtol=0.05,
         )
@@ -663,16 +689,16 @@ class AutomatedCoarseTilingTests(
     # Matrix
     # ------------------------------------------------------------------
     _CHECKS = {
-        "hinted": _check_hints_preserved,
-        "unhinted": _check_tiling_discovered,
-        "partial": _check_partial_hints_preserved,
+        "explicit": _check_loops_preserved,
+        "auto": _check_tiling_discovered,
+        "explicit_auto": _check_loops_preserved_with_auto,
     }
 
-    parameter_axes = {"hint_mode": tuple(_CHECKS), "solver_method": ("cpsat",)}
+    parameter_axes = {"tiling_mode": tuple(_CHECKS), "solver_method": ("cpsat",)}
 
     # SDPA is omitted: its Spyre decomposition emits for_each_tile loops of its
-    # own, which _for_each_tile_levels would count as pins, and using SDPA in
-    # this test suite requires resolution of
+    # own, which _pin_order would count as pins, and using SDPA in this test
+    # suite requires resolution of
     # https://github.com/torch-spyre/torch-spyre/issues/3198
 
     parameter_models = (
@@ -696,10 +722,12 @@ class AutomatedCoarseTilingTests(
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["hint_mode"] in ("unhinted", "partial"):
+        if params["tiling_mode"] in ("auto", "explicit_auto"):
             decorators.append(expected_unimplemented)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:
         """Body of one generated method: build the model, check its contract."""
-        self._CHECKS[params["hint_mode"]](self, factory(self), params["solver_method"])
+        self._CHECKS[params["tiling_mode"]](
+            self, factory(self), params["solver_method"]
+        )
