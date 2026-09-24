@@ -1674,39 +1674,25 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     x_start, x_size, sb.end_time, sb.in_buffer, f"x_{sb.name}"
                 )
             )
-            # The address top must equal ``offset + eff_size`` even while the
-            # buffer is spilled. OR-Tools' no_overlap_2d (diffn.cc,
-            # AddNonOverlappingRectangles) adds "at most one of i-below-j,
-            # j-below-i" clauses for optional boxes of fixed size without
-            # guarding them by presence, which is sound only when every box's
-            # end is start + size. A free top on spilled buffers lets both hold
-            # and makes CP-SAT prove wrong optima (false OPTIMAL/INFEASIBLE).
-            if isinstance(sb.eff_size, int):
-                y_intervals.append(
-                    model.new_optional_fixed_size_interval_var(
-                        sb.offset, sb.eff_size, sb.in_buffer, f"y_{sb.name}"
-                    )
+            # An interval's ``end`` must be affine (a single var), so the top
+            # of a division-dependent footprint needs its own var, tied to
+            # ``offset + eff_size`` unconditionally. Its range covers every
+            # offset/footprint pair, so a spilled buffer loses no assignment.
+            y_end = model.new_int_var(
+                0,
+                max(0, self._capacity_units - 1) + sb.buffer.size,
+                f"top_{sb.name}",
+            )
+            model.add(y_end == sb.offset + sb.eff_size)
+            y_intervals.append(
+                model.new_optional_interval_var(
+                    sb.offset,
+                    sb.eff_size,
+                    y_end,
+                    sb.in_buffer,
+                    f"y_{sb.name}",
                 )
-            else:
-                # An interval's ``end`` must be affine (a single var), so the top
-                # of a division-dependent footprint needs its own var, tied to
-                # ``offset + eff_size`` unconditionally. Its range covers every
-                # offset/footprint pair, so a spilled buffer loses no assignment.
-                y_end = model.new_int_var(
-                    0,
-                    max(0, self._capacity_units - 1) + sb.buffer.size,
-                    f"top_{sb.name}",
-                )
-                model.add(y_end == sb.offset + sb.eff_size)
-                y_intervals.append(
-                    model.new_optional_interval_var(
-                        sb.offset,
-                        sb.eff_size,
-                        y_end,
-                        sb.in_buffer,
-                        f"y_{sb.name}",
-                    )
-                )
+            )
         model.add_no_overlap_2d(x_intervals, y_intervals)
 
     def _get_children(
