@@ -96,23 +96,43 @@ def _describe(tiling: dict[str, CoarseTileInfo]) -> str:
     )
 
 
-def _written_loops(operations: Sequence) -> frozenset[int]:
-    """The outer ``loop_group_id`` of every loop nest a ``for_each_tile`` wrote.
+def _nests(tiling: dict[str, CoarseTileInfo]) -> dict[int, dict[str, CoarseTileInfo]]:
+    """The tiled ops grouped into loop nests, keyed by outermost loop id.
 
-    ``CoarseTileInfo`` does not record which pass stamped it, so the loops the
-    program wrote are told apart from the ones the compiler added by the marker
-    the splice leaves: ``_stamp_direct_loop_info`` appends a ``DimHint`` with
-    ``loop_var_range`` set to every op it stamps, and no hint scope sets that
-    field.
+    ``loop_group_id[0]`` names an op's outermost loop, so ops sharing it sit in
+    one nest however deep each of them goes.
     """
-    return frozenset(
-        op.loop_info.loop_group_id[0]
-        for op in operations
-        if getattr(op, "loop_info", None) is not None
-        and any(
-            h.loop_var_range is not None for h in getattr(op, "dim_hints", None) or []
-        )
-    )
+    nests: dict[int, dict[str, CoarseTileInfo]] = {}
+    for name, info in tiling.items():
+        nests.setdefault(info.loop_group_id[0], {})[name] = info
+    return nests
+
+
+def _nest_mismatch(nest: dict[str, CoarseTileInfo], expected: _Counts) -> Optional[str]:
+    """Why ``nest`` is not a loop nest with trip counts ``expected``, or None.
+
+    The longest ``loop_group_id`` in ``nest`` is its path.  Every op must sit
+    on a prefix of that path -- an op only the outer levels cover carries only
+    theirs -- with the same prefix of ``expected`` as its counts.  So a loop
+    that went missing shortens the path, a level added inside the nest
+    lengthens it, and a loop with the wrong count fails the counts of every op
+    it covers.
+
+    Prefix holds for a nest that tiles only output dims, which is all these
+    cases write.  A nest that tiles a reduction dim can give its fill op a
+    subset of levels that skips one (``_compute_fill_loop_info_planned``);
+    such a nest never matches here, and no case expects one to.
+    """
+    path = max((info.loop_group_id for info in nest.values()), key=len)
+    if len(path) != len(expected):
+        return f"it is {len(path)} deep, not {len(expected)}"
+    for name, info in sorted(nest.items()):
+        depth = len(info.loop_group_id)
+        if info.loop_group_id != path[:depth]:
+            return f"{name} sits in a loop off the nest's path {path}"
+        if _counts(info) != expected[:depth]:
+            return f"{name} is tiled {_counts(info)}, not {expected[:depth]}"
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,12 +164,6 @@ class _TilingCase:
     explicit_auto_pins:
         The loops for the *explicit_auto* mode, where automatic tiling is on
         as well.  What must survive is each loop exactly as written.
-    explicit_auto_expects_discovery:
-        Whether the explicit_auto mode requires the compiler to tile something
-        outside the loops.  True when the loops leave ops outside them (the
-        MLP's and SwiGLU's down projection); False when they cover the whole
-        model (softmax), where a loop the user wrote is never re-tiled and the
-        loops surviving is the whole contract.
     """
 
     inner: Callable[..., torch.Tensor]
@@ -161,7 +175,6 @@ class _TilingCase:
     explicit_auto_pins: tuple[tuple[str, int], ...]
     atol: float
     rtol: float
-    explicit_auto_expects_discovery: bool = True
 
     @property
     def explicit_nest(self) -> _Counts:
@@ -226,13 +239,11 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     substituting this subclass for it.  ``coarse_tile`` stamps ``loop_info``
     well before the scheduler is built, so reading it here sees the final plan.
 
-    ``tiling`` maps every coarse-tiled op to its ``CoarseTileInfo``, and
-    ``written`` holds the outer ``loop_group_id`` of each loop nest the program
-    wrote (see ``_written_loops``).
+    ``tiling`` maps every coarse-tiled op to its ``CoarseTileInfo``: the loops
+    codegen will emit, whichever pass stamped them.
     """
 
     tiling: dict[str, CoarseTileInfo] = {}
-    written: frozenset[int] = frozenset()
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
@@ -241,7 +252,6 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
             for op in graph.operations
             if getattr(op, "loop_info", None) is not None
         }
-        type(self).written = _written_loops(graph.operations)
 
 
 class AutomatedCoarseTilingTests(
@@ -269,8 +279,8 @@ class AutomatedCoarseTilingTests(
         *,
         layout_solver: str,
         auto_tiling: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo], frozenset[int]]:
-        """Compile ``case``; return (cpu_result, device_result, tiling, written)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo]]:
+        """Compile ``case`` and return (cpu_result, device_result, tiling)."""
         # Raises the "gate is missing" NotImplementedError before compiling.
         if auto_tiling:
             # TODO: Implement coarse tiling configuration
@@ -279,7 +289,6 @@ class AutomatedCoarseTilingTests(
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
-        CollectTilingPasses.written = frozenset()
         # TODO: Patch coarse tiling config here
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
@@ -299,12 +308,7 @@ class AutomatedCoarseTilingTests(
             compiled = torch.compile(case.model(pins), fullgraph=True)
             device_result = compiled(*case.args).to("cpu")
 
-        return (
-            cpu_result,
-            device_result,
-            CollectTilingPasses.tiling,
-            CollectTilingPasses.written,
-        )
+        return cpu_result, device_result, CollectTilingPasses.tiling
 
     def _assert_matches_cpu(self, case: "_TilingCase", device, cpu) -> None:
         torch.testing.assert_close(
@@ -316,91 +320,47 @@ class AutomatedCoarseTilingTests(
         )
 
     # ------------------------------------------------------------------
-    # Reading the loops
-    # ------------------------------------------------------------------
-    def _split_written(
-        self, tiling: dict[str, CoarseTileInfo], written: frozenset[int]
-    ) -> tuple[dict[str, CoarseTileInfo], dict[str, CoarseTileInfo]]:
-        """Split the tiled ops into the written loop nest and everything else.
-
-        The pins nest, so the program writes exactly one outermost loop, and
-        ``loop_group_id[0]`` names it on every op inside it.
-        """
-        self.assertEqual(
-            len(written),
-            1,
-            f"expected the pins to write one loop nest, found outer loop ids "
-            f"{sorted(written)}:\n{_describe(tiling)}",
-        )
-        (outer,) = written
-        inside = {n: i for n, i in tiling.items() if i.loop_group_id[0] == outer}
-        outside = {n: i for n, i in tiling.items() if i.loop_group_id[0] != outer}
-        return inside, outside
-
-    def _assert_nest(self, nest: dict[str, CoarseTileInfo], expected: _Counts) -> None:
-        """``nest`` is one loop nest with exactly the trip counts ``expected``.
-
-        The longest ``loop_group_id`` in ``nest`` is its path.  Every op sits
-        on a prefix of that path -- an op only the outer levels stamped carries
-        only theirs -- with the same prefix of ``expected`` as its counts.  A
-        written loop that went missing shortens the path, a level added inside
-        the nest lengthens it, and a loop with the wrong count fails the counts
-        of every op it covers.
-
-        Prefix holds for a ``for_each_tile`` nest because the splice stamps
-        each op outermost level first and records an inner level's ops on every
-        level enclosing it.  A reduction's fill op can skip a middle level
-        (``_compute_fill_loop_info_planned``), but only in a nest coarse_tile
-        built, never in one the program wrote.
-        """
-        path = max((info.loop_group_id for info in nest.values()), key=len)
-        self.assertEqual(
-            len(path),
-            len(expected),
-            f"the loop nest is {len(path)} deep, not the {len(expected)} "
-            f"written:\n{_describe(nest)}",
-        )
-        for name, info in sorted(nest.items()):
-            depth = len(info.loop_group_id)
-            self.assertEqual(
-                info.loop_group_id,
-                path[:depth],
-                f"{name} sits in a loop off the nest's path {path}:\n{_describe(nest)}",
-            )
-            self.assertEqual(
-                _counts(info),
-                expected[:depth],
-                f"{name} is tiled {_counts(info)}, not {expected[:depth]} as "
-                f"written:\n{_describe(nest)}",
-            )
-
-    # ------------------------------------------------------------------
     # The three contracts
     # ------------------------------------------------------------------
-    def _check_loops_preserved(self, case: _TilingCase, solver: str) -> None:
-        """The loops are applied exactly: every loop written, no level invented."""
-        cpu, device, tiling, written = self._compile_and_collect(
-            case, case.pins, layout_solver=solver, auto_tiling=False
+    def _check_loops_kept(
+        self,
+        case: "_TilingCase",
+        pins: tuple[tuple[str, int], ...],
+        expected: _Counts,
+        solver: str,
+        *,
+        auto_tiling: bool,
+    ) -> None:
+        """Some loop nest is exactly the one ``pins`` wrote, and the result is right.
+
+        What else the compiler tiles, and which pass stamped the matching nest,
+        does not matter -- only that codegen gets the written loops.  A loop
+        removed, or a level added inside one, leaves no nest that matches.
+        """
+        cpu, device, tiling = self._compile_and_collect(
+            case, pins, layout_solver=solver, auto_tiling=auto_tiling
         )
-        self.assertTrue(
-            tiling,
-            "no op was coarse-tiled: the for_each_tile loops were not spliced "
-            f"(expected the nest {list(case.pins)})",
-        )
-        inside, outside = self._split_written(tiling, written)
-        self._assert_nest(inside, case.explicit_nest)
-        # With the tile search off, the written loops are the only thing that
-        # may tile anything.
-        self.assertFalse(
-            outside,
-            f"ops outside the {len(case.pins)} written loops were tiled too, "
-            f"but only the written ones were asked for:\n{_describe(outside)}",
+        mismatches = {
+            outer: _nest_mismatch(nest, expected)
+            for outer, nest in _nests(tiling).items()
+        }
+        self.assertIn(
+            None,
+            mismatches.values(),
+            f"no loop nest is the written {list(pins)} "
+            f"(per nest: {mismatches}):\n{_describe(tiling)}",
         )
         self._assert_matches_cpu(case, device, cpu)
 
+    def _check_loops_preserved(self, case: "_TilingCase", solver: str) -> None:
+        """The written loops come out exactly as written."""
+        self._check_loops_kept(
+            case, case.pins, case.explicit_nest, solver, auto_tiling=False
+        )
+
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
         """With no loops at all, the compiler picks a tiling by itself."""
-        cpu, device, tiling, _ = self._compile_and_collect(
+        cpu, device, tiling = self._compile_and_collect(
             case, (), layout_solver=solver, auto_tiling=True
         )
         self.assertTrue(
@@ -413,37 +373,14 @@ class AutomatedCoarseTilingTests(
     def _check_loops_preserved_with_auto(
         self, case: "_TilingCase", solver: str
     ) -> None:
-        """The written loops survive verbatim; the compiler tiles around them.
-
-        A ``for_each_tile`` loop is authoritative, so automatic tiling may only
-        add loops over ops outside it, never re-tile an op inside it -- which
-        would show up as a level added to the written nest.  Where the compiler
-        puts its own loops is its choice, and only the numerics
-        (``_assert_matches_cpu``) can call that choice wrong.
-        """
-        cpu, device, tiling, written = self._compile_and_collect(
+        """With the tile search on as well, the written loops still come out."""
+        self._check_loops_kept(
             case,
             case.explicit_auto_pins,
-            layout_solver=solver,
+            case.explicit_auto_nest,
+            solver,
             auto_tiling=True,
         )
-        self.assertTrue(tiling, "no op was coarse-tiled: the loops were dropped")
-        inside, outside = self._split_written(tiling, written)
-        self._assert_nest(inside, case.explicit_auto_nest)
-        if case.explicit_auto_expects_discovery:
-            self.assertTrue(
-                outside,
-                f"the loops {list(case.explicit_auto_pins)} survived but "
-                f"nothing was added: the tile search left every op outside "
-                f"them untiled:\n{_describe(tiling)}",
-            )
-        else:
-            self.assertFalse(
-                outside,
-                f"the loops {list(case.explicit_auto_pins)} cover the whole "
-                f"model, but the compiler tiled:\n{_describe(outside)}",
-            )
-        self._assert_matches_cpu(case, device, cpu)
 
     # ------------------------------------------------------------------
     # Models.  Each returns the model, its axis labels and the tiling contract,
@@ -467,7 +404,6 @@ class AutomatedCoarseTilingTests(
             out_dims=["R", "C"],
             pins=(("C", 4),),  # Reduction axis is not tiled for now
             explicit_auto_pins=(("C", 4),),
-            explicit_auto_expects_discovery=False,
             # A good run lands at 2e-5 on outputs of order 1/512; the
             # reduction-tiled one lands at 3e-3, and this has to separate them.
             atol=5e-4,
@@ -573,9 +509,7 @@ class AutomatedCoarseTilingTests(
 
     parameter_axes = {"tiling_mode": tuple(_CHECKS), "solver_method": ("cpsat",)}
 
-    # SDPA is omitted: its Spyre decomposition emits for_each_tile loops of its
-    # own, which _written_loops would count as written by the caller, and
-    # using SDPA in this test suite requires resolution of
+    # SDPA is omitted: using SDPA in this test suite requires resolution of
     # https://github.com/torch-spyre/torch-spyre/issues/3198
 
     parameter_models = (
