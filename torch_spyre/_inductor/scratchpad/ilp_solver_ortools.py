@@ -1678,6 +1678,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # of a division-dependent footprint needs its own var, tied to
             # ``offset + eff_size`` unconditionally. Its range covers every
             # offset/footprint pair, so a spilled buffer loses no assignment.
+
+            # the top bound must be larger than capacity to account for buffers
+            # which are larger than LX itself
             y_end = model.new_int_var(
                 0,
                 max(0, self._capacity_units - 1) + sb.buffer.size,
