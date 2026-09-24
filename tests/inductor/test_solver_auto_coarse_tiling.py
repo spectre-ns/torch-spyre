@@ -413,22 +413,23 @@ class AutomatedCoarseTilingTests(
     def _mlp_case(self) -> "_TilingCase":
         """Two-layer MLP (Linear -> silu -> Linear), dims S x Din x Dh x Dout.
 
-        The loops cover the first Linear and silu: S divided 2 ways outside
-        Dh divided 4 ways.  Both are free (output) axes there -- Din is the
-        first GEMM's reduction -- and the second Linear, which reduces over
-        Dh, runs outside every loop on the assembled activation.  That second
-        Linear is what automatic tiling may add a loop to; the explicit_auto
-        mode writes only the S loop.
+        The loops cover the whole model: S divided 2 ways outside Dout divided
+        2 ways.  Both are free (output) axes -- Din is the first GEMM's
+        reduction and Dh the second's -- so both GEMMs sit inside the nest,
+        the second one reading the first's in-loop result.  The Dout loop
+        slices only the second Linear's weight and bias; the first Linear and
+        silu have no Dout axis and are invariant at that level.  The loops
+        cover the whole model, so the explicit_auto mode writes the same nest
+        and leaves the compiler nothing outside it to tile.
         """
         seq_len, in_dim, hidden_dim, out_dim = 128, 256, 1024, 256
         fc1 = torch.nn.Linear(in_dim, hidden_dim).half()
         fc2 = torch.nn.Linear(hidden_dim, out_dim).half()
 
-        def up_proj(x, w1, b1):
-            return torch.nn.functional.silu(torch.nn.functional.linear(x, w1, b1))
-
-        def down_proj(h, w2, b2):
-            return torch.nn.functional.linear(h, w2, b2)
+        def mlp(x, w1, b1, w2, b2):
+            return torch.nn.functional.linear(
+                torch.nn.functional.silu(torch.nn.functional.linear(x, w1, b1)), w2, b2
+            )
 
         args = (
             torch.randn(seq_len, in_dim, dtype=torch.float16).to(DEVICE_NAME),
@@ -438,13 +439,19 @@ class AutomatedCoarseTilingTests(
             fc2.bias.to(DEVICE_NAME),
         )
         return _TilingCase(
-            inner=up_proj,
-            outer=down_proj,
+            inner=mlp,
+            outer=None,
             args=args,
-            named_dims=(["S", "Din"], ["Dh", "Din"], ["Dh"]),
-            out_dims=["S", "Dh"],
-            pins=(("S", 2), ("Dh", 4)),
-            explicit_auto_pins=(("S", 2),),
+            named_dims=(
+                ["S", "Din"],
+                ["Dh", "Din"],
+                ["Dh"],
+                ["Dout", "Dh"],
+                ["Dout"],
+            ),
+            out_dims=["S", "Dout"],
+            pins=(("S", 2), ("Dout", 2)),
+            explicit_auto_pins=(("S", 2), ("Dout", 2)),
             atol=0.02,
             rtol=0.05,
         )
