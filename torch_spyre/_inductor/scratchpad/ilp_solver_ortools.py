@@ -1680,7 +1680,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # offset/footprint pair, so a spilled buffer loses no assignment.
             y_end = model.new_int_var(
                 0,
-                self._capacity_units,
+                max(0, self._capacity_units - 1) + sb.buffer.size,
                 f"top_{sb.name}",
             )
             model.add(y_end == sb.offset + sb.eff_size)
