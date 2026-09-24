@@ -33,7 +33,7 @@ from torch._inductor.graph import GraphLowering
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
-from torch_spyre._inductor.propagate_hints import DimHint
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.wsr import for_each_tile
 
@@ -77,189 +77,42 @@ def expected_unimplemented(fn):
     return wrapper
 
 
-# One buffer's coarse-tile fingerprint: the trip counts of the loop nest it
-# sits in, outermost level first.  An op at an outer level of a deeper nest
-# carries a prefix of its group's counts -- a drain left outside a two-level
-# nest reads (4,) where the interior ops read (4, 2).
+# The trip counts of a loop nest, outermost level first.  An op at an outer
+# level of a deeper nest carries a prefix of its nest's counts -- an op only
+# the outer loop stamped reads (2,) where the interior ops read (2, 4).
 _Counts = tuple[int, ...]
 
 
-@dataclasses.dataclass(frozen=True)
-class _Level:
-    """One level of a loop nest, and what asked for it.
+def _counts(info: CoarseTileInfo) -> _Counts:
+    return tuple(int(count) for count in info.loop_count)
 
-    The label is what makes a pinned level distinguishable from a discovered
-    one by *identity* rather than by position, so a discovered level may land
-    *outside* a pinned one without failing the test, while a pin that was
-    dropped or re-tiled is still caught.
 
-    A pinned level is one the caller wrote as a ``for_each_tile`` call:
-    ``pin`` is its index into the case's pins, outermost first.  A discovered
-    level is one the compiler added through a hint scope of its own:
-    ``hint_id`` identifies that scope and ``dim`` is the name it tiled
-    (``"_span_overflow"`` for span overflow).  All three are ``None`` on a
-    level that could not be attributed (see ``_label_nest``).
+def _describe(tiling: dict[str, CoarseTileInfo]) -> str:
+    """One line per tiled op: its loop path, trip counts and tiled dims."""
+    return "\n".join(
+        f"  {name}: loop_group_id={info.loop_group_id} "
+        f"loop_count={_counts(info)} loop_tiled_dims={info.loop_tiled_dims}"
+        for name, info in sorted(tiling.items())
+    )
+
+
+def _written_loops(operations: Sequence) -> frozenset[int]:
+    """The outer ``loop_group_id`` of every loop nest a ``for_each_tile`` wrote.
+
+    ``CoarseTileInfo`` does not record which pass stamped it, so the loops the
+    program wrote are told apart from the ones the compiler added by the marker
+    the splice leaves: ``_stamp_direct_loop_info`` appends a ``DimHint`` with
+    ``loop_var_range`` set to every op it stamps, and no hint scope sets that
+    field.
     """
-
-    count: int
-    pin: Optional[int] = None
-    hint_id: Optional[int] = None
-    dim: Optional[str] = None
-
-    def __repr__(self) -> str:
-        if self.pin is not None:
-            label = f"pin{self.pin}"
-        elif self.hint_id is not None:
-            label = self.dim or f"hint{self.hint_id}"
-        else:
-            label = "?"
-        return f"{label}:{self.count}"
-
-
-_Nest = tuple[_Level, ...]
-
-
-def _trip_counts(nest: _Nest) -> _Counts:
-    """Drop the labels: the plain outermost-first trip counts of ``nest``."""
-    return tuple(level.count for level in nest)
-
-
-def _is_subsequence(counts: _Counts, nest: _Counts) -> bool:
-    """True if ``counts`` is ``nest`` with zero or more levels left out.
-
-    Subsequence rather than prefix: an op at an outer level of a deeper nest
-    drops the *inner* levels and so does read as a prefix, but a reduction's
-    fill op keeps only the output levels outer to the reduction (see
-    ``_compute_fill_loop_info_planned``), which can leave out a level in the
-    middle.  Prefix would call that legitimate nest a violation.
-    """
-    remaining = iter(nest)
-    return all(count in remaining for count in counts)
-
-
-def _group_hints(ops: Sequence) -> tuple[DimHint, ...]:
-    """One hint per compiler-added level of a loop group, outermost first.
-
-    Only hint scopes count here; ``for_each_tile`` levels are labelled by
-    ``_pin_order`` instead, and the filters below already drop
-    them (their hints carry ``split_count=1``).
-
-    The group, not the op, is the unit here.  ``loop_count`` is a group-level
-    fact -- every member carries the whole nest, including the levels it is
-    invariant at -- so a single op's ``dim_hints`` can be *shorter* than the
-    nest and is not a list the counts can be zipped against.  This unions
-    across the group the way ``_hints_levels`` does, keeping a scope as soon
-    as *some* member is tiled by it, which is exactly the rule that decided
-    the group's levels.
-
-    Two filters mirror that function: a hint the op is broadcast against
-    (``loop_var is None``) and a split of 1 both produce no loop level, so
-    neither can label one.
-    """
-    best: dict[int, DimHint] = {}
-    for op in ops:
-        for h in getattr(op, "dim_hints", []):
-            prev = best.get(h.hint_id)
-            if (
-                prev is None
-                or prev.loop_var is None
-                or (prev.split_count == 1 and h.split_count > 1)
-            ):
-                best[h.hint_id] = h
-    return tuple(
-        sorted(
-            (h for h in best.values() if h.loop_var is not None and h.split_count != 1),
-            key=lambda h: h.hint_id,
+    return frozenset(
+        op.loop_info.loop_group_id[0]
+        for op in operations
+        if getattr(op, "loop_info", None) is not None
+        and any(
+            h.loop_var_range is not None for h in getattr(op, "dim_hints", None) or []
         )
     )
-
-
-def _splice_hints(op) -> list[DimHint]:
-    """``op``'s ``for_each_tile`` hints, outermost level first.
-
-    ``_stamp_direct_loop_info`` appends one ``DimHint`` with ``loop_var_range``
-    set to every op of each level it stamps, outermost level first, and no hint
-    scope sets that field.
-    """
-    return [
-        h
-        for h in getattr(op, "dim_hints", None) or []
-        if h.loop_var is not None and getattr(h, "loop_var_range", None) is not None
-    ]
-
-
-def _pin_order(operations: Sequence) -> dict:
-    """Each ``for_each_tile`` loop variable, mapped to its pin index.
-
-    Every level has its own loop variable, so the variable is what identifies
-    a pin.  Pins nest outermost first and every op lists its levels outermost
-    first, so the order in which the variables first appear over the operation
-    list is the nesting order.  ``hint_id`` cannot key a pin: the splice leaves
-    it at its default of 0 on every level.
-    """
-    order: dict = {}
-    for op in operations:
-        for h in _splice_hints(op):
-            order.setdefault(h.loop_var, len(order))
-    return order
-
-
-def _label_nest(op, group_hints: tuple[DimHint, ...], pin_of: dict) -> _Nest:
-    """Pair ``op``'s trip counts with the loops and hints that produced them.
-
-    The labels are the op's ``for_each_tile`` levels, outermost first, each
-    named by its loop variable's pin index, followed by the group's
-    compiler-added hint levels, and the pairing is positional.  Putting the
-    pinned levels outermost is an assumption about where the tile search nests
-    its own levels; equal lengths are what make the pairing unambiguous, and a
-    mismatch leaves the whole nest unlabelled rather than guessed at.
-
-    The group's hints, not the op's, label the compiler-added levels -- the
-    op's own being a subset, they can only agree on length by being the same
-    list, and where they *would* differ (below) the op has none at all.
-
-    The lengths disagree for a *trimmed* nest: a reduction's fill op keeps
-    only the output levels outer to the reduction
-    (``_compute_fill_loop_info_planned``), as does the ``reduce_copy`` built
-    from it.  Neither is constructed through ``copy_op_metadata``, so neither
-    carries ``dim_hints`` to fall back on, and their levels come back
-    unlabelled rather than guessed at from a subset that merely fits.  That
-    is safe as long as nothing keys on them: a pin still shows up labelled on
-    the ops that carry the untrimmed nest, and the count-only checks in
-    ``_check_loops_preserved`` cover the trimmed op.
-    """
-    counts = tuple(int(count) for count in op.loop_info.loop_count)
-    labels = [_Level(count=0, pin=pin_of[h.loop_var]) for h in _splice_hints(op)]
-    labels += [
-        _Level(count=0, hint_id=h.hint_id, dim=h.dim_names[0] if h.dim_names else None)
-        for h in group_hints
-    ]
-    if len(labels) != len(counts):
-        return tuple(_Level(count=count) for count in counts)
-    return tuple(
-        dataclasses.replace(label, count=count) for label, count in zip(labels, counts)
-    )
-
-
-def _label_tiling(operations: Sequence) -> dict[str, _Nest]:
-    """Every coarse-tiled op in ``operations``, mapped to its labelled nest."""
-    tiled = [op for op in operations if getattr(op, "loop_info", None) is not None]
-
-    def group_key(op) -> tuple[int, ...]:
-        # Group index is loop_group_id[0]; the rest of the tuple is nesting
-        # depth, which a trimmed nest truncates (_compute_fill_loop_info_planned
-        # keeps the prefix), so keying on the whole tuple would split a group.
-        return tuple(op.loop_info.loop_group_id[:1])
-
-    by_group: dict[tuple[int, ...], list] = {}
-    for op in tiled:
-        by_group.setdefault(group_key(op), []).append(op)
-    group_hints = {key: _group_hints(ops) for key, ops in by_group.items()}
-    pin_of = _pin_order(operations)
-    return {
-        op.get_name(): _label_nest(op, group_hints[group_key(op)], pin_of)
-        for op in tiled
-    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -291,6 +144,12 @@ class _TilingCase:
     explicit_auto_pins:
         The loops for the *explicit_auto* mode, where automatic tiling is on
         as well.  What must survive is each loop exactly as written.
+    explicit_auto_expects_discovery:
+        Whether the explicit_auto mode requires the compiler to tile something
+        outside the loops.  True when the loops leave ops outside them (the
+        MLP's and SwiGLU's down projection); False when they cover the whole
+        model (softmax), where a loop the user wrote is never re-tiled and the
+        loops surviving is the whole contract.
     """
 
     inner: Callable[..., torch.Tensor]
@@ -302,11 +161,17 @@ class _TilingCase:
     explicit_auto_pins: tuple[tuple[str, int], ...]
     atol: float
     rtol: float
+    explicit_auto_expects_discovery: bool = True
 
     @property
     def explicit_nest(self) -> _Counts:
         """The loop nest ``pins`` prescribes: their counts, outermost first."""
         return tuple(count for _, count in self.pins)
+
+    @property
+    def explicit_auto_nest(self) -> _Counts:
+        """The same for ``explicit_auto_pins``."""
+        return tuple(count for _, count in self.explicit_auto_pins)
 
     def model(self, pins: tuple[tuple[str, int], ...]) -> Callable[..., torch.Tensor]:
         """The whole model, with ``pins`` wrapped around ``inner``."""
@@ -361,17 +226,22 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     substituting this subclass for it.  ``coarse_tile`` stamps ``loop_info``
     well before the scheduler is built, so reading it here sees the final plan.
 
-    ``dim_hints`` is never cleared, so it is still on the ops here: the
-    ``for_each_tile`` levels and the compiler's own hint scopes each leave
-    theirs, and that is the only thing that distinguishes a caller's pin from
-    a level the compiler found on its own.
+    ``tiling`` maps every coarse-tiled op to its ``CoarseTileInfo``, and
+    ``written`` holds the outer ``loop_group_id`` of each loop nest the program
+    wrote (see ``_written_loops``).
     """
 
-    tiling: dict[str, _Nest] = {}
+    tiling: dict[str, CoarseTileInfo] = {}
+    written: frozenset[int] = frozenset()
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
-        type(self).tiling = _label_tiling(graph.operations)
+        type(self).tiling = {
+            op.get_name(): op.loop_info
+            for op in graph.operations
+            if getattr(op, "loop_info", None) is not None
+        }
+        type(self).written = _written_loops(graph.operations)
 
 
 class AutomatedCoarseTilingTests(
@@ -399,8 +269,8 @@ class AutomatedCoarseTilingTests(
         *,
         layout_solver: str,
         auto_tiling: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _Nest]]:
-        """Compile ``case`` and return (cpu_result, device_result, tiling)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, CoarseTileInfo], frozenset[int]]:
+        """Compile ``case``; return (cpu_result, device_result, tiling, written)."""
         # Raises the "gate is missing" NotImplementedError before compiling.
         if auto_tiling:
             # TODO: Implement coarse tiling configuration
@@ -409,6 +279,7 @@ class AutomatedCoarseTilingTests(
         cpu_result = case.model(())(*(arg.to("cpu") for arg in case.args))
 
         CollectTilingPasses.tiling = {}
+        CollectTilingPasses.written = frozenset()
         # TODO: Patch coarse tiling config here
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
@@ -428,7 +299,12 @@ class AutomatedCoarseTilingTests(
             compiled = torch.compile(case.model(pins), fullgraph=True)
             device_result = compiled(*case.args).to("cpu")
 
-        return cpu_result, device_result, CollectTilingPasses.tiling
+        return (
+            cpu_result,
+            device_result,
+            CollectTilingPasses.tiling,
+            CollectTilingPasses.written,
+        )
 
     def _assert_matches_cpu(self, case: "_TilingCase", device, cpu) -> None:
         torch.testing.assert_close(
@@ -440,93 +316,91 @@ class AutomatedCoarseTilingTests(
         )
 
     # ------------------------------------------------------------------
-    # Reading the labels
+    # Reading the loops
     # ------------------------------------------------------------------
-    def _classify_levels(
-        self, tiling: dict[str, _Nest], pins: tuple[tuple[str, int], ...]
-    ) -> tuple[dict[int, _Level], dict[int, _Level]]:
-        """Split the applied levels into the caller's pins and the rest.
+    def _split_written(
+        self, tiling: dict[str, CoarseTileInfo], written: frozenset[int]
+    ) -> tuple[dict[str, CoarseTileInfo], dict[str, CoarseTileInfo]]:
+        """Split the tiled ops into the written loop nest and everything else.
 
-        ``pins[i]`` is the ``(dim, count)`` of the caller's *i*-th
-        ``for_each_tile``, outermost first, and a level labelled ``pin=i`` is
-        the loop that call became.  Every level labelled with a ``hint_id``
-        instead was added by the compiler.
-
-        Asserts each pinned level still divides by the count it named.  The
-        axis needs no check: a ``for_each_tile`` names it in the program, so
-        unlike a hint scope it has nothing to bind to the wrong one.  Returns
-        the ``(pinned, discovered)`` levels, keyed by pin index and hint id
-        respectively, so the caller can say which of the two it expected.
+        The pins nest, so the program writes exactly one outermost loop, and
+        ``loop_group_id[0]`` names it on every op inside it.
         """
-        seen_pinned: dict[int, _Level] = {}
-        discovered: dict[int, _Level] = {}
-        for name, nest in sorted(tiling.items()):
-            for level in nest:
-                if level.hint_id is not None:
-                    discovered[level.hint_id] = level
-                if level.pin is None:
-                    continue
-                dim, count = pins[level.pin]
-                self.assertEqual(
-                    level.count,
-                    count,
-                    f"{name} tiles the level pinned on '{dim}' {level.count} "
-                    f"ways, not the pinned {count} (its nest is {list(nest)})",
-                )
-                seen_pinned[level.pin] = level
-        return seen_pinned, discovered
+        self.assertEqual(
+            len(written),
+            1,
+            f"expected the pins to write one loop nest, found outer loop ids "
+            f"{sorted(written)}:\n{_describe(tiling)}",
+        )
+        (outer,) = written
+        inside = {n: i for n, i in tiling.items() if i.loop_group_id[0] == outer}
+        outside = {n: i for n, i in tiling.items() if i.loop_group_id[0] != outer}
+        return inside, outside
+
+    def _assert_nest(self, nest: dict[str, CoarseTileInfo], expected: _Counts) -> None:
+        """``nest`` is one loop nest with exactly the trip counts ``expected``.
+
+        The longest ``loop_group_id`` in ``nest`` is its path.  Every op sits
+        on a prefix of that path -- an op only the outer levels stamped carries
+        only theirs -- with the same prefix of ``expected`` as its counts.  A
+        written loop that went missing shortens the path, a level added inside
+        the nest lengthens it, and a loop with the wrong count fails the counts
+        of every op it covers.
+
+        Prefix holds for a ``for_each_tile`` nest because the splice stamps
+        each op outermost level first and records an inner level's ops on every
+        level enclosing it.  A reduction's fill op can skip a middle level
+        (``_compute_fill_loop_info_planned``), but only in a nest coarse_tile
+        built, never in one the program wrote.
+        """
+        path = max((info.loop_group_id for info in nest.values()), key=len)
+        self.assertEqual(
+            len(path),
+            len(expected),
+            f"the loop nest is {len(path)} deep, not the {len(expected)} "
+            f"written:\n{_describe(nest)}",
+        )
+        for name, info in sorted(nest.items()):
+            depth = len(info.loop_group_id)
+            self.assertEqual(
+                info.loop_group_id,
+                path[:depth],
+                f"{name} sits in a loop off the nest's path {path}:\n{_describe(nest)}",
+            )
+            self.assertEqual(
+                _counts(info),
+                expected[:depth],
+                f"{name} is tiled {_counts(info)}, not {expected[:depth]} as "
+                f"written:\n{_describe(nest)}",
+            )
 
     # ------------------------------------------------------------------
     # The three contracts
     # ------------------------------------------------------------------
     def _check_loops_preserved(self, case: _TilingCase, solver: str) -> None:
         """The loops are applied exactly: every loop written, no level invented."""
-        cpu, device, tiling = self._compile_and_collect(
+        cpu, device, tiling, written = self._compile_and_collect(
             case, case.pins, layout_solver=solver, auto_tiling=False
         )
-        expected = case.explicit_nest
         self.assertTrue(
             tiling,
             "no op was coarse-tiled: the for_each_tile loops were not spliced "
             f"(expected the nest {list(case.pins)})",
         )
-        # Two count-only claims, kept beside the keyed ones below as the single
-        # witness here that does not depend on the labelling: a level the
-        # labeller could not attribute is invisible to every keyed check.
-        nests = {name: _trip_counts(nest) for name, nest in tiling.items()}
-        for name, counts in sorted(nests.items()):
-            self.assertTrue(
-                _is_subsequence(counts, expected),
-                f"{name} is tiled {counts}, which is not the explicit nest "
-                f"{expected} with levels left out",
-            )
-        self.assertIn(
-            expected,
-            set(nests.values()),
-            f"no op carries the full explicit nest {expected}; "
-            f"the applied tiling was {nests}",
-        )
-        # The rest is keyed on the loops themselves: with the tile search off
-        # they are the only thing that may tile anything, so every level is
-        # accounted for by a pin, dividing by the count that pin named.
-        seen_pinned, discovered = self._classify_levels(tiling, case.pins)
-        self.assertEqual(
-            sorted(seen_pinned),
-            list(range(len(case.pins))),
-            f"the applied tiling {tiling} does not carry one level per "
-            f"pin: {len(case.pins)} for_each_tile loops wrap the model",
-        )
+        inside, outside = self._split_written(tiling, written)
+        self._assert_nest(inside, case.explicit_nest)
+        # With the tile search off, the written loops are the only thing that
+        # may tile anything.
         self.assertFalse(
-            discovered,
-            f"levels {list(discovered.values())} were invented by the "
-            f"compiler, but only the {len(case.pins)} explicit ones were "
-            f"written (the applied tiling was {tiling})",
+            outside,
+            f"ops outside the {len(case.pins)} written loops were tiled too, "
+            f"but only the written ones were asked for:\n{_describe(outside)}",
         )
         self._assert_matches_cpu(case, device, cpu)
 
     def _check_tiling_discovered(self, case: "_TilingCase", solver: str) -> None:
         """With no loops at all, the compiler picks a tiling by itself."""
-        cpu, device, tiling = self._compile_and_collect(
+        cpu, device, tiling, _ = self._compile_and_collect(
             case, (), layout_solver=solver, auto_tiling=True
         )
         self.assertTrue(
@@ -542,31 +416,33 @@ class AutomatedCoarseTilingTests(
         """The written loops survive verbatim; the compiler tiles around them.
 
         A ``for_each_tile`` loop is authoritative, so automatic tiling may only
-        add loops over ops outside it, never re-tile an op inside it.  Checked
-        by label, not by position: where the compiler puts its own loops is
-        its choice, and only the numerics (``_assert_matches_cpu``) can call
-        that choice wrong.
+        add loops over ops outside it, never re-tile an op inside it -- which
+        would show up as a level added to the written nest.  Where the compiler
+        puts its own loops is its choice, and only the numerics
+        (``_assert_matches_cpu``) can call that choice wrong.
         """
-        cpu, device, tiling = self._compile_and_collect(
+        cpu, device, tiling, written = self._compile_and_collect(
             case,
             case.explicit_auto_pins,
             layout_solver=solver,
             auto_tiling=True,
         )
         self.assertTrue(tiling, "no op was coarse-tiled: the loops were dropped")
-        seen_pinned, discovered = self._classify_levels(tiling, case.explicit_auto_pins)
-        self.assertEqual(
-            sorted(seen_pinned),
-            list(range(len(case.explicit_auto_pins))),
-            f"the applied tiling {tiling} lost a written loop: the loops "
-            f"{list(case.explicit_auto_pins)} should all still be there",
-        )
-        self.assertTrue(
-            discovered,
-            f"the loops {list(case.explicit_auto_pins)} survived but nothing "
-            f"was added: the tile search left every op outside them untiled "
-            f"({tiling})",
-        )
+        inside, outside = self._split_written(tiling, written)
+        self._assert_nest(inside, case.explicit_auto_nest)
+        if case.explicit_auto_expects_discovery:
+            self.assertTrue(
+                outside,
+                f"the loops {list(case.explicit_auto_pins)} survived but "
+                f"nothing was added: the tile search left every op outside "
+                f"them untiled:\n{_describe(tiling)}",
+            )
+        else:
+            self.assertFalse(
+                outside,
+                f"the loops {list(case.explicit_auto_pins)} cover the whole "
+                f"model, but the compiler tiled:\n{_describe(outside)}",
+            )
         self._assert_matches_cpu(case, device, cpu)
 
     # ------------------------------------------------------------------
@@ -591,6 +467,7 @@ class AutomatedCoarseTilingTests(
             out_dims=["R", "C"],
             pins=(("C", 4),),  # Reduction axis is not tiled for now
             explicit_auto_pins=(("C", 4),),
+            explicit_auto_expects_discovery=False,
             # A good run lands at 2e-5 on outputs of order 1/512; the
             # reduction-tiled one lands at 3e-3, and this has to separate them.
             atol=5e-4,
@@ -697,8 +574,8 @@ class AutomatedCoarseTilingTests(
     parameter_axes = {"tiling_mode": tuple(_CHECKS), "solver_method": ("cpsat",)}
 
     # SDPA is omitted: its Spyre decomposition emits for_each_tile loops of its
-    # own, which _pin_order would count as pins, and using SDPA in this test
-    # suite requires resolution of
+    # own, which _written_loops would count as written by the caller, and
+    # using SDPA in this test suite requires resolution of
     # https://github.com/torch-spyre/torch-spyre/issues/3198
 
     parameter_models = (
