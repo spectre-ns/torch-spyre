@@ -4553,16 +4553,6 @@ def _rescale_index(
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
 
-    Every non-constant term must match a ``full_strides`` entry, which holds for
-    a *write* index -- its every term is one of the output layout's own strides.
-    A read index is not rescalable this way and is never passed here: terms are
-    paired to strides *by value*, so an input stride that merely coincides with
-    some other output dim's stride would be silently rescaled by that dim's tile
-    stride. ``tile_prediction`` therefore carries a predicted read index through
-    unchanged (coarse tiling resizes the op's own output buffer, never the
-    buffers it reads); the applier rescales a consumer read against the dep's
-    *own* coefficients in ``_patch_retiled_load_indexes``.
-
     `index` is affine in some set of loop variables, with one additive term
     per dimension whose coefficient equals the matching entry in
     `full_strides` (plus, possibly, a constant offset term). Returns the
