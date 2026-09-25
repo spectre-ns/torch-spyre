@@ -38,7 +38,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
-from ..pass_utils import op_out_coords
+from ..pass_utils import iteration_space_from_op, op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
     coarse_tile_post_stickify,
@@ -50,7 +50,10 @@ from .plan_solver import TileSpec
 
 
 def _get_out_var(
-    op: ComputedBuffer, out_coords: list[sympy.Expr], host_dim: int
+    op: ComputedBuffer,
+    out_coords: list[sympy.Expr],
+    iter_space: Mapping[sympy.Symbol, sympy.Expr],
+    host_dim: int,
 ) -> tuple[sympy.Symbol | None, str | None]:
     """``(loop_var, None)`` for output ``host_dim``, or ``(None, reason)``.
 
@@ -61,6 +64,13 @@ def _get_out_var(
     coordinate that is not a function of exactly one loop variable -- a
     constant, or several vars folded into one host dim -- since there is then no
     single loop to tile.
+
+    Also rejects a coordinate whose one free symbol is not in ``iter_space``,
+    the op's own iteration variables. ``op_out_coords`` evaluates the write
+    index against indirect-index sizes and enclosing ``for_each_tile`` loop
+    ranges, so a coordinate can be an indirect-index symbol or an enclosing
+    loop's variable -- a symbol the op does not loop over, so there is no loop
+    of its own to tile.
     """
     if host_dim >= len(out_coords):
         return None, (
@@ -75,7 +85,14 @@ def _get_out_var(
             f"{coord} on {op.get_name()} has {len(free_symbols)} free "
             "symbols; expected exactly one loop var."
         )
-    return next(iter(free_symbols)), None
+    loop_var = next(iter(free_symbols))
+    if loop_var not in iter_space:
+        return None, (
+            f"coarse tiling: host_dim={host_dim} output coordinate {coord} on "
+            f"{op.get_name()} is not one of its iteration variables "
+            f"{list(iter_space)}."
+        )
+    return loop_var, None
 
 
 def _get_red_var(
@@ -153,12 +170,13 @@ def try_resolve_tile_axis_loop_vars(
     reduction axis (:func:`_get_red_var`).
     """
     out_coords = op_out_coords(op)
+    iter_space = iteration_space_from_op(op)
     loop_vars: list[sympy.Symbol] = []
     for axis in spec.axes:
         if axis.is_reduction:
             loop_var, reason = _get_red_var(op, axis.host_dim)
         else:
-            loop_var, reason = _get_out_var(op, out_coords, axis.host_dim)
+            loop_var, reason = _get_out_var(op, out_coords, iter_space, axis.host_dim)
         if loop_var is None:
             return None, reason
         loop_vars.append(loop_var)

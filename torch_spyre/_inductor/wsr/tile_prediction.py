@@ -243,9 +243,9 @@ def _predict_iter_space(op: ComputedBuffer, tiling: TileSpec) -> dict | None:
     levels.
 
     Behind :func:`_rejection_reason` only: that gate has established that the
-    spec resolves and that every loop symbol it names is present in the
-    iteration space. Returns ``None`` if a symbol's extent does not divide by its
-    tile count.
+    spec resolves, and the resolver names only the op's own iteration
+    variables. Returns ``None`` if a symbol's extent does not divide by its tile
+    count.
 
     Keys stay the op's *pre-tiling* symbols; only extents move. That is
     deliberate. The applied op's symbols do not exist yet, and the caller pairs
@@ -350,10 +350,16 @@ def _rejection_reason(op: ComputedBuffer, tiling: TileSpec) -> str | None:
     calls resolve each axis unguarded. Axis legality itself is not restated
     here: :func:`try_resolve_tile_axis_loop_vars` is the shared authority, so
     this rejects exactly what ``tile_spec_to_dim_hints`` rejects when it lowers
-    the same spec, with the same reason. What is added is the extra reach
-    *prediction* has -- the output ranges and the iteration space it divides,
-    and (via :func:`_output_layout_rejection`) the output layout it rebuilds,
-    none of which lowering touches.
+    the same spec, with the same reason. What is added is the one thing
+    *prediction* reaches and lowering does not: the output layout it rebuilds
+    (:func:`_output_layout_rejection`).
+
+    Nor are the two lists prediction divides by position restated. An output
+    ``host_dim`` the resolver bounds against ``op_out_coords`` is in bounds for
+    ``op.data.ranges`` too -- the two have the same length for any op whose
+    write index exists (see :func:`_output_layout_rejection`) -- and every loop
+    variable it resolves is one of the op's iteration variables, which is all
+    :func:`_predict_iter_space` needs.
 
     The symmetry with lowering is the point. ``predict_frame`` divides
     ``ranges``, ``reduction_ranges`` and the output layout for *every* axis
@@ -376,23 +382,9 @@ def _rejection_reason(op: ComputedBuffer, tiling: TileSpec) -> str | None:
     """
     if tiling.is_untiled:
         return None
-    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, tiling)
-    if loop_vars is None:
+    _, reason = try_resolve_tile_axis_loop_vars(op, tiling)
+    if reason is not None:
         return reason
-    iter_space = iteration_space_from_op(op)
-    ranges = list(op.data.ranges)
-    for axis, sym in zip(tiling.axes, loop_vars):
-        if not axis.is_reduction and axis.host_dim >= len(ranges):
-            return (
-                f"host_dim={axis.host_dim} is out of bounds for data ranges "
-                f"{ranges} on {op.get_name()}."
-            )
-        if sym not in iter_space:
-            return (
-                f"host_dim={axis.host_dim} on {op.get_name()} resolves to loop "
-                f"var {sym}, which is absent from its iteration space "
-                f"{dict(iter_space)}."
-            )
     # Last, so a spec rejected for both reasons reports the axis reason lowering
     # would report rather than a prediction-only one.
     return _output_layout_rejection(op, tiling)

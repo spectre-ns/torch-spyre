@@ -2206,6 +2206,11 @@ def _mock_op_out_coords(op):
     return getattr(op, "_test_out_coords", [])
 
 
+def _mock_iteration_space(op):
+    """The loop vars ``_mock_op_out_coords`` names, over the op's own ranges."""
+    return dict(zip(getattr(op, "_test_out_coords", []), op.data.ranges))
+
+
 class TestCoarseTile(unittest.TestCase):
     def setUp(self):
         self._patch = patch(
@@ -9740,6 +9745,33 @@ class TestValidateTiling(unittest.TestCase):
         ):
             self.assertIsNone(predict_frame(op, TileSpec((TileAxis(0, 2),))))
 
+    def test_output_coord_outside_iteration_space_rejected(self):
+        """A coordinate whose one symbol the op does not loop over -- an
+        indirect-index symbol, or an enclosing ``for_each_tile`` loop's
+        variable, both of which ``op_out_coords`` can surface -- has no loop of
+        the op's own to tile. Lowering, enumeration and prediction all refuse
+        it, through the one resolver."""
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            try_resolve_tile_axis_loop_vars,
+        )
+        from torch_spyre._inductor.wsr.enumerate_tilings import _lowering_accepts
+
+        op = _ftl_pointwise((512, 256), name="val_not_iter_var")
+        spec = TileSpec((TileAxis(0, 2),))
+        # Not vacuous: with its real coordinates the same axis resolves.
+        self.assertIsNotNone(try_resolve_tile_axis_loop_vars(op, spec)[0])
+        with patch(
+            "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
+            return_value=[sympy_index_symbol("indirect0"), sympy_index_symbol("d1")],
+        ):
+            loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
+            self.assertIsNone(loop_vars)
+            with self.assertRaises(Unsupported):
+                tile_spec_to_dim_hints(op, spec, [0])
+            self.assertFalse(_lowering_accepts(op, TileAxis(0, 2)))
+            self.assertEqual(_rejection_reason(op, spec), reason)
+            self.assertIsNone(predict_frame(op, spec))
+
     def test_untiled_spec_accepted(self):
         op = _ftl_pointwise((512, 256), name="val_untiled")
         self.assertIsNone(_rejection_reason(op, TileSpec()))
@@ -10118,6 +10150,13 @@ class TestTileSpecLoweringOutput(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
                 side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling."
+                "iteration_space_from_op",
+                side_effect=_mock_iteration_space,
             )
         )
 
@@ -10504,6 +10543,13 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
             patch(
                 "torch_spyre._inductor.scratchpad.coarse_tiling.op_out_coords",
                 side_effect=_mock_op_out_coords,
+            )
+        )
+        self.enterContext(
+            patch(
+                "torch_spyre._inductor.scratchpad.coarse_tiling."
+                "iteration_space_from_op",
+                side_effect=_mock_iteration_space,
             )
         )
 
