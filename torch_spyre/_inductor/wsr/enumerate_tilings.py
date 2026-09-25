@@ -20,14 +20,16 @@ arrives separately. Its whole contract is to answer "what tilings could this op
 legally take", exhaustively and deterministically, so the solver has a complete
 candidate set to search.
 
-"Legally" includes "can be lowered". Every option passes the lowering itself,
-``scratchpad.coarse_tiling.tile_spec_to_dim_hints``, before it is offered, so a
-spec the solver picks from this set cannot then fail there. A reduction
-``host_dim`` is minted, sized and stick-checked in the frame that lowering reads
+"Legally" includes "can be lowered". Every option passes the lowering's own
+resolver, ``scratchpad.coarse_tiling.try_resolve_tile_axis_loop_vars``, before
+it is offered, so a spec the solver picks from this set cannot then fail in
+``tile_spec_to_dim_hints`` -- and the predictor (``wsr.tile_prediction``), which
+reads the same resolver, cannot refuse it on axis grounds either. A reduction
+``host_dim`` is minted, sized and stick-checked in the frame that resolver reads
 it in: a position in the op's *squeezed* reduction loop variables
-(:func:`~.coarse_tile.reduction_loop_vars`), which carry no entry for a size-1
-reduction dim, so ``host_dim`` is not a ``reduction_ranges`` position once the
-reduction has a unit dim.
+(:func:`~.coarse_tile.reduction_loop_vars`). The resolver refuses every
+reduction axis of an op with a size-1 reduction dim, so such an op is offered
+no reduction tilings.
 
 The strategy is **exact divisors**: a split count is
 admissible only if it divides its dim's extent exactly, because coarse tiling
@@ -69,7 +71,7 @@ from .. import config
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import host_coordinates, iteration_space_from_op
-from ..scratchpad.coarse_tiling import tile_spec_to_dim_hints
+from ..scratchpad.coarse_tiling import _get_red_var, try_resolve_tile_axis_loop_vars
 from ..scratchpad.plan_solver import TileAxis, TileSpec
 from .coarse_tile import _stick_host_dim, reduction_loop_vars
 from .span_overflow_hint_analysis import (
@@ -157,22 +159,19 @@ def _reduction_split_cuts_input_stick(op: ComputedBuffer, red_var, split: int) -
 def _reduction_split_counts(op: ComputedBuffer, red_pos: int) -> list[int]:
     """Legal split counts (> 1) for reduction dim ``red_pos``, exact divisors.
 
-    ``red_pos`` indexes the op's squeezed reduction loop variables
-    (:func:`reduction_loop_vars`), and the extent is that loop variable's own
-    range, so the dim that is sized, the dim that is stick-checked and the dim
-    ``tile_spec_to_dim_hints`` later tiles are one dim.
+    ``red_pos`` is resolved to its loop variable by the lowering's own
+    ``_get_red_var`` -- a position in the squeezed reduction loop variables --
+    and the extent is that loop variable's own range, so the dim that is sized,
+    the dim that is stick-checked and the dim ``tile_spec_to_dim_hints`` later
+    tiles are one dim. A dim the resolver refuses has no legal splits.
 
     Exact divisors of the reduction extent, minus the unit-tile split (rejected
     for Reduction ops, matching ``_split_candidates_for_host_dim``), minus any
     split that cuts an input stick, bounded by ``_MAX_AUTO_TILE_SPLIT_COUNT``.
     """
-    try:
-        red_vars = reduction_loop_vars(op)
-    except (StopIteration, AssertionError):
+    red_var, _ = _get_red_var(op, red_pos)
+    if red_var is None:
         return []
-    if red_pos >= len(red_vars):
-        return []
-    red_var = red_vars[red_pos]
     try:
         full = int(iteration_space_from_op(op)[red_var])
     except (KeyError, TypeError, ValueError):
@@ -202,20 +201,20 @@ def _reduction_split_counts(op: ComputedBuffer, red_pos: int) -> list[int]:
 
 
 def _lowering_accepts(op: ComputedBuffer, axis: TileAxis) -> bool:
-    """Whether ``tile_spec_to_dim_hints`` can lower ``axis`` on ``op``.
+    """Whether the lowering can resolve ``axis`` on ``op`` to a loop variable.
 
-    Asks the lowering itself, so no option is offered that it would reject. A
-    rejection is ordinary pruning here, not an error: the reason is logged and
-    the axis dropped.
+    Asks :func:`try_resolve_tile_axis_loop_vars` -- the resolver
+    ``tile_spec_to_dim_hints`` raises through -- so no option is offered that the
+    lowering would reject. A rejection is ordinary pruning here, not an error:
+    the reason is logged and the axis dropped.
     """
-    try:
-        tile_spec_to_dim_hints(op, TileSpec((axis,)), [0])
-    except Unsupported as exc:
+    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, TileSpec((axis,)))
+    if loop_vars is None:
         logger.debug(
             "enumerate_tile_options: dropping %s on %s: %s",
             axis,
             op.get_name(),
-            exc,
+            reason,
         )
         return False
     return True
@@ -268,13 +267,14 @@ def enumerate_tile_options(
     spec. Deterministic and unconsumed; the solver prices and
     chooses among these.
 
-    Every option lowers: each candidate dim is checked with
-    :func:`_lowering_accepts` before any spec is built from it, and a dim the
-    lowering rejects contributes no options. One check per dim is enough
-    because ``tile_spec_to_dim_hints`` resolves each axis of a spec
-    independently and from its ``host_dim`` and ``is_reduction`` alone, never
-    its ``count``: an axis lowers exactly when its dim does, and a spec exactly
-    when each of its axes does.
+    Every option lowers: each candidate dim is resolved through
+    :func:`try_resolve_tile_axis_loop_vars` before any spec is built from it --
+    an output dim by :func:`_lowering_accepts`, a reduction dim inside
+    :func:`_reduction_split_counts` -- and a dim the resolver rejects
+    contributes no options. One check per dim is enough because the resolver
+    reads each axis independently and from its ``host_dim`` and
+    ``is_reduction`` alone, never its ``count``: an axis resolves exactly when
+    its dim does, and a spec exactly when each of its axes does.
     """
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
@@ -325,12 +325,7 @@ def enumerate_tile_options(
         except (StopIteration, AssertionError):
             n_red = 0
         for red_pos in range(n_red):
-            red_splits = _reduction_split_counts(op, red_pos)[:max_splits_per_dim]
-            if not red_splits or not _lowering_accepts(
-                op, TileAxis(red_pos, red_splits[0], is_reduction=True)
-            ):
-                continue
-            for split in red_splits:
+            for split in _reduction_split_counts(op, red_pos)[:max_splits_per_dim]:
                 options.append(
                     TileSpec(
                         (TileAxis(host_dim=red_pos, count=split, is_reduction=True),)
