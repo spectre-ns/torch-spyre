@@ -20,13 +20,14 @@ arrives separately. Its whole contract is to answer "what tilings could this op
 legally take", exhaustively and deterministically, so the solver has a complete
 candidate set to search.
 
-"Legally" includes "can be lowered". Every option passes the lowering's own
-resolver, :func:`~.coarse_tile.try_resolve_tile_axis_loop_vars`, before it is
-offered, so a spec the solver picks from this set cannot then fail in
-``scratchpad.coarse_tiling.tile_spec_to_dim_hints``. A reduction ``host_dim``
-is minted, sized and stick-checked in the frame that resolver reads it in: an
-*unsqueezed* ``op.data.reduction_ranges`` position, whose loop variable comes
-from :func:`~.coarse_tile.reduction_loop_var_by_ranges_pos`.
+"Legally" includes "can be lowered". Every option passes the lowering itself,
+``scratchpad.coarse_tiling.tile_spec_to_dim_hints``, before it is offered, so a
+spec the solver picks from this set cannot then fail there. A reduction
+``host_dim`` is minted, sized and stick-checked in the frame that lowering reads
+it in: a position in the op's *squeezed* reduction loop variables
+(:func:`~.coarse_tile.reduction_loop_vars`), which carry no entry for a size-1
+reduction dim, so ``host_dim`` is not a ``reduction_ranges`` position once the
+reduction has a unit dim.
 
 The strategy is **exact divisors**: a split count is
 admissible only if it divides its dim's extent exactly, because coarse tiling
@@ -67,13 +68,10 @@ from torch._inductor.ir import ComputedBuffer, Reduction
 from .. import config
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import host_coordinates
+from ..pass_utils import host_coordinates, iteration_space_from_op
+from ..scratchpad.coarse_tiling import tile_spec_to_dim_hints
 from ..scratchpad.plan_solver import TileAxis, TileSpec
-from .coarse_tile import (
-    _stick_host_dim,
-    reduction_loop_var_by_ranges_pos,
-    try_resolve_tile_axis_loop_vars,
-)
+from .coarse_tile import _stick_host_dim, reduction_loop_vars
 from .span_overflow_hint_analysis import (
     _MAX_AUTO_TILE_SPLIT_COUNT,
     _MAX_SPLITS_PER_DIM,
@@ -91,8 +89,6 @@ logger = get_inductor_logger("wsr.enumerate_tilings")
 # these two bound the *shape* of the option set, not individual splits.
 _MAX_TILE_DIMS = 2
 _MAX_TILE_OPTIONS = 64
-
-logger = get_inductor_logger("coarse_tile")
 
 
 def _output_stick_host_dim(op: ComputedBuffer) -> int | None:
@@ -136,10 +132,10 @@ def _reduction_split_cuts_input_stick(op: ComputedBuffer, red_var, split: int) -
     physical stick in any input the reduction dim controls.
 
     The reduction analogue of ``_input_stick_alignment_error``: it uses the
-    reduction loop var (from :func:`reduction_loop_var_by_ranges_pos`) as the
-    target symbol instead of an output host dim's symbols, and reuses the same
-    low-level helpers. Fails closed -- an input whose coordinates cannot be
-    derived is treated as cut.
+    reduction loop var (from :func:`reduction_loop_vars`) as the target symbol
+    instead of an output host dim's symbols, and reuses the same low-level
+    helpers. Fails closed -- an input whose coordinates cannot be derived is
+    treated as cut.
     """
     for dep, layout in _input_read_deps(op):
         if not _layout_has_static_span_metadata(layout):
@@ -161,34 +157,28 @@ def _reduction_split_cuts_input_stick(op: ComputedBuffer, red_var, split: int) -
 def _reduction_split_counts(op: ComputedBuffer, red_pos: int) -> list[int]:
     """Legal split counts (> 1) for reduction dim ``red_pos``, exact divisors.
 
+    ``red_pos`` indexes the op's squeezed reduction loop variables
+    (:func:`reduction_loop_vars`), and the extent is that loop variable's own
+    range, so the dim that is sized, the dim that is stick-checked and the dim
+    ``tile_spec_to_dim_hints`` later tiles are one dim.
+
     Exact divisors of the reduction extent, minus the unit-tile split (rejected
     for Reduction ops, matching ``_split_candidates_for_host_dim``), minus any
     split that cuts an input stick, bounded by ``_MAX_AUTO_TILE_SPLIT_COUNT``.
     """
-    reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
-    if red_pos >= len(reduction_ranges):
-        return []
     try:
-        full = int(reduction_ranges[red_pos])
-    except (TypeError, ValueError):
+        red_vars = reduction_loop_vars(op)
+    except (StopIteration, AssertionError):
+        return []
+    if red_pos >= len(red_vars):
+        return []
+    red_var = red_vars[red_pos]
+    try:
+        full = int(iteration_space_from_op(op)[red_var])
+    except (KeyError, TypeError, ValueError):
         return []
     if full <= 1:
         return []
-    # ``red_pos`` is an unsqueezed ``reduction_ranges`` position -- ``full`` was
-    # just read at it -- so the loop var must be resolved in that same frame.
-    # Indexing the squeezed ``reduction_loop_vars`` with it names a different
-    # dim once a size-1 dim precedes this one, and on the last dim runs off the
-    # end of the list. That used to raise IndexError, which was caught here and
-    # reported as "no legal splits"; the resolved list is ``reduction_ranges``
-    # long and ``red_pos`` is bounds-checked above, so IndexError is no longer
-    # possible and is deliberately not caught.
-    try:
-        by_pos = reduction_loop_var_by_ranges_pos(op)
-    except (StopIteration, AssertionError):
-        return []
-    if by_pos is None:
-        return []
-    red_var = by_pos[red_pos]
     divisors = sorted(
         {
             d
@@ -212,20 +202,20 @@ def _reduction_split_counts(op: ComputedBuffer, red_pos: int) -> list[int]:
 
 
 def _lowering_accepts(op: ComputedBuffer, axis: TileAxis) -> bool:
-    """Whether lowering can resolve ``axis`` on ``op`` to a loop variable.
+    """Whether ``tile_spec_to_dim_hints`` can lower ``axis`` on ``op``.
 
-    Asks :func:`try_resolve_tile_axis_loop_vars` -- the lowering's own
-    authority, the same call ``tile_spec_to_dim_hints`` raises through -- so no
-    option is offered that the lowering would reject. A rejection is ordinary
-    pruning here, not an error: the reason is logged and the axis dropped.
+    Asks the lowering itself, so no option is offered that it would reject. A
+    rejection is ordinary pruning here, not an error: the reason is logged and
+    the axis dropped.
     """
-    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, TileSpec((axis,)))
-    if loop_vars is None:
+    try:
+        tile_spec_to_dim_hints(op, TileSpec((axis,)), [0])
+    except Unsupported as exc:
         logger.debug(
             "enumerate_tile_options: dropping %s on %s: %s",
             axis,
             op.get_name(),
-            reason,
+            exc,
         )
         return False
     return True
@@ -281,11 +271,10 @@ def enumerate_tile_options(
     Every option lowers: each candidate dim is checked with
     :func:`_lowering_accepts` before any spec is built from it, and a dim the
     lowering rejects contributes no options. One check per dim is enough
-    because :func:`try_resolve_tile_axis_loop_vars` resolves each axis of a
-    spec independently and from its ``host_dim`` and ``is_reduction`` alone,
-    never its ``count``: an axis resolves exactly when its dim does, and a spec
-    exactly when each of its axes does. Checking finished specs instead would
-    repeat the same answer once per split and per combination.
+    because ``tile_spec_to_dim_hints`` resolves each axis of a spec
+    independently and from its ``host_dim`` and ``is_reduction`` alone, never
+    its ``count``: an axis lowers exactly when its dim does, and a spec exactly
+    when each of its axes does.
     """
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
@@ -314,7 +303,12 @@ def enumerate_tile_options(
 
     # --- reduction options: single-level only ---------------------------------
     if isinstance(op.data, Reduction) and config.enable_reduction_tiling:
-        n_red = len(getattr(op.data, "reduction_ranges", []))
+        # Positions in the squeezed reduction loop variables, the frame a
+        # reduction TileAxis.host_dim is lowered in (module docstring).
+        try:
+            n_red = len(reduction_loop_vars(op))
+        except (StopIteration, AssertionError):
+            n_red = 0
         for red_pos in range(n_red):
             red_splits = _reduction_split_counts(op, red_pos)[:max_splits_per_dim]
             if not red_splits or not _lowering_accepts(
