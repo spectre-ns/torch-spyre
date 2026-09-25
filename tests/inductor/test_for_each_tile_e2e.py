@@ -59,14 +59,11 @@ import torch
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import passes as ts_passes
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
-    CoarseTilingPass,
     PrescribedRegion,
     prescribed_regions,
 )
-from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 
 from for_each_tile_fixtures import (
     B,
@@ -769,16 +766,10 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
 
 
 class _CollectRegions(CustomPreSchedulingPasses):
-    """Pre-scheduling pipeline that records the graph's regions once it is done.
-
-    Also tries to re-tile the first region op through ``CoarseTilingPass`` and
-    records the error, so a test can check that the pass refuses.  The error is
-    caught here rather than raised, so the compile itself still completes.
-    """
+    """Pre-scheduling pipeline that records the graph's regions once it is done."""
 
     operations: list = []
     regions: list[PrescribedRegion] = []
-    retile_error: Exception | None = None
 
     def __call__(self, graph) -> None:
         super().__call__(graph)
@@ -788,7 +779,7 @@ class _CollectRegions(CustomPreSchedulingPasses):
 
 
 class TestPrescribedRegionsE2E(_DynamoResetTestCase):
-    """``prescribed_regions`` on real spliced graphs, and the re-tile refusal.
+    """``prescribed_regions`` on real spliced graphs.
 
     A region is every op between the first and last op one outermost
     ``for_each_tile`` loop stamped.  These tests compile the loop and read the
