@@ -2225,20 +2225,6 @@ def _enum_split_options(
     return _legal_split_options(op, options.values())
 
 
-def _spec_contains(spec: TileSpec, pin: TileSpec) -> bool:
-    """True if every ``pin`` axis appears in ``spec`` in pin order (a sub-nest).
-
-    Subsequence, not equality: a pin fixes some levels and the solve is free to
-    nest discovered levels inside or outside them, so a spec honours the pin as
-    long as the pin's axes occur within it, in the same relative order. Axis
-    identity is exact -- ``TileAxis`` is frozen, so ``in`` matches host_dim,
-    count and is_reduction together, which is what makes a pin's *count* binding
-    and not just its axis.
-    """
-    remaining = iter(spec.axes)
-    return all(axis in remaining for axis in pin.axes)
-
-
 def _op_read_span_is_evaluable(op: Operation) -> bool:
     """True when the read-distance filter can compute concrete post-tile spans.
 
@@ -3083,28 +3069,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         With unified tiling off the only option is the untiled ``TileSpec``, so
         enumeration and every downstream plan stay bit-identical to today. With
-        it on (the CP-SAT co-opt path), the solve is the single authority on
-        coarse tiling -- the pre-stickification hint pass has stood down
-        (``_solver_owns_tiling``), so a caller's hint reaches here as data on
-        ``op.dim_hints`` rather than as an already-applied tiling. Two roles:
+        it on (the CP-SAT co-opt path), **discovery** (an extra
+        ``auto_coarse_tiling`` turns on) offers the op the output-axis tilings it
+        could take, minus any whose per-core read span would still exceed the
+        read-distance limit (``MAX_SPAN_BYTES``); the untiled option is dropped
+        too when the op's own full-size read overflows, and an op with no
+        fitting tiling raises ``Unsupported`` (see
+        :func:`_drop_read_distance_violations`). Without discovery the op stays
+        untiled.
 
-        - A **carried pin** (a hint the caller placed) is *mandatory*: the option
-          set is reduced to the tilings that contain it and untiled is dropped,
-          so the solve can only pick a tiling that honours the pin. This is what
-          lets a pin compose with discovery in one solve instead of being applied
-          in a separate, earlier phase (which could not nest). The pin is honored
-          under unified tiling whether or not discovery is on.
-        - **Discovery** (an extra ``auto_coarse_tiling`` turns on) offers an
-          *un-pinned* op the output-axis tilings it could take, minus any whose
-          per-core read span would still exceed the read-distance limit
-          (``MAX_SPAN_BYTES``); the untiled option is dropped too when the op's
-          own full-size read overflows, and an op with no fitting tiling raises
-          ``Unsupported`` (see :func:`_drop_read_distance_violations`). Without
-          discovery an un-pinned op stays untiled.
+        Filtered by op kind:
 
-        Filtered by op kind either way:
-
-        - **Restickify** offers nothing, pin or no pin: no tiling form is correct
+        - **Restickify** offers nothing: no tiling form is correct
           post-stickification.
         - **Everything else** -- pointwise, reduction, *and matmul* -- offers only
           output-axis tilings (``is_clean``). That single filter, plus the
@@ -3115,16 +3091,18 @@ class CoOptimizingAllocator(ScratchpadAllocator):
           path, ~2 orders off CPU -- see ``_mlp_case``), and its N/stick dim is
           never emitted. What remains for a matmul is row/M-axis output tiling,
           which is correct and backend-accepted (see
-          ``test_hint_matmul_row_tiling``), so a pin or a discovered tiling on
-          that axis is honored the same as for any other op.
+          ``test_hint_matmul_row_tiling``), so a discovered tiling on that axis
+          is honored the same as for any other op.
 
         (The ``_resize_device_layout`` gap #3218 that rejects a tile-sized read
         copy is confined to the span-overflow path, where a matmul feeds a
         differently-shaped consumer -- a separate mechanism, still xfailed, not
         reached by the ordinary M-axis output tiling offered here.)
 
-        An op already tiled (``loop_info`` set, e.g. by a prior apply) is left
-        untouched, so the solve never re-tiles or un-tiles it.
+        An op already tiled (``loop_info`` set -- by the ``spyre_hint`` pass
+        pre-stickification, a ``for_each_tile`` loop, or a prior apply) is left
+        untouched, so the solve never re-tiles or un-tiles it. The solve reads no
+        hints of its own.
         """
         untiled = [TileSpec()]
         if getattr(self, "_suppress_tiling", False):
@@ -3135,9 +3113,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return untiled
         if self._get_op_name(op) == "restickify":
             return untiled
-        from torch_spyre._inductor.scratchpad.coarse_tiling import (
-            dim_hints_to_tile_spec,
-        )
+        if not config.auto_coarse_tiling:
+            return untiled
         from torch_spyre._inductor.wsr.enumerate_tilings import enumerate_tile_options
 
         try:
@@ -3147,30 +3124,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         except Unsupported:
             options = list(untiled)
 
-        try:
-            pin = dim_hints_to_tile_spec(op, getattr(op, "dim_hints", []))
-        except Unsupported as exc:
-            # The hint pass has stood down (``_solver_owns_tiling``), so a hint
-            # that cannot become a TileSpec is not applied anywhere else: say so
-            # rather than letting the caller's tiling vanish without a trace.
-            logger.warning(
-                "%s: spyre_hint not honoured by the coarse-tiling solve: %s",
-                op.get_name(),
-                exc,
-            )
-            pin = TileSpec()
-        if not pin.is_untiled:
-            # Mandatory pin: keep only pin-honouring tilings, drop untiled, and
-            # always offer the bare pin so a pin the enumerator does not reach on
-            # its own (a legal tiling it happens not to emit) is never lost.
-            honoring = [t for t in options if _spec_contains(t, pin)]
-            if pin not in honoring:
-                honoring.append(pin)
-            return honoring
-
-        if not config.auto_coarse_tiling:
-            return untiled
-        # Discovery offers an unpinned op tilings the solve is free to pick, but
+        # Discovery offers the op tilings the solve is free to pick, but
         # the CP-SAT cost model carries no span term, so a discovered TileSpec is
         # never otherwise checked against the hardware read-distance limit
         # (MAX_SPAN_BYTES) the span-overflow planner enforces. Drop any candidate

@@ -26,10 +26,6 @@ hint-driven group already stamped pre-stickification at pass 430. It reuses the
 existing ``coarse_tile`` machinery verbatim; the only new work is lowering a
 ``TileSpec`` to per-op ``DimHint``s and deriving groups as consecutive runs of
 ops that share a spec.
-
-The reverse direction lives here too: :func:`dim_hints_to_tile_spec` lifts the
-``DimHint``s an op already carries back into the ``TileSpec`` they describe, so
-a caller's hint can be stated in the same terms as a tiling this pass applies.
 """
 
 from __future__ import annotations
@@ -41,19 +37,15 @@ import sympy
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation
 
-from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
-    _hint_ranges_pos,
     coarse_tile_post_stickify,
     resolve_tile_axis_loop_vars,
-    try_resolve_tile_axis_loop_vars,
     validate_coarse_tile_groups,
 )
 from .allocator import ScratchpadOptimizationPass
-from .plan_solver import TileAxis, TileSpec
+from .plan_solver import TileSpec
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
 
@@ -62,7 +54,6 @@ def tile_spec_to_dim_hints(
     op: ComputedBuffer,
     spec: TileSpec,
     hint_ids: Sequence[int],
-    dim_names: Sequence[Sequence[str]] | None = None,
 ) -> list[DimHint]:
     """Lower a :class:`TileSpec` into per-op :class:`DimHint`s.
 
@@ -71,12 +62,6 @@ def tile_spec_to_dim_hints(
     ``hint_id`` for that level. ``hint_ids`` has one entry per axis, outermost
     first, matching the group's ``levels``.
 
-    ``dim_names`` defaults to the discovered-tiling label ``["_coarse_tile"]`` on
-    every axis. A caller re-applying a *carried* pin passes the pin's own names
-    per axis so the applied level keeps the caller's dim name (e.g. ``"S"``)
-    rather than being relabelled as compiler-discovered -- the identity a
-    consumer keying on the pin (debug output, the hint-preservation tests) reads.
-
     Axis resolution -- which loop var a ``host_dim`` names in each frame, and
     every ``Unsupported`` a spec can earn -- belongs to
     :func:`resolve_tile_axis_loop_vars`, the single authority on applying a
@@ -84,181 +69,24 @@ def tile_spec_to_dim_hints(
     this lowering by construction rather than by keeping a copy in step. The
     predictor is one such consumer (``wsr.tile_prediction._rejection_reason``),
     so what the solve prices is exactly what this function can lower. Only the
-    ``hint_ids`` / ``dim_names`` pairing lives here. The inverse is
-    :func:`dim_hints_to_tile_spec`.
+    ``hint_ids`` pairing lives here.
     """
     if len(hint_ids) != len(spec.axes):
         raise ValueError(
             f"tile_spec_to_dim_hints: {len(hint_ids)} hint_ids for "
             f"{len(spec.axes)} axes on {op.get_name()}"
         )
-    if dim_names is not None and len(dim_names) != len(spec.axes):
-        raise ValueError(
-            f"tile_spec_to_dim_hints: {len(dim_names)} dim_names for "
-            f"{len(spec.axes)} axes on {op.get_name()}"
-        )
-    # One fresh list per axis -- a shared default would let a later mutation of
-    # one hint's dim_names reach every other hint built here.
-    names = (
-        [["_coarse_tile"] for _ in spec.axes]
-        if dim_names is None
-        else [list(n) for n in dim_names]
-    )
     loop_vars = resolve_tile_axis_loop_vars(op, spec)
     return [
         DimHint(
-            dim_names=axis_names,
+            dim_names=["_coarse_tile"],
             split_count=axis.count,
             loop_var=loop_var,
             is_reduction=axis.is_reduction,
             hint_id=hint_id,
         )
-        for axis, loop_var, hint_id, axis_names in zip(
-            spec.axes, loop_vars, hint_ids, names
-        )
+        for axis, loop_var, hint_id in zip(spec.axes, loop_vars, hint_ids)
     ]
-
-
-def _level_hints(dim_hints: Sequence[DimHint]) -> list[DimHint]:
-    """The hints that produce a loop level, outermost-first by ``hint_id``.
-
-    ``_hints_levels``' rule for the hint path: a hint the op is broadcast
-    against (``loop_var is None``) and a split of 1 tile nothing, unless
-    ``loop_var_range`` makes it a WhileLoop-splice level. Shared by
-    :func:`dim_hints_to_tile_spec`, which builds one axis per hint returned
-    here, and :func:`_carried_pins`, which pairs those axes back with these
-    hints -- so the two can never disagree on which hint an axis came from.
-    """
-    return sorted(
-        (
-            h
-            for h in dim_hints
-            if h.loop_var is not None
-            and (h.split_count != 1 or h.loop_var_range is not None)
-        ),
-        key=lambda h: h.hint_id,
-    )
-
-
-def dim_hints_to_tile_spec(
-    op: ComputedBuffer,
-    dim_hints: Sequence[DimHint],
-) -> TileSpec:
-    """The :class:`TileSpec` that ``op``'s ``dim_hints`` describe.
-
-    The inverse of :func:`tile_spec_to_dim_hints`: where that resolves each
-    :class:`TileAxis` to the loop variable it tiles, this recovers each hint's
-    positional ``host_dim`` from its ``loop_var``.
-
-    Which hints become axes follows ``_hints_levels``, the hint path's own rule.
-    A hint ``op`` is broadcast against (``loop_var is None``) and a split of 1
-    tile nothing, so neither contributes an axis; with no hint left the result
-    is the untiled spec. The rest are ordered outermost-first by ``hint_id`` --
-    ``spyre_hint``'s counter grows inwards -- which is the order a ``TileSpec``
-    nests its axes in.
-
-    Each hint is placed with ``_hint_ranges_pos``, the resolution
-    ``coarse_tile`` itself plans and divides a hint at, so an axis names the dim
-    the hint path would tile: an ``op_out_coords`` position for an output hint,
-    an unsqueezed ``reduction_ranges`` position for a reduction hint. The spec
-    is then checked against the lowering: :func:`try_resolve_tile_axis_loop_vars`
-    must resolve every axis back to its own hint's ``loop_var``. So
-    ``tile_spec_to_dim_hints`` on the result reproduces the hints' loop
-    variables, split counts and reduction flags, in order, by construction.
-
-    ``hint_id`` and ``dim_names`` are not carried: ``TileAxis`` has no field for
-    either. Axis order keeps the ids positionally, so a caller that must re-stamp
-    them can pair the sorted hints back against ``spec.axes``.
-
-    Raises ``Unsupported`` for a level-producing hint the spec cannot express,
-    since dropping it would understate the op's nest:
-
-    * a WhileLoop-splice hint (``loop_var_range`` set) -- a ``for_each_tile``
-      level whose trip count is ``loop_var_range``, not a split of a dim of
-      ``op``;
-    * a hint whose ``loop_var`` is not an output or reduction dim of ``op``, as
-      its ``is_reduction`` says;
-    * a hint whose axis the lowering would resolve to a different loop
-      variable, or reject outright.
-    """
-    leveled = _level_hints(dim_hints)
-    if not leveled:
-        return TileSpec()
-    out_coords = op_out_coords(op)
-    axes: list[TileAxis] = []
-    for h in leveled:
-        if h.loop_var_range is not None:
-            raise Unsupported(
-                f"coarse tiling: hint_{h.hint_id} on {op.get_name()} is a "
-                f"WhileLoop-splice level (loop_var_range={h.loop_var_range}), "
-                "which a TileSpec cannot express."
-            )
-        host_dim, is_reduction = _hint_ranges_pos(op, h, out_coords)
-        if host_dim is None:
-            kind = "a reduction" if h.is_reduction else "an output"
-            raise Unsupported(
-                f"coarse tiling: hint_{h.hint_id}'s loop var {h.loop_var} is not "
-                f"{kind} dim of {op.get_name()}."
-            )
-        axes.append(
-            TileAxis(host_dim=host_dim, count=h.split_count, is_reduction=is_reduction)
-        )
-    spec = TileSpec(tuple(axes))
-    loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
-    if loop_vars is None:
-        raise Unsupported(reason)
-    for h, loop_var in zip(leveled, loop_vars):
-        if loop_var != h.loop_var:
-            raise Unsupported(
-                f"coarse tiling: hint_{h.hint_id} tiles {h.loop_var} on "
-                f"{op.get_name()}, but its TileSpec axis lowers to {loop_var}."
-            )
-    return spec
-
-
-def _carried_pins(op: Operation) -> dict[tuple[int, int, bool], DimHint]:
-    """Index ``op``'s un-applied hints by the axis each tiles.
-
-    The key is ``(host_dim, count, is_reduction)`` -- the identity a chosen
-    :class:`TileAxis` matches on -- and the value is the ``DimHint`` it came
-    from, so :class:`CoarseTilingPass` can recover a carried pin's ``hint_id``
-    and dim name when it applies a spec that contains that axis. Pairs each axis
-    of :func:`dim_hints_to_tile_spec`'s result back with the hint it was built
-    from, both taken in :func:`_level_hints`' order. Empty when the op carries no
-    level-producing hint (the unhinted / discovered-only cases) or when a hint
-    fails to convert (``dim_hints_to_tile_spec`` raises) -- either way the reuse
-    it feeds is inert.
-    """
-    dim_hints = list(getattr(op, "dim_hints", None) or [])
-    leveled = _level_hints(dim_hints)
-    if not leveled:
-        return {}
-    try:
-        spec = dim_hints_to_tile_spec(op, dim_hints)
-    except Unsupported:
-        return {}
-    return {
-        (axis.host_dim, axis.count, axis.is_reduction): h
-        for axis, h in zip(spec.axes, leveled)
-    }
-
-
-def _find_carried_pin(
-    pins_by_op: Mapping[str, Mapping[tuple[int, int, bool], DimHint]],
-    group_ops: Sequence[Operation],
-    axis: TileAxis,
-) -> DimHint | None:
-    """The carried pin some group op holds for ``axis``, or ``None``.
-
-    A group shares one spec, so any member that carried the pin identifies it;
-    the first match wins.
-    """
-    key = (axis.host_dim, axis.count, axis.is_reduction)
-    for op in group_ops:
-        pin = pins_by_op.get(op.get_name(), {}).get(key)
-        if pin is not None:
-            return pin
-    return None
 
 
 def derive_tiling_groups(
@@ -352,52 +180,21 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             )
         if not groups_specs:
             return
-        # Snapshot each op's carried pins before the loop below overwrites any
-        # dim_hints. A carried pin is a caller hint that reached the solve as
-        # data (``_solver_owns_tiling``) instead of a pre-stickification tiling;
-        # reusing its id/name below is what lets a pin keep its identity after
-        # being applied here rather than pre-stickification.
-        pins_by_op = {
-            op.get_name(): _carried_pins(op)
-            for group_ops, _ in groups_specs
-            for op in group_ops
-        }
-        # Fresh ids for compiler-discovered levels start above every id already
-        # on the graph -- the carried pins included, so a reused pin id (small)
-        # never clashes with a minted one. The group-id offset is derived the
-        # same way, both *before* this pass stamps anything of its own.
-        next_fresh_id = _derive_hint_id_base(graph)
+        # Both bases are derived off the graph *before* this pass stamps any of
+        # its own hints/groups, so pre-existing (hint-driven) ids are avoided
+        # and the ids this pass mints increase monotonically.
+        next_hint_id = _derive_hint_id_base(graph)
         group_idx_offset = _derive_group_idx_offset(graph)
-        # A pin can spread across ops the solve split into different spec-groups,
-        # but ``validate_coarse_tile_groups`` forbids one hint id in two groups.
-        # So a pin's own id is reused by the *first* group that carries its axis
-        # and every later group mints a fresh id for that axis instead: the pin
-        # still surfaces under its own id (and name) at least once -- enough to
-        # identify it -- while the rest reads as discovered. This assumes a pin
-        # nests outermost (its small id sorts outer), which holds for every pin
-        # the caller places today; a pin used as an inner level would want its id
-        # ordered against the discovered ones, not simply reused.
-        claimed_pin_ids: set[int] = set()
         groups: list[tuple] = []
         for group_ops, spec in groups_specs:
-            axis_ids: list[int] = []
-            axis_names: list[list[str]] = []
-            for axis in spec.axes:
-                pin = _find_carried_pin(pins_by_op, group_ops, axis)
-                if pin is not None and pin.hint_id not in claimed_pin_ids:
-                    claimed_pin_ids.add(pin.hint_id)
-                    axis_ids.append(pin.hint_id)
-                    axis_names.append(list(pin.dim_names))
-                else:
-                    axis_ids.append(next_fresh_id)
-                    axis_names.append(["_coarse_tile"])
-                    next_fresh_id += 1
+            hint_ids = list(range(next_hint_id, next_hint_id + len(spec.axes)))
+            next_hint_id += len(spec.axes)
             levels = [
                 (hint_id, sympy.Integer(axis.count))
-                for hint_id, axis in zip(axis_ids, spec.axes)
+                for hint_id, axis in zip(hint_ids, spec.axes)
             ]
             for op in group_ops:
-                op.dim_hints = tile_spec_to_dim_hints(op, spec, axis_ids, axis_names)
+                op.dim_hints = tile_spec_to_dim_hints(op, spec, hint_ids)
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
         # This pass runs inside scratchpad/LX planning -- after stickification

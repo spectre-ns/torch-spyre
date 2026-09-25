@@ -1460,6 +1460,36 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             cuts.append(cut)
         return cuts
 
+    def _tile_count_terms(
+        self,
+        model: "cp_model.CpModel",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+    ) -> list["cp_model.IntVar"]:
+        """One int per buffer: the tile count of its chosen division's tiling.
+
+        ``TileSpec.tile_count`` is 1 for the untiled spec, and ``add_element``
+        ties it to the buffer's division the way :meth:`_cut_literals` ties
+        ``tile_id``. A buffer whose candidates all tile alike (every one
+        untiled, or a single division) is left out: its count is a constant
+        and cannot move the sum.
+
+        Returns an empty list when nothing carries a choice of tiling, which is
+        every path except the joint solve with ``unified_tiling`` on, so the
+        tile-count stage below vanishes there.
+        """
+        terms = []
+        for name, sb in tensors.items():
+            divisions = getattr(sb.buffer, "core_divisions", None)
+            if not divisions:
+                continue
+            counts = [cd.tiling.tile_count for cd in divisions]
+            if min(counts) == max(counts):
+                continue
+            var = model.new_int_var(min(counts), max(counts), f"tile_count_{name}")
+            model.add_element(sb.division, counts, var)
+            terms.append(var)
+        return terms
+
     def _solve_and_record(
         self,
         solver: "cp_model.CpSolver",
@@ -1551,6 +1581,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "[CP-SAT layout solver] cut tiebreak over %d candidate cut(s)",
                 len(cut_terms),
             )
+        # Tile counts, so the last stage can prefer the coarsest tiling. Empty
+        # unless the joint solve is choosing tilings, like ``cut_terms``.
+        tile_terms = self._tile_count_terms(model, tensors)
 
         status = None
         core_terms = None
@@ -1582,11 +1615,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             #   2. cut count      -- fewest coarse-tiling loop-group boundaries.
             #   3. parallelism    -- maximize total core usage.
             #   4. division shape -- minimize summed squared split factors.
+            #   5. tile count     -- minimize the summed tile count.
             #
             # Each stage pins the previous optimum as a constraint before
             # optimizing the next, so a later stage only breaks ties the earlier
-            # ones leave open: never trade a spill for fewer cuts, nor cuts for
-            # parallelism.
+            # ones leave open: never trade a spill for fewer cuts, cuts for
+            # parallelism, or anything for a coarser tiling.
 
             # Fallback discipline: the traffic objective below knows no relayout
             # price, and an unpriced shuffle looks free - the exact degeneracy
@@ -1650,22 +1684,40 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(sum(core_cost_terms))
                 status = _solve_stage("division shape")
 
+                # -- 5. tile count ----------------------------------------------
+                # Nothing above ranks how finely an op is tiled, so tilings that
+                # differ only in count tie on every stage and the multi-worker
+                # portfolio picks one arbitrarily (the same graph drew 4, 8 and
+                # 64 run to run). Holding the division-shape optimum (integer,
+                # so the round is exact), take the fewest tiles. Tilings exist
+                # only on division-carrying buffers, so this runs only here.
+                if tile_terms:
+                    model.add(sum(core_cost_terms) <= round(solver.ObjectiveValue()))
+                    model.minimize(sum(tile_terms))
+                    status = _solve_stage("tile count")
+
         final_tensors = self._extract(solver, tensors)
 
         if logger.isEnabledFor(logging.DEBUG):
             if status is None:
                 status = cp_model.INFEASIBLE
             spilled = [n for n, t in final_tensors.items() if t.address is None]
-            # The final solve minimized the balance cost when there were
-            # divisions to choose (with occupancy held at ``occupancy``);
-            # otherwise only the residency solve ran and the objective is HBM
-            # traffic.
+            # The final solve minimized the tile count when there were tilings
+            # to choose, else the balance cost when there were divisions to
+            # choose (with occupancy held at ``occupancy``); otherwise only the
+            # residency solve ran and the objective is HBM traffic.
+            if core_terms and tile_terms:
+                final_objective = "tile_count"
+            elif core_terms:
+                final_objective = "balance"
+            else:
+                final_objective = "hbm_traffic"
             logger.debug(
                 "[CP-SAT layout solver] tensors=%d resident=%d %s=%d "
                 "occupancy=%s status=%s walltime=%.2f ms",
                 len(tensors),
                 len(tensors) - len(spilled),
-                "balance" if core_terms else "hbm_traffic",
+                final_objective,
                 round(solver.ObjectiveValue()),
                 occupancy if occupancy is not None else "n/a",
                 solver.StatusName(status),
