@@ -6075,6 +6075,70 @@ class TestReadCopyElisionProof(unittest.TestCase):
         with self.assertRaises(Exception):
             record.copy_name = "other"
 
+    def test_graph_output_copy_is_not_elided(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer],
+            get_output_names=lambda: ["copy0"],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer])
+
+    def test_non_memory_dependency_prevents_copy_elision(self):
+        from torch._inductor.dependencies import StarDep
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.loop_info import ReadCopyElisionRecord
+        from torch_spyre._inductor.read_copy_elision import elide_proven_read_copies
+
+        copy_op = MagicMock(spec=ComputedBuffer)
+        copy_op.get_name.return_value = "copy0"
+        consumer = MagicMock(spec=ComputedBuffer)
+        consumer.get_name.return_value = "consumer0"
+        consumer.get_read_writes.return_value.reads = []
+        consumer._read_copy_elision_record = ReadCopyElisionRecord(
+            consumer_name="consumer0",
+            copy_name="copy0",
+            source_name="input0",
+            direct_inner_fn=lambda: None,
+        )
+        star_reader = MagicMock()
+        star_reader.get_read_writes.return_value.reads = [StarDep("copy0")]
+        graph = SimpleNamespace(
+            operations=[copy_op, consumer, star_reader],
+            get_output_names=lambda: [],
+            removed_buffers=set(),
+        )
+
+        with patch(
+            "torch_spyre._inductor.read_copy_elision._prove_matmul_direct_read"
+        ) as prove:
+            elide_proven_read_copies(graph)
+
+        prove.assert_not_called()
+        self.assertEqual(graph.operations, [copy_op, consumer, star_reader])
+
     def test_local_bounds_are_measured_in_source_elements(self):
         from torch._inductor.dependencies import MemoryDep
         from torch_spyre._inductor.read_copy_elision import _affine_bounds
@@ -6353,7 +6417,20 @@ class TestPointSpliceAdvance(unittest.TestCase):
         )
 
     def test_restickify_metadata_resolves_exact_dependency(self):
-        from torch_spyre._inductor.insert_restickify import _restickify_dep_index
+        from torch_spyre._inductor.insert_restickify import (
+            _restickify_dep_index,
+            RestickifyArgInfo,
+        )
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        dummy_layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [Integer(1)],
+            [Integer(1)],
+            SpyreTensorLayout([1], torch.float16),
+        )
 
         u0 = sympy.Symbol("u0", integer=True)
         deps = [self._dep(32 * u0), self._dep(32 * u0 + 1)]
@@ -6361,26 +6438,61 @@ class TestPointSpliceAdvance(unittest.TestCase):
         self.assertEqual(
             _restickify_dep_index(
                 deps,
-                {
-                    "arg_name": "block_table",
-                    "dep_index": 32 * u0 + 1,
-                    "occurrence": 0,
-                },
+                RestickifyArgInfo(
+                    arg_name="block_table",
+                    dep_index=32 * u0 + 1,
+                    occurrence=0,
+                    target_layout=dummy_layout,
+                ),
             ),
             1,
         )
 
     def test_legacy_restickify_metadata_rejects_ambiguous_name(self):
-        from torch_spyre._inductor.insert_restickify import _restickify_dep_index
+        from torch_spyre._inductor.insert_restickify import (
+            _restickify_dep_index,
+            RestickifyArgInfo,
+        )
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        dummy_layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [Integer(1)],
+            [Integer(1)],
+            SpyreTensorLayout([1], torch.float16),
+        )
 
         u0 = sympy.Symbol("u0", integer=True)
         deps = [self._dep(32 * u0), self._dep(32 * u0 + 1)]
 
         with self.assertRaisesRegex(AssertionError, "matches multiple reads"):
-            _restickify_dep_index(deps, {"arg_name": "block_table"})
+            _restickify_dep_index(
+                deps,
+                RestickifyArgInfo(
+                    arg_name="block_table",
+                    dep_index=None,
+                    occurrence=0,
+                    target_layout=dummy_layout,
+                ),
+            )
 
     def test_restickify_metadata_rejects_missing_exact_dependency(self):
-        from torch_spyre._inductor.insert_restickify import _restickify_dep_index
+        from torch_spyre._inductor.insert_restickify import (
+            _restickify_dep_index,
+            RestickifyArgInfo,
+        )
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        dummy_layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [Integer(1)],
+            [Integer(1)],
+            SpyreTensorLayout([1], torch.float16),
+        )
 
         u0 = sympy.Symbol("u0", integer=True)
         deps = [self._dep(32 * u0)]
@@ -6388,11 +6500,12 @@ class TestPointSpliceAdvance(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "no matching"):
             _restickify_dep_index(
                 deps,
-                {
-                    "arg_name": "block_table",
-                    "dep_index": 32 * u0 + 1,
-                    "occurrence": 0,
-                },
+                RestickifyArgInfo(
+                    arg_name="block_table",
+                    dep_index=32 * u0 + 1,
+                    occurrence=0,
+                    target_layout=dummy_layout,
+                ),
             )
 
     def test_point_read_is_not_staged_into_a_read_copy(self):
@@ -7656,7 +7769,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         This pins the invariant a wrong-order/right-count bug would silently
         violate: the returned SymbolKind list must match the MLIR parameter
-        order positionally, which is the same order dxp_standalone stores in
+        order positionally, which is the same order the backend stores in
         inputSym_.
         """
         import regex as re
