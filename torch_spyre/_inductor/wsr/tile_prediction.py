@@ -175,39 +175,6 @@ def _predict_output_layout(
 ) -> FixedTiledLayout | None:
     """The per-tile output ``FixedTiledLayout``, built exactly as
     ``_divide_ranges`` builds it.
-
-    One resize **per tile level**, in ``TileSpec.axes`` order, chaining size,
-    stride and device layout -- mirroring ``_divide_ranges``, which runs once
-    per level and feeds each result to the next (coarse_tile.py:2211-2220).
-    The composition is not associative, so a single full->tile resize is not
-    equivalent: ``_resize_device_layout`` matches size-1 device dims to a size-1
-    host dim by size alone (ir.py:236, no stride tiebreak and no one-to-one
-    constraint), so once an earlier level drives a host dim to extent 1, a
-    later resize can re-match a one-stick tile-count dim onto it and collapse
-    its stride to the ``-1`` singleton sentinel. A single resize never sees
-    that intermediate state and leaves the real stride in place. Measured: 4
-    of 104 multi-level combinations diverge, all of that shape.
-
-    Host strides come from ``compute_tile_stride``, not from
-    ``contiguous_strides(new_size)``: the latter agrees only when the committed
-    layout is contiguous, and silently reorders a transposed or channels-last
-    layout (e.g. size [4, 128, 128] stride [128, 1, 16384] tiled to
-    [4, 64, 128] yields [64, 1, 8192] applied vs [8192, 128, 1] contiguous).
-    ``predict_frame`` feeds these straight to ``_rescale_index`` as the tile
-    strides, so a reordered stride mismatches the applied per-core view.
-
-    ``_stick_host_dim`` is re-resolved per level against the running device
-    layout, as the applier does -- it recovers the *authoritative* stick host
-    dim by coordinate identity, so transposed same-size dims resolve.
-
-    Unlike ``_divide_ranges``, this does not re-check that the layout is a
-    ``FixedTiledLayout`` before reading ``layout.device_layout``:
-    :func:`_output_layout_rejection` has already rejected anything else, and
-    restating the guard here would put a second (silently skipping) authority
-    beside the gate.
-
-    Returns ``None`` if any level's host extent does not divide by its tile
-    count -- a candidate to drop, propagated by :func:`predict_frame`.
     """
     layout = op.layout
     cur_size = [int(s) for s in layout.size]
@@ -235,48 +202,7 @@ def _predict_output_layout(
 
 
 def _predict_iter_space(op: ComputedBuffer, tiling: TileSpec) -> dict | None:
-    """The op's iteration space with each tiled symbol's extent divided down.
-
-    Each axis's loop symbol comes from :func:`try_resolve_tile_axis_loop_vars`,
-    the resolver lowering uses, so this divides exactly the symbols
-    ``tile_spec_to_dim_hints`` would name. Counts on one symbol multiply across
-    levels.
-
-    Behind :func:`_rejection_reason` only: that gate has established that the
-    spec resolves, and the resolver names only the op's own iteration
-    variables. Returns ``None`` if a symbol's extent does not divide by its tile
-    count.
-
-    Keys stay the op's *pre-tiling* symbols; only extents move. That is
-    deliberate. The applied op's symbols do not exist yet, and the caller pairs
-    this dict with the op's committed (untiled) ``MemoryDep`` --
-    ``_prepare_per_core_view`` builds ``dep_coeff`` as
-    ``{sym: dep.index.coeff(sym) for sym in iter_space}``. Renaming the keys to
-    what the tiled op will carry would break that pairing outright.
-
-    The two namespaces are not interchangeable, and they overlap, so a mismatch
-    reads the wrong dim rather than raising. Applying a tiling re-runs
-    ``extract_read_writes -> index_vars_squeeze``, whose ``SqueezeView.squeezer``
-    drops every dim of size 1 and mints ``d0, d1, ...`` from a fresh counter over
-    the survivors; a dim tiled to per-tile extent 1 therefore loses its symbol
-    and everything after it renumbers. Ranges ``[4, 128, 256]`` tiled on dim 1 by
-    128 predicts ``{d0: 4, d1: 1, d2: 256}`` while the applied op carries
-    ``{d0: 4, d1: 256}`` -- ``d1`` in both, meaning different dims. Never match a
-    predicted frame against a post-apply dep by symbol. This is confined to the
-    dep view: ``_divide_ranges`` keeps the unit dim at full rank, so ``ranges``,
-    ``stride`` and ``device_size`` are unaffected.
-
-    The surviving ``sym -> 1`` entry is inert in every consumer -- nothing splits
-    a unit dim, and ``_per_core_view_from_prep`` skips ``split <= 1`` before
-    device placement. Its one order-sensitive site is that function's
-    ``contiguous_dim = len(dim_splits) - 1`` k-fast matmul reorder, which would
-    select the phantom instead of the real trailing dim. That is unreachable
-    rather than handled: it needs a ``Reduction`` (for ``is_matmul``), and both
-    ``TileSpec`` producers reject Reduction unit tiles
-    (``enumerate_tilings._reduction_split_counts`` and
-    ``span_overflow_hint_analysis._split_candidates_for_host_dim``). If either
-    filter is relaxed to admit them, drop the unit entry here instead.
-    """
+    """The op's iteration space with each tiled symbol's extent divided down."""
     loop_vars, _ = try_resolve_tile_axis_loop_vars(op, tiling)
     if loop_vars is None:  # unreachable behind _rejection_reason
         return None
@@ -293,42 +219,8 @@ def _predict_iter_space(op: ComputedBuffer, tiling: TileSpec) -> dict | None:
 
 
 def _output_layout_rejection(op: ComputedBuffer, tiling: TileSpec) -> str | None:
-    """Why ``tiling``'s per-tile output layout is not predictable, else ``None``.
-
-    ``_divide_ranges`` gates its device-layout rebuild on
-    ``isinstance(layout, FixedTiledLayout)`` (coarse_tile.py:2205) and returns
-    quietly without it, having still rewritten ``ranges`` and the host
-    size/stride. :func:`_predict_output_layout` does not mirror that gate -- it
-    reads ``layout.device_layout`` unconditionally -- so without this check a
-    plain ``FixedLayout`` op raises ``AttributeError: 'FixedLayout' object has
-    no attribute 'device_layout'`` out of ``predict_frame``, which reports every
-    other rejection by returning ``None``. A caller would have to wrap candidate
-    pruning in a bare ``except`` to survive it.
-
-    Rejecting is the conservative direction rather than the faithful one: the
-    applier does tile these ops, just without rebuilding the device layout. A
-    frame pairing tiled ranges with the *untiled* device layout is exactly the
-    half-tiled frame the rest of this gate exists to prevent, and
-    ``_prepare_per_core_view`` maps a non-``FixedTiledLayout`` buffer to
-    unrepresentable for *every* candidate, so such a frame could never be priced
-    anyway. Prediction stays strictly less permissive than application, which is
-    the invariant that matters.
-
-    Scoped to a spec carrying an output axis, mirroring the applier: a
-    reduction-only spec never rebuilds the layout on either side, so gating it
-    here would newly reject ops that predict fine today. The cost is that
-    ``PredictedFrame.layout`` is only guaranteed to be a ``FixedTiledLayout``
-    when the spec tiles an output dim; a reduction-only frame passes through
-    whatever the op committed.
-
-    ``_divide_ranges``'s *other* layout guard, ``len(layout.size) ==
-    len(ranges)``, needs no counterpart. A rank mismatch does not survive far
-    enough to reach either the applier or the predictor: ``store_output``
-    indexes the layout with the op's own iteration vars, so
-    ``op.get_read_writes()`` asserts inside ``_fixed_indexer``, and
-    :func:`try_resolve_tile_axis_loop_vars` reaches that through
-    ``op_out_coords`` first. That guard exists for the symbolic-size
-    plain-``FixedLayout`` case, which this function already rejects.
+    """
+    Why ``tiling``'s per-tile output layout is not predictable, else ``None``.
     """
     if all(axis.is_reduction for axis in tiling.axes):
         return None
@@ -344,41 +236,8 @@ def _output_layout_rejection(op: ComputedBuffer, tiling: TileSpec) -> str | None
 
 
 def _rejection_reason(op: ComputedBuffer, tiling: TileSpec) -> str | None:
-    """Why ``tiling`` cannot be predicted onto ``op``, or ``None`` if it can.
-
-    ``predict_frame``'s single gate, and the reason the private predictors it
-    calls resolve each axis unguarded. Axis legality itself is not restated
-    here: :func:`try_resolve_tile_axis_loop_vars` is the shared authority, so
-    this rejects exactly what ``tile_spec_to_dim_hints`` rejects when it lowers
-    the same spec, with the same reason. What is added is the one thing
-    *prediction* reaches and lowering does not: the output layout it rebuilds
-    (:func:`_output_layout_rejection`).
-
-    Nor are the two lists prediction divides by position restated. An output
-    ``host_dim`` the resolver bounds against ``op_out_coords`` is in bounds for
-    ``op.data.ranges`` too -- the two have the same length for any op whose
-    write index exists (see :func:`_output_layout_rejection`) -- and every loop
-    variable it resolves is one of the op's iteration variables, which is all
-    :func:`_predict_iter_space` needs.
-
-    The symmetry with lowering is the point. ``predict_frame`` divides
-    ``ranges``, ``reduction_ranges`` and the output layout for *every* axis
-    unconditionally, so an axis that quietly failed to resolve downstream would
-    not drop out of the prediction -- it would return a frame whose ranges and
-    layout say "tiled" while its ``iter_space`` still says "untiled", priced by
-    the solver as though consistent and only refused much later, at apply time.
-
-    The reduction bound needs no restating either. The resolver refuses an op
-    whose reduction loop variables do not line up one-to-one with
-    ``reduction_ranges``, so a reduction ``host_dim`` that resolves is also the
-    ``reduction_ranges`` position this module divides -- and the position the
-    applier divides.
-
-    Divisibility is deliberately not checked here. It is detected where it is
-    computed instead -- ``_try_exact_div`` at each of the four division sites --
-    so this gate does not have to restate the level-by-level layout walk or
-    assume ``ranges``, ``layout.size`` and the iteration space agree on an
-    extent. All four report the same way this does, by value.
+    """
+    Why ``tiling`` cannot be predicted onto ``op``, or ``None`` if it can.
     """
     if tiling.is_untiled:
         return None
