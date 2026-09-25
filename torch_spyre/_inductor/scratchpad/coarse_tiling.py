@@ -36,14 +36,15 @@ from collections.abc import Mapping, Sequence
 import sympy
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, Operation
+from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
+from ..pass_utils import op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
     coarse_tile_post_stickify,
-    resolve_tile_axis_loop_vars,
+    reduction_loop_vars,
     validate_coarse_tile_groups,
 )
 from .allocator import ScratchpadOptimizationPass
@@ -64,31 +65,60 @@ def tile_spec_to_dim_hints(
     ``hint_id`` for that level. ``hint_ids`` has one entry per axis, outermost
     first, matching the group's ``levels``.
 
-    Axis resolution -- which loop var a ``host_dim`` names in each frame, and
-    every ``Unsupported`` a spec can earn -- belongs to
-    :func:`resolve_tile_axis_loop_vars`, the single authority on applying a
-    ``TileSpec`` to an op, so that any other consumer of a spec agrees with
-    this lowering by construction rather than by keeping a copy in step. The
-    predictor is one such consumer (``wsr.tile_prediction._rejection_reason``),
-    so what the solve prices is exactly what this function can lower. Only the
-    ``hint_ids`` pairing lives here.
+    The output-axis case is exactly ``_dims_to_hints`` (span overflow): resolve
+    the loop var from ``op_out_coords(op)[host_dim]``. The reduction-axis case is
+    the inverse of :func:`reduction_loop_vars` -- ``host_dim`` positionally
+    indexes the op's ordered reduction loop variables.
     """
     if len(hint_ids) != len(spec.axes):
         raise ValueError(
             f"tile_spec_to_dim_hints: {len(hint_ids)} hint_ids for "
             f"{len(spec.axes)} axes on {op.get_name()}"
         )
-    loop_vars = resolve_tile_axis_loop_vars(op, spec)
-    return [
-        DimHint(
-            dim_names=["_coarse_tile"],
-            split_count=axis.count,
-            loop_var=loop_var,
-            is_reduction=axis.is_reduction,
-            hint_id=hint_id,
+    out_coords = op_out_coords(op)
+    red_vars: list[sympy.Symbol] | None = None
+    hints: list[DimHint] = []
+    for axis, hint_id in zip(spec.axes, hint_ids):
+        if axis.is_reduction:
+            if not isinstance(op.data, Reduction):
+                raise Unsupported(
+                    f"coarse tiling: reduction axis host_dim={axis.host_dim} "
+                    f"requested on non-Reduction op {op.get_name()}."
+                )
+            if red_vars is None:
+                red_vars = reduction_loop_vars(op)
+            if axis.host_dim >= len(red_vars):
+                raise Unsupported(
+                    f"coarse tiling: reduction host_dim={axis.host_dim} is out "
+                    f"of bounds for {len(red_vars)} reduction loop variables on "
+                    f"{op.get_name()}."
+                )
+            loop_var = red_vars[axis.host_dim]
+        else:
+            if axis.host_dim >= len(out_coords):
+                raise Unsupported(
+                    f"coarse tiling: host_dim={axis.host_dim} is out of bounds "
+                    f"for {len(out_coords)} output coordinates on {op.get_name()}."
+                )
+            coord = out_coords[axis.host_dim]
+            free_symbols = coord.free_symbols
+            if len(free_symbols) != 1:
+                raise Unsupported(
+                    f"coarse tiling: host_dim={axis.host_dim} output coordinate "
+                    f"{coord} on {op.get_name()} has {len(free_symbols)} free "
+                    "symbols; expected exactly one loop var."
+                )
+            loop_var = next(iter(free_symbols))
+        hints.append(
+            DimHint(
+                dim_names=["_coarse_tile"],
+                split_count=axis.count,
+                loop_var=loop_var,
+                is_reduction=axis.is_reduction,
+                hint_id=hint_id,
+            )
         )
-        for axis, loop_var, hint_id in zip(spec.axes, loop_vars, hint_ids)
-    ]
+    return hints
 
 
 @dataclasses.dataclass(frozen=True)
