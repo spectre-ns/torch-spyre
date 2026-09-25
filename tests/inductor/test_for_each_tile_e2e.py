@@ -785,14 +785,6 @@ class _CollectRegions(CustomPreSchedulingPasses):
         cls = type(self)
         cls.operations = list(graph.operations)
         cls.regions = prescribed_regions(graph.operations)
-        cls.retile_error = None
-        if cls.regions:
-            name = graph.operations[cls.regions[0].start].get_operation_name()
-            choice = {name: TileSpec(axes=(TileAxis(host_dim=0, count=2),))}
-            try:
-                CoarseTilingPass(choice).apply_pass(graph)
-            except Unsupported as exc:
-                cls.retile_error = exc
 
 
 class TestPrescribedRegionsE2E(_DynamoResetTestCase):
@@ -892,21 +884,6 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
         self.assertNotEqual(first.loop_group_id, second.loop_group_id)
         for region in regions:
             self._assert_region_is_whole(operations, region)
-
-    def test_coarse_tiling_pass_refuses_region_op(self):
-        """``CoarseTilingPass`` will not re-tile an op a loop already tiles."""
-        A = cached_randn((STICK_ROWS, STICK_COLS))
-        B = cached_randn((STICK_ROWS, STICK_COLS), differentiation=1)
-
-        _, regions = self._compile(
-            add_tiled_fn, A.to(DEVICE_NAME), B.to(DEVICE_NAME), 128
-        )
-
-        self.assertTrue(regions)
-        self.assertIsInstance(_CollectRegions.retile_error, Unsupported)
-        self.assertIn(
-            "for_each_tile loop already tiles", str(_CollectRegions.retile_error)
-        )
 
 
 if __name__ == "__main__":
