@@ -1635,13 +1635,9 @@ class TestDepthwiseConvWindowBlocked(unittest.TestCase):
                 "reduction_window_blocked_vars",
                 force_kh_split,
             ),
-            patch.object(
-                    passes, "finalize_work_division_for_scheduler", finalize
-                )
+            patch.object(passes, "finalize_work_division_for_scheduler", finalize),
         ):
-            with self.assertLogs(
-                "spyre.inductor.pass_utils", "WARNING"
-            ) as logs:
+            with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
                 out = torch.compile(self._conv)(x_dev, w_dev).cpu()
         ref = self._conv(x, w)
         kh = forced["kh"]
