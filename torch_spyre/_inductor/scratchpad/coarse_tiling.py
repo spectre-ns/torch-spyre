@@ -40,7 +40,7 @@ from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import op_out_coords
+from ..pass_utils import iteration_space_from_op, op_out_coords
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
     coarse_tile_post_stickify,
