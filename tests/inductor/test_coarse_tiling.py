@@ -2249,7 +2249,6 @@ class TestCoarseTile(unittest.TestCase):
             self.assertIn("would overwrite the existing loop_info", str(ctx.exception))
             self.assertIs(tiled_op.loop_info, before)
 
-
     def test_post_stickify_skips_pass_1(self):
         """coarse_tile_post_stickify must skip both planning and execution
         of Pass 1 -- a full-buffer boundary read stays a direct read of the
