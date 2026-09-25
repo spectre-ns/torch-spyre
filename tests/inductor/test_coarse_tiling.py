@@ -2234,6 +2234,25 @@ class TestCoarseTile(unittest.TestCase):
                 _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
             )
 
+    def test_post_stickify_skips_pass_1_unsupported_overwrite(self):
+        """coarse_tile_post_stickify must skip both planning and execution
+        of Pass 1 -- a full-buffer boundary read stays a direct read of the
+        full buffer, not redirected to a copy."""
+        from torch._inductor.ir import ComputedBuffer
+
+        gm = fx.symbolic_trace(lambda: None)
+        graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        graph_ctx.__enter__()
+        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+        self.assertEqual(len(full_deps), 1)
+
+        groups = [([tiled_op], [(0, Integer(8))])]
+        with self.assertRaises(Unsupported) as ctx:
+            coarse_tile_post_stickify(_graph(operations), groups)
+        self.assertIn("would overwrite the existing loop_info", str(ctx.exception))
+        self.assertIs(tiled_op.loop_info, before)
+
+
     def test_post_stickify_skips_pass_1(self):
         """coarse_tile_post_stickify must skip both planning and execution
         of Pass 1 -- a full-buffer boundary read stays a direct read of the
