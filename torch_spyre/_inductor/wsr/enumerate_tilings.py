@@ -84,6 +84,8 @@ from .span_overflow_hint_analysis import (
     _within_stick_host_dim,
 )
 
+logger = get_inductor_logger("wsr.enumerate_tilings")
+
 # Default caps for the enumerator. Split counts stay bounded by
 # ``_MAX_AUTO_TILE_SPLIT_COUNT`` (imported, NOT migrated to config.py);
 # these two bound the *shape* of the option set, not individual splits.
