@@ -979,6 +979,14 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     # others never see a copy and their objective carries no relayout term.
     decides_lx_relayouts: bool = False
 
+    @classmethod
+    def replans_after_tiling(cls) -> bool:
+        """Whether the allocator should apply the coarse tilings this engine's
+        solve chose and then solve again over the tiled graph
+        (``CoOptimizingAllocator._materialize_selection``). Otherwise its first
+        placement stands, and any tiling it chose is its own to apply."""
+        return False
+
     @abstractmethod
     def plan_layout_and_core_divisions(
         self, cost_expr: sympy.Expr | None = None

@@ -115,6 +115,24 @@ def _reduction_op(out_shape, reduction_ranges, name="buf0", reduction_type="sum"
     return op
 
 
+def _reader(ranges):
+    """A ComputedBuffer reading the tiled op's output, over ``ranges``."""
+    reader = MagicMock(spec=ComputedBuffer)
+    reader.data = SimpleNamespace(ranges=list(ranges))
+    return reader
+
+
+def _counts(options, host_dim):
+    """The single-level counts ``options`` offers for output ``host_dim``."""
+    return [
+        spec.axes[0].count
+        for spec in options
+        if spec.depth == 1
+        and not spec.axes[0].is_reduction
+        and spec.axes[0].host_dim == host_dim
+    ]
+
+
 def _exact_divisor_splits(n, max_split=_MAX_AUTO_TILE_SPLIT_COUNT):
     """Independent reference: exact divisors of ``n`` in ``(1, max_split]``."""
     return sorted(k for k in range(2, min(n, max_split) + 1) if n % k == 0)
@@ -243,6 +261,63 @@ class TestNoBadReductionOptions(unittest.TestCase):
                     self.assertLessEqual(len(red_axes), 1, spec.label)
                     # Never an output axis and a reduction axis together.
                     self.assertFalse(red_axes and out_axes, spec.label)
+
+
+class TestApplyRefusals(unittest.TestCase):
+    """Counts the coarse-tile apply would refuse are not offered."""
+
+    def test_a_folded_device_dim_admits_no_count(self):
+        # The attention output [1, 64, hq, 128] lays heads and head_dim's outer
+        # stick out as one device dim, which ``_resize_device_layout`` cannot
+        # resize for any tile.
+        op = _pointwise_op((1, 64, 40, 128))
+        self.assertNotEqual(enumerate_tile_options(op), [TileSpec()])  # non-vacuity
+        dl = op.layout.device_layout
+        op.layout.device_layout = SpyreTensorLayout(
+            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+        )
+        self.assertEqual(enumerate_tile_options(op), [TileSpec()])
+
+    def test_a_unit_tile_beside_another_unit_dim_is_refused(self):
+        # The tile [1, 1, 2048] has two unit host dims, so growing a copy-out's
+        # full buffer back from it cannot tell which device dim grows.
+        self.assertEqual(
+            _counts(enumerate_tile_options(_pointwise_op((1, 64, 2048))), 1),
+            [2, 4, 8, 16, 32],
+        )
+        self.assertIn(
+            64, _counts(enumerate_tile_options(_pointwise_op((8, 64, 128))), 1)
+        )
+
+    _SHAPE = (2, 8, 5, 64, 128)
+
+    def test_a_reshaping_reader_drops_only_the_unit_tile(self):
+        untouched = enumerate_tile_options(_pointwise_op(self._SHAPE))
+        self.assertIn(64, _counts(untouched, 3))  # non-vacuity
+        options = enumerate_tile_options(
+            _pointwise_op(self._SHAPE), readers=[_reader((2, 8, 5, 64, 64))]
+        )
+        for dim in (0, 1, 2, 3):
+            self.assertEqual(
+                _counts(options, dim),
+                [c for c in _counts(untouched, dim) if c != self._SHAPE[dim]],
+            )
+
+    def test_a_rank_changing_reader_drops_the_unit_tile(self):
+        options = enumerate_tile_options(
+            _pointwise_op(self._SHAPE), readers=[_reader((2, 40, 64, 128))]
+        )
+        self.assertNotIn(64, _counts(options, 3))
+        self.assertIn(32, _counts(options, 3))
+
+    def test_a_same_shape_or_non_computed_reader_keeps_the_unit_tile(self):
+        extern = SimpleNamespace(data=SimpleNamespace(ranges=[2, 40, 64, 128]))
+        for readers in ([], [_reader(self._SHAPE)], [extern]):
+            options = enumerate_tile_options(
+                _pointwise_op(self._SHAPE), readers=readers
+            )
+            self.assertIn(64, _counts(options, 3))
+            self.assertEqual(_counts(options, 2), [5])
 
 
 if __name__ == "__main__":

@@ -728,6 +728,23 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
 
         self.assertEqual(options, [TileSpec()])
 
+    def test_reshaping_reader_drops_the_unit_tile(self):
+        # d3:64 leaves a 1-extent tile, which CoarseTilingPass cannot retile
+        # for a reader that views the output through another rank.
+        op = _pointwise_op((2, 8, 5, 64, 128))
+        reader = MagicMock(spec=ComputedBuffer)
+        reader.data = SimpleNamespace(ranges=[2, 40, 64, 128])
+        unit_tile = TileSpec((TileAxis(host_dim=3, count=64),))
+
+        self.assertIn(unit_tile, self._candidates(op))
+        with patch.object(
+            CoOptimizingAllocator,
+            "_readers_by_name",
+            {op.get_name(): [reader]},
+            create=True,
+        ):
+            self.assertNotIn(unit_tile, self._candidates(op))
+
     def test_matmul_offered_output_tiling(self):
         # A matmul is no longer excluded by an op-kind guard: under discovery it
         # is offered its row/M-axis (host_dim 0, non-reduction) output tilings,
@@ -908,6 +925,29 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self.assertEqual(len(nests), 1, _describe(tiling))
         self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
 
+    @unittest.expectedFailure
+    def test_apply_grows_back_a_unit_tile_beside_a_unit_dim(self):
+        # d1:64 leaves the producer's tile (1, 1, 2048), and its copy-out's full
+        # buffer is grown back from that tile's device layout. Beside the unit
+        # dim 0 the grow-back cannot tell the two unit dims apart and returns
+        # [1, 32, 1, 64] for [64, 32, 1, 64], so the untiled consumer reads a
+        # buffer 1/64 the size it expects. The enumerator no longer offers this
+        # tiling; forcing it shows the apply itself still accepts it.
+        x = torch.randn(1, 64, 2048, dtype=torch.float16)
+        y = torch.randn(1, 64, 2048, dtype=torch.float16)
+        unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
+
+        def chosen(alloc, graph, allocation):
+            return {
+                op.get_operation_name(): unit_tile
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer) and _reads_graph_inputs_only(op)
+            }
+
+        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+            cpu, device, _ = self._compile(lambda x, y: (x + y) * 2, (x, y))
+        self._assert_close(device, cpu)
+
     def test_permuted_consumer_shares_the_nest_on_the_matching_dim(self):
         # d1:4 is the consumer tiling that walks the producer's dim 0, so the
         # two share one four-trip nest although their specs differ.
@@ -936,3 +976,63 @@ class TileOwnershipGroupingTests(unittest.TestCase):
 
         cpu, device, _ = self._compile(fn, (a, b, d))
         self._assert_close(device, cpu)
+
+
+class ReplanAfterTilingGateTests(unittest.TestCase):
+    """``_materialize_selection`` applies chosen tilings and solves again only
+    for an engine whose ``replans_after_tiling()`` is true; any other engine's
+    first placement stands, whatever tilings its allocation carries."""
+
+    _CHOICES = {"buf0": _D0_BY_4}
+
+    def _materialize(self, layout_solver, **patches):
+        with ts_inductor_config.patch(
+            co_optimizing_lx_planning=True, layout_solver=layout_solver
+        ):
+            alloc = select_allocator()
+            solver = alloc._build_solver([])
+            allocation = [MagicMock()]
+            graph = SimpleNamespace(operations=[])
+            with contextlib.ExitStack() as stack:
+                chosen = stack.enter_context(
+                    patch.object(
+                        CoOptimizingAllocator,
+                        "_chosen_tilings",
+                        return_value=self._CHOICES,
+                    )
+                )
+                apply = stack.enter_context(
+                    patch(
+                        "torch_spyre._inductor.scratchpad.coarse_tiling."
+                        "CoarseTilingPass"
+                    )
+                )
+                for name, value in patches.items():
+                    stack.enter_context(
+                        patch.object(CoOptimizingAllocator, name, return_value=value)
+                    )
+                result = alloc._materialize_selection(graph, solver, allocation)
+            return solver, allocation, result, chosen, apply
+
+    def test_annealer_placement_stands(self):
+        solver, allocation, result, chosen, apply = self._materialize(
+            "simulated_annealing"
+        )
+        self.assertFalse(solver.replans_after_tiling())
+        self.assertIs(result[0], solver)
+        self.assertIs(result[1], allocation)
+        chosen.assert_not_called()
+        apply.assert_not_called()
+
+    @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+    def test_cpsat_applies_and_solves_again(self):
+        second_solver, second_allocation = MagicMock(), [MagicMock()]
+        _, _, result, _, apply = self._materialize(
+            "cpsat",
+            _prepare_buffers=[],
+            _build_solver=second_solver,
+            _solve=second_allocation,
+        )
+        apply.assert_called_once_with(self._CHOICES)
+        self.assertIs(result[0], second_solver)
+        self.assertIs(result[1], second_allocation)

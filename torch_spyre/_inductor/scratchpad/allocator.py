@@ -2909,7 +2909,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         spill reasons off the solver that produced the allocation it commits, so
         returning one without the other would report the first solve's reasons
         against the second solve's plan.
+
+        Only for an engine that asks for it (``replans_after_tiling()``): for any
+        other, the first placement stands and the pair is returned unchanged.
         """
+        assert isinstance(solver, CoreDivisionLayoutSolver)
+        if not solver.replans_after_tiling():
+            return solver, allocation
         choices = self._chosen_tilings(graph, allocation)
         if logger.isEnabledFor(logging.DEBUG):
             for name, spec in choices.items():
@@ -2992,8 +2998,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         max_cores = config.sencores
         profiles, matmul_roles = _find_distinct_matmul_splits(graph.operations)
         # Tilings are offered per op (``_tiling_candidates``), but whether an op
-        # sits inside a for_each_tile region is a graph-level fact.
+        # sits inside a for_each_tile region, and who reads its output, are
+        # graph-level facts.
         self._prescribed_ops: frozenset[str] = frozenset()
+        self._readers_by_name: dict[str, list[Operation]] = {}
         if _solver_picks_tilings():
             from torch_spyre._inductor.scratchpad.coarse_tiling import (
                 prescribed_regions,
@@ -3004,6 +3012,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 for region in prescribed_regions(graph.operations)
                 for name in region.names
             )
+            for reader in graph.operations:
+                for name in {dep.name for dep in reader.get_read_writes().reads}:
+                    self._readers_by_name.setdefault(name, []).append(reader)
 
         # Ops pinned to their committed (work-division) division: each guard
         # detects a distinct wrong-code or scheduling hazard the joint solver
@@ -3223,7 +3234,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         try:
             # enumerate_tile_options returns untiled first; the is_clean filter
             # keeps it and the output-only specs, preserving that order.
-            options = [t for t in enumerate_tile_options(op) if t.is_clean]
+            readers = getattr(self, "_readers_by_name", {}).get(op.get_name(), ())
+            options = [
+                t for t in enumerate_tile_options(op, readers=readers) if t.is_clean
+            ]
         except Unsupported:
             options = list(untiled)
 

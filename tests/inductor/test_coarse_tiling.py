@@ -9884,6 +9884,22 @@ class TestValidateTiling(unittest.TestCase):
         )
         self.assertIsNone(predict_frame(op, TileSpec((TileAxis(0, 4),))))
 
+    def test_unresizable_device_layout_rejected(self):
+        """A device dim folding two host dims -- the attention output
+        ``[1, 64, hq, 128]`` lays heads and head_dim's outer stick out as one --
+        cannot be resized to any tile. ``_resize_device_layout`` raises on it,
+        which used to escape ``predict_frame``."""
+        from torch_spyre._C import SpyreTensorLayout
+
+        op = _ftl_pointwise((1, 64, 40, 128), name="val_folded")
+        spec = TileSpec((TileAxis(1, 2),))
+        self.assertIsNotNone(predict_frame(op, spec))  # non-vacuity
+        dl = op.layout.device_layout
+        op.layout.device_layout = SpyreTensorLayout(
+            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+        )
+        self.assertIsNone(predict_frame(op, spec))
+
     def test_indivisible_extent_returns_none(self):
         """Coarse tiling emits equal-sized tiles, so an extent that is not a
         multiple of its count has no per-tile frame.
