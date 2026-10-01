@@ -1706,8 +1706,8 @@ def _split_candidates_for_host_dim(
             # can under-count the dimensions fixed-arity reduction templates
             # expect and crash native codegen (DtException: "Not enough
             # dimensions") rather than fail cleanly at the Python level.
-            # Pointwise unit tiles remain legal unless the layout check below
-            # refuses them.
+            # Pointwise unit tiles remain legal; there is existing coverage for
+            # full-size exact divisors on Pointwise ops.
             (not isinstance(op.data, Reduction) or full_size // split > 1)
             and split <= _MAX_AUTO_TILE_SPLIT_COUNT
             and _post_tile_stick_alignment_error(op.layout, host_dim, split) is None

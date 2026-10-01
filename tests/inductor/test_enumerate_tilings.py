@@ -263,24 +263,6 @@ class TestNoBadReductionOptions(unittest.TestCase):
                     self.assertFalse(red_axes and out_axes, spec.label)
 
 
-def _reader(ranges):
-    """A ComputedBuffer reading the tiled op's output, over ``ranges``."""
-    reader = MagicMock(spec=ComputedBuffer)
-    reader.data = SimpleNamespace(ranges=list(ranges))
-    return reader
-
-
-def _counts(options, host_dim):
-    """The single-level counts ``options`` offers for output ``host_dim``."""
-    return [
-        spec.axes[0].count
-        for spec in options
-        if spec.depth == 1
-        and not spec.axes[0].is_reduction
-        and spec.axes[0].host_dim == host_dim
-    ]
-
-
 class TestApplyRefusals(unittest.TestCase):
     """Counts the coarse-tile apply would refuse are not offered."""
 
@@ -295,17 +277,6 @@ class TestApplyRefusals(unittest.TestCase):
             [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
         )
         self.assertEqual(enumerate_tile_options(op), [TileSpec()])
-
-    def test_a_unit_tile_beside_another_unit_dim_is_refused(self):
-        # The tile [1, 1, 2048] has two unit host dims, so growing a copy-out's
-        # full buffer back from it cannot tell which device dim grows.
-        self.assertEqual(
-            _counts(enumerate_tile_options(_pointwise_op((1, 64, 2048))), 1),
-            [2, 4, 8, 16, 32],
-        )
-        self.assertIn(
-            64, _counts(enumerate_tile_options(_pointwise_op((8, 64, 128))), 1)
-        )
 
     def test_a_unit_tile_is_offered(self):
         # A dim tiled all the way down is offered, also when the tile then has

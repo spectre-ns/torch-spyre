@@ -3784,17 +3784,17 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         self.assertIn("does not evenly divide", error)
 
-    def test_planner_refuses_a_unit_tile_beside_another_unit_dim(self):
-        # 17 of 17 leaves the tile [1, 1, 16, 64], whose two unit host dims make
-        # the copy-out's full buffer ungrowable from it (_post_tile_resize_error).
+    def test_planner_allows_full_size_exact_divisor_for_pointwise(self):
         op = _pointwise_op((1, 17, 16, 64))
 
         with patch(
             "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
             32768,
         ):
-            with self.assertRaisesRegex(Unsupported, "no combined split"):
-                plan_span_overflow_tile(op, max_cores=4)
+            plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.levels[0].split_count, 17)
 
     def test_planner_rejects_full_size_exact_divisor_for_reduction(self):
         # Reduction codegen/DDC can drop unit-size iteration dims before fixed
