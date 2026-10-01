@@ -19,20 +19,49 @@ import json
 import uuid
 from dataclasses import dataclass
 
-import regex as re
-
 from .junit import RunCoordinates
 
 ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "clickhouse-v2.spyre.ibm.com")
 
 ID_SEP = "|"
 
-_SHA256 = re.compile(r"[0-9a-f]{64}")
-_HEX12 = re.compile(r"[0-9a-f]{12}")
+
+# Stdlib only: derive_artifact_id.py imports this module on the runner's bare python3.
+def _is_hex(s: str, n: int) -> bool:
+    return len(s) == n and all(c in "0123456789abcdef" for c in s)
+
+
+def _strip_dev_suffix(name: str) -> str:
+    for suffix in ("-devel", "-dev"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
 
 # The component stamped on rows when the caller names none. A DEFAULT, not a constant: a
 # test cell may run another component's suite, and component is a hash input.
 COMPONENT_DEFAULT = "torch-spyre"
+
+# Tag namespaces that say where/when a test ran (arch, test type, cadence), not what it is.
+# Never hashed, so one test keeps one id across arches and test types; stored per run. A
+# deny-list: an unclassified namespace can only leave an id split, never merge two tests.
+RUN_CONTEXT_TAG_NAMESPACES = frozenset({"platform", "testtype", "cadence"})
+
+# Tag namespaces that carry a measured value (`refcoverage__48/48`): not membership at all, so
+# neither hashed nor tagged -- stored as props['result.<ns>'].
+RESULT_TAG_NAMESPACES = frozenset({"refcoverage"})
+
+# Bare tags older emitters wrote, mapped to their namespaced form; migrations/006 applies the
+# same map to history.
+LEGACY_TAG_ALIASES = {
+    "nightly": "cadence__nightly",
+    "weekly": "cadence__weekly",
+    "fvt": "testtype__fvt",
+    "svt": "testtype__svt",
+    "spyre-inference": "domain__spyre-inference",
+    "spyre-backend": "domain__spyre-backend",
+    "torch-spyre": "domain__torch-spyre",
+}
 
 # Full-metadata identity record, one per component layer (each Containerfile overwrites its
 # own). Preferred read path.
@@ -69,6 +98,30 @@ class DerivedId:
     def complete(cls, *values) -> bool:
         """True when every required field is non-blank; a blank one refuses the id."""
         return all(cls.norm(v) for v in values)
+
+    @staticmethod
+    def canon_tag(tag) -> str:
+        """A legacy bare tag in its namespaced form (lowercase); any other tag unchanged."""
+        return LEGACY_TAG_ALIASES.get(DerivedId.norm(tag), tag)
+
+    @staticmethod
+    def namespace(tag) -> str:
+        return DerivedId.norm(DerivedId.canon_tag(tag)).split("__", 1)[0]
+
+    @classmethod
+    def split_tags(cls, tags) -> tuple:
+        """(identity tags, run-context tags, result props) -- what a test is, where it ran,
+        and values it measured."""
+        ident, ctx, results = set(), set(), {}
+        for t in (cls.canon_tag(x) for x in (tags or []) if cls.norm(x)):
+            ns = cls.namespace(t)
+            if ns in RESULT_TAG_NAMESPACES:
+                results[f"result.{ns}"] = t.split("__", 1)[1] if "__" in t else ""
+            elif ns in RUN_CONTEXT_TAG_NAMESPACES:
+                ctx.add(t)
+            else:
+                ident.add(t)
+        return sorted(ident), sorted(ctx), results
 
     @classmethod
     def tag_part(cls, tags) -> str:
@@ -113,14 +166,20 @@ class CaseId(DerivedId):
     """Content identity of a test, so the same test reconciles across runs."""
 
     @classmethod
+    def tag_part(cls, tags) -> str:
+        """Only the identity tags: run-context and result tags never reach the hash."""
+        return super().tag_part(cls.split_tags(tags)[0])
+
+    @classmethod
     def derive(cls, component: str, classname: str, name: str, tags) -> str:
         """The test's uuid, or '' with no component/name; classname may be blank."""
         if not cls.complete(component, name):
             return ""
+        # name keeps its case: sibling tests can differ only by case (upstream test_T / test_t).
         return cls.hash(
             cls.norm(component),
             cls.norm(classname),
-            cls.norm(name),
+            str(name).strip(),
             cls.tag_part(tags),
         )
 
@@ -258,15 +317,15 @@ class ArtifactIdentity:
         inputs into id12 and uses its config name) is matched by passing those three fields.
         """
         repo, _, digest = (ref or "").strip().partition("@")
-        if not _SHA256.fullmatch(
-            digest.removeprefix("sha256:")
-        ) or not digest.startswith("sha256:"):
+        if not _is_hex(digest.removeprefix("sha256:"), 64) or not digest.startswith(
+            "sha256:"
+        ):
             raise ValueError(f"image ref needs an @sha256:<64 hex> digest: {ref!r}")
-        if id12 and not _HEX12.fullmatch(id12):
+        if id12 and not _is_hex(id12, 12):
             raise ValueError(f"id12 must be 12 hex characters: {id12!r}")
         repo_name = repo.rsplit("/", 1)[-1].split(":", 1)[0]
         return cls(
-            component=component or re.sub(r"-(devel|dev)$", "", repo_name),
+            component=component or _strip_dev_suffix(repo_name),
             artifact_name=name or repo_name,
             id12=id12 or digest[7:19],
             arch=DerivedId.arch(arch),
@@ -281,7 +340,7 @@ class ArtifactIdentity:
     ) -> "ArtifactIdentity":
         """A downloadable file or folder; id12 is its content sha256, never its address."""
         digest = DerivedId.norm(sha256).removeprefix("sha256:")
-        if not url or not _SHA256.fullmatch(digest):
+        if not url or not _is_hex(digest, 64):
             raise ValueError(
                 f"generic artifact needs <url>#<64-hex sha256>: {url!r}#{sha256!r}"
             )
@@ -413,6 +472,7 @@ run_id_of = RunId.derive
 run_id_for = RunId.for_args
 case_id_for = CaseId.derive
 tags_for_case = CaseId.tags_for
+split_case_tags = CaseId.split_tags
 artifact_id_for = ArtifactId.derive
 base_artifact_id = ArtifactId.from_image
 gha_artifact_id = GhaArtifactId.derive

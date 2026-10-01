@@ -44,7 +44,9 @@ from spyre_clickhouse_ingest import (
     insert_gha_artifact_result,
     insert_test_results,
     promote_xpass,
+    capability_declaration,
     cases_already_ingested,
+    drop_older_case_attempts,
     benchmarks_already_ingested,
     component_of,
     target_database,
@@ -919,14 +921,20 @@ def parse_test_xml(xml_path: Path):
     except ValueError:
         triggered_at = datetime.now(UTC)
 
-    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins.
-    by_key = {}
+    # One row per exact (classname, name); a repeat is a re-run, so the last attempt wins
+    # and the earlier attempts are kept only as its result.reruns count.
+    by_key: dict = {}
+    seen: Counter = Counter()
     for tc in suite.findall(".//testcase"):
-        by_key[(tc.get("classname", ""), tc.get("name", ""))] = tc
+        key = (tc.get("classname", ""), tc.get("name", ""))
+        by_key[key] = tc
+        seen[key] += 1
     raw_cases = []
-    for tc in by_key.values():
+    for key, tc in by_key.items():
         status, fail_msg = classify_testcase(tc)
         properties = extract_properties(tc)
+        if seen[key] > 1:
+            properties = [*properties, ("result.reruns", str(seen[key] - 1))]
         op_name, dtype, platform = extract_op_dtype_platform(
             tc.get("name", ""), properties
         )
@@ -1184,22 +1192,26 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
             continue
         # Only the cases carrying this tier's tag: the covering run may have executed a
         # wider set, and importing all of it would credit this tier with foreign cases.
-        cases = schema_model.TEST_CASES.qualified(db)
         client.command(
             f"INSERT INTO {runs} "
-            "(run_id, test_case_id, component, status, duration_s, fail_message, props) "
+            "(run_id, test_case_id, component, status, duration_s, fail_message, props, tags, "
+            "measurements) "
             "SELECT {run_id:UUID}, cr.test_case_id, cr.component, cr.status, cr.duration_s, "
             # mapContains rather than a bare lookup: an older row predating ran_in has no
             # such key, and defaulting it to the SOURCE run keeps that row honest instead of
             # silently claiming this run executed it.
             "       cr.fail_message, "
             "       mapUpdate(cr.props, map('ran_in', "
-            "           if(mapContains(cr.props,'ran_in'), cr.props['ran_in'], toString(cr.run_id)))) "
+            "           if(mapContains(cr.props,'ran_in'), cr.props['ran_in'], toString(cr.run_id)))), "
+            "       cr.tags, cr.measurements "
             f"FROM {runs} AS cr "
-            f"INNER JOIN {cases} AS c ON c.test_case_id = cr.test_case_id "
-            "     AND c.component = cr.component "
             "WHERE cr.run_id = {src:UUID} AND cr.component = {component:String} "
-            "  AND has(c.tags, concat('testtype__', {tier:String}))",
+            "  AND has(cr.tags, concat('testtype__', {tier:String})) "
+            # Only a case this run executed itself replaces the copy; a local skip does not.
+            f"  AND cr.test_case_id NOT IN (SELECT test_case_id FROM {runs} "
+            "      WHERE run_id = {run_id:UUID} AND component = {component:String} "
+            "        AND status != 'skipped' "
+            "        AND props['ran_in'] IN ('', toString({run_id:UUID})))",
             parameters={
                 "run_id": run_id,
                 "src": src_run,
@@ -1247,6 +1259,23 @@ def _perf_leg(legs: dict, args, run_id: str, measured: int) -> None:
             (run_id, "perf"), {"failed": 0, "total": 0, "duration_s": 0.0}
         )
         acc["total"] += measured
+
+
+def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
+    """A leg per `capability.test_type` the cases declare, beside the run's functional one.
+
+    The verdicts themselves land in capability_runs; this is what ties them to the artifact.
+    """
+    for case in cases:
+        decl, _ = capability_declaration(case)
+        if not decl or case.get("status") == "skipped":
+            continue
+        acc = legs.setdefault(
+            (run_id, decl["test_type"]), {"failed": 0, "total": 0, "duration_s": 0.0}
+        )
+        acc["total"] += 1
+        acc["failed"] += case.get("status") in ("failed", "error")
+        acc["duration_s"] += float(case.get("duration_s", 0) or 0)
 
 
 def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
@@ -1351,6 +1380,7 @@ def _write_gha_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
             git_ref=args.branch,
             git_sha=args.sha,
             run_url=_opt(args, "run_url") or _gha_run_url(args),
+            attempt=getattr(args, "run_attempt", 0),
         )
         if wrote:
             print(
@@ -1385,6 +1415,14 @@ def main():
         "the test_case_id they hash into) name the suite's real owner.",
     )
     parser.add_argument("--gha-run-id", default="")
+    parser.add_argument(
+        "--run-attempt",
+        type=int,
+        default=0,
+        help="GitHub run attempt the XMLs came from. A re-run reuses the run_id and file "
+        "names, so given, a newer attempt's cases replace an older attempt's in v2 instead "
+        "of being refused as already ingested. 0 (default) keeps first-write-wins.",
+    )
     parser.add_argument(
         "--artifact-id",
         default="",
@@ -1717,6 +1755,7 @@ def main():
             runner_run_id = _runner_run_id(args, run_id)
             # v1-table reads, so gated on v1 being written. v2 dedups on its own table via
             # cases_already_ingested(run_id, component).
+            v1_seen = False
             if args.write_v1:
                 existing = client.query(
                     "SELECT count() FROM test_runs "
@@ -1738,9 +1777,13 @@ def main():
                             "filename": run["filename"],
                         },
                     )
-                if existing.result_rows[0][0] > 0:
+                v1_seen = existing.result_rows[0][0] > 0
+                if v1_seen:
                     print(f"  Already ingested — skipping {run['filename']}")
-                    continue
+                    # v1 stays first-write-wins; a re-run attempt still reaches v2, whose
+                    # attempt-aware dedup lets the newer results replace the older.
+                    if not args.run_attempt:
+                        continue
             # `errors` is printed separately from `failed` even though it is a SUBSET of
             # it: a run whose outcomes are pytest errors could not start (bad import,
             # unloadable model), which is a different triage path from N regressions.
@@ -1752,7 +1795,7 @@ def main():
                 + f"  xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
             )
 
-            if args.write_v1:
+            if args.write_v1 and not v1_seen:
                 insert_run(client, run_id, run, args)
 
                 # The (run_id, filename) dedup above already covers this file; a run_id-only recheck here would skip a second file sharing the same run_id.
@@ -1785,9 +1828,20 @@ def main():
                         _v2_run_id,
                         component_of(args, COMPONENT_DEFAULT),
                         xml_path.name,
+                        attempt=args.run_attempt,
                     ):
                         print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                     else:
+                        # Before the insert, so a failed delete aborts this file (caught
+                        # below) rather than leaving two attempts' rows under one run_id.
+                        drop_older_case_attempts(
+                            client,
+                            v2db,
+                            _v2_run_id,
+                            component_of(args, COMPONENT_DEFAULT),
+                            xml_path.name,
+                            args.run_attempt,
+                        )
                         _n = insert_test_results(
                             client,
                             v2db,
@@ -1795,6 +1849,7 @@ def main():
                             _v2_run_id,
                             cases,
                             xml_path.name,
+                            attempt=args.run_attempt,
                         )
                         print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
 
@@ -1808,6 +1863,7 @@ def main():
                         _acc["failed"] += int(run.get("failed", 0) or 0)
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
+                        _capability_legs(artifact_legs, _v2_run_id, cases)
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
                 print(
@@ -1816,7 +1872,7 @@ def main():
                 )
 
             total_cases += len(cases)
-            if args.write_v1:
+            if args.write_v1 and not v1_seen:
                 print(
                     f"  Inserted {len(cases)} test cases + "
                     f"{sum(len(c['properties']) for c in cases)} properties"
