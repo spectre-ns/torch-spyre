@@ -192,7 +192,9 @@ def _predict_output_layout(
     op: ComputedBuffer, tiling: TileSpec
 ) -> FixedTiledLayout | None:
     """The per-tile output ``FixedTiledLayout``, built exactly as
-    ``_divide_ranges`` builds it.
+    ``_divide_ranges`` builds it, or ``None`` where that would fail: an extent
+    that does not divide, or a device layout ``_resize_device_layout`` cannot
+    resize (e.g. one device dim folding two host dims).
     """
     layout = op.layout
     cur_size = [int(s) for s in layout.size]
@@ -203,18 +205,27 @@ def _predict_output_layout(
             continue
         extent = _try_exact_div(cur_size[axis.host_dim], axis.count)
         if extent is None:
+            logger.debug(
+                "dropping tiling %s on %s: output size does not divide evenly",
+                tiling,
+                op.get_name(),
+            )
             return None
         new_size = list(cur_size)
         new_size[axis.host_dim] = int(extent)
         cur_stride = [
             int(s) for s in compute_tile_stride(cur_size, cur_stride, new_size)
         ]
-        cur_dev = _resize_device_layout(
-            cur_dev,
-            cur_size,
-            new_size,
-            stick_host_dim=_stick_host_dim(op, cur_dev),
-        )
+        try:
+            cur_dev = _resize_device_layout(
+                cur_dev,
+                cur_size,
+                new_size,
+                stick_host_dim=_stick_host_dim(op, cur_dev),
+            )
+        except RuntimeError as exc:
+            logger.debug("dropping tiling %s on %s: %s", tiling, op.get_name(), exc)
+            return None
         cur_size = new_size
     return FixedTiledLayout(layout.device, layout.dtype, cur_size, cur_stride, cur_dev)
 
@@ -307,12 +318,14 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
     )
     layout = _predict_output_layout(op, tiling) if output_counts else op.layout
     iter_space = _predict_iter_space(op, tiling)
-    if ranges is None or reduction_ranges is None or layout is None:
+    if ranges is None or reduction_ranges is None:
         logger.debug(
             "dropping tiling %s on %s: extents do not divide evenly",
             tiling,
             op.get_name(),
         )
+        return None
+    if layout is None:  # _predict_output_layout logged why
         return None
     if iter_space is None:
         logger.debug(

@@ -21,6 +21,7 @@ import math
 from collections.abc import Sequence
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -40,7 +41,10 @@ from ..pass_utils import (
     op_out_coords,
 )
 from ..work_division import MAX_SPAN_BYTES
+from .coarse_tile import _loop_var_hinted_ranges, _stick_host_dim
 
+if TYPE_CHECKING:
+    from torch_spyre._C import SpyreTensorLayout
 
 logger = get_inductor_logger("wsr.span_overflow_hint_analysis")
 
@@ -337,6 +341,53 @@ def _post_tile_stick_alignment_error(
         f"tile size {tile_size}, which is not aligned to Spyre stick size "
         f"{stick_elems}; coarse-tile boundaries would cut through physical sticks"
     )
+
+
+def _post_tile_resize_error(
+    op: ComputedBuffer, host_dim: int, split_count: int, stick_host_dim: int | None
+) -> str | None:
+    """Why the apply could not lay out ``op``'s tile for ``host_dim`` split
+    ``split_count`` ways, or ``None``. Makes ``_divide_ranges``'s
+    ``_resize_device_layout`` call, which raises on e.g. a device dim folding
+    two host dims, then ``_allocate_full_buffer``'s, which grows a copy-out's
+    full buffer from the tile and must give back the original layout: a unit
+    tile beside another unit host dim leaves the growing dim unidentifiable,
+    and the full buffer silently keeps the tile's extent."""
+    layout = op.layout
+    if (
+        split_count <= 1
+        or not isinstance(layout, FixedTiledLayout)
+        or len(layout.size) != len(op.data.ranges)
+        or host_dim in _loop_var_hinted_ranges(op)
+    ):
+        return None
+    full_size = [int(s) for s in layout.size]
+    tile_size = list(full_size)
+    tile_size[host_dim] //= split_count
+    try:
+        tile = _resize_device_layout(
+            layout.device_layout, full_size, tile_size, stick_host_dim=stick_host_dim
+        )
+    except RuntimeError as exc:
+        return str(exc)
+    try:
+        full = _resize_device_layout(
+            tile, tile_size, full_size, stick_host_dim=stick_host_dim
+        )
+    except RuntimeError:
+        return None  # _allocate_full_buffer falls back to a row-major layout
+    original = layout.device_layout
+
+    def stepped(stl: SpyreTensorLayout) -> list[tuple[int, int]]:
+        # A unit device dim's stride is never stepped, so it does not count.
+        return [
+            (size, stride if size > 1 else -1)
+            for size, stride in zip(stl.device_size, stl.stride_map)
+        ]
+
+    if stepped(full) != stepped(original):
+        return f"the tile {tile} grows back to {full}, not {original}"
+    return None
 
 
 def _is_batch_matmul_reduction(op: ComputedBuffer) -> bool:
@@ -1605,7 +1656,9 @@ def _split_candidates_for_host_dim(
     because coarse tiling emits equal-sized loop tiles.  Then the candidates are
     filtered for output and input stick alignment: a split is legal only if the
     resulting tile boundary does not cut through physical sticks in the output
-    layout or any direct input layout controlled by the same output symbol.
+    layout or any direct input layout controlled by the same output symbol,
+    and only if the apply can resize the output's device layout to the tile
+    and back (:func:`_post_tile_resize_error`).
     """
     ranges = list(op.data.ranges)
     if host_dim >= len(ranges):
@@ -1633,6 +1686,11 @@ def _split_candidates_for_host_dim(
             for d in (i, full_size // i)
         }
     )
+    stick_host_dim = (
+        _stick_host_dim(op, op.layout.device_layout)
+        if isinstance(op.layout, FixedTiledLayout)
+        else None
+    )
     legal_candidates = [
         split
         for split in candidates
@@ -1644,12 +1702,13 @@ def _split_candidates_for_host_dim(
             # can under-count the dimensions fixed-arity reduction templates
             # expect and crash native codegen (DtException: "Not enough
             # dimensions") rather than fail cleanly at the Python level.
-            # Pointwise unit tiles remain legal; there is existing coverage for
-            # full-size exact divisors on Pointwise ops.
+            # Pointwise unit tiles remain legal unless the layout check below
+            # refuses them.
             (not isinstance(op.data, Reduction) or full_size // split > 1)
             and split <= _MAX_AUTO_TILE_SPLIT_COUNT
             and _post_tile_stick_alignment_error(op.layout, host_dim, split) is None
             and _input_stick_alignment_error(op, host_dim, split) is None
+            and _post_tile_resize_error(op, host_dim, split, stick_host_dim) is None
         )
     ]
     capped_candidates = _cap_split_candidates(legal_candidates, required_count)

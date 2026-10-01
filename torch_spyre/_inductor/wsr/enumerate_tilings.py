@@ -64,8 +64,9 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Iterable, Sequence
 
-from torch._inductor.ir import ComputedBuffer, Reduction
+from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from .. import config
 from ..errors import Unsupported
@@ -127,6 +128,25 @@ def _output_split_counts(op: ComputedBuffer, host_dim: int) -> list[int]:
     except Unsupported:
         return []
     return [s for s in candidates if s > 1]
+
+
+def _unit_tile_breaks_a_reader(
+    op: ComputedBuffer, host_dim: int, count: int, readers: Sequence[ComputedBuffer]
+) -> bool:
+    """Whether tiling ``host_dim`` ``count`` ways leaves a 1-extent tile that a
+    reader views through another rank or shape, which ``_squeezed_retile_dims``
+    refuses for a reader outside the tiling group. Which readers end up outside
+    is not known yet, so any reader counts."""
+    ranges = tuple(op.data.ranges)
+    if int(ranges[host_dim]) // count != 1:
+        return False
+    for reader in readers:
+        reader_ranges = tuple(reader.data.ranges)
+        if len(reader_ranges) < len(ranges) or (
+            reader_ranges[host_dim] != 1 and reader_ranges != ranges
+        ):
+            return True
+    return False
 
 
 def _reduction_split_cuts_input_stick(op: ComputedBuffer, red_var, split: int) -> bool:
@@ -256,6 +276,7 @@ def enumerate_tile_options(
     max_dims: int = _MAX_TILE_DIMS,
     max_splits_per_dim: int = _MAX_SPLITS_PER_DIM,
     max_options: int = _MAX_TILE_OPTIONS,
+    readers: Iterable[Operation] = (),
 ) -> list[TileSpec]:
     """Return the coarse tilings ``op`` could legally take, untiled first.
 
@@ -275,6 +296,9 @@ def enumerate_tile_options(
     reads each axis independently and from its ``host_dim`` and
     ``is_reduction`` alone, never its ``count``: an axis resolves exactly when
     its dim does, and a spec exactly when each of its axes does.
+
+    ``readers`` are the ops reading ``op``'s output; a unit tile some reader
+    views through another shape is not offered (:func:`_unit_tile_breaks_a_reader`).
     """
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
@@ -283,11 +307,17 @@ def enumerate_tile_options(
     # --- output-range options -------------------------------------------------
     stick_dim = _output_stick_host_dim(op)
     n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+    # Only a ComputedBuffer reader is re-indexed by the apply.
+    retiled_readers = [r for r in readers if isinstance(r, ComputedBuffer)]
     per_dim: list[tuple[int, list[int]]] = []
     for host_dim in range(n_out):
         if host_dim == stick_dim:
             continue  # fail closed on the stick dim (module docstring)
-        counts = _output_split_counts(op, host_dim)[:max_splits_per_dim]
+        counts = [
+            count
+            for count in _output_split_counts(op, host_dim)
+            if not _unit_tile_breaks_a_reader(op, host_dim, count, retiled_readers)
+        ][:max_splits_per_dim]
         if counts and _lowering_accepts(op, TileAxis(host_dim, counts[0])):
             per_dim.append((host_dim, counts))
 
