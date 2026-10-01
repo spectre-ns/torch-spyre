@@ -82,6 +82,7 @@ warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
 # torch._C._get_privateuse1_backend_name() returns e.g. "spyre".
 # This is what slf.device_type will be at test runtime.
 _OOT_DEVICE_TYPE: str = _get_privateuse1_device_type()
+assert _OOT_DEVICE_TYPE != "privateuse1"
 
 
 # ---------------------------------------------------------------------------
