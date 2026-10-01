@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer
 
+    from torch_spyre._C import SpyreTensorLayout
+
 
 @dataclass(frozen=True)
 class CarriedReductionSpec:
@@ -150,6 +152,14 @@ class PropagationPlan:
         Original (pre-division) strides of the tiled op's layout, captured at
         planning time before ``_divide_ranges`` mutates the op.  Only set when
         ``kind == "copy_out"``.
+    full_device_layout:
+        Original (pre-division) device layout of the tiled op's output, which
+        the copy-out's full buffer takes as its own.  Captured at planning time
+        because it cannot always be recovered from the tile: once two host
+        dims of the tile have extent 1, their device dims are
+        indistinguishable.  ``None`` when the op has no device layout yet
+        (pre-stickify) or when the full buffer is larger than the op's own
+        output (a WhileLoop-splice dim).
     reduction:
         Shape/identity/nesting decisions for the reduction machinery. Only
         set when ``kind == "reduction"``.
@@ -184,6 +194,7 @@ class PropagationPlan:
     kind: Literal["loop_internal", "copy_out", "reduction", "mutation_write_back"]
     full_ranges: list[sympy.Expr] | None = None
     full_strides: tuple[sympy.Expr, ...] | None = None
+    full_device_layout: SpyreTensorLayout | None = None
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False

@@ -5665,6 +5665,48 @@ def _forced_span_plan_on_dim1(split_count, expect_size):
     return forced
 
 
+def _forced_span_plan(shape, levels):
+    """Force every op whose output ranges are ``shape`` onto ``levels``.
+
+    ``levels`` is ``(host_dim, split_count)`` pairs, outermost first. Unlike
+    ``_forced_span_plan_on_dim1`` it can tile any output dim and nest levels.
+    Anything of another shape falls back to the real planner.
+    """
+    real_plan = plan_span_overflow_tile
+    for host_dim, split_count in levels:
+        assert shape[host_dim] % split_count == 0
+
+    def forced(op, max_cores):
+        try:
+            ranges = tuple(int(r) for r in getattr(op.data, "ranges", None) or ())
+        except (TypeError, ValueError):
+            ranges = ()
+        if ranges != tuple(shape):
+            return real_plan(op, max_cores)
+        host_dim, split_count = levels[0]
+        return SpanOverflowTilePlan(
+            levels=tuple(
+                SpanOverflowTileLevel(selected_host_dim=dim, split_count=count)
+                for dim, count in levels
+            ),
+            chunking_infos=(
+                ChunkingInfo(
+                    total_bytes=1,
+                    per_core_span=1,
+                    core_split_estimate=1,
+                    selected_device_dim_size=split_count,
+                    selected_device_span_stride_elems=1,
+                    selected_host_dim=host_dim,
+                    stick_elems=64,
+                    reason="forced for unit-tile validation",
+                ),
+            ),
+            reason="forced for unit-tile validation",
+        )
+
+    return forced
+
+
 def _forced_reduction_range_plan(split_count, reduction_size, output_split=None):
     """Force a non-matmul Reduction onto a reduction-range tile plan.
 
@@ -6563,6 +6605,83 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 atol=0.05,
                 rtol=0.05,
             )
+
+    def _assert_unit_tiling_matches_cpu(self, shape, levels):
+        """Run ``x + y`` tiled by ``levels`` on the device, against CPU.
+
+        Each case needs a shape of its own: a second compile of one shape
+        would reuse the first one's code, whatever plan is forced.
+        """
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(shape, dtype=torch.float16)
+        y = torch.randn(shape, dtype=torch.float16)
+
+        def source_check(src):
+            # Load-bearing: the forced tiling reached codegen, level by level.
+            self.assertIn("LoopSpec(", src)
+            for _host_dim, split_count in levels:
+                self.assertIn(f"count=sympify('{split_count}')", src)
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan(shape, levels),
+        ):
+            compare_with_cpu(
+                lambda x, y: x + y,
+                x,
+                y,
+                run_compile=True,
+                run_eager=False,
+                source_check=source_check,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_unit_tile_reads_advance_numeric(self):
+        """A dim tiled all the way down, so each tile has extent 1 in it.
+
+        That dim's index symbol is squeezed out of the tiled op's reads, so the
+        per-tile step of a read cannot be found by substituting into the
+        index: the outer-dim case read tile ``t`` from ``t`` rows of the
+        *next* dim in, and the middle-dim case read every tile from tile 0.
+        """
+        for shape, levels in (
+            ((7, 3, 128), ((0, 7),)),
+            ((5, 3, 128), ((1, 3),)),
+        ):
+            with self.subTest(shape=shape, levels=levels):
+                self._assert_unit_tiling_matches_cpu(shape, levels)
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_unit_tile_with_two_unit_dims_numeric(self):
+        """A tile with two extent-1 host dims: two dims each tiled all the way
+        down, or one tiled all the way down beside a dim that was already 1.
+
+        The copy-out's full buffer must keep the layout the op's output had
+        before tiling. Grown back from such a tile it kept the tile's extent
+        in both dims, since their device dims cannot be told apart.
+        """
+        for shape, levels in (
+            ((3, 5, 128), ((0, 3), (1, 5))),
+            ((1, 17, 16, 64), ((1, 17),)),
+        ):
+            with self.subTest(shape=shape, levels=levels):
+                self._assert_unit_tiling_matches_cpu(shape, levels)
 
     # The three Reduction-producer directions below execute a group whose
     # PRODUCER is a tiled reduction reading a full-size buffer (a graph input).

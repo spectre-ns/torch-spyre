@@ -349,10 +349,12 @@ def _post_tile_resize_error(
     """Why the apply could not lay out ``op``'s tile for ``host_dim`` split
     ``split_count`` ways, or ``None``. Makes ``_divide_ranges``'s
     ``_resize_device_layout`` call, which raises on e.g. a device dim folding
-    two host dims, then ``_allocate_full_buffer``'s, which grows a copy-out's
-    full buffer from the tile and must give back the original layout: a unit
-    tile beside another unit host dim leaves the growing dim unidentifiable,
-    and the full buffer silently keeps the tile's extent."""
+    two host dims. For a Reduction it then makes ``_allocate_full_buffer``'s,
+    which grows an accumulator from the tile and must give back the original
+    layout: once two device dims of the tile have extent 1 the growing one is
+    unidentifiable, and the accumulator silently keeps the tile's extent. A
+    copy-out's full buffer is not grown from the tile; it takes the layout
+    planning recorded (``PropagationPlan.full_device_layout``)."""
     layout = op.layout
     if (
         split_count <= 1
@@ -370,6 +372,8 @@ def _post_tile_resize_error(
         )
     except RuntimeError as exc:
         return str(exc)
+    if not isinstance(op.data, Reduction):
+        return None
     try:
         full = _resize_device_layout(
             tile, tile_size, full_size, stick_host_dim=stick_host_dim
@@ -1658,7 +1662,7 @@ def _split_candidates_for_host_dim(
     resulting tile boundary does not cut through physical sticks in the output
     layout or any direct input layout controlled by the same output symbol,
     and only if the apply can resize the output's device layout to the tile
-    and back (:func:`_post_tile_resize_error`).
+    (:func:`_post_tile_resize_error`).
     """
     ranges = list(op.data.ranges)
     if host_dim >= len(ranges):

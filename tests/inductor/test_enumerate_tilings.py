@@ -263,6 +263,24 @@ class TestNoBadReductionOptions(unittest.TestCase):
                     self.assertFalse(red_axes and out_axes, spec.label)
 
 
+def _reader(ranges):
+    """A ComputedBuffer reading the tiled op's output, over ``ranges``."""
+    reader = MagicMock(spec=ComputedBuffer)
+    reader.data = SimpleNamespace(ranges=list(ranges))
+    return reader
+
+
+def _counts(options, host_dim):
+    """The single-level counts ``options`` offers for output ``host_dim``."""
+    return [
+        spec.axes[0].count
+        for spec in options
+        if spec.depth == 1
+        and not spec.axes[0].is_reduction
+        and spec.axes[0].host_dim == host_dim
+    ]
+
+
 class TestApplyRefusals(unittest.TestCase):
     """Counts the coarse-tile apply would refuse are not offered."""
 
@@ -288,6 +306,34 @@ class TestApplyRefusals(unittest.TestCase):
         self.assertIn(
             64, _counts(enumerate_tile_options(_pointwise_op((8, 64, 128))), 1)
         )
+
+    def test_a_unit_tile_is_offered(self):
+        # A dim tiled all the way down is offered, also when the tile then has
+        # a second unit host dim: [1, 1, 2048] of [1, 64, 2048].
+        for shape in ((8, 64, 128), (1, 64, 2048)):
+            with self.subTest(shape=shape):
+                self.assertIn(
+                    64, _counts(enumerate_tile_options(_pointwise_op(shape)), 1)
+                )
+
+    def test_a_reduction_tile_that_cannot_grow_back_is_refused(self):
+        # A Reduction's accumulators are still grown from the tile. Halving a
+        # two-stick dim leaves a one-stick tile, whose tile-count device dim
+        # is then one of two with extent 1.
+        from torch_spyre._inductor.wsr.coarse_tile import _stick_host_dim
+        from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+            _post_tile_resize_error,
+        )
+
+        shape = (1, 6, 128)
+        for op, refused in (
+            (_reduction_op(shape, (8,)), True),
+            (_pointwise_op(shape), False),
+        ):
+            with self.subTest(data=type(op.data).__name__):
+                stick_host_dim = _stick_host_dim(op, op.layout.device_layout)
+                error = _post_tile_resize_error(op, 2, 2, stick_host_dim)
+                self.assertEqual(error is not None, refused, error)
 
     _SHAPE = (2, 8, 5, 64, 128)
 

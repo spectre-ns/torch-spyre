@@ -2885,6 +2885,96 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         self.assertEqual(op.loop_info.squeezed_advance_per_read, [])
         self.assertFalse(hasattr(op.loop_info, "predivision_unit_step_per_read"))
 
+    def test_unit_tile_step_is_stamped_when_no_read_copy_runs(self):
+        """Post-stickify tiling inserts no read copies, so a dim tiled down to
+        extent 1 leaves its step on the op's own read.
+
+        Dividing squeezes that dim's ``d{i}`` symbol out of the read index and
+        renumbers the rest, so an entry left in ``tiled_dims_per_read`` would
+        name whichever dim inherited the number. The step travels as a
+        ``(host_stride, extent)`` pair instead, with the stride the read's own
+        index had for the dim before the divide.
+        """
+        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
+        for ranges, in_stride, hints, levels, index, tiled, squeezed in (
+            # The outer dim: d1 and d2 renumber to d0 and d1.
+            (
+                [7, 3, 128],
+                [384, 128, 1],
+                ((1, 0),),
+                [(1, 7)],
+                128 * d0 + d1,
+                [[]],
+                [[(384, 1)]],
+            ),
+            # A middle dim.
+            (
+                [7, 3, 128],
+                [384, 128, 1],
+                ((1, 1),),
+                [(1, 3)],
+                384 * d0 + d1,
+                [[]],
+                [[(128, 1)]],
+            ),
+            # Two dims, one level each.
+            (
+                [7, 3, 128],
+                [384, 128, 1],
+                ((1, 0), (2, 1)),
+                [(1, 7), (2, 3)],
+                d0,
+                [[], []],
+                [[(384, 1)], [(128, 1)]],
+            ),
+            # One dim over two levels: the outer level steps two unit tiles.
+            (
+                [8, 3, 128],
+                [384, 128, 1],
+                ((1, 0), (2, 0)),
+                [(1, 4), (2, 2)],
+                128 * d0 + d1,
+                [[], []],
+                [[(384, 2)], [(384, 1)]],
+            ),
+            # A read that is not row-major: the stride is the read's own.
+            (
+                [7, 3, 128],
+                [128, 896, 1],
+                ((1, 0),),
+                [(1, 7)],
+                896 * d0 + d1,
+                [[]],
+                [[(128, 1)]],
+            ),
+            # Not a unit tile: the dim keeps its symbol and its entry.
+            (
+                [14, 3, 128],
+                [384, 128, 1],
+                ((1, 0),),
+                [(1, 7)],
+                384 * d0 + 128 * d1 + d2,
+                [[(0, 2)]],
+                None,
+            ),
+        ):
+            with self.subTest(ranges=ranges, in_stride=in_stride, levels=levels):
+                op = _make_real_pointwise_op(
+                    ranges=[Integer(r) for r in ranges],
+                    input_shapes_strides=[(ranges, in_stride)],
+                    name="buf0",
+                    hints=hints,
+                )
+                levels = [(hint_id, Integer(count)) for hint_id, count in levels]
+                coarse_tile_post_stickify(_graph([op]), [([op], levels)])
+                (read,) = op.get_read_writes().reads
+                self.assertEqual(read.index, index)
+                self.assertEqual(op.loop_info.tiled_dims_per_read, [tiled])
+                self.assertEqual(
+                    op.loop_info.squeezed_advance_per_read,
+                    [] if squeezed is None else [squeezed],
+                )
+
     def test_predivision_step_wins_and_warns_on_legacy_disagreement(self):
         from torch_spyre._inductor.wsr.coarse_tile import _select_unit_steps
 
