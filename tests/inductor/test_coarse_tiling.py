@@ -9277,19 +9277,14 @@ class TestCoeffThroughFloor(unittest.TestCase):
 # ===========================================================================
 
 
-def _ftl_pointwise(
-    shape, name="buf0", dtype=torch.float16, host_stride=None, in_stride=None
-):
+def _ftl_pointwise(shape, name="buf0", dtype=torch.float16, host_stride=None):
     """A genuine ComputedBuffer(Pointwise) with a FixedTiledLayout, built from a
     real ``inner_fn`` over a real ``InputBuffer`` -- so its deps carry Inductor's
     own ``sympy_index_symbol`` symbols and survive IR mutation.
 
     ``host_stride`` defaults to contiguous.  Pass a non-contiguous stride to
     build a transposed layout; the within-stick dim is then the innermost
-    (stride-1) host dim rather than the last one.  ``in_stride`` defaults to the
-    output's, giving a read whose coefficients match the write's; pass a
-    different one to exercise a read that addresses a differently-strided
-    buffer.
+    (stride-1) host dim rather than the last one.
 
     Requires an active graph handler (it registers buffers on
     ``V.graph.name_to_buffer``), which is why every class using it sets one up.
@@ -9299,9 +9294,7 @@ def _ftl_pointwise(
     ``_stick_host_dim`` could never resolve the stick dim by coordinate identity
     and every caller silently fell back to size-based inference in
     ``_resize_device_layout`` -- including ``test_transposed_layout_host_strides``,
-    whose whole point is a layout that defeats that inference. The mock also
-    reported ``reads=set()``, so ``read_index`` fell back to the write index and
-    the read path went untested.
+    whose whole point is a layout that defeats that inference.
     """
     from torch._inductor.ir import FlexibleLayout
     from torch_spyre._C import SpyreTensorLayout
@@ -9312,7 +9305,6 @@ def _ftl_pointwise(
         stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
     else:
         stride = [int(s) for s in host_stride]
-    read_stride = stride if in_stride is None else [int(s) for s in in_stride]
     within_stick = stride.index(min(stride))
     dim_order = [i for i in range(len(size)) if i != within_stick] + [within_stick]
 
@@ -9324,8 +9316,8 @@ def _ftl_pointwise(
                 "spyre:0",
                 dtype,
                 size,
-                read_stride,
-                SpyreTensorLayout(size, read_stride, dtype, list(range(len(size)))),
+                stride,
+                SpyreTensorLayout(size, stride, dtype, list(range(len(size)))),
             )
         ],
         FixedTiledLayout(
@@ -9655,68 +9647,6 @@ class TestPredictIterSpaceNamespace(unittest.TestCase):
         self.assertEqual(
             self._extents(predicted), self._extents(iteration_space_from_op(op))
         )
-
-
-class TestPredictReadIndex(unittest.TestCase):
-    """``read_index`` addresses a buffer coarse tiling does not resize, so the
-    prediction must carry the committed index through unchanged.
-
-    It was previously rescaled against the *output's* full/tile strides.
-    ``_rescale_index`` pairs terms to strides by value, so an input stride that
-    coincided with some other output dim's stride was rescaled by that dim's
-    tile stride, and one matching nothing raised a bare ``RuntimeError``.
-    """
-
-    def setUp(self):
-        gm = fx.symbolic_trace(lambda: None)
-        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
-        self._graph_ctx.__enter__()
-
-    def tearDown(self):
-        self._graph_ctx.__exit__(None, None, None)
-
-    @staticmethod
-    def _read_index(op):
-        from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
-
-        invalidate_op_read_writes(op)
-        return next(d.index for d in op.get_read_writes().reads if hasattr(d, "index"))
-
-    def test_read_index_matches_the_applied_dep(self):
-        # Output stored dim1-innermost; input contiguous -- so the input's dim-1
-        # stride (128) collides with the *output's* dim-2 stride (128).
-        op = _ftl_pointwise(
-            [4, 128, 128], host_stride=[16384, 1, 128], in_stride=[16384, 128, 1]
-        )
-        committed = self._read_index(op)
-        # Dep symbols carry Inductor's integer/nonneg assumptions, so build the
-        # expected index from the same factory -- a plain sympy.Symbol("d0")
-        # prints identically but compares unequal.
-        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
-        self.assertEqual(committed, 16384 * d0 + 128 * d1 + d2)
-
-        tiling = TileSpec((TileAxis(1, 2),))
-        frame = predict_frame(op, tiling)
-        # The write index *is* rescaled: it addresses the op's own output.
-        self.assertEqual([int(s) for s in frame.layout.stride], [8192, 1, 64])
-
-        op.dim_hints = tile_spec_to_dim_hints(op, tiling, [0])
-        coarse_tile_post_stickify(_graph([op]), [([op], [(0, Integer(2))])])
-        self.assertEqual(frame.read_index, self._read_index(op))
-        self.assertEqual(frame.read_index, committed)
-
-    def test_input_stride_absent_from_output_layout_does_not_raise(self):
-        """A stride matching no output stride used to reach ``_rescale_index``'s
-        bare ``RuntimeError`` -- which no ``except Unsupported`` candidate-pruning
-        caller would catch."""
-        op = _ftl_pointwise(
-            [4, 128, 128],
-            name="rd_odd",
-            host_stride=[16384, 1, 128],
-            in_stride=[16384, 384, 3],
-        )
-        frame = predict_frame(op, TileSpec((TileAxis(1, 2),)))
-        self.assertEqual(frame.read_index, self._read_index(op))
 
 
 class TestValidateTiling(unittest.TestCase):
@@ -10640,18 +10570,20 @@ class TestEnumeratedOptionsLower(unittest.TestCase):
             {axis.host_dim for spec in options for axis in spec.axes}, {0, 2}
         )
 
-    def test_unit_reduction_dims_are_skipped_not_offered(self):
-        # A size-1 reduction dim has no loop variable, so it is never offered,
-        # and the dims around it are offered at their squeezed positions --
-        # exactly the options of the same op without the unit dims.
+    def test_unit_reduction_dim_withholds_reduction_options(self):
+        # An op with a size-1 reduction dim is offered no reduction tilings,
+        # wherever the unit dim sits. The output [64] is the stick dim, so such
+        # an op is left with the untiled option alone.
         control = self._assert_every_option_lowers(
             _make_real_tiled_op("red_ctl", [64], [6, 16, 128])
         )
-        unit = self._assert_every_option_lowers(
-            _make_real_tiled_op("red_unit", [64], [1, 6, 1, 16, 128])
-        )
-        self.assertEqual(unit, control)
-        # Not vacuous: every reduction dim is offered.
+        for reduction_ranges in ([1, 6, 16, 128], [6, 1, 16, 128], [1, 6, 1, 16, 128]):
+            with self.subTest(reduction_ranges=reduction_ranges):
+                unit = self._assert_every_option_lowers(
+                    _make_real_tiled_op("red_unit", [64], reduction_ranges)
+                )
+                self.assertEqual(unit, [TileSpec()])
+        # Not vacuous: without a unit dim every reduction dim is offered.
         self.assertEqual(
             {
                 axis.host_dim

@@ -27,9 +27,11 @@ it is offered, so a spec the solver picks from this set cannot then fail in
 reads the same resolver, cannot refuse it on axis grounds either. A reduction
 ``host_dim`` is minted, sized and stick-checked in the frame that resolver reads
 it in: a position in the op's *squeezed* reduction loop variables
-(:func:`~.coarse_tile.reduction_loop_vars`). A size-1 reduction dim has no loop
-variable, so it is never offered, and the reduction dims around it are offered
-at their squeezed positions.
+(:func:`~.coarse_tile.reduction_loop_vars`). An op with a size-1 reduction dim
+is offered no reduction tilings: Inductor mints no loop variable for that dim,
+so the squeezed positions no longer line up with ``reduction_ranges``. The
+resolver itself accepts a reduction axis on such an op, so this limits what is
+offered, not what lowers.
 
 The strategy is **exact divisors**: a split count is
 admissible only if it divides its dim's extent exactly, because coarse tiling
@@ -283,10 +285,10 @@ def enumerate_tile_options(
     The set always contains the empty (untiled) :class:`TileSpec` and
     every single- or nested-output tiling over exact divisors of non-stick
     output dims (up to ``max_dims`` dims tiled at once), plus every single-level
-    reduction tiling when ``op`` is a Reduction and ``enable_reduction_tiling``
-    is set. It never emits a nested output+reduction spec or a multi-reduction
-    spec. Deterministic and unconsumed; the solver prices and
-    chooses among these.
+    reduction tiling when ``op`` is a Reduction with no size-1 reduction dim and
+    ``enable_reduction_tiling`` is set. It never emits a nested output+reduction
+    spec or a multi-reduction spec. Deterministic and unconsumed; the solver
+    prices and chooses among these.
 
     Every option lowers: each candidate dim is resolved through
     :func:`try_resolve_tile_axis_loop_vars` before any spec is built from it --
@@ -332,7 +334,12 @@ def enumerate_tile_options(
                 options.append(TileSpec(axes))
 
     # --- reduction options: single-level only ---------------------------------
-    if isinstance(op.data, Reduction) and config.enable_reduction_tiling:
+    if (
+        isinstance(op.data, Reduction)
+        and config.enable_reduction_tiling
+        # No reduction tilings beside a size-1 reduction dim (module docstring).
+        and all(r != 1 for r in op.data.reduction_ranges)
+    ):
         # Positions in the squeezed reduction loop variables, the frame a
         # reduction TileAxis.host_dim is lowered in (module docstring).
         try:
