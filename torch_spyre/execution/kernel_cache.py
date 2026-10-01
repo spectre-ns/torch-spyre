@@ -31,7 +31,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("kernel_cache")
 
-# All artifacts that dxp_standalone must produce for a valid compiled kernel.
+# All artifacts that dbo-opt must produce for a valid compiled kernel.
 # A cache entry is only considered a hit if every one of these is present.
 _SYMBOL_KINDS_FILE = "symbol_kinds.json"
 _REQUIRED_ARTIFACTS = [
@@ -146,7 +146,7 @@ def get_kernel_registry() -> _KernelHashRegistry:
 
 
 @lru_cache(maxsize=1)
-def _get_dxp_version() -> str:
+def _get_backend_compiler_version() -> str:
     """Return a combined deeptools+flex version string from the Spyre components file.
 
     Reads the path given by the ``LIB_VERSION_FILE`` environment variable
@@ -198,8 +198,14 @@ def _get_dxp_version() -> str:
 @lru_cache(maxsize=1)
 def _get_torch_spyre_version() -> str:
     """Return the torch_spyre package version string."""
-    from torch_spyre.version import __version__
-
+    try:
+        from torch_spyre._version import __version__
+    except ImportError as exc:
+        raise RuntimeError(
+            "torch_spyre._version is missing; cannot determine the torch_spyre "
+            "version for the cache key. The wheel was built without "
+            "setuptools_scm. Set SPYRE_KERNEL_CACHE=0 to run without caching."
+        ) from exc
     return __version__
 
 
@@ -216,7 +222,7 @@ def _strip_debug_handles(obj):
     debug_handle_ carries Inductor-assigned buffer names and source file paths
     that are process/run-specific. Including them in the cache key causes false
     misses (identical graphs with different buffer names hash differently) and
-    does not affect compilation correctness — dxp_standalone ignores the field.
+    does not affect compilation correctness — the backend ignores the field.
     """
     if isinstance(obj, dict):
         return {
@@ -235,8 +241,9 @@ def compute_specs_hash(
     The key is a SHA-256 hash covering: the JSON of every sdsc_N.json dict
     (op structure, iteration space, tiling, shapes, dtypes), the trip count of
     every LoopSpec, all baked symbol offsets (pool, kernel_slice, derived),
-    the total pool allocation size, and the versions of torch, torch_spyre,
-    dxp_standalone, and the active compile config.
+    the total pool allocation size, the versions of torch, torch_spyre and
+    the deeptools/flex toolchain, the backend compiler in use, and the active
+    compile config.
 
     Args:
         specs:       The OpSpec/LoopSpec tree to hash.
@@ -382,7 +389,15 @@ def compute_specs_hash(
         [
             torch.__version__,
             _get_torch_spyre_version(),
-            _get_dxp_version(),
+            _get_backend_compiler_version(),
+            # Bundles are compiled by dbo-opt, not dxp_standalone.
+            # _get_backend_compiler_version() reports the deeptools package
+            # version, which ships both binaries and so does not change when
+            # the backend does.
+            # Without this tag, entries produced by dxp_standalone stay
+            # indistinguishable -- _REQUIRED_ARTIFACTS are the same filenames --
+            # and would be served as hits, so dbo-opt would never run.
+            "backend=dbo-opt",
         ]
     )
 
@@ -470,15 +485,52 @@ def load_symbol_kinds(cached_dir: str) -> list[SymbolKind]:
         return [SymbolKind(**kind) for kind in json.load(f)]
 
 
-def allocate_compile_dir(cache_key: str) -> str:
+# Cache dirs are named by hash alone; this records which kernels map to one.
+_KERNEL_NAME_FILE = "kernel_name.txt"
+
+
+def record_kernel_name(kernel_dir: str, kernel_name: str) -> None:
+    """Append kernel_name to <kernel_dir>/kernel_name.txt unless already listed.
+
+    Never raises: failing to record a name must not fail a compile.
+
+    The read-check-append is not atomic across processes, so two processes
+    recording the same name concurrently can each append it and produce a
+    duplicate line. This is harmless — the file is a debugging aid, not part
+    of the cache key — so no locking is used.
+    """
+    if not kernel_name:
+        return
+    # A newline would corrupt the one-name-per-line format.
+    name = kernel_name.strip()
+    if not name or "\n" in name or "\r" in name:
+        return
+    marker = os.path.join(kernel_dir, _KERNEL_NAME_FILE)
+    try:
+        try:
+            with open(marker) as f:
+                if name in f.read().splitlines():
+                    return
+        except FileNotFoundError:
+            pass
+        with open(marker, "a") as f:
+            f.write(f"{name}\n")
+    except OSError as e:
+        logger.debug("Could not record kernel name %s in %s: %s", name, kernel_dir, e)
+
+
+def allocate_compile_dir(cache_key: str, *, kernel_name: str = "") -> str:
     """Reserve a unique temp directory inside the cache root for compilation.
 
     Placing it inside the cache root (not /tmp) ensures the subsequent rename
     in commit_compile_dir is atomic on POSIX.
+
+    ``kernel_name``, when given, is recorded in kernel_name.txt.
     """
     cache_root = get_cache_root_dir()
     tmp_dir = os.path.join(cache_root, f"{cache_key}.tmp.{uuid.uuid4().hex}")
     os.makedirs(tmp_dir, exist_ok=True)
+    record_kernel_name(tmp_dir, kernel_name)
     return tmp_dir
 
 
@@ -492,7 +544,10 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     cached_dir = os.path.join(cache_root, cache_key)
 
     if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy.
+        # Another process/thread won the race — discard our copy, but first
+        # merge our recorded kernel names into the winner's file so no name
+        # is lost.
+        _merge_kernel_names(tmp_dir, cached_dir)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
         return cached_dir
@@ -501,18 +556,35 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
         os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
         logger.info("Saved compiled kernel to cache: %s", cached_dir)
     except OSError:
+        _merge_kernel_names(tmp_dir, cached_dir)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
 
     return cached_dir
 
 
+def _merge_kernel_names(tmp_dir: str, cached_dir: str) -> None:
+    """Record the names listed in tmp_dir's marker into cached_dir's marker.
+
+    Called when a race loser discards tmp_dir, so a name only that process
+    recorded is not lost. Never raises.
+    """
+    try:
+        with open(os.path.join(tmp_dir, _KERNEL_NAME_FILE)) as f:
+            names = f.read().splitlines()
+    except OSError:
+        return
+    for name in names:
+        record_kernel_name(cached_dir, name)
+
+
 def _move_to_failed_dir(compile_dir: str) -> None:
     """Move a failed compile dir into a ``failed/`` subdirectory of the cache root.
 
     Keeps the cache root clean while still retaining failed artifacts for
-    manual debugging (``dxp_standalone -d <path>``).  If the rename itself
-    fails (e.g. cross-device move), the original path is kept and logged.
+    manual debugging (re-run dbo-opt over the dir's ``bundle.mlir``).  If the
+    rename itself fails (e.g. cross-device move), the original path is kept and
+    logged.
     """
     cache_root = get_cache_root_dir()
     failed_root = os.path.join(cache_root, "failed")

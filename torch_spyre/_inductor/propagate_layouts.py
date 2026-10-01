@@ -239,6 +239,8 @@ def _project_pointwise_dim_order(
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
+    # The trailing -1 is the sparse-stick marker and must be preserved as-is,
+    # not shifted (it is not a dimension index).
     leading = list(range(-rank_diff))
     return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
 
@@ -583,7 +585,23 @@ def _single_arg_op_layout(
 
             input_ea = stl.element_arrangement
 
-            fmt = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
+            # For bool inputs, ea_map must resolve from the physical backing
+            # dtype (e.g. IEEE_FP32 for a fp32-backed bool) rather than the
+            # logical torch.bool, which is not in the EA map. Use the
+            # bool-equivalent dtype of the STL's device_dtype as the source.
+            ea_src_dtype = in_layout.dtype
+            if ea_src_dtype == torch.bool:
+                resolved_dtype = bool_equivalent_dtype(stl.device_dtype)
+                if resolved_dtype is not None:
+                    ea_src_dtype = resolved_dtype
+                else:
+                    logger.warning(
+                        "bool input has unrecognised device_dtype %s; "
+                        "falling back to torch.bool for EA map lookup",
+                        stl.device_dtype,
+                    )
+
+            fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
 
             # Two strategies, chosen by whether a staggered EA is involved:
             #
@@ -679,12 +697,28 @@ def _single_arg_op_layout(
 
     in_coords = host_coordinates(in_layout, dep, None)
     out_coords = host_coordinates(output, output_dep, None)
-    if (
+    is_identity_access = (
         in_coords == out_coords
         and in_layout.size == output.size
         and dep.index == output_dep.index
         and same_device_size(in_layout.dtype, out_dtype_for_layout)
-    ):
+    )
+    if aten_op is None and not is_identity_access:
+        # An op with no origins (e.g. a synthetically-constructed
+        # ComputedBuffer like while_loop_bridge.py's carry-snapshot copy)
+        # matches no case above and falls through to here regardless of
+        # aten_op. The identity-access branch right below is sound for any
+        # aten_op (known or None), but the scanning fallback further down
+        # (_output_stl_from_stick_expr/_candidate_output_stls) was designed
+        # around known aten ops' access patterns, not an arbitrary
+        # origins-less op with a real shape/index change. Raise loudly
+        # instead of silently computing a layout for an access pattern this
+        # fallthrough was never built to handle. See issue #4458.
+        raise Unsupported(
+            f"layout propagation for a single-arg op with no origins and a "
+            f"non-identity access (in_layout={in_layout}, output={output})"
+        )
+    if is_identity_access:
         # Input and output tensors are being accessed identically and elem size is the same.
         # We can simply propagate the device_layout including ElementArrangement.
         stl = SpyreTensorLayout(
@@ -790,7 +824,9 @@ def _clone_layout(
             f"Cannot find alternative layout with size={output.size} and coordinates={out_coords}"
         )
 
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [required_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args, out_stl, [required_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -813,7 +849,9 @@ def _exx2_layout(
     )
     reduction_var = find_reduction_var((x.dep,), output_dep)
     req_in_stl = find_stick_compatible_input_layout(x, reduction_var, "exx2", "x")
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args, out_stl, [req_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -836,7 +874,9 @@ def _layernormnorm_layout(
     req_in_stl = find_stick_compatible_input_layout(
         x, reduction_var, "layernormnorm", "x"
     )
-    op.restick_cost_fn = FixedInOutNode.from_args(args[:1], out_stl, [req_in_stl], op)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        args[:1], out_stl, [req_in_stl], op, output_dep
+    )
     return [out_stl]
 
 
@@ -1066,7 +1106,19 @@ def find_stick_compatible_input_layout(
     # so return immediately without checking the stick.
     for stl, dev_coords in candidates:
         if stl.element_arrangement != ElementArrangement.STANDARD:
-            return stl
+            # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
+            # structure and are normally returned immediately.  However for
+            # batchmatmulfp8 the activation input (QFP8CH) must have
+            # reduction_var on its stick.  A sparse QFP8CH candidate has
+            # reduction_var on an outer dim, not the stick — returning it here
+            # would propagate an incompatible layout and crash downstream.
+            # Skip it so the loop continues to the next candidate (typically a
+            # dense QFP8CH where K is already on the stick).
+            if reduction_type != BATCH_MATMUL_FP8_OP or (
+                reduction_var in dev_coords[-1].free_symbols
+            ):
+                return stl
+            continue
         if reduction_var not in dev_coords[-1].free_symbols:
             continue
         if reduction_type == BATCH_MATMUL_OP and any(
@@ -1130,6 +1182,102 @@ def find_stick_compatible_input_layout(
 
     raise Unsupported(
         f"{reduction_type}: cannot restickify any input layout of {label} to carry {label}_var={reduction_var}"
+    )
+
+
+def _flat_dense_projection_x_layout(
+    x: PropArg,
+    y: PropArg,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    reduction_var: sympy.Symbol,
+    m_size: int,
+    n_size: int,
+) -> SpyreTensorLayout | None:
+    """Return a canonical flat-M layout for a logically 2-D dense projection.
+
+    A fused attention producer can retain a higher-rank contiguous host view
+    such as ``[B, L, H, D]`` even though the projection reads it as the logical
+    matrix ``[B*L, H*D]``.  Preserving those physical outer axes makes the
+    backend encode the shared-weight projection as a BMM, which is much slower
+    than the equivalent flat MM.  Collapse only when the complete access is
+    provably one dense row-major 2-D matrix and the weight is shared (rank 2).
+
+    Genuine BMMs retain a rank-3 output and/or a batched weight and therefore do
+    not enter this path.
+    """
+
+    if (
+        m_size <= 1
+        or n_size <= 1
+        or len(output.size) != 2
+        or len(x.layout.size) <= 2
+        or len(y.layout.size) != 2
+        or x.layouts[0].element_arrangement != ElementArrangement.STANDARD
+        or x.layouts[0].device_dtype != DataFormats.SEN169_FP16
+    ):
+        return None
+
+    x_size = [concretize_expr(size) for size in x.layout.size]
+    x_stride = [concretize_expr(stride) for stride in x.layout.stride]
+    y_size = [concretize_expr(size) for size in y.layout.size]
+    out_size = [concretize_expr(size) for size in output.size]
+    out_stride = [concretize_expr(stride) for stride in output.stride]
+
+    def is_dense_contiguous(size: list[int], stride: list[int]) -> bool:
+        expected = 1
+        for dim_size, dim_stride in zip(reversed(size), reversed(stride)):
+            if dim_size != 1 and dim_stride != expected:
+                return False
+            expected *= dim_size
+        return True
+
+    if not is_dense_contiguous(x_size, x_stride) or not is_dense_contiguous(
+        out_size, out_stride
+    ):
+        return None
+
+    active_x_vars = set(x.dep.index.free_symbols) & set(x.dep.ranges)
+    row_vars = active_x_vars - {reduction_var}
+    if reduction_var not in active_x_vars or len(row_vars) != 1:
+        return None
+    (row_var,) = row_vars
+
+    row_size = concretize_expr(x.dep.ranges[row_var])
+    reduction_size = concretize_expr(x.dep.ranges[reduction_var])
+    active_out_vars = set(output_dep.index.free_symbols) & set(output_dep.ranges)
+    generated_vars = active_out_vars - {row_var}
+    if row_var not in active_out_vars or len(generated_vars) != 1:
+        return None
+    (generated_var,) = generated_vars
+    generated_size = concretize_expr(output_dep.ranges[generated_var])
+
+    if (
+        row_size != m_size
+        or generated_size != n_size
+        or math.prod(x_size) != row_size * reduction_size
+        or math.prod(y_size) != reduction_size * generated_size
+        or math.prod(out_size) != m_size * n_size
+        or row_var in y.dep.index.free_symbols
+        or {reduction_var, generated_var}
+        != (set(y.dep.index.free_symbols) & set(y.dep.ranges))
+    ):
+        return None
+
+    expected_index = reduction_size * row_var + reduction_var
+    expected_output_index = generated_size * row_var + generated_var
+    if (
+        sympy.simplify(x.dep.index - expected_index) != 0
+        or sympy.simplify(output_dep.index - expected_output_index) != 0
+    ):
+        return None
+
+    return SpyreTensorLayout(
+        [row_size, reduction_size],
+        [reduction_size, 1],
+        x.layout.dtype,
+        [0, 1],
+        ElementArrangement.STANDARD,
     )
 
 
@@ -1207,6 +1355,7 @@ def _matmul_layouts(
     reduction_var = find_reduction_var((x.dep,), output_dep)
     n_size = get_matmul_n_size(op)
     m_size = get_matmul_m_size(op)
+    exact_input_indices: set[int] = set()
 
     if n_size == 1:
         # N has no loop symbol after size-one simplification, so there is no
@@ -1266,6 +1415,14 @@ def _matmul_layouts(
         out_dims = len(output.size)
         out_stick_dim = _out_stick_dim
 
+    if data.reduction_type == BATCH_MATMUL_OP:
+        flat_x_stl = _flat_dense_projection_x_layout(
+            x, y, output, output_dep, reduction_var, m_size, n_size
+        )
+        if flat_x_stl is not None:
+            x_req_stl = flat_x_stl
+            exact_input_indices.add(0)
+
     out_dim_order = list(range(out_dims - 2))
     if out_stick_dim == out_dims - 1:
         out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
@@ -1282,6 +1439,8 @@ def _matmul_layouts(
         out_stl,
         [x_req_stl, y_req_stl],
         op,
+        output_dep,
+        exact_input_indices=exact_input_indices,
     )
     return [out_stl]
 
@@ -1363,7 +1522,7 @@ def _conv_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [x, y], out_stl, [x_req_stl, y_req_stl], op
+        [x, y], out_stl, [x_req_stl, y_req_stl], op, output_dep
     )
     return [out_stl]
 
@@ -1532,7 +1691,7 @@ def _multi_arg_pointwise_layouts(
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes)]
+        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes, op=op)]
         if dc is not None
     }
 
@@ -1546,8 +1705,10 @@ def _multi_arg_pointwise_layouts(
 
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
-    in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
-    out_coords = host_coordinates(output, output_dep, ind_sizes)
+    in_coords = [
+        host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
+    ]
+    out_coords = host_coordinates(output, output_dep, ind_sizes, op=op)
     can_use_same_layout = True
 
     if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
@@ -1585,7 +1746,7 @@ def _multi_arg_pointwise_layouts(
                 projected_dim_order,
                 output_ea,
             )
-            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
+            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes, op=op)
             if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
             # For indirect-access value tensors, the stick dimension cannot
@@ -1693,7 +1854,7 @@ def _multi_arg_pointwise_layouts(
             continue
         # Stick must be offset-free; per-input feasibility is left to
         # AllSameNode (INF-costs incompatible).
-        out_coord = device_coordinates(candidate, output_dep, ind_sizes)
+        out_coord = device_coordinates(candidate, output_dep, ind_sizes, op=op)
         if not is_stick_expr_offset_free(out_coord[-1], stick_size):
             continue
         # Move to front (or insert if new): the in-place layout must win on
@@ -1876,7 +2037,7 @@ def _keep_by_index_layouts(
     out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
 
     op.restick_cost_fn = FixedInOutNode.from_args(
-        [values, indices], out_stl, [values_req_stl, indices_req_stl], op
+        [values, indices], out_stl, [values_req_stl, indices_req_stl], op, output_dep
     )
     return [out_stl]
 

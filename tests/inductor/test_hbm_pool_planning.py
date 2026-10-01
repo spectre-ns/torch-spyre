@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from unittest.mock import patch as mock_patch
 
+import pytest
 import regex as re
 import torch
 from sympy import Integer
@@ -33,7 +34,7 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
-import pytest
+from utils_inductor import mock_backend_compiler
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -311,7 +312,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         that would silently drift if _compute_size_bytes's stick-alignment
         changes for unrelated reasons.
         """
-        from torch_spyre._inductor.constants import SEGMENT_SIZE
+        from torch_spyre._inductor.constants import MAX_REGION_SIZE
         from torch_spyre._inductor.hbm_pool_planning import (
             Allocator,
             _compute_size_bytes,
@@ -326,7 +327,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
 
         hbm_pool_planning([bundle])
 
-        expected_alloc = Allocator(SEGMENT_SIZE)
+        expected_alloc = Allocator(MAX_REGION_SIZE)
         # buf0's live range ends at "mid" (step 1), buf1's starts there --
         # sorted by (start, end, name) as in the real implementation,
         # buf0 allocates first.
@@ -759,7 +760,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             mock_patch.object(SpyreKernel, "codegen_kernel", _recording_codegen_kernel),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             torch.compile(fn)(x, y)
 
@@ -805,7 +806,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             mock_patch.object(
                 async_compile_mod, "get_output_dir", _recording_get_output_dir
             ),
@@ -871,7 +872,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
             pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
@@ -914,7 +915,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, y)
         src = source_codes[0]
@@ -946,7 +947,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x, y)
         src = source_codes[0]
@@ -993,7 +994,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
+            mock_backend_compiler(),
         ):
             # Without the alias-read guard this raises InductorError from
             # generate_bundle's pool_size assertion.

@@ -1,8 +1,8 @@
 name: tests
 
-# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
-# model_ops_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for the
-# others. A push run passes test_type: trunk (below) so it's distinguishable
+# One of torch-spyre's three "trunk" (push-to-main) workflows -- see
+# upstream_tests.yaml, upstream_tests_beta.yaml for the others. Its trunk scan
+# also runs the model-ops suites (tests/configs/model_ops_tests/). A push run passes test_type: trunk (below) so it's distinguishable
 # from a manually-dispatched regression run once tier-tagging reaches ClickHouse.
 on:
   push:
@@ -80,7 +80,8 @@ jobs:
   #
   # Runs on every PR and merge-queue check. Delegates to the shared
   # detect-doc-only-change composite action, which checks if any file outside
-  # tests/docs/, docs/, README.md, or CODEOWNERS was modified.
+  # tests/docs/, docs/, extensions/clickhouse-ingest/docs/, README.md,
+  # extensions/clickhouse-ingest/README.md, or CODEOWNERS was modified.
   #
   # code_changed=true  --> non-doc files changed  --> run tests
   # code_changed=false --> only doc/CODEOWNERS files changed --> skip tests
@@ -120,9 +121,12 @@ jobs:
   # ---------------------------------------------------------------------------
   run-tests:
     needs: changes
+    # Also skipped once auto_merge is enabled on the PR, and for every merge-queue run -- native GHA checks aren't required there; the gate below still reports green since "skipped" isn't a failure.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      needs.changes.outputs.integration_labeled != 'true'
+      needs.changes.outputs.integration_labeled != 'true' &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.auto_merge != null) &&
+      github.event_name != 'merge_group'
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
@@ -147,6 +151,7 @@ jobs:
       CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)

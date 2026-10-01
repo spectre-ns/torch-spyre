@@ -139,19 +139,21 @@ SuperDSC is an IR that closely matches the hardware model. KernelTile IR (KTIR) 
 DeepTools runs as an out-of-process subprocess. During scheduling, the
 generated host code calls `async_compile.sdsc(...)`
 ([`execution/async_compile.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/execution/async_compile.py)),
-which runs `dxp_standalone -d <output_dir>` to turn the
-SuperDSC JSON into a device binary. (The bundle itself is produced
+which runs `dbo-opt --export-dir=<output_dir> -kEmitSpyreCode <output_dir>/bundle.mlir`
+to turn the SuperDSC JSON into a device binary. An SDSC bundle is dbo-opt's
+default input, so no `--from-ktir` is passed; that flag selects the KTIR
+frontend instead. (The bundle itself is produced
 earlier, in Python, by `generate_bundle(...)`.) Each kernel gets its own output
 directory created with `tempfile.mkdtemp` under `<cache_dir>/inductor-spyre`,
 so the bundles are stored separately from Inductor's content-addressed
 Python/Triton cache.
 
-Setting `SPYRE_ASYNC_DXP_COMPILE=1` submits each `dxp_standalone` run to
-Inductor's compile-worker process pool instead of running it inline, so the
-`dxp_standalone` invocations for separate kernels compile in parallel. The
-flag takes effect only when more than one compile thread is configured.
-With a single thread, or when it is left at its default of `0`, each kernel
-compiles synchronously.
+Independent kernels compile in parallel through Inductor's compile-worker
+process pool whenever `TORCHINDUCTOR_COMPILE_THREADS` is greater than `1`.
+Bundle generation stays in the parent process; workers invoke `dbo-opt`, and
+the generated wrapper resolves their results at `async_compile.wait()` before
+execution. Set `TORCHINDUCTOR_COMPILE_THREADS=1` to compile inline. There is no
+separate Spyre feature flag.
 
 ## Further Reading
 
