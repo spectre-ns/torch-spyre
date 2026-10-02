@@ -5668,13 +5668,16 @@ def _forced_span_plan_on_dim1(split_count, expect_size):
 def _forced_span_plan(shape, levels):
     """Force every op whose output ranges are ``shape`` onto ``levels``.
 
-    ``levels`` is ``(host_dim, split_count)`` pairs, outermost first. Unlike
-    ``_forced_span_plan_on_dim1`` it can tile any output dim and nest levels.
-    Anything of another shape falls back to the real planner.
+    ``levels`` is ``(host_dim, split_count)`` pairs, outermost first; a third
+    element ``True`` makes the level tile reduction range ``host_dim`` instead
+    of an output dim. Unlike ``_forced_span_plan_on_dim1`` it can tile any
+    output dim and nest levels. Anything of another shape falls back to the
+    real planner.
     """
     real_plan = plan_span_overflow_tile
-    for host_dim, split_count in levels:
-        assert shape[host_dim] % split_count == 0
+    levels = [(*level, False)[:3] for level in levels]
+    for host_dim, split_count, is_reduction in levels:
+        assert is_reduction or shape[host_dim] % split_count == 0
 
     def forced(op, max_cores):
         try:
@@ -5683,11 +5686,13 @@ def _forced_span_plan(shape, levels):
             ranges = ()
         if ranges != tuple(shape):
             return real_plan(op, max_cores)
-        host_dim, split_count = levels[0]
+        host_dim, split_count, _is_reduction = levels[0]
         return SpanOverflowTilePlan(
             levels=tuple(
-                SpanOverflowTileLevel(selected_host_dim=dim, split_count=count)
-                for dim, count in levels
+                SpanOverflowTileLevel(
+                    selected_host_dim=dim, split_count=count, is_reduction=is_reduction
+                )
+                for dim, count, is_reduction in levels
             ),
             chunking_infos=(
                 ChunkingInfo(
@@ -6606,36 +6611,42 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
-    def _assert_unit_tiling_matches_cpu(self, shape, levels):
-        """Run ``x + y`` tiled by ``levels`` on the device, against CPU.
+    def _assert_forced_tiling_matches_cpu(self, fn, inputs, shape, levels):
+        """Run ``fn`` on the device with every op of output ``shape`` tiled by
+        ``levels`` (see ``_forced_span_plan``), against CPU.
 
         Each case needs a shape of its own: a second compile of one shape
         would reuse the first one's code, whatever plan is forced.
         """
-        torch.manual_seed(0xAFFE)
-        x = torch.randn(shape, dtype=torch.float16)
-        y = torch.randn(shape, dtype=torch.float16)
 
         def source_check(src):
             # Load-bearing: the forced tiling reached codegen, level by level.
             self.assertIn("LoopSpec(", src)
-            for _host_dim, split_count in levels:
-                self.assertIn(f"count=sympify('{split_count}')", src)
+            for level in levels:
+                self.assertIn(f"count=sympify('{level[1]}')", src)
 
         with patch(
             "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
             _forced_span_plan(shape, levels),
         ):
             compare_with_cpu(
-                lambda x, y: x + y,
-                x,
-                y,
+                fn,
+                *inputs,
                 run_compile=True,
                 run_eager=False,
                 source_check=source_check,
                 atol=0.05,
                 rtol=0.05,
             )
+
+    def _assert_unit_tiling_matches_cpu(self, shape, levels):
+        """Run ``x + y`` tiled by ``levels`` on the device, against CPU."""
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(shape, dtype=torch.float16)
+        y = torch.randn(shape, dtype=torch.float16)
+        self._assert_forced_tiling_matches_cpu(
+            lambda x, y: x + y, (x, y), shape, levels
+        )
 
     @config.patch(
         {
@@ -6682,6 +6693,34 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         ):
             with self.subTest(shape=shape, levels=levels):
                 self._assert_unit_tiling_matches_cpu(shape, levels)
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_one_stick_output_tiles_numeric(self):
+        """A reduction whose output stick dim is tiled down to one stick, alone
+        and under a reduction-range level.
+
+        The tile's tile-count device dim then has extent 1, like the device
+        dim of any other unit dim. The copy-out's full buffer and the
+        reduction's full accumulator must keep the layout the output had
+        before tiling: grown back from the tile they kept one stick.
+        """
+        for in_shape, out_shape, levels in (
+            ((8, 6, 256), (6, 256), ((1, 4),)),
+            ((8, 3, 256), (3, 256), ((1, 4), (0, 2, True))),
+        ):
+            with self.subTest(out_shape=out_shape, levels=levels):
+                torch.manual_seed(0xAFFE)
+                x = torch.randn(in_shape, dtype=torch.float16)
+                self._assert_forced_tiling_matches_cpu(
+                    lambda x: x.sum(dim=0), (x,), out_shape, levels
+                )
 
     # The three Reduction-producer directions below execute a group whose
     # PRODUCER is a tiled reduction reading a full-size buffer (a graph input).

@@ -699,8 +699,9 @@ def _compute_full_ranges_planned(
 def _planned_full_device_layout(
     op: ComputedBuffer, full_ranges: list[Expr]
 ) -> SpyreTensorLayout | None:
-    """The device layout a copy-out's full buffer takes: ``op``'s own, read
-    before ``_divide_ranges`` replaces it with the tile's.
+    """The device layout a copy-out's full buffer or a reduction's full
+    accumulator takes: ``op``'s own, read before ``_divide_ranges`` replaces it
+    with the tile's.
 
     ``None`` when ``op`` has no device layout yet (pre-stickify), or when the
     full buffer is not ``op``'s own shape -- a WhileLoop-splice dim, which
@@ -1013,6 +1014,9 @@ def _plan_tiling_propagation(
                     full_output_strides=full_output_strides,
                     per_tile_strides=per_tile_strides,
                     carried=carried,
+                    full_output_device_layout=_planned_full_device_layout(
+                        op, full_output_ranges
+                    ),
                 )
                 info.propagation = PropagationPlan(
                     kind="reduction",
@@ -4205,9 +4209,10 @@ def _allocate_full_buffer(
     insert_at_idx, and returns the new ComputedBuffer.
 
     ``full_device_layout`` is the device layout planning recorded for the full
-    buffer (``PropagationPlan.full_device_layout``). Without one, the layout is
-    grown from the tile's, which is only sound while at most one host dim of
-    the tile has extent 1.
+    buffer (``PropagationPlan.full_device_layout`` for a copy-out,
+    ``ReductionPlan.full_output_device_layout`` for an accumulator). Without
+    one, the layout is grown from the tile's, which is only sound while at most
+    one host dim of the tile has extent 1.
     """
     from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
 
@@ -6344,6 +6349,8 @@ def _insert_combine_op(
         tiled_op_info,
         tiled_dims_per_read=tiled_dims_per_read,
         output_tiled_dims=output_tiled_dims,
+        # tiled_op's entries are for tiled_op's reads, not these two.
+        squeezed_advance_per_read=[],
     )
     V.graph.name_to_buffer[combine_name] = combine_buf
 
@@ -6698,6 +6705,7 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         group_start_idx_after_full = operations.index(accum_full) + 1
         accum_tile = _allocate_full_buffer(
@@ -6717,6 +6725,7 @@ def _propagate_tiled_reduction_op(
             reduction_plan.full_output_strides,
             operations,
             group_start_idx,
+            full_device_layout=reduction_plan.full_output_device_layout,
         )
         fill_target = accum_full
         combine_target = accum_full

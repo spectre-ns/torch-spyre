@@ -287,24 +287,23 @@ class TestApplyRefusals(unittest.TestCase):
                     64, _counts(enumerate_tile_options(_pointwise_op(shape)), 1)
                 )
 
-    def test_a_reduction_tile_that_cannot_grow_back_is_refused(self):
-        # A Reduction's accumulators are still grown from the tile. Halving a
-        # two-stick dim leaves a one-stick tile, whose tile-count device dim
-        # is then one of two with extent 1.
-        from torch_spyre._inductor.wsr.coarse_tile import _stick_host_dim
+    def test_a_one_stick_tile_is_offered_for_a_reduction_too(self):
+        # Halving a two-stick dim leaves a one-stick tile, whose tile-count
+        # device dim is then one of two with extent 1. Nothing is grown back
+        # from that tile -- the full buffer and the accumulator take the layout
+        # planning recorded -- so the split is as legal for a Reduction as for
+        # a Pointwise.
         from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
-            _post_tile_resize_error,
+            _split_candidates_for_host_dim,
         )
 
         shape = (1, 6, 128)
-        for op, refused in (
-            (_reduction_op(shape, (8,)), True),
-            (_pointwise_op(shape), False),
+        for kind, op in (
+            ("reduction", _reduction_op(shape, (8,))),
+            ("pointwise", _pointwise_op(shape)),
         ):
-            with self.subTest(data=type(op.data).__name__):
-                stick_host_dim = _stick_host_dim(op, op.layout.device_layout)
-                error = _post_tile_resize_error(op, 2, 2, stick_host_dim)
-                self.assertEqual(error is not None, refused, error)
+            with self.subTest(kind=kind):
+                self.assertIn(2, _split_candidates_for_host_dim(op, 2))
 
     _SHAPE = (2, 8, 5, 64, 128)
 

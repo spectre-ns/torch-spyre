@@ -110,6 +110,11 @@ class ReductionPlan:
     per_tile_strides:
         Host strides of the per-outer-tile accumulation buffer, derived from
         ``full_output_strides`` via ``compute_tile_stride`` at planning time.
+    full_output_device_layout:
+        Original (pre-division) device layout of the op's output, which the
+        full-sized accumulation buffer takes as its own -- see
+        ``PropagationPlan.full_device_layout``, the copy-out's counterpart.
+        ``None`` under the same conditions.
     """
 
     reduction_type: str
@@ -121,6 +126,7 @@ class ReductionPlan:
     full_output_strides: tuple[sympy.Expr, ...]
     per_tile_strides: tuple[sympy.Expr, ...]
     carried: CarriedReductionSpec | None = None
+    full_output_device_layout: SpyreTensorLayout | None = None
 
 
 @dataclass(frozen=True)

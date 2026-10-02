@@ -13,6 +13,18 @@
 # limitations under the License.
 
 
+class PreSchedulerPassesSideTable:
+    def __init__(self):
+        pass
+
+    def set_lx_ineligable(self):
+        pass
+
+    def get_lx_ineligable(self):
+        pass
+
+    def 
+
 import inspect
 import logging
 import time
@@ -513,6 +525,7 @@ class CustomPreSchedulingPasses:
         return cost_model_pass_module.LAST_REPORT
 
     def __init__(self):
+        self.side_table = PreSchedulerPassesSideTable()
         self.passes = [
             #
             # Convert for_each_tile WhileLoops bodies into inlined IR with loop_infos

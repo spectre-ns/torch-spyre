@@ -21,7 +21,6 @@ import math
 from collections.abc import Sequence
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -43,8 +42,6 @@ from ..pass_utils import (
 from ..work_division import MAX_SPAN_BYTES
 from .coarse_tile import _loop_var_hinted_ranges, _stick_host_dim
 
-if TYPE_CHECKING:
-    from torch_spyre._C import SpyreTensorLayout
 
 logger = get_inductor_logger("wsr.span_overflow_hint_analysis")
 
@@ -349,12 +346,10 @@ def _post_tile_resize_error(
     """Why the apply could not lay out ``op``'s tile for ``host_dim`` split
     ``split_count`` ways, or ``None``. Makes ``_divide_ranges``'s
     ``_resize_device_layout`` call, which raises on e.g. a device dim folding
-    two host dims. For a Reduction it then makes ``_allocate_full_buffer``'s,
-    which grows an accumulator from the tile and must give back the original
-    layout: once two device dims of the tile have extent 1 the growing one is
-    unidentifiable, and the accumulator silently keeps the tile's extent. A
-    copy-out's full buffer is not grown from the tile; it takes the layout
-    planning recorded (``PropagationPlan.full_device_layout``)."""
+    two host dims. The full buffer the tiles are gathered into needs no check:
+    it is not grown back from the tile, it takes the layout planning recorded
+    (``PropagationPlan.full_device_layout`` for a copy-out,
+    ``ReductionPlan.full_output_device_layout`` for an accumulator)."""
     layout = op.layout
     if (
         split_count <= 1
@@ -367,30 +362,11 @@ def _post_tile_resize_error(
     tile_size = list(full_size)
     tile_size[host_dim] //= split_count
     try:
-        tile = _resize_device_layout(
+        _resize_device_layout(
             layout.device_layout, full_size, tile_size, stick_host_dim=stick_host_dim
         )
     except RuntimeError as exc:
         return str(exc)
-    if not isinstance(op.data, Reduction):
-        return None
-    try:
-        full = _resize_device_layout(
-            tile, tile_size, full_size, stick_host_dim=stick_host_dim
-        )
-    except RuntimeError:
-        return None  # _allocate_full_buffer falls back to a row-major layout
-    original = layout.device_layout
-
-    def stepped(stl: SpyreTensorLayout) -> list[tuple[int, int]]:
-        # A unit device dim's stride is never stepped, so it does not count.
-        return [
-            (size, stride if size > 1 else -1)
-            for size, stride in zip(stl.device_size, stl.stride_map)
-        ]
-
-    if stepped(full) != stepped(original):
-        return f"the tile {tile} grows back to {full}, not {original}"
     return None
 
 
