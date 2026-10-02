@@ -2345,10 +2345,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertIs(edge.consumer_op, self.consumer_op)
             self.assertEqual(edge.read_dep.name, "plain")
             self.assertEqual(
-                edge.match_pairs(
-                    [cd.splits for cd in self.parent_divs],
-                    [cd.splits for cd in self.consumer_divs],
-                ),
+                edge.match_pairs(self.parent_divs, self.consumer_divs),
                 [(0, 0), (1, 1)],
             )
             # The update's own write is the carry edge, not a read edge.
