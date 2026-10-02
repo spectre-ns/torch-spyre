@@ -3565,8 +3565,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 op, carry_update_edges, prep_cache
             ).items():
                 read_matches = read_edge.match_pairs(
-                    [cd.splits for cd in divisions[storage_name]],
-                    [cd.splits for cd in buf_divisions],
+                    divisions[storage_name],
+                    buf_divisions,
                 )
                 if storage_name in parent_proj:
                     known = set(cd_parent_matches.get(storage_name, []))
