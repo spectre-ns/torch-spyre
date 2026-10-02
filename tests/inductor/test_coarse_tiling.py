@@ -9472,32 +9472,28 @@ class TestPredictFrame(unittest.TestCase):
         coarse_tile_post_stickify(_graph([op]), [([op], [(0, Integer(4))])])
         self.assertEqual(op.layout.offset, frame.layout.offset)
 
-    def test_a_symbolic_dim_is_read_at_its_compile_time_value(self):
-        """A dim left symbolic by a recompile for a second shape predicts the
-        tile layout of the same op with that dim static: the device layout was
-        built from the symbol's value, and the prediction reads the same one."""
+    def test_a_symbolic_dim_refuses_a_tiling_on_a_static_dim(self):
+        """A dim left symbolic by a recompile for a second shape leaves the op
+        untileable even on its static dims: the applier reads every extent of
+        a tiled op as an int. Prediction returns ``None`` and lowering raises
+        ``Unsupported`` for it, both on the resolver's reason."""
         from torch._dynamo.source import ConstantSource
 
         shape, tiling = (4, 8, 256), TileSpec((TileAxis(1, 2),))
-        static = predict_frame(_ftl_pointwise(shape, name="static"), tiling)
+        static = _ftl_pointwise(shape, name="static")
+        self.assertIsNotNone(predict_frame(static, tiling))  # non-vacuity
         s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
         op = _ftl_pointwise(shape, name="symbolic")
         object.__setattr__(op.data, "ranges", [s0, Integer(8), Integer(256)])
         op.layout.size = [s0, Integer(8), Integer(256)]
 
-        frame = predict_frame(op, tiling)
-
-        self.assertEqual(list(frame.ranges), [s0, 4, 256])
-        self.assertEqual(list(frame.layout.size), list(static.layout.size))
-        self.assertEqual(list(frame.layout.stride), list(static.layout.stride))
-        self.assertEqual(
-            list(frame.layout.device_layout.device_size),
-            list(static.layout.device_layout.device_size),
-        )
-        self.assertEqual(
-            list(frame.layout.device_layout.stride_map),
-            list(static.layout.device_layout.stride_map),
-        )
+        self.assertIsNone(predict_frame(op, tiling))
+        _, reason = try_resolve_tile_axis_loop_vars(op, tiling)
+        self.assertIn(f"symbolic output range {s0}", reason)
+        with self.assertRaisesRegex(Unsupported, f"symbolic output range {s0}"):
+            tile_spec_to_dim_hints(op, tiling, [0])
+        # The untiled frame is still the op's own.
+        self.assertIsNotNone(predict_frame(op, TileSpec()))
 
     def test_single_output_axis(self):
         self._apply_and_compare(
@@ -9956,6 +9952,19 @@ class TestValidateTiling(unittest.TestCase):
         dl = op.layout.device_layout
         op.layout.device_layout = SpyreTensorLayout(
             [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+        )
+        self.assertIsNone(predict_frame(op, spec))
+
+    def test_underivable_tile_stride_rejected(self):
+        """A padded outer stride the cumulative tile count does not divide --
+        ``[3, 3, 128]`` at strides ``[512, 128, 1]``, dim 1 split three ways --
+        has no tile stride. ``compute_tile_stride`` raises on it, which used to
+        escape ``predict_frame``."""
+        spec = TileSpec((TileAxis(1, 3),))
+        contiguous = _ftl_pointwise((3, 3, 128), name="val_contiguous")
+        self.assertIsNotNone(predict_frame(contiguous, spec))  # non-vacuity
+        op = _ftl_pointwise(
+            (3, 3, 128), name="val_padded_stride", host_stride=(512, 128, 1)
         )
         self.assertIsNone(predict_frame(op, spec))
 

@@ -85,7 +85,7 @@ from torch._inductor.ir import ComputedBuffer
 
 from ..ir import FixedTiledLayout, _resize_device_layout
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import concretize_expr, iteration_space_from_op
+from ..pass_utils import iteration_space_from_op
 from ..scratchpad.coarse_tiling import try_resolve_tile_axis_loop_vars
 from ..scratchpad.plan_solver import TileSpec
 from .coarse_tile import (
@@ -94,6 +94,8 @@ from .coarse_tile import (
     _stick_host_dim,
 )
 from .tile import compute_tile_stride
+from ..errors import Unsupported
+
 
 logger = get_inductor_logger("tile_prediction")
 
@@ -192,13 +194,13 @@ def _predict_output_layout(
     """The per-tile output ``FixedTiledLayout``, built exactly as
     ``_divide_ranges`` builds it, or ``None`` where that would fail: an extent
     that does not divide, or a device layout ``_resize_device_layout`` cannot
-    resize (e.g. one device dim folding two host dims). A symbolic size or
-    stride is read at its compile-time value, which the device layout was built
-    from.
+    resize (e.g. one device dim folding two host dims). Sizes and strides are
+    static here: ``_rejection_reason`` has already refused an op with a
+    symbolic extent, as the resolver does.
     """
     layout = op.layout
-    cur_size = [concretize_expr(s) for s in layout.size]
-    cur_stride = [concretize_expr(s) for s in layout.stride]
+    cur_size = [int(s) for s in layout.size]
+    cur_stride = [int(s) for s in layout.stride]
     cur_dev = layout.device_layout
     for axis in tiling.axes:
         if axis.is_reduction:
@@ -213,9 +215,13 @@ def _predict_output_layout(
             return None
         new_size = list(cur_size)
         new_size[axis.host_dim] = int(extent)
-        cur_stride = [
-            int(s) for s in compute_tile_stride(cur_size, cur_stride, new_size)
-        ]
+        try:
+            cur_stride = [
+                int(s) for s in compute_tile_stride(cur_size, cur_stride, new_size)
+            ]
+        except Unsupported as exc:
+            logger.debug("dropping tiling %s on %s: %s", tiling, op.get_name(), exc)
+            return None
         try:
             cur_dev = _resize_device_layout(
                 cur_dev,
