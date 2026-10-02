@@ -9472,6 +9472,33 @@ class TestPredictFrame(unittest.TestCase):
         coarse_tile_post_stickify(_graph([op]), [([op], [(0, Integer(4))])])
         self.assertEqual(op.layout.offset, frame.layout.offset)
 
+    def test_a_symbolic_dim_is_read_at_its_compile_time_value(self):
+        """A dim left symbolic by a recompile for a second shape predicts the
+        tile layout of the same op with that dim static: the device layout was
+        built from the symbol's value, and the prediction reads the same one."""
+        from torch._dynamo.source import ConstantSource
+
+        shape, tiling = (4, 8, 256), TileSpec((TileAxis(1, 2),))
+        static = predict_frame(_ftl_pointwise(shape, name="static"), tiling)
+        s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
+        op = _ftl_pointwise(shape, name="symbolic")
+        object.__setattr__(op.data, "ranges", [s0, Integer(8), Integer(256)])
+        op.layout.size = [s0, Integer(8), Integer(256)]
+
+        frame = predict_frame(op, tiling)
+
+        self.assertEqual(list(frame.ranges), [s0, 4, 256])
+        self.assertEqual(list(frame.layout.size), list(static.layout.size))
+        self.assertEqual(list(frame.layout.stride), list(static.layout.stride))
+        self.assertEqual(
+            list(frame.layout.device_layout.device_size),
+            list(static.layout.device_layout.device_size),
+        )
+        self.assertEqual(
+            list(frame.layout.device_layout.stride_map),
+            list(static.layout.device_layout.stride_map),
+        )
+
     def test_single_output_axis(self):
         self._apply_and_compare(
             (512, 256, 128), TileSpec((TileAxis(0, 4),)), [(0, Integer(4))]

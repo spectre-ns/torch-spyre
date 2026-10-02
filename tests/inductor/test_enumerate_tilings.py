@@ -27,8 +27,12 @@ from unittest.mock import MagicMock, patch
 import sympy
 import torch
 
+from torch import fx
+from torch._dynamo.source import ConstantSource
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.virtualized import V
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -334,6 +338,23 @@ class TestApplyRefusals(unittest.TestCase):
             )
             self.assertIn(64, _counts(options, 3))
             self.assertEqual(_counts(options, 2), [5])
+
+    def test_a_symbolic_dim_leaves_the_static_dims_their_counts(self):
+        # A recompile for a second shape leaves the changed dim symbolic in the
+        # host layout while the device layout is built from its actual value.
+        # The resize check reads that value, so the static dims keep the counts
+        # they have when every dim is static.
+        shape = (4, 8, 256)
+        static = enumerate_tile_options(_pointwise_op(shape))
+        self.assertEqual(_counts(static, 1), [2, 4, 8])  # non-vacuity
+        with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+            s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
+            op = _pointwise_op(shape)
+            op.data.ranges = [s0, *shape[1:]]
+            op.layout.size = [s0, *shape[1:]]
+            options = enumerate_tile_options(op)
+        self.assertEqual(_counts(options, 1), _counts(static, 1))
+        self.assertEqual(_counts(options, 0), [])
 
 
 if __name__ == "__main__":
