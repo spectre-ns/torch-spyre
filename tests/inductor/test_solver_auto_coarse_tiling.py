@@ -925,14 +925,15 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self.assertEqual(len(nests), 1, _describe(tiling))
         self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
 
-    @unittest.expectedFailure
     def test_apply_grows_back_a_unit_tile_beside_a_unit_dim(self):
-        # d1:64 leaves the producer's tile (1, 1, 2048), and its copy-out's full
-        # buffer is grown back from that tile's device layout. Beside the unit
-        # dim 0 the grow-back cannot tell the two unit dims apart and returns
-        # [1, 32, 1, 64] for [64, 32, 1, 64], so the untiled consumer reads a
-        # buffer 1/64 the size it expects. The enumerator no longer offers this
-        # tiling; forcing it shows the apply itself still accepts it.
+        # d1:64 leaves the producer's tile (1, 1, 2048). Growing its copy-out's
+        # full buffer back from that tile's device layout cannot tell the two
+        # unit dims apart beside the unit dim 0, and would return
+        # [1, 32, 1, 64] for [64, 32, 1, 64]. The apply instead gives the full
+        # buffer the producer's own device layout, read before the tile is
+        # divided, so the untiled consumer reads a buffer of the size it
+        # expects. The enumerator does not offer this tiling; forcing it checks
+        # the apply itself.
         x = torch.randn(1, 64, 2048, dtype=torch.float16)
         y = torch.randn(1, 64, 2048, dtype=torch.float16)
         unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
