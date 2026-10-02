@@ -2486,7 +2486,7 @@ def _loop_var_to_reduction_ranges_pos(
     if sym not in red_vars:
         return None
     not_one = [i for i, r in enumerate(op.data.reduction_ranges) if r != 1]
-    if len(not_one) != len(red_vars):
+    if len(not_one) < len(red_vars):
         return None
     return not_one[red_vars.index(sym)]
 
