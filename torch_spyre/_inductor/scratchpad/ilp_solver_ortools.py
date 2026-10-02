@@ -1183,6 +1183,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     decides_lx_relayouts = True
 
+    @classmethod
+    def replans_after_tiling(cls) -> bool:
+        return True
+
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
