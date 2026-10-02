@@ -2885,6 +2885,96 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         self.assertEqual(op.loop_info.squeezed_advance_per_read, [])
         self.assertFalse(hasattr(op.loop_info, "predivision_unit_step_per_read"))
 
+    def test_unit_tile_step_is_stamped_when_no_read_copy_runs(self):
+        """Post-stickify tiling inserts no read copies, so a dim tiled down to
+        extent 1 leaves its step on the op's own read.
+
+        Dividing squeezes that dim's ``d{i}`` symbol out of the read index and
+        renumbers the rest, so an entry left in ``tiled_dims_per_read`` would
+        name whichever dim inherited the number. The step travels as a
+        ``(host_stride, extent)`` pair instead, with the stride the read's own
+        index had for the dim before the divide.
+        """
+        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
+        for ranges, in_stride, hints, levels, index, tiled, squeezed in (
+            # The outer dim: d1 and d2 renumber to d0 and d1.
+            (
+                [7, 3, 128],
+                [384, 128, 1],
+                ((1, 0),),
+                [(1, 7)],
+                128 * d0 + d1,
+                [[]],
+                [[(384, 1)]],
+            ),
+            # A middle dim.
+            (
+                [7, 3, 128],
+                [384, 128, 1],
+                ((1, 1),),
+                [(1, 3)],
+                384 * d0 + d1,
+                [[]],
+                [[(128, 1)]],
+            ),
+            # Two dims, one level each.
+            (
+                [7, 3, 128],
+                [384, 128, 1],
+                ((1, 0), (2, 1)),
+                [(1, 7), (2, 3)],
+                d0,
+                [[], []],
+                [[(384, 1)], [(128, 1)]],
+            ),
+            # One dim over two levels: the outer level steps two unit tiles.
+            (
+                [8, 3, 128],
+                [384, 128, 1],
+                ((1, 0), (2, 0)),
+                [(1, 4), (2, 2)],
+                128 * d0 + d1,
+                [[], []],
+                [[(384, 2)], [(384, 1)]],
+            ),
+            # A read that is not row-major: the stride is the read's own.
+            (
+                [7, 3, 128],
+                [128, 896, 1],
+                ((1, 0),),
+                [(1, 7)],
+                896 * d0 + d1,
+                [[]],
+                [[(128, 1)]],
+            ),
+            # Not a unit tile: the dim keeps its symbol and its entry.
+            (
+                [14, 3, 128],
+                [384, 128, 1],
+                ((1, 0),),
+                [(1, 7)],
+                384 * d0 + 128 * d1 + d2,
+                [[(0, 2)]],
+                None,
+            ),
+        ):
+            with self.subTest(ranges=ranges, in_stride=in_stride, levels=levels):
+                op = _make_real_pointwise_op(
+                    ranges=[Integer(r) for r in ranges],
+                    input_shapes_strides=[(ranges, in_stride)],
+                    name="buf0",
+                    hints=hints,
+                )
+                levels = [(hint_id, Integer(count)) for hint_id, count in levels]
+                coarse_tile_post_stickify(_graph([op]), [([op], levels)])
+                (read,) = op.get_read_writes().reads
+                self.assertEqual(read.index, index)
+                self.assertEqual(op.loop_info.tiled_dims_per_read, [tiled])
+                self.assertEqual(
+                    op.loop_info.squeezed_advance_per_read,
+                    [] if squeezed is None else [squeezed],
+                )
+
     def test_predivision_step_wins_and_warns_on_legacy_disagreement(self):
         from torch_spyre._inductor.wsr.coarse_tile import _select_unit_steps
 
@@ -9277,19 +9367,14 @@ class TestCoeffThroughFloor(unittest.TestCase):
 # ===========================================================================
 
 
-def _ftl_pointwise(
-    shape, name="buf0", dtype=torch.float16, host_stride=None, in_stride=None
-):
+def _ftl_pointwise(shape, name="buf0", dtype=torch.float16, host_stride=None):
     """A genuine ComputedBuffer(Pointwise) with a FixedTiledLayout, built from a
     real ``inner_fn`` over a real ``InputBuffer`` -- so its deps carry Inductor's
     own ``sympy_index_symbol`` symbols and survive IR mutation.
 
     ``host_stride`` defaults to contiguous.  Pass a non-contiguous stride to
     build a transposed layout; the within-stick dim is then the innermost
-    (stride-1) host dim rather than the last one.  ``in_stride`` defaults to the
-    output's, giving a read whose coefficients match the write's; pass a
-    different one to exercise a read that addresses a differently-strided
-    buffer.
+    (stride-1) host dim rather than the last one.
 
     Requires an active graph handler (it registers buffers on
     ``V.graph.name_to_buffer``), which is why every class using it sets one up.
@@ -9299,9 +9384,7 @@ def _ftl_pointwise(
     ``_stick_host_dim`` could never resolve the stick dim by coordinate identity
     and every caller silently fell back to size-based inference in
     ``_resize_device_layout`` -- including ``test_transposed_layout_host_strides``,
-    whose whole point is a layout that defeats that inference. The mock also
-    reported ``reads=set()``, so ``read_index`` fell back to the write index and
-    the read path went untested.
+    whose whole point is a layout that defeats that inference.
     """
     from torch._inductor.ir import FlexibleLayout
     from torch_spyre._C import SpyreTensorLayout
@@ -9312,7 +9395,6 @@ def _ftl_pointwise(
         stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
     else:
         stride = [int(s) for s in host_stride]
-    read_stride = stride if in_stride is None else [int(s) for s in in_stride]
     within_stick = stride.index(min(stride))
     dim_order = [i for i in range(len(size)) if i != within_stick] + [within_stick]
 
@@ -9324,8 +9406,8 @@ def _ftl_pointwise(
                 "spyre:0",
                 dtype,
                 size,
-                read_stride,
-                SpyreTensorLayout(size, read_stride, dtype, list(range(len(size)))),
+                stride,
+                SpyreTensorLayout(size, stride, dtype, list(range(len(size)))),
             )
         ],
         FixedTiledLayout(
@@ -9377,6 +9459,45 @@ class TestPredictFrame(unittest.TestCase):
         self.assertEqual(pred_devsize, list(op.layout.device_layout.device_size))
         self.assertEqual(pred_stride, [int(s) for s in op.layout.stride])
         self.assertEqual(pred_stridemap, list(op.layout.device_layout.stride_map))
+
+    def test_offset_is_kept(self):
+        """The tile's layout keeps the output layout's own offset, as the
+        applier does: it resizes that layout in place."""
+        tiling = TileSpec((TileAxis(0, 4),))
+        op = _ftl_pointwise((512, 256, 128))
+        op.layout.offset = Integer(4096)
+        frame = predict_frame(op, tiling)
+        self.assertEqual(frame.layout.offset, 4096)
+        op.dim_hints = tile_spec_to_dim_hints(op, tiling, [0])
+        coarse_tile_post_stickify(_graph([op]), [([op], [(0, Integer(4))])])
+        self.assertEqual(op.layout.offset, frame.layout.offset)
+
+    def test_a_symbolic_dim_is_read_at_its_compile_time_value(self):
+        """A dim left symbolic by a recompile for a second shape predicts the
+        tile layout of the same op with that dim static: the device layout was
+        built from the symbol's value, and the prediction reads the same one."""
+        from torch._dynamo.source import ConstantSource
+
+        shape, tiling = (4, 8, 256), TileSpec((TileAxis(1, 2),))
+        static = predict_frame(_ftl_pointwise(shape, name="static"), tiling)
+        s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
+        op = _ftl_pointwise(shape, name="symbolic")
+        object.__setattr__(op.data, "ranges", [s0, Integer(8), Integer(256)])
+        op.layout.size = [s0, Integer(8), Integer(256)]
+
+        frame = predict_frame(op, tiling)
+
+        self.assertEqual(list(frame.ranges), [s0, 4, 256])
+        self.assertEqual(list(frame.layout.size), list(static.layout.size))
+        self.assertEqual(list(frame.layout.stride), list(static.layout.stride))
+        self.assertEqual(
+            list(frame.layout.device_layout.device_size),
+            list(static.layout.device_layout.device_size),
+        )
+        self.assertEqual(
+            list(frame.layout.device_layout.stride_map),
+            list(static.layout.device_layout.stride_map),
+        )
 
     def test_single_output_axis(self):
         self._apply_and_compare(
@@ -9657,68 +9778,6 @@ class TestPredictIterSpaceNamespace(unittest.TestCase):
         )
 
 
-class TestPredictReadIndex(unittest.TestCase):
-    """``read_index`` addresses a buffer coarse tiling does not resize, so the
-    prediction must carry the committed index through unchanged.
-
-    It was previously rescaled against the *output's* full/tile strides.
-    ``_rescale_index`` pairs terms to strides by value, so an input stride that
-    coincided with some other output dim's stride was rescaled by that dim's
-    tile stride, and one matching nothing raised a bare ``RuntimeError``.
-    """
-
-    def setUp(self):
-        gm = fx.symbolic_trace(lambda: None)
-        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
-        self._graph_ctx.__enter__()
-
-    def tearDown(self):
-        self._graph_ctx.__exit__(None, None, None)
-
-    @staticmethod
-    def _read_index(op):
-        from torch_spyre._inductor.pass_utils import invalidate_op_read_writes
-
-        invalidate_op_read_writes(op)
-        return next(d.index for d in op.get_read_writes().reads if hasattr(d, "index"))
-
-    def test_read_index_matches_the_applied_dep(self):
-        # Output stored dim1-innermost; input contiguous -- so the input's dim-1
-        # stride (128) collides with the *output's* dim-2 stride (128).
-        op = _ftl_pointwise(
-            [4, 128, 128], host_stride=[16384, 1, 128], in_stride=[16384, 128, 1]
-        )
-        committed = self._read_index(op)
-        # Dep symbols carry Inductor's integer/nonneg assumptions, so build the
-        # expected index from the same factory -- a plain sympy.Symbol("d0")
-        # prints identically but compares unequal.
-        d0, d1, d2 = (sympy_index_symbol(f"d{i}") for i in range(3))
-        self.assertEqual(committed, 16384 * d0 + 128 * d1 + d2)
-
-        tiling = TileSpec((TileAxis(1, 2),))
-        frame = predict_frame(op, tiling)
-        # The write index *is* rescaled: it addresses the op's own output.
-        self.assertEqual([int(s) for s in frame.layout.stride], [8192, 1, 64])
-
-        op.dim_hints = tile_spec_to_dim_hints(op, tiling, [0])
-        coarse_tile_post_stickify(_graph([op]), [([op], [(0, Integer(2))])])
-        self.assertEqual(frame.read_index, self._read_index(op))
-        self.assertEqual(frame.read_index, committed)
-
-    def test_input_stride_absent_from_output_layout_does_not_raise(self):
-        """A stride matching no output stride used to reach ``_rescale_index``'s
-        bare ``RuntimeError`` -- which no ``except Unsupported`` candidate-pruning
-        caller would catch."""
-        op = _ftl_pointwise(
-            [4, 128, 128],
-            name="rd_odd",
-            host_stride=[16384, 1, 128],
-            in_stride=[16384, 384, 3],
-        )
-        frame = predict_frame(op, TileSpec((TileAxis(1, 2),)))
-        self.assertEqual(frame.read_index, self._read_index(op))
-
-
 class TestValidateTiling(unittest.TestCase):
     """``_rejection_reason`` gates ``predict_frame`` on exactly the conditions
     ``tile_spec_to_dim_hints`` refuses to lower, plus the ones only prediction
@@ -9883,6 +9942,22 @@ class TestValidateTiling(unittest.TestCase):
             torch.device("spyre:0"), torch.float16, [512, 256], [256, 1]
         )
         self.assertIsNone(predict_frame(op, TileSpec((TileAxis(0, 4),))))
+
+    def test_unresizable_device_layout_rejected(self):
+        """A device dim folding two host dims -- the attention output
+        ``[1, 64, hq, 128]`` lays heads and head_dim's outer stick out as one --
+        cannot be resized to any tile. ``_resize_device_layout`` raises on it,
+        which used to escape ``predict_frame``."""
+        from torch_spyre._C import SpyreTensorLayout
+
+        op = _ftl_pointwise((1, 64, 40, 128), name="val_folded")
+        spec = TileSpec((TileAxis(1, 2),))
+        self.assertIsNotNone(predict_frame(op, spec))  # non-vacuity
+        dl = op.layout.device_layout
+        op.layout.device_layout = SpyreTensorLayout(
+            [64, 80, 1, 64], [5120, 64, -1, 1], dl.device_dtype, dl.element_arrangement
+        )
+        self.assertIsNone(predict_frame(op, spec))
 
     def test_indivisible_extent_returns_none(self):
         """Coarse tiling emits equal-sized tiles, so an extent that is not a
@@ -10394,6 +10469,38 @@ class TestTileSpecLoweringReduction(unittest.TestCase):
                 (read,) = op.get_read_writes().reads
                 self.assertEqual(int(read.ranges[loop_var]), expected[host_dim + 1])
 
+    def test_trailing_broadcast_reduction_dim_tiles_the_named_dim(self):
+        """A reduction dim no read walks (an expanded operand: stride 0) is the
+        last one, so Inductor drops its loop variable from every read dep and
+        ``reduction_loop_vars`` comes back shorter than the non-size-1 dims.
+        What is left is a prefix of them, so the k-th loop variable still
+        belongs to the k-th non-size-1 dim and the hint must tile it, not be
+        dropped."""
+        for reduction_ranges, in_shape_stride, pos, expected in (
+            ([8, 16], ([8, 8, 16], [8, 1, 0]), 0, [4, 16]),
+            ([1, 8, 16], ([8, 1, 8, 16], [8, 8, 1, 0]), 1, [1, 4, 16]),
+        ):
+            with self.subTest(reduction_ranges=reduction_ranges):
+                op = _make_real_reduction_op(
+                    ranges=[Integer(8)],
+                    reduction_ranges=[Integer(r) for r in reduction_ranges],
+                    input_shape_stride=in_shape_stride,
+                    name=f"buf_bcast{len(reduction_ranges)}",
+                    hints=((1, 1),),
+                )
+                # Not vacuous: only the 8 has a loop variable.
+                (loop_var,) = reduction_loop_vars(op)
+                self.assertEqual(_loop_var_to_reduction_ranges_pos(op, loop_var), pos)
+                spec = TileSpec((TileAxis(0, 2, is_reduction=True),))
+                op.dim_hints = tile_spec_to_dim_hints(op, spec, [1])
+                levels = [(1, Integer(2))]
+                plan = plan_coarse_tile_groups([op], [([op], levels)])
+                _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+                self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[pos]])
+                self.assertEqual([int(r) for r in op.data.reduction_ranges], expected)
+                (read,) = op.get_read_writes().reads
+                self.assertEqual(int(read.ranges[loop_var]), 4)
+
     def test_loop_vars_that_do_not_pair_raise(self):
         """Loop variables that do not pair one-to-one with the non-size-1
         reduction dims (a leaked broadcast symbol, say) leave the applier no
@@ -10624,18 +10731,20 @@ class TestEnumeratedOptionsLower(unittest.TestCase):
             {axis.host_dim for spec in options for axis in spec.axes}, {0, 2}
         )
 
-    def test_unit_reduction_dims_are_skipped_not_offered(self):
-        # A size-1 reduction dim has no loop variable, so it is never offered,
-        # and the dims around it are offered at their squeezed positions --
-        # exactly the options of the same op without the unit dims.
+    def test_unit_reduction_dim_withholds_reduction_options(self):
+        # An op with a size-1 reduction dim is offered no reduction tilings,
+        # wherever the unit dim sits. The output [64] is the stick dim, so such
+        # an op is left with the untiled option alone.
         control = self._assert_every_option_lowers(
             _make_real_tiled_op("red_ctl", [64], [6, 16, 128])
         )
-        unit = self._assert_every_option_lowers(
-            _make_real_tiled_op("red_unit", [64], [1, 6, 1, 16, 128])
-        )
-        self.assertEqual(unit, control)
-        # Not vacuous: every reduction dim is offered.
+        for reduction_ranges in ([1, 6, 16, 128], [6, 1, 16, 128], [1, 6, 1, 16, 128]):
+            with self.subTest(reduction_ranges=reduction_ranges):
+                unit = self._assert_every_option_lowers(
+                    _make_real_tiled_op("red_unit", [64], reduction_ranges)
+                )
+                self.assertEqual(unit, [TileSpec()])
+        # Not vacuous: without a unit dim every reduction dim is offered.
         self.assertEqual(
             {
                 axis.host_dim
@@ -10678,6 +10787,127 @@ class TestEnumeratedOptionsLower(unittest.TestCase):
         # it, and host_dim 1 is out of bounds though [1, 8] has two entries.
         self.assertTrue(_lowering_accepts(red_unit, TileAxis(0, 2, is_reduction=True)))
         self.assertFalse(_lowering_accepts(red_unit, TileAxis(1, 2, is_reduction=True)))
+
+
+class TestPlannedFullBufferLayout(unittest.TestCase):
+    """A buffer the tiles are gathered into -- a copy-out's full buffer, a
+    reduction's full accumulator -- takes the device layout the op's output had
+    before tiling. Grown back from the tile it would keep the tile's extent
+    wherever the tile has two device dims of extent 1."""
+
+    def setUp(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+
+        gm = fx.symbolic_trace(lambda: None)
+        # _allocate_full_buffer lowers a real spyre.empty node, which needs a
+        # fake mode and the Spyre lowering table besides the graph handler.
+        for ctx in (
+            V.set_graph_handler(GraphLowering(gm)),
+            V.set_fake_mode(FakeTensorMode()),
+            enable_spyre_lowerings(),
+        ):
+            ctx.__enter__()
+            self.addCleanup(ctx.__exit__, None, None, None)
+
+    def _tile(self, op, axes):
+        """Tile ``op`` by ``axes`` post-stickify, with a reader outside the
+        loop group, and return the operations list."""
+        from torch._inductor.ir import ComputedBuffer, Pointwise, StorageBox, TensorBox
+
+        load = TensorBox(StorageBox(op)).make_loader()
+        reader = ComputedBuffer(
+            name="reader",
+            layout=op.layout,
+            data=Pointwise.create(
+                device=torch.device("cpu"),
+                dtype=op.layout.dtype,
+                inner_fn=load,
+                ranges=list(op.data.ranges),
+            ).data.data,
+        )
+        reader.operation_name = "reader"
+        V.graph.name_to_buffer["reader"] = reader
+        hint_ids = list(range(1, len(axes) + 1))
+        op.dim_hints = tile_spec_to_dim_hints(op, TileSpec(axes), hint_ids)
+        levels = [(h, Integer(a.count)) for h, a in zip(hint_ids, axes)]
+        # The live graph's own list: _allocate_full_buffer lowers into it.
+        operations = V.graph.operations
+        operations.extend([op, reader])
+        coarse_tile_post_stickify(V.graph, [([op], levels)])
+        return operations
+
+    def _assert_full_buffers_keep(self, operations, op, size, device_layout):
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        # The buffers the apply allocated at the op's full size; the copy ops
+        # that write into them carry a mutation layout instead.
+        full = [
+            o
+            for o in operations
+            if o is not op
+            and o.get_name() != "reader"
+            and isinstance(o.layout, FixedTiledLayout)
+            and [int(s) for s in o.layout.size] == size
+        ]
+        self.assertTrue(full)  # non-vacuity
+        for buf in full:
+            with self.subTest(buf=buf.get_name()):
+                self.assertEqual(
+                    list(buf.layout.device_layout.device_size),
+                    list(device_layout.device_size),
+                )
+                self.assertEqual(
+                    list(buf.layout.device_layout.stride_map),
+                    list(device_layout.stride_map),
+                )
+
+    def test_copy_out_full_buffer(self):
+        # Two dims tiled all the way down: the tile is [1, 1, 128].
+        op = _make_real_tiled_op("pw_full", [3, 5, 128])
+        original = op.layout.device_layout
+        operations = self._tile(op, (TileAxis(0, 3), TileAxis(1, 5)))
+        self.assertEqual(op.loop_info.propagation.kind, "copy_out")
+        self.assertEqual([int(s) for s in op.layout.size], [1, 1, 128])
+        self._assert_full_buffers_keep(operations, op, [3, 5, 128], original)
+
+    def _assert_reduction_accumulator_keeps_layout(self, axes):
+        # The stick dim tiled down to one stick, beside a reduction-range
+        # level: the tile's tile-count device dim has extent 1, like dim 0's
+        # would if it were 1.
+        op = _make_real_tiled_op("red_full", [6, 256], [8])
+        original = op.layout.device_layout
+        operations = self._tile(op, axes)
+        self.assertEqual(op.loop_info.propagation.kind, "reduction")
+        self.assertEqual([int(s) for s in op.layout.size], [6, 64])
+        self._assert_full_buffers_keep(operations, op, [6, 256], original)
+
+    def test_reduction_full_accumulator_under_an_outer_output_level(self):
+        # A copy fills the full accumulator once per outer tile.
+        self._assert_reduction_accumulator_keeps_layout(
+            (TileAxis(1, 4), TileAxis(0, 2, is_reduction=True))
+        )
+
+    def test_reduction_full_accumulator_over_an_inner_output_level(self):
+        # The combine op writes the full accumulator directly.
+        self._assert_reduction_accumulator_keeps_layout(
+            (TileAxis(0, 2, is_reduction=True), TileAxis(1, 4))
+        )
+
+    def test_combine_op_does_not_inherit_the_tiled_ops_unit_steps(self):
+        # A reduction range tiled all the way down leaves its step on the
+        # tiled op's read. The combine op reads the per-tile partial and the
+        # accumulator instead, and neither advances by that step.
+        op = _make_real_tiled_op("red_unit", [14, 128], [16])
+        operations = self._tile(
+            op, (TileAxis(0, 7), TileAxis(0, 16, is_reduction=True))
+        )
+        self.assertTrue(any(any(r) for r in op.loop_info.squeezed_advance_per_read))
+        (combine,) = [
+            o for o in operations if o.get_name().startswith("coarse_tile_combine_")
+        ]
+        self.assertEqual(combine.loop_info.squeezed_advance_per_read, [])
 
 
 class TestDeriveTilingGroups(unittest.TestCase):

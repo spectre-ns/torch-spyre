@@ -38,9 +38,16 @@ the one the tiled op will carry. Applying a tiling re-runs Inductor's
 per-tile extent is 1 and renumbers the survivors from a fresh ``d0`` -- names
 that do not exist yet at prediction time, and that a prediction could not use
 anyway because it is paired with the op's still-committed deps. So the
-symbol-carrying fields (``iter_space``, ``write_index``, ``read_index``) are
-valid only against *untiled* deps, while the symbol-free ones (``ranges``,
-``layout``) are exact against the applied op. See ``_predict_iter_space``.
+symbol-carrying fields (``iter_space``, ``write_index``) are valid only against
+*untiled* deps, while the symbol-free ones (``ranges``, ``layout``) are exact
+against the applied op. See ``_predict_iter_space``.
+
+The frame covers the op's own loops and its own output buffer, and carries no
+read index. What a read becomes is not the op's to decide: once a tiling is
+applied, a load of a producer tiled in the same loop group addresses that
+producer's per-tile buffer, at its tile strides, while a load of a buffer
+outside the group keeps its committed index. Which one a read is depends on the
+producer's tiling, which a per-op prediction is not given.
 
 A candidate that cannot be predicted is reported by returning ``None``, never
 by raising. Callers enumerate candidates and price the ones that survive, so an
@@ -60,6 +67,9 @@ Dependencies stay one-way (``tile_prediction -> coarse_tile``, and the
 resolver in ``scratchpad.coarse_tiling``). Nothing here
 mutates IR; the solver must not import this module -- the allocator calls the
 predictor and hands results across, which is what keeps the solver IR-free.
+
+Nothing calls it yet: the allocator seam that prices candidates through it --
+per-tiling division enumeration -- arrives separately.
 """
 
 from __future__ import annotations
@@ -73,7 +83,7 @@ from torch._inductor.ir import ComputedBuffer
 
 from ..ir import FixedTiledLayout, _resize_device_layout
 from ..logging_utils import get_inductor_logger
-from ..pass_utils import iteration_space_from_op
+from ..pass_utils import concretize_expr, iteration_space_from_op
 from ..scratchpad.coarse_tiling import try_resolve_tile_axis_loop_vars
 from ..scratchpad.plan_solver import TileSpec
 from .coarse_tile import (
@@ -95,17 +105,16 @@ class PredictedFrame:
 
     ``ranges`` / ``reduction_ranges`` are the per-tile extents; ``layout`` is the
     per-tile output ``FixedTiledLayout`` (the op's own layout when untiled);
-    ``write_index`` is rescaled to the tile strides while ``read_index`` is the
-    op's committed read index unchanged (see ``predict_frame`` -- coarse tiling
-    resizes the op's own output buffer, never the buffers it reads); and
-    ``iter_space`` maps each loop symbol to its per-tile extent.
+    ``write_index`` is the op's write index rescaled to the tile strides; and
+    ``iter_space`` maps each loop symbol to its per-tile extent. There is no
+    read index: what a read becomes depends on its producer's tiling (module
+    docstring).
 
-    ``iter_space``, ``write_index`` and ``read_index`` are keyed by the op's
-    *pre-tiling* loop symbols (see ``_predict_iter_space``), so they pair only
-    with the committed, untiled ``MemoryDep``. ``ranges``, ``reduction_ranges``
-    and ``layout`` carry no symbols and
-    match the applied op exactly, including when a tiled dim divides to a
-    per-tile extent of 1.
+    ``iter_space`` and ``write_index`` are keyed by the op's *pre-tiling* loop
+    symbols (see ``_predict_iter_space``), so they pair only with the
+    committed, untiled ``MemoryDep``. ``ranges``, ``reduction_ranges`` and
+    ``layout`` carry no symbols and match the applied op exactly, including
+    when a tiled dim divides to a per-tile extent of 1.
     """
 
     op_name: str
@@ -114,7 +123,6 @@ class PredictedFrame:
     reduction_ranges: list
     layout: FixedTiledLayout
     write_index: Expr
-    read_index: Expr
     iter_space: dict
 
 
@@ -180,31 +188,46 @@ def _predict_output_layout(
     op: ComputedBuffer, tiling: TileSpec
 ) -> FixedTiledLayout | None:
     """The per-tile output ``FixedTiledLayout``, built exactly as
-    ``_divide_ranges`` builds it.
+    ``_divide_ranges`` builds it, or ``None`` where that would fail: an extent
+    that does not divide, or a device layout ``_resize_device_layout`` cannot
+    resize (e.g. one device dim folding two host dims). A symbolic size or
+    stride is read at its compile-time value, which the device layout was built
+    from.
     """
     layout = op.layout
-    cur_size = [int(s) for s in layout.size]
-    cur_stride = [int(s) for s in layout.stride]
+    cur_size = [concretize_expr(s) for s in layout.size]
+    cur_stride = [concretize_expr(s) for s in layout.stride]
     cur_dev = layout.device_layout
     for axis in tiling.axes:
         if axis.is_reduction:
             continue
         extent = _try_exact_div(cur_size[axis.host_dim], axis.count)
         if extent is None:
+            logger.debug(
+                "dropping tiling %s on %s: output size does not divide evenly",
+                tiling,
+                op.get_name(),
+            )
             return None
         new_size = list(cur_size)
         new_size[axis.host_dim] = int(extent)
         cur_stride = [
             int(s) for s in compute_tile_stride(cur_size, cur_stride, new_size)
         ]
-        cur_dev = _resize_device_layout(
-            cur_dev,
-            cur_size,
-            new_size,
-            stick_host_dim=_stick_host_dim(op, cur_dev),
-        )
+        try:
+            cur_dev = _resize_device_layout(
+                cur_dev,
+                cur_size,
+                new_size,
+                stick_host_dim=_stick_host_dim(op, cur_dev),
+            )
+        except RuntimeError as exc:
+            logger.debug("dropping tiling %s on %s: %s", tiling, op.get_name(), exc)
+            return None
         cur_size = new_size
-    return FixedTiledLayout(layout.device, layout.dtype, cur_size, cur_stride, cur_dev)
+    return FixedTiledLayout(
+        layout.device, layout.dtype, cur_size, cur_stride, cur_dev, layout.offset
+    )
 
 
 def _predict_iter_space(op: ComputedBuffer, tiling: TileSpec) -> dict | None:
@@ -291,12 +314,14 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
     )
     layout = _predict_output_layout(op, tiling) if output_counts else op.layout
     iter_space = _predict_iter_space(op, tiling)
-    if ranges is None or reduction_ranges is None or layout is None:
+    if ranges is None or reduction_ranges is None:
         logger.debug(
             "dropping tiling %s on %s: extents do not divide evenly",
             tiling,
             op.get_name(),
         )
+        return None
+    if layout is None:  # _predict_output_layout logged why
         return None
     if iter_space is None:
         logger.debug(
@@ -306,17 +331,7 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
         )
         return None
 
-    rw = op.get_read_writes()
-    write_index = next(iter(rw.writes)).index
-
-    # reads indexes are unaffected by current op tiling
-    try:
-        read_index = next(
-            (d.index for d in rw.reads if hasattr(d, "index")), write_index
-        )
-    except NotImplementedError:
-        return None
-
+    write_index = next(iter(op.get_read_writes().writes)).index
     if output_counts:
         full_strides = [sympy.sympify(s) for s in op.layout.stride]
         tile_strides = [sympy.sympify(s) for s in layout.stride]
@@ -329,6 +344,5 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
         reduction_ranges=reduction_ranges,
         layout=layout,
         write_index=write_index,
-        read_index=read_index,
         iter_space=iter_space,
     )

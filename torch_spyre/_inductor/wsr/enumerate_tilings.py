@@ -27,9 +27,11 @@ it is offered, so a spec the solver picks from this set cannot then fail in
 reads the same resolver, cannot refuse it on axis grounds either. A reduction
 ``host_dim`` is minted, sized and stick-checked in the frame that resolver reads
 it in: a position in the op's *squeezed* reduction loop variables
-(:func:`~.coarse_tile.reduction_loop_vars`). A size-1 reduction dim has no loop
-variable, so it is never offered, and the reduction dims around it are offered
-at their squeezed positions.
+(:func:`~.coarse_tile.reduction_loop_vars`). An op with a size-1 reduction dim
+is offered no reduction tilings: Inductor mints no loop variable for that dim,
+so the squeezed positions no longer line up with ``reduction_ranges``. The
+resolver itself accepts a reduction axis on such an op, so this limits what is
+offered, not what lowers.
 
 The strategy is **exact divisors**: a split count is
 admissible only if it divides its dim's extent exactly, because coarse tiling
@@ -64,8 +66,9 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Iterable, Sequence
 
-from torch._inductor.ir import ComputedBuffer, Reduction
+from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from .. import config
 from ..errors import Unsupported
@@ -128,6 +131,25 @@ def _output_split_counts(op: ComputedBuffer, host_dim: int) -> list[int]:
     except Unsupported:
         return []
     return [s for s in candidates if s > 1]
+
+
+def _unit_tile_breaks_a_reader(
+    op: ComputedBuffer, host_dim: int, count: int, readers: Sequence[ComputedBuffer]
+) -> bool:
+    """Whether tiling ``host_dim`` ``count`` ways leaves a 1-extent tile that a
+    reader views through another rank or shape, which ``_squeezed_retile_dims``
+    refuses for a reader outside the tiling group. Which readers end up outside
+    is not known yet, so any reader counts."""
+    ranges = tuple(op.data.ranges)
+    if int(ranges[host_dim]) // count != 1:
+        return False
+    for reader in readers:
+        reader_ranges = tuple(reader.data.ranges)
+        if len(reader_ranges) < len(ranges) or (
+            reader_ranges[host_dim] != 1 and reader_ranges != ranges
+        ):
+            return True
+    return False
 
 
 def _reduction_split_cuts_input_stick(op: ComputedBuffer, red_var, split: int) -> bool:
@@ -257,16 +279,17 @@ def enumerate_tile_options(
     max_dims: int = _MAX_TILE_DIMS,
     max_splits_per_dim: int = _MAX_SPLITS_PER_DIM,
     max_options: int = _MAX_TILE_OPTIONS,
+    readers: Iterable[Operation] = (),
 ) -> list[TileSpec]:
     """Return the coarse tilings ``op`` could legally take, untiled first.
 
     The set always contains the empty (untiled) :class:`TileSpec` and
     every single- or nested-output tiling over exact divisors of non-stick
     output dims (up to ``max_dims`` dims tiled at once), plus every single-level
-    reduction tiling when ``op`` is a Reduction and ``enable_reduction_tiling``
-    is set. It never emits a nested output+reduction spec or a multi-reduction
-    spec. Deterministic and unconsumed; the solver prices and
-    chooses among these.
+    reduction tiling when ``op`` is a Reduction with no size-1 reduction dim and
+    ``enable_reduction_tiling`` is set. It never emits a nested output+reduction
+    spec or a multi-reduction spec. Deterministic and unconsumed; the solver
+    prices and chooses among these.
 
     Every option lowers: each candidate dim is resolved through
     :func:`try_resolve_tile_axis_loop_vars` before any spec is built from it --
@@ -276,6 +299,9 @@ def enumerate_tile_options(
     reads each axis independently and from its ``host_dim`` and
     ``is_reduction`` alone, never its ``count``: an axis resolves exactly when
     its dim does, and a spec exactly when each of its axes does.
+
+    ``readers`` are the ops reading ``op``'s output; a unit tile some reader
+    views through another shape is not offered (:func:`_unit_tile_breaks_a_reader`).
     """
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
@@ -289,11 +315,17 @@ def enumerate_tile_options(
     # --- output-range options -------------------------------------------------
     stick_dim = _output_stick_host_dim(op)
     n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+    # Only a ComputedBuffer reader is re-indexed by the apply.
+    retiled_readers = [r for r in readers if isinstance(r, ComputedBuffer)]
     per_dim: list[tuple[int, list[int]]] = []
     for host_dim in range(n_out):
         if host_dim == stick_dim:
             continue  # fail closed on the stick dim (module docstring)
-        counts = _output_split_counts(op, host_dim)[:max_splits_per_dim]
+        counts = [
+            count
+            for count in _output_split_counts(op, host_dim)
+            if not _unit_tile_breaks_a_reader(op, host_dim, count, retiled_readers)
+        ][:max_splits_per_dim]
         if counts and _lowering_accepts(op, TileAxis(host_dim, counts[0])):
             per_dim.append((host_dim, counts))
 
@@ -320,7 +352,12 @@ def enumerate_tile_options(
                 options.append(TileSpec(axes))
 
     # --- reduction options: single-level only ---------------------------------
-    if isinstance(op.data, Reduction) and config.enable_reduction_tiling:
+    if (
+        isinstance(op.data, Reduction)
+        and config.enable_reduction_tiling
+        # No reduction tilings beside a size-1 reduction dim (module docstring).
+        and all(r != 1 for r in op.data.reduction_ranges)
+    ):
         # Positions in the squeezed reduction loop variables, the frame a
         # reduction TileAxis.host_dim is lowered in (module docstring).
         try:
