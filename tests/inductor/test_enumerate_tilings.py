@@ -339,22 +339,58 @@ class TestApplyRefusals(unittest.TestCase):
             self.assertIn(64, _counts(options, 3))
             self.assertEqual(_counts(options, 2), [5])
 
-    def test_a_symbolic_dim_leaves_the_static_dims_their_counts(self):
+    def test_a_symbolic_dim_is_offered_no_tiling(self):
         # A recompile for a second shape leaves the changed dim symbolic in the
         # host layout while the device layout is built from its actual value.
-        # The resize check reads that value, so the static dims keep the counts
-        # they have when every dim is static.
+        # The applier reads every extent of a tiled op as an int, so the op is
+        # offered no tiling, not even on its static dims. The split helper the
+        # span-overflow planner shares still reads the symbol's value and
+        # returns the static dim's counts instead of raising.
+        from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
+            _split_candidates_for_host_dim,
+        )
+
         shape = (4, 8, 256)
         static = enumerate_tile_options(_pointwise_op(shape))
         self.assertEqual(_counts(static, 1), [2, 4, 8])  # non-vacuity
+        static_splits = _split_candidates_for_host_dim(_pointwise_op(shape), 1)
         with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
             s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
             op = _pointwise_op(shape)
             op.data.ranges = [s0, *shape[1:]]
             op.layout.size = [s0, *shape[1:]]
             options = enumerate_tile_options(op)
-        self.assertEqual(_counts(options, 1), _counts(static, 1))
-        self.assertEqual(_counts(options, 0), [])
+            splits = _split_candidates_for_host_dim(op, 1)
+        self.assertEqual(options, [TileSpec()])
+        self.assertEqual(splits, static_splits)
+
+    def test_a_symbolic_stride_is_offered_no_tiling(self):
+        # A mutation op inherits its target view's strides, so a stride can be
+        # symbolic over static sizes. The applier orders strides by value, so
+        # the op is offered no tiling.
+        shape = (4, 8, 256)
+        with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+            s0 = V.graph.sizevars.shape_env.create_symbol(8, ConstantSource("s0"))
+            op = _pointwise_op(shape)
+            self.assertEqual(_counts(enumerate_tile_options(op), 1), [2, 4, 8])
+            op.layout.stride = [256 * s0, 256, 1]
+            options = enumerate_tile_options(op)
+        self.assertEqual(options, [TileSpec()])
+
+    def test_a_symbolic_output_dim_withholds_reduction_options(self):
+        # Reduction axes are resolved one dim at a time, past the resolver's
+        # own symbolic-extent check, so the enumerator has to refuse the op
+        # itself: the reduction dim is static, the output dim beside it is not.
+        with patch.object(config, "enable_reduction_tiling", True):
+            static = enumerate_tile_options(_reduction_op((4, 256), (8,)))
+            self.assertTrue(any(s.axes[0].is_reduction for s in static if s.axes))
+            with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+                s0 = V.graph.sizevars.shape_env.create_symbol(4, ConstantSource("s0"))
+                op = _reduction_op((4, 256), (8,))
+                op.data.ranges = [s0, 256]
+                op.layout.size = [s0, 256]
+                options = enumerate_tile_options(op)
+        self.assertEqual(options, [TileSpec()])
 
 
 if __name__ == "__main__":

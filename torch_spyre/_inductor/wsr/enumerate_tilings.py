@@ -75,7 +75,11 @@ from ..errors import Unsupported
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import host_coordinates, iteration_space_from_op
-from ..scratchpad.coarse_tiling import _get_red_var, try_resolve_tile_axis_loop_vars
+from ..scratchpad.coarse_tiling import (
+    _get_red_var,
+    _symbolic_extent_reason,
+    try_resolve_tile_axis_loop_vars,
+)
 from ..scratchpad.plan_solver import TileAxis, TileSpec
 from .coarse_tile import _stick_host_dim, reduction_loop_vars
 from .span_overflow_hint_analysis import (
@@ -302,14 +306,18 @@ def enumerate_tile_options(
 
     ``readers`` are the ops reading ``op``'s output; a unit tile some reader
     views through another shape is not offered (:func:`_unit_tile_breaks_a_reader`).
+
+    An op with a symbolic extent is offered the untiled option alone: the
+    applier cannot tile it on any axis (:func:`_symbolic_extent_reason`). The
+    resolver refuses its output axes for the same reason; asking once here also
+    covers the reduction axes, which are resolved one dim at a time.
     """
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
         return options
-    # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
-    # and has no device layout of its own to size or stick-check a tile
-    # against; prediction refuses to tile it for the same reason.
-    if not isinstance(op.get_layout(), FixedTiledLayout):
+    symbolic = _symbolic_extent_reason(op)
+    if symbolic is not None:
+        logger.debug("enumerate_tile_options: %s", symbolic)
         return options
 
     # --- output-range options -------------------------------------------------
