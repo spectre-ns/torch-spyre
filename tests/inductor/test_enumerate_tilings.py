@@ -364,6 +364,19 @@ class TestApplyRefusals(unittest.TestCase):
         self.assertEqual(options, [TileSpec()])
         self.assertEqual(splits, static_splits)
 
+    def test_a_symbolic_stride_is_offered_no_tiling(self):
+        # A mutation op inherits its target view's strides, so a stride can be
+        # symbolic over static sizes. The applier orders strides by value, so
+        # the op is offered no tiling.
+        shape = (4, 8, 256)
+        with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+            s0 = V.graph.sizevars.shape_env.create_symbol(8, ConstantSource("s0"))
+            op = _pointwise_op(shape)
+            self.assertEqual(_counts(enumerate_tile_options(op), 1), [2, 4, 8])
+            op.layout.stride = [256 * s0, 256, 1]
+            options = enumerate_tile_options(op)
+        self.assertEqual(options, [TileSpec()])
+
     def test_a_symbolic_output_dim_withholds_reduction_options(self):
         # Reduction axes are resolved one dim at a time, past the resolver's
         # own symbolic-extent check, so the enumerator has to refuse the op

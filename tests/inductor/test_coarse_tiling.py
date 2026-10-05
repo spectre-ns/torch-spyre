@@ -9495,6 +9495,25 @@ class TestPredictFrame(unittest.TestCase):
         # The untiled frame is still the op's own.
         self.assertIsNotNone(predict_frame(op, TileSpec()))
 
+    def test_a_symbolic_stride_refuses_a_tiling_over_static_sizes(self):
+        """A mutation op inherits its target view's strides, so its stride can
+        be symbolic while every size and range is static. The applier orders
+        strides by value, so the op is untileable all the same."""
+        from torch._dynamo.source import ConstantSource
+
+        shape, tiling = (4, 8, 256), TileSpec((TileAxis(1, 2),))
+        s0 = V.graph.sizevars.shape_env.create_symbol(8, ConstantSource("s0"))
+        op = _ftl_pointwise(shape, name="symbolic_stride")
+        self.assertIsNotNone(predict_frame(op, tiling))  # non-vacuity
+        op.layout.stride = [256 * s0, Integer(256), Integer(1)]
+
+        self.assertIsNone(predict_frame(op, tiling))
+        _, reason = try_resolve_tile_axis_loop_vars(op, tiling)
+        self.assertIn("symbolic layout metadata", reason)
+        with self.assertRaisesRegex(Unsupported, "symbolic layout metadata"):
+            tile_spec_to_dim_hints(op, tiling, [0])
+        self.assertIsNotNone(predict_frame(op, TileSpec()))
+
     def test_single_output_axis(self):
         self._apply_and_compare(
             (512, 256, 128), TileSpec((TileAxis(0, 4),)), [(0, Integer(4))]

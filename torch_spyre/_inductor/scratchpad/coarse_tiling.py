@@ -39,6 +39,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation, Reduction
 
 from ..errors import Unsupported
+from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
 from ..pass_utils import iteration_space_from_op, op_out_coords
 from ..propagate_hints import DimHint
@@ -48,6 +49,7 @@ from ..wsr.coarse_tile import (
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
+from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .allocator import ScratchpadOptimizationPass
 from .plan_solver import TileSpec
 
@@ -169,6 +171,11 @@ def _symbolic_extent_reason(op: ComputedBuffer) -> str | None:
     (``_raw_to_squeezed_pos``, ``_divide_ranges``), whichever axis the tiling
     falls on. So an op with a symbolic extent anywhere -- a dim a recompile for
     a second shape left symbolic -- cannot be tiled even on its static dims.
+
+    The same holds for the rest of a tiled layout's metadata
+    (``_layout_has_static_span_metadata``): the host strides can be symbolic
+    over static sizes -- a mutation op inherits its target view's strides --
+    and ``compute_tile_stride`` orders them by value.
     """
     for what, extents in (
         ("output range", getattr(op.data, "ranges", None)),
@@ -182,6 +189,15 @@ def _symbolic_extent_reason(op: ComputedBuffer) -> str | None:
                     f"{extent}; the applier reads every extent of a tiled op "
                     "as an integer, so the op cannot be tiled."
                 )
+    layout = getattr(op, "layout", None)
+    if isinstance(layout, FixedTiledLayout) and not _layout_has_static_span_metadata(
+        layout
+    ):
+        return (
+            f"coarse tiling: {op.get_name()} has symbolic layout metadata "
+            f"(stride {list(layout.stride)}); the applier reads a tiled op's "
+            "layout as integers, so the op cannot be tiled."
+        )
     return None
 
 
