@@ -1931,7 +1931,7 @@ class UniquenessCheckTest(TestCase):
     def test_a_fully_priced_plan_is_not_reported(self):
         """Every other plan spills a priced buffer, so the runner-up is dearer.
 
-        The probe solves for that runner-up, and a plan extracted from 
+        The probe solves for that runner-up, and a plan extracted from
         it would spill a buffer here despite the probe returning OPTIMAL."""
         solver = self._solver()
         with self.assertNoLogs(self._LOGGER, level="WARNING"):
