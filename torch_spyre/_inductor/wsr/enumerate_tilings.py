@@ -315,6 +315,11 @@ def enumerate_tile_options(
     options: list[TileSpec] = [TileSpec()]
     if not isinstance(op, ComputedBuffer):
         return options
+    # A mutation writes through its target's layout (MutationLayoutSHOULDREMOVE)
+    # and has no device layout of its own to size or stick-check a tile
+    # against; prediction refuses to tile it for the same reason.
+    if not isinstance(op.get_layout(), FixedTiledLayout):
+        return options
     symbolic = _symbolic_extent_reason(op)
     if symbolic is not None:
         logger.debug("enumerate_tile_options: %s", symbolic)
