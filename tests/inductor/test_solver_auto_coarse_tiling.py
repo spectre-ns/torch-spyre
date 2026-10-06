@@ -947,6 +947,28 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # the producer wrote 16.
         self._assert_group_refused(lambda x, y: (x + y)[:32].repeat(1, 2, 1) * 2)
 
+    def test_apply_refuses_a_tiling_along_a_repeated_axis(self):
+        # repeat walks dim 1 of its input twice. Tiled four ways on that axis
+        # it once compiled and read the wrong elements: a tile has to advance
+        # and then wrap back, which the apply cannot express. The enumerator
+        # does not offer the axis; forcing it checks the apply itself.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+
+        def chosen(alloc, graph, allocation):
+            return {
+                op.get_operation_name(): _D1_BY_4
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer) and not _reads_graph_inputs_only(op)
+            }
+
+        with (
+            patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen),
+            self.assertRaises(Exception) as refusal,
+        ):
+            self._compile(lambda x, y: (x + y).repeat(1, 2, 1) * 2, (x, y))
+        self.assertIn("more than once along", str(refusal.exception))
+
     def test_apply_accepts_a_consumer_that_reads_in_step(self):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
@@ -1039,11 +1061,10 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         cpu, device, _ = self._compile(fn, (x, y))
         self._assert_close(device, cpu)
 
-    @expected_gap("runs backwards")
     def test_consumer_that_repeats_its_producer(self):
-        # Unforced. repeat reads dim 1 of its input through a modular index.
-        # The solve tiled the repeat on that dim, which the apply took and
-        # codegen then could not express.
+        # Unforced. repeat walks dim 1 of its input twice. The solve once tiled
+        # the repeat on that dim, which the apply took and codegen then could
+        # not express; the axis is no longer on offer.
         x = torch.randn(128, 128, 2048, dtype=torch.float16)
         y = torch.randn(128, 128, 2048, dtype=torch.float16)
         cpu, device, _ = self._compile(

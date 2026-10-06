@@ -602,7 +602,9 @@ along with its core division. It has no effect with any other solver.
 
 - **Candidates.** An op is offered the output-axis tilings
   `enumerate_tile_options` finds: never the stick dim, never a reduction
-  axis, and none that leave a per-core read over the read-distance limit.
+  axis, never an axis one of its reads repeats along (the repeated dim of
+  `x.repeat`, whose tiles would have to wrap back over `x`), and none that
+  leave a per-core read over the read-distance limit.
   Ops a `spyre_hint` or `for_each_tile` loop already tiles, every op inside
   a `for_each_tile` region, restickifies and mutations are offered only the
   untiled option. Each tiling gets its own division menu, enumerated on the

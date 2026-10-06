@@ -31,6 +31,7 @@ ops that run the same loop nest.
 from __future__ import annotations
 
 import dataclasses
+import operator
 from collections.abc import Mapping, Sequence
 
 import sympy
@@ -50,6 +51,7 @@ from ..pass_utils import (
     tile_ownership_view,
 )
 from ..propagate_hints import DimHint
+from ..views import convert_modular_indexing
 from ..wsr.coarse_tile import (
     _loop_var_to_reduction_ranges_pos,
     coarse_tile_post_stickify,
@@ -209,6 +211,59 @@ def _symbolic_extent_reason(op: ComputedBuffer) -> str | None:
     return None
 
 
+def _revisits_an_element(
+    index: sympy.Expr, loop_var: sympy.Symbol, extent: sympy.Expr
+) -> bool:
+    """Whether ``index`` reaches some element twice as ``loop_var`` alone runs
+    ``extent`` iterations, every other variable held at 0. An index that cannot
+    be evaluated counts as revisiting."""
+    along = index.xreplace({s: 0 for s in index.free_symbols - {loop_var}})
+    try:
+        at = sympy.lambdify(
+            loop_var, along, modules=[{"FloorDiv": operator.floordiv}, "math"]
+        )
+        seen = set()
+        for step in range(int(extent)):
+            element = at(step)
+            if element in seen:
+                return True
+            seen.add(element)
+    except (NameError, TypeError, ValueError):
+        return True
+    return False
+
+
+def _repeated_read_reason(op: ComputedBuffer, loop_var: sympy.Symbol) -> str | None:
+    """Why ``loop_var`` cannot be tiled for walking an input more than once, or
+    ``None``.
+
+    ``x.repeat(1, 2, 1)`` reads ``x[d0, d1 mod N, d2]``: as ``d1`` runs, the
+    read walks ``x``'s dim 1 and then walks it again. The applier moves a tiled
+    read on by one tile extent per iteration, and this one would have to come
+    back round. A tile holding one whole repetition reads the same span every
+    time, which fails in codegen; a smaller one advances and then wraps, which
+    compiles and reads the wrong elements.
+
+    Only a read that comes back to an element is refused. The digits of a
+    reshape -- ``(d mod 4, d // 4)`` -- are modular and reach each element
+    once, so they are left alone, and so is a read that does not move along the
+    axis at all (a broadcast), which the applier holds still.
+    """
+    for dep in op_read_writes(op).reads:
+        if not isinstance(dep, MemoryDep) or loop_var not in dep.ranges:
+            continue
+        index = convert_modular_indexing(dep.index)
+        if not any(loop_var in mod.free_symbols for mod in index.find(sympy.Mod)):
+            continue
+        if _revisits_an_element(index, loop_var, dep.ranges[loop_var]):
+            return (
+                f"coarse tiling: {op.get_name()} reads {dep.name} more than once "
+                f"along {loop_var} ({dep.index}); a tile of that axis would have "
+                f"to wrap back over {dep.name}, so the axis cannot be tiled."
+            )
+    return None
+
+
 def try_resolve_tile_axis_loop_vars(
     op: ComputedBuffer, spec: TileSpec
 ) -> tuple[list[sympy.Symbol] | None, str | None]:
@@ -227,7 +282,8 @@ def try_resolve_tile_axis_loop_vars(
     reduction axis (:func:`_get_red_var`).
 
     A non-empty ``spec`` on an op with a symbolic extent is rejected whatever
-    its axes (:func:`_symbolic_extent_reason`).
+    its axes (:func:`_symbolic_extent_reason`), and so is an axis some read of
+    the op repeats along (:func:`_repeated_read_reason`).
     """
     if spec.axes:
         reason = _symbolic_extent_reason(op)
@@ -242,6 +298,9 @@ def try_resolve_tile_axis_loop_vars(
         else:
             loop_var, reason = _get_out_var(op, out_coords, iter_space, axis.host_dim)
         if loop_var is None:
+            return None, reason
+        reason = _repeated_read_reason(op, loop_var)
+        if reason is not None:
             return None, reason
         loop_vars.append(loop_var)
     return loop_vars, None

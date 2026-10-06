@@ -39,6 +39,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 from torch._inductor.virtualized import V
+from torch.utils._sympy.functions import ModularIndexing
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
@@ -355,6 +356,33 @@ class TestApplyRefusals(unittest.TestCase):
             op.layout = MutationLayoutSHOULDREMOVE(_pointwise_op(shape, name="target"))
             options = enumerate_tile_options(op)
         self.assertEqual(options, [TileSpec()])
+
+    def test_a_repeated_axis_is_offered_no_tiling(self):
+        # x.repeat(1, 2, 1) reads x[d0, d1 mod 8, d2]: dim 1 walks x's dim 1
+        # and then walks it again, which no tile of that axis can follow. The
+        # digits of a reshape are modular too, but reach each element once, so
+        # that axis keeps its counts.
+        shape = (4, 16, 256)
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        repeat = 2048 * d0 + 256 * ModularIndexing(d1, 1, 8) + d2
+        digits = (
+            2048 * d0
+            + 1024 * ModularIndexing(d1, 1, 4)
+            + 256 * ModularIndexing(d1, 4, 4)
+            + d2
+        )
+        for name, index, dim_1 in (
+            ("repeat", repeat, []),
+            ("digits", digits, [2, 4, 8, 16]),
+        ):
+            with self.subTest(read=name):
+                op = _pointwise_op(shape)
+                op.get_read_writes().reads = {
+                    MemoryDep("src", index, (d0, d1, d2), shape)
+                }
+                options = enumerate_tile_options(op)
+                self.assertEqual(_counts(options, 1), dim_1)
+                self.assertEqual(_counts(options, 0), [2, 4])
 
     def test_a_symbolic_dim_is_offered_no_tiling(self):
         # A recompile for a second shape leaves the changed dim symbolic in the
