@@ -1651,11 +1651,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Loop-group boundaries the tiling implies, as solver variables, so the
         # ladder below can rank them. Empty unless the joint solve is actually
         # choosing tilings, which makes the cut stage inert.
-        cut_terms = (
-            self._cut_literals(model, tensors, children_of)
-            if config.coarse_tile_cut_tiebreak
-            else []
-        )
+        cut_terms = self._cut_literals(model, tensors, children_of)
         if cut_terms:
             logger.debug(
                 "[CP-SAT layout solver] cut tiebreak over %d candidate cut(s)",

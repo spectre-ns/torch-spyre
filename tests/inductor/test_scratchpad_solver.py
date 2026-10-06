@@ -43,7 +43,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
-from utils_inductor import expected_gap
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -1441,14 +1440,13 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             self._chosen_tiling([out, consumer, sink], "out").is_untiled,
         )
 
-    @staticmethod
-    def _unmatched_tiled_pair():
-        """``[a, b, sink]`` where b reads a, and both tilings run the same nest
-        (d0:2), so adjacent they would share it -- but the table has no (tiled
-        a, tiled b) pair: b walks a different dim of a's buffer. Sharing the
-        nest would read the wrong tile, so b must stay untiled even though
-        tiling it is the more parallel division. Every buffer is barred from LX
-        so residency cannot make the choice instead."""
+    def test_cut_stage_splits_a_pair_the_table_does_not_match(self):
+        # b reads a, and both tilings run the same nest (d0:2), so adjacent
+        # they would share it -- but the table has no (tiled a, tiled b) pair:
+        # b walks a different dim of a's buffer. Sharing the nest would read
+        # the wrong tile, so b must stay untiled even though tiling it is the
+        # more parallel division. Every buffer is barred from LX so residency
+        # cannot make the choice instead.
         spec = TileSpec((TileAxis(host_dim=0, count=2),))
         barred = "keep residency out of the choice"
         a = CoreDivisionBuffer(
@@ -1478,32 +1476,15 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             parents=["b"],
             cd_parent_matches={"b": [(0, 0), (1, 0)]},
         )
-        return [a, b, sink]
-
-    def test_cut_stage_splits_a_pair_the_table_does_not_match(self):
-        self.assertTrue(
-            self._chosen_tiling(self._unmatched_tiled_pair(), "b").is_untiled
-        )
-
-    @expected_gap("shares a nest the table does not match")
-    def test_cut_tiebreak_off_still_splits_a_pair_the_table_does_not_match(self):
-        # Ranking plans by cut count is optional; keeping an unmatched pair out
-        # of one nest is not. With the tiebreak off nothing counts cuts, but b
-        # tiled beside a would still read the wrong tile.
-        with config.patch({"coarse_tile_cut_tiebreak": False}):
-            tiling = self._chosen_tiling(self._unmatched_tiled_pair(), "b")
-        self.assertTrue(
-            tiling.is_untiled,
-            f"b ({tiling.label}) shares a nest the table does not match",
-        )
+        self.assertTrue(self._chosen_tiling([a, b, sink], "b").is_untiled)
 
     def test_cut_stage_splits_a_pair_an_untileable_op_sits_between(self):
         # Op order a, b, c; c reads a, and the table matches their tilings.
         # But b can only be untiled, and loop groups are consecutive runs, so
         # b splits a from c whatever they choose: a tiled is copied out for c
         # to read. That is two cuts (a, and c before the sink) against one for
-        # an untiled a. Tiling a is the more parallel division, which the
-        # parallelism stage would take if a and c counted as one nest.
+        # an untiled a. a's tiled candidate also carries a two-core split,
+        # which the parallelism stage would take if a and c counted as one nest.
         spec = TileSpec((TileAxis(host_dim=0, count=2),))
         barred = "keep residency out of the choice"
         a = CoreDivisionBuffer(
