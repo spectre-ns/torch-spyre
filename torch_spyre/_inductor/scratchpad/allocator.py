@@ -1805,13 +1805,21 @@ class ResidencyEdge:
     input from HBM and still keep its completed output in LX for a matching
     consumer. Candidate-specific checks are in :meth:`parent_view` and
     :meth:`consumer_view`.
+
+    ``read_deps`` holds every read the consumer makes of the buffer. One
+    residency serves them all, so a candidate has to own the buffer the same
+    way through each. ``a + a.permute(1, 0, 2)`` reads ``a`` once in step and
+    once transposed: a division that splits dim 0 or dim 1 slices ``a`` along
+    one of them for the first read and the other for the second, so it has no
+    pair. One that splits only dim 2, which both reads walk alike, or does not
+    split at all, still does.
     """
 
     buf_name: str
     parent_op: Operation
     consumer_op: Operation
     write_dep: MemoryDep
-    read_dep: MemoryDep
+    read_deps: tuple[MemoryDep, ...]
     prep_cache: dict
 
     def parent_view(self, division: CoreDivision) -> Optional[PerCoreView]:
@@ -1826,14 +1834,40 @@ class ResidencyEdge:
             return None
         return view
 
+    def _common_read_view(
+        self, view_of: Callable[[MemoryDep], Optional[PerCoreView]]
+    ) -> Optional[PerCoreView]:
+        """The view every read of the buffer has under ``view_of``, or ``None``
+        when some read has none or two reads own the buffer differently."""
+        first, *rest = (view_of(dep) for dep in self.read_deps)
+        if first is None:
+            return None
+        if any(view is None or not first.same_partition(view) for view in rest):
+            return None
+        return first
+
     def consumer_view(self, division: CoreDivision) -> Optional[PerCoreView]:
         """The consumer's read-view under ``division``, or ``None`` when its
         slicing of the buffer is unrepresentable -- we never pin on a slicing
-        we cannot verify."""
-        view, _partial, repr_ok = _view_for_div(
-            self.consumer_op, self.read_dep, self.buf_name, division, self.prep_cache
+        we cannot verify -- or differs from one read of the buffer to another."""
+
+        def core_view(dep: MemoryDep) -> Optional[PerCoreView]:
+            view, _partial, repr_ok = _view_for_div(
+                self.consumer_op, dep, self.buf_name, division, self.prep_cache
+            )
+            return view if repr_ok else None
+
+        return self._common_read_view(core_view)
+
+    def consumer_tile_view(self, division: CoreDivision) -> Optional[PerCoreView]:
+        """How the consumer's reads walk the buffer tile by tile under
+        ``division``, or ``None`` when that cannot be represented or differs
+        from one read to another (see :func:`_tile_view_for_div`)."""
+        return self._common_read_view(
+            lambda dep: _tile_view_for_div(
+                self.consumer_op, dep, self.buf_name, division, self.prep_cache
+            )
         )
-        return view if repr_ok else None
 
     @staticmethod
     def _cores_used(division: CoreDivision):
@@ -1859,12 +1893,7 @@ class ResidencyEdge:
             )
             for cd in parent_divisions
         ]
-        consumer_tiles = [
-            _tile_view_for_div(
-                self.consumer_op, self.read_dep, self.buf_name, cd, self.prep_cache
-            )
-            for cd in consumer_divisions
-        ]
+        consumer_tiles = [self.consumer_tile_view(cd) for cd in consumer_divisions]
         return [
             (i, j)
             for i, (parent_view, parent_tile) in enumerate(
@@ -1910,18 +1939,17 @@ def build_residency_edge(
         except NotImplementedError:
             return False
 
-    read_dep = next(
-        (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
-        None,
+    read_deps = tuple(
+        r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)
     )
-    if write_dep is None or read_dep is None:
+    if write_dep is None or not read_deps:
         return None
     return ResidencyEdge(
         buf_name=buf_name,
         parent_op=parent_op,
         consumer_op=consumer_op,
         write_dep=write_dep,
-        read_dep=read_dep,
+        read_deps=read_deps,
         prep_cache=prep_cache,
     )
 
@@ -3687,7 +3715,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             parent_op=storage_op,
             consumer_op=update_op,
             write_dep=storage_write,
-            read_dep=update_write.rename({record.update_name: record.storage_name}),
+            read_deps=(update_write.rename({record.update_name: record.storage_name}),),
             prep_cache=prep_cache,
         )
 
@@ -3704,8 +3732,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         buffer, so its ordinary producer -> consumer edge is excluded, and without
         this edge nothing ties a resident storage's ownership to that reader. Each
         returned edge, keyed by storage name, compares the storage's write with the
-        reader's access renamed onto the storage, as
-        :meth:`_loop_carry_update_edge` does for the update's own write.
+        reader's accesses renamed onto the storage, as
+        :meth:`_loop_carry_update_edge` does for the update's own write. A
+        reader that reaches one storage through several reads gets one edge
+        holding them all.
         """
         if consumer_op is None:
             return {}
@@ -3715,12 +3745,17 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if carry_edge is None or not isinstance(dep, MemoryDep):
                 continue
             storage_name = carry_edge.buf_name
+            read = dep.rename({dep.name: storage_name})
+            edge = edges.get(storage_name)
+            if edge is not None:
+                edge.read_deps += (read,)
+                continue
             edges[storage_name] = ResidencyEdge(
                 buf_name=storage_name,
                 parent_op=carry_edge.parent_op,
                 consumer_op=consumer_op,
                 write_dep=carry_edge.write_dep,
-                read_dep=dep.rename({dep.name: storage_name}),
+                read_deps=(read,),
                 prep_cache=prep_cache,
             )
         return edges

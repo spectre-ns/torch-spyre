@@ -613,8 +613,10 @@ along with its core division. It has no effect with any other solver.
   slice on both sides. `TileSpec` equality is not the test. `host_dim` is
   positional in each op's own output, so equal specs can tile different
   dims of a shared buffer (a permuted or reducing consumer), and unequal
-  specs the same one. A buffer that some reader takes only in part gets no
-  compatible pairs.
+  specs the same one. A consumer that reads the buffer more than once has to
+  agree through every read: `a + a.permute(1, 0, 2)` pairs with `a` only
+  under a division or tiling on a dim both reads walk alike. A buffer that
+  some reader takes only in part gets no compatible pairs.
 - **Loop groups.** Consecutive ops that run the same loop nest (the same
   trip count at each level) share a loop group. The solve requires every
   producer/consumer edge inside a group to be a compatible pair, and

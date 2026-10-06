@@ -1024,12 +1024,11 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         for nest in _nests(tiling).values():
             self.assertLess(len(self._model_ops(nest)), 2, _describe(tiling))
 
-    @expected_gap("cannot share a loop nest")
     def test_consumer_that_reads_its_producer_twice(self):
         # Unforced. One read of a is in step with it and the other transposed,
         # so no tiling of the consumer walks both the way a is written. The
-        # pair table was built from the first read alone: the solve put the
-        # two ops in one nest and the apply refused it.
+        # pair table was once built from the first read alone: the solve put
+        # the two ops in one nest and the apply refused it.
         x = torch.randn(128, 128, 2048, dtype=torch.float16)
         y = torch.randn(128, 128, 2048, dtype=torch.float16)
 

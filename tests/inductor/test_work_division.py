@@ -96,7 +96,6 @@ from torch_spyre._inductor.work_division_constraints import (
     restickify_padding_blocked_vars,
     topk_split_domains,
 )
-from utils_inductor import expected_gap
 
 
 def _isym(name):
@@ -2360,7 +2359,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
             self.assertIsNotNone(edge)
             self.assertEqual(edge.buf_name, storage_op.get_name())
-            self.assertEqual(edge.read_dep.name, storage_op.get_name())
+            self.assertEqual(
+                [dep.name for dep in edge.read_deps], [storage_op.get_name()]
+            )
             self.assertEqual(
                 edge.match_pairs(self.parent_divs, self.consumer_divs),
                 [(0, 0), (1, 1)],
@@ -2401,7 +2402,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertEqual(set(edges), {"plain"})
             edge = edges["plain"]
             self.assertIs(edge.consumer_op, self.consumer_op)
-            self.assertEqual(edge.read_dep.name, "plain")
+            self.assertEqual([dep.name for dep in edge.read_deps], ["plain"])
             self.assertEqual(
                 edge.match_pairs(self.parent_divs, self.consumer_divs),
                 [(0, 0), (1, 1)],
@@ -2492,7 +2493,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                                 "plain", producer, self.consumer_op, reads, None, {}
                             )
                         if memory in reads and memory in writes:
-                            self.assertIs(edge.read_dep, memory)
+                            self.assertEqual(edge.read_deps, (memory,))
                             self.assertIs(edge.write_dep, memory)
                         else:
                             self.assertIsNone(edge)
