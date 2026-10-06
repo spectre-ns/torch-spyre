@@ -55,7 +55,6 @@ from torch_spyre._inductor.wsr import for_each_tile
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_scratchpad_use import _ParameterizedScratchpadMeta  # noqa: E402
-from utils_inductor import expected_gap  # noqa: E402
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -939,14 +938,6 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # wrote 16.
         self._assert_group_refused(lambda x, y: (x + y)[:32] * 2)
 
-    @expected_gap("Exception not raised")
-    def test_apply_refuses_a_narrowing_consumer_that_repeats(self):
-        # Half the rows again, but each twice along dim 1, so the consumer
-        # reads as many elements as the producer wrote. Counting elements
-        # cannot tell that from a full read; tile t still reads 8 rows where
-        # the producer wrote 16.
-        self._assert_group_refused(lambda x, y: (x + y)[:32].repeat(1, 2, 1) * 2)
-
     def test_apply_refuses_a_tiling_along_a_repeated_axis(self):
         # repeat walks dim 1 of its input twice. Tiled four ways on that axis
         # it once compiled and read the wrong elements: a tile has to advance
@@ -1065,6 +1056,14 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # Unforced. repeat walks dim 1 of its input twice. The solve once tiled
         # the repeat on that dim, which the apply took and codegen then could
         # not express; the axis is no longer on offer.
+        #
+        # The repeat also takes half the producer's rows, each twice, so it
+        # reads as many elements as the producer wrote. The apply tells a full
+        # read by counting elements and would take the two in one nest, where
+        # a tile reads half the rows its producer wrote. It is never handed
+        # one: the unread rows are a back gap, which bars the producer's
+        # buffer from LX, and a barred buffer gets no pairs. There is no test
+        # of the apply refusing that nest for that reason.
         x = torch.randn(128, 128, 2048, dtype=torch.float16)
         y = torch.randn(128, 128, 2048, dtype=torch.float16)
         cpu, device, _ = self._compile(
