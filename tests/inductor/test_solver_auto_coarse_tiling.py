@@ -55,6 +55,7 @@ from torch_spyre._inductor.wsr import for_each_tile
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_scratchpad_use import _ParameterizedScratchpadMeta  # noqa: E402
+from utils_inductor import expected_gap  # noqa: E402
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -745,6 +746,27 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         ):
             self.assertNotIn(unit_tile, self._candidates(op))
 
+    def test_op_inside_a_for_each_tile_region_offered_no_tiling(self):
+        # A for_each_tile region also holds ops no loop level stamped. The
+        # user's loop covers them all the same, so the solve may not start a
+        # nest of its own there.
+        op = _pointwise_op((1, 2, 16, 64))
+        self.assertGreater(len(self._candidates(op)), 1)  # non-vacuity
+        with patch.object(
+            CoOptimizingAllocator,
+            "_prescribed_ops",
+            frozenset({op.get_operation_name()}),
+            create=True,
+        ):
+            self.assertEqual(self._candidates(op), [TileSpec()])
+
+    def test_restickify_offered_no_tiling(self):
+        # No tiling of a restickify is correct once the sticks are laid out.
+        op = _pointwise_op((1, 2, 16, 64))
+        self.assertGreater(len(self._candidates(op)), 1)  # non-vacuity
+        op.origin_node = SimpleNamespace(target=torch.ops.spyre.restickify.default)
+        self.assertEqual(self._candidates(op), [TileSpec()])
+
     def test_matmul_offered_output_tiling(self):
         # A matmul is no longer excluded by an op-kind guard: under discovery it
         # is offered its row/M-axis (host_dim 0, non-reduction) output tilings,
@@ -898,8 +920,11 @@ class TileOwnershipGroupingTests(unittest.TestCase):
     def _assert_group_refused(self, fn):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
-        with self.assertRaisesRegex(Exception, "cannot share a loop nest"):
+        # Not assertRaisesRegex: the OOT harness drops its pattern, and with it
+        # the only thing telling this refusal from any other exception.
+        with self.assertRaises(Exception) as refusal:
             self._compile_with_both_tiled_d0(fn, (x, y))
+        self.assertIn("cannot share a loop nest", str(refusal.exception))
 
     def test_apply_refuses_a_permuted_consumer_in_the_nest(self):
         # The consumer's d0 is the producer's dim 1.
@@ -913,6 +938,14 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # Same dim, half the rows: tile t reads 8 rows where the producer
         # wrote 16.
         self._assert_group_refused(lambda x, y: (x + y)[:32] * 2)
+
+    @expected_gap("Exception not raised")
+    def test_apply_refuses_a_narrowing_consumer_that_repeats(self):
+        # Half the rows again, but each twice along dim 1, so the consumer
+        # reads as many elements as the producer wrote. Counting elements
+        # cannot tell that from a full read; tile t still reads 8 rows where
+        # the producer wrote 16.
+        self._assert_group_refused(lambda x, y: (x + y)[:32].repeat(1, 2, 1) * 2)
 
     def test_apply_accepts_a_consumer_that_reads_in_step(self):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
@@ -976,6 +1009,57 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             return torch.ops.spyre.copy_forced(d, a + b)
 
         cpu, device, _ = self._compile(fn, (a, b, d))
+        self._assert_close(device, cpu)
+
+    def test_narrowing_consumer_stays_out_of_its_producers_nest(self):
+        # The consumer takes half the producer's rows, and the only tiling on
+        # offer for either would walk them in one nest. A buffer read in part
+        # gets no pairs, so the solve may not pick that.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        cpu, device, tiling = self._compile(
+            lambda x, y: (x + y)[:32] * 2, (x, y), consumer_menu=[_D0_BY_4]
+        )
+        self._assert_close(device, cpu)
+        for nest in _nests(tiling).values():
+            self.assertLess(len(self._model_ops(nest)), 2, _describe(tiling))
+
+    @expected_gap("cannot share a loop nest")
+    def test_consumer_that_reads_its_producer_twice(self):
+        # Unforced. One read of a is in step with it and the other transposed,
+        # so no tiling of the consumer walks both the way a is written. The
+        # pair table was built from the first read alone: the solve put the
+        # two ops in one nest and the apply refused it.
+        x = torch.randn(128, 128, 2048, dtype=torch.float16)
+        y = torch.randn(128, 128, 2048, dtype=torch.float16)
+
+        def fn(x, y):
+            a = x + y
+            return a + a.permute(1, 0, 2)
+
+        cpu, device, _ = self._compile(fn, (x, y))
+        self._assert_close(device, cpu)
+
+    @expected_gap("runs backwards")
+    def test_consumer_that_repeats_its_producer(self):
+        # Unforced. repeat reads dim 1 of its input through a modular index.
+        # The solve tiled the repeat on that dim, which the apply took and
+        # codegen then could not express.
+        x = torch.randn(128, 128, 2048, dtype=torch.float16)
+        y = torch.randn(128, 128, 2048, dtype=torch.float16)
+        cpu, device, _ = self._compile(
+            lambda x, y: (x + y)[:64].repeat(1, 2, 1) * 2, (x, y)
+        )
+        self._assert_close(device, cpu)
+
+    @expected_gap("'MultiOutput' object has no attribute 'data'")
+    def test_consumer_of_a_fallback_kernel(self):
+        # tril lowers to a FallbackKernel, whose output is a MultiOutput with
+        # no iteration space to build a view from. Its consumer has tilings to
+        # offer, which is what sends the pair table to that producer.
+        x = torch.randn(128, 128, dtype=torch.float16)
+        y = torch.randn(128, 128, dtype=torch.float16)
+        cpu, device, _ = self._compile(lambda x, y: torch.tril(x) + y, (x, y))
         self._assert_close(device, cpu)
 
 

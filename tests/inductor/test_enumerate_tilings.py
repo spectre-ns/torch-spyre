@@ -31,7 +31,13 @@ from torch import fx
 from torch._dynamo.source import ConstantSource
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FlexibleLayout,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+    Reduction,
+)
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import SpyreTensorLayout
@@ -338,6 +344,17 @@ class TestApplyRefusals(unittest.TestCase):
             )
             self.assertIn(64, _counts(options, 3))
             self.assertEqual(_counts(options, 2), [5])
+
+    def test_a_mutation_layout_is_offered_no_tiling(self):
+        # A mutation writes through its target's layout, which has no device
+        # layout of its own to size or stick-check a tile against.
+        shape = (4, 8, 256)
+        op = _pointwise_op(shape)
+        self.assertEqual(_counts(enumerate_tile_options(op), 1), [2, 4, 8])
+        with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+            op.layout = MutationLayoutSHOULDREMOVE(_pointwise_op(shape, name="target"))
+            options = enumerate_tile_options(op)
+        self.assertEqual(options, [TileSpec()])
 
     def test_a_symbolic_dim_is_offered_no_tiling(self):
         # A recompile for a second shape leaves the changed dim symbolic in the

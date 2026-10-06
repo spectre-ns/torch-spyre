@@ -902,6 +902,35 @@ def requires_dxp_standalone():
         )
 
 
+def expected_gap(symptom: str):
+    """Expect a test to fail *only* the way one known, still-open defect makes it.
+
+    The test runs, and is reported xfail when its failure carries ``symptom``.
+    Any other failure fails the test, and so does a clean pass -- the signal
+    that the defect is fixed and the marker should go.
+    ``unittest.expectedFailure`` would absorb every exception instead, and stay
+    satisfied after the defect was fixed wrong.
+
+    Imperative rather than a pytest mark, so ``-m 'not xfail'`` does not
+    deselect these: they still run and still xfail at runtime.
+    """
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                fn(*args, **kwargs)
+            except Exception as exc:
+                if symptom not in str(exc):
+                    raise
+                pytest.xfail(f"known gap: {symptom}")
+            pytest.fail(f"{fn.__name__} passed -- remove @expected_gap")
+
+        return wrapper
+
+    return decorate
+
+
 def assert_lx_only_relayout_payload(output_dirs):
     """The compiled bundle's SDSC payload carries exactly one LX relayout op and
     no HBM movement: one ``STCDPOpLx``, no op named for DMA, restickify or an
