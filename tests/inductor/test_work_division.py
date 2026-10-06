@@ -60,8 +60,6 @@ from torch_spyre._inductor.scratchpad.allocator import (
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
-    TileAxis,
-    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     is_empty_tiled_layout,
@@ -2243,7 +2241,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
         return stack
 
-    def _table(self, allocator, not_read_in_full=frozenset()):
+    def _table(self, allocator):
         return allocator._cd_parent_matches(
             self.consumer_op,
             self.consumer_divs,
@@ -2252,7 +2250,6 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.op_by_name,
             {},
             self.residency,
-            not_read_in_full,
         )
 
     def test_match_table_is_the_expected_pairs(self):
@@ -2314,32 +2311,6 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.assertLessEqual(
             set(pairs), {(1, 1)}, "a pair must hold for every read of the producer"
         )
-
-    def test_a_barred_producer_pairs_once_a_tiling_is_in_play(self):
-        # The pairs also say which consumers may share a producer's loop nest,
-        # and that does not depend on whether the buffer may live in LX. So
-        # once either side offers a tiling, a barred producer gets its pairs:
-        # the tiled candidates with each other, the untiled ones as before. A
-        # producer some reader takes only part of still gets none.
-        x, y = _isym("x"), _isym("y")
-        spec = TileSpec((TileAxis(host_dim=0, count=2),))
-        tiled = CoreDivision(splits={x: 4}, tiling=spec, tile_splits=((y, 2),))
-        self.divisions["spilled"] = [tiled, self.parent_divs[1]]
-        self.consumer_divs.append(tiled)
-        tile_view = _physical_view((1, 2))
-
-        def tile_view_for_div(op, dep, buf_name, division, prep_cache):
-            return tile_view if division.tile_splits else allocator_module._WHOLE_VIEW
-
-        allocator = CoOptimizingAllocator(MagicMock(), size=1)
-        with (
-            self._patches(),
-            patch.object(
-                allocator_module, "_tile_view_for_div", side_effect=tile_view_for_div
-            ),
-        ):
-            self.assertEqual(self._table(allocator)["spilled"], [(0, 4), (1, 1)])
-            self.assertNotIn("spilled", self._table(allocator, frozenset({"spilled"})))
 
     def test_loop_carry_update_is_a_storage_ownership_edge(self):
         allocator = CoOptimizingAllocator(MagicMock(), size=1)

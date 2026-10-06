@@ -3447,12 +3447,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         prep_cache: dict = {}
         buffers: list[CoreDivisionBuffer] = []
         residency_by_buf = self._residency_by_buf(graph, mem_usage, lifetimes)
-        not_read_in_full = frozenset(
-            name
-            for name, cds in divisions.items()
-            if any(cd.tile_splits for cd in cds)
-            and buffer_not_read_in_full(graph, name)
-        )
 
         # Resolve every compiler-tagged carry before constructing any buffer.
         # If its aliased update cannot be represented as a physical-ownership
@@ -3543,7 +3537,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 op_by_name,
                 prep_cache,
                 residency_by_buf,
-                not_read_in_full,
             )
             cd_parent_relayouts = self._cd_parent_relayouts(
                 graph,
@@ -3940,7 +3933,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op_by_name: dict[str, Operation],
         prep_cache: dict,
         residency_by_buf: dict[str, Optional[str]],
-        not_read_in_full: frozenset[str] = frozenset(),
     ) -> dict[str, list[tuple[int, int]]]:
         """Physical slicing-match pairs for each divided producer this op reads.
 
@@ -3958,29 +3950,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for parent in parent_names:
             if parent not in op_by_name:
                 continue
-            reason = residency_by_buf.get(parent, "not in graph")
-            if (
-                reason is not None
-                and parent not in not_read_in_full
-                and any(
-                    cd.tile_splits
-                    for cd in (*divisions.get(parent, ()), *consumer_divs)
-                )
-            ):
-                # The pairs also decide which consumers may share a producer's
-                # loop nest, and that holds whether or not the buffer may live
-                # in LX. A barred parent is pinned out of LX by the solver, so
-                # its pairs gate nothing else. A buffer some reader takes only
-                # part of stays without pairs: views compare partitions, not
-                # extents, so they would pair a half-dim reader with a
-                # full-dim writer.
-                reason = None
             edge = build_residency_edge(
                 parent,
                 op_by_name[parent],
                 consumer_op,
                 consumer_reads,
-                reason,
+                residency_by_buf.get(parent, "not in graph"),
                 prep_cache,
             )
             if edge is None:

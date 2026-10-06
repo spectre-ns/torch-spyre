@@ -616,7 +616,9 @@ along with its core division. It has no effect with any other solver.
   specs the same one. A consumer that reads the buffer more than once has to
   agree through every read: `a + a.permute(1, 0, 2)` pairs with `a` only
   under a division or tiling on a dim both reads walk alike. A buffer that
-  some reader takes only in part gets no compatible pairs.
+  may not live in LX gets no compatible pairs, one that some reader takes
+  only in part included: tiling exists to keep buffers in LX, so its
+  producer and consumer never share a nest.
 - **Loop groups.** Consecutive ops that run the same loop nest (the same
   trip count at each level) share a loop group. The solve requires every
   producer/consumer edge inside a group to be a compatible pair, and

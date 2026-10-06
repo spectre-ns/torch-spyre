@@ -1051,11 +1051,10 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         )
         self._assert_close(device, cpu)
 
-    @expected_gap("'MultiOutput' object has no attribute 'data'")
     def test_consumer_of_a_fallback_kernel(self):
         # tril lowers to a FallbackKernel, whose output is a MultiOutput with
-        # no iteration space to build a view from. Its consumer has tilings to
-        # offer, which is what sends the pair table to that producer.
+        # no iteration space to build a view from. It cannot live in LX, so it
+        # gets no pairs -- its consumer having tilings to offer changes nothing.
         x = torch.randn(128, 128, dtype=torch.float16)
         y = torch.randn(128, 128, dtype=torch.float16)
         cpu, device, _ = self._compile(lambda x, y: torch.tril(x) + y, (x, y))
