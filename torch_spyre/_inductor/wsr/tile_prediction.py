@@ -52,7 +52,9 @@ producer's tiling, which a per-op prediction is not given.
 A candidate that cannot be predicted is reported by returning ``None``, never
 by raising. Callers enumerate candidates and price the ones that survive, so an
 unpredictable spec is one to drop from the menu rather than a compilation
-failure. The reason is logged at debug. Lowering keeps the opposite contract:
+failure -- and ``_prepare_per_core_view`` already returns ``None`` for a buffer
+no candidate can be viewed through, so the branch exists on the caller's side
+either way. The reason is logged at debug. Lowering keeps the opposite contract:
 by the time ``tile_spec_to_dim_hints`` runs the spec has been chosen, so it
 raises ``Unsupported``. Both read the same authority,
 ``scratchpad.coarse_tiling.try_resolve_tile_axis_loop_vars`` -- as does the
@@ -302,6 +304,10 @@ def predict_frame(op: ComputedBuffer, tiling: TileSpec) -> PredictedFrame | None
     exception, because callers *enumerate* candidates: a spec that cannot be
     predicted is one to drop from the menu, not a compilation failure. The
     reason is logged at debug rather than discarded.
+
+    ``None`` is also what ``_prepare_per_core_view`` returns for a buffer no
+    candidate can be viewed through, so a caller pricing candidates already has
+    this branch.
 
     Everything is checked before anything is divided, so there is no partially
     divided frame to return -- but the divisibility of a given extent is
