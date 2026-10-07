@@ -1327,8 +1327,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         tensors: dict[str, _LifetimeBufferWithCpVars],
     ) -> Optional[bool]:
         """Whether the optimum ``solver`` holds is the only one over the plan's
-        decision variables (None when the probe hit its limit), and the variables
-        that differ in the tied plan."""
+        decision variables, and the variables that differ in the tied plan.
+        If it cannot prove uniqueness, the function returns False.
+        """
         decision = [v for sb in tensors.values() for v in sb.decision_variables()]
         probe = model.clone()
         differs = []
@@ -1344,11 +1345,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         if status == cp_model.INFEASIBLE:
             return True  # no other plan exists at all
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return None  # probe ran out of time with nothing found
+            return False  # probe ran out of time we cannot prove uniqueness
         best, runner_up = solver.ObjectiveValue(), probe_solver.ObjectiveValue()
         if round(runner_up) <= round(best):
-            return False  # a different plan costs the same: tie
-        return True if status == cp_model.OPTIMAL else None
+            return False  # a different plan costs the same to within 1
+        return True  # another plan was found that is worse than the best one
 
     def _minimize_cost_expr(
         self,
@@ -1392,8 +1393,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
                     f"after {solver.WallTime():.2f}s"
                 )
-            if status == cp_model.OPTIMAL and not self._is_unique_solution(
-                model, solver, tensors
+            if (
+                config.enable_uniqueness_check
+                and status == cp_model.OPTIMAL
+                and not self._is_unique_solution(model, solver, tensors)
             ):
                 logger.warning(
                     "[CP-SAT layout solver] Non-unique optimal solution found after %s",

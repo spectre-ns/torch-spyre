@@ -1904,6 +1904,10 @@ class UniquenessCheckTest(TestCase):
 
     _LOGGER = "torch_spyre._inductor.scratchpad.ilp_solver_ortools"
 
+    def setUp(self):
+        # The probe is off by default (SPYRE_ENABLE_UNIQUENESS_CHECK).
+        self.enterContext(config.patch({"enable_uniqueness_check": True}))
+
     @staticmethod
     def _solver(size=1 << 20):
         return CpSatLayoutSolver(
