@@ -50,7 +50,13 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _spec_within_read_distance,
     select_allocator,
 )
-from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    CoreDivision,
+    CoreDivisionBuffer,
+    SolveError,
+    TileAxis,
+    TileSpec,
+)
 from torch_spyre._inductor.wsr import for_each_tile
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -256,17 +262,24 @@ class CollectTilingPasses(CustomPreSchedulingPasses):
     well before the scheduler is built, so reading it here sees the final plan.
 
     ``tiling`` maps every coarse-tiled op to its ``CoarseTileInfo``: the loops
-    codegen will emit, whichever pass stamped them.
+    codegen will emit, whichever pass stamped them. ``core_splits`` maps each
+    of them to its committed core division over its output: the split factor
+    of each dim, keyed by that dim's stride in the output index.
     """
 
     tiling: dict[str, CoarseTileInfo] = {}
+    core_splits: dict[str, dict[int, int]] = {}
 
     def __call__(self, graph: GraphLowering) -> None:
         super().__call__(graph)
-        type(self).tiling = {
-            op.get_name(): op.loop_info
-            for op in graph.operations
-            if getattr(op, "loop_info", None) is not None
+        tiled = [
+            op for op in graph.operations if getattr(op, "loop_info", None) is not None
+        ]
+        type(self).tiling = {op.get_name(): op.loop_info for op in tiled}
+        type(self).core_splits = {
+            op.get_name(): dict(op.op_it_space_splits[0])
+            for op in tiled
+            if getattr(op, "op_it_space_splits", None) is not None
         }
 
 
@@ -452,7 +465,10 @@ class AutomatedCoarseTilingTests(
         cover the whole model, so the explicit_auto mode writes the same nest
         and leaves the compiler nothing outside it to tile.
         """
-        seq_len, in_dim, hidden_dim, out_dim = 8192, 256, 1024, 256
+        # S is large enough that the hidden activations (S x Dh) do not fit LX
+        # untiled. At a size where they do, a nest only adds the copy-out at
+        # its boundary and the solve rightly leaves the model untiled.
+        seq_len, in_dim, hidden_dim, out_dim = 32768, 256, 1024, 256
         fc1 = torch.nn.Linear(in_dim, hidden_dim).half()
         fc2 = torch.nn.Linear(hidden_dim, out_dim).half()
 
@@ -1011,6 +1027,25 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self.assertEqual(len(self._model_ops(nests[0])), 2, _describe(tiling))
         self.assertIsNone(_nest_mismatch(nests[0], (4,)), _describe(tiling))
 
+    def test_a_tile_is_divided_across_cores_along_its_tiled_dim(self):
+        # Every op runs one d0:4 nest, 16 rows to a tile. The solve owns each
+        # op's division and ties the divisions of the nest together, so it may
+        # give each core a slice of the tiled dim itself. The balanced division
+        # it prefers does: 4 cores along those 16 rows.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        cpu, device, tiling = self._compile(
+            lambda x, y: (x + y) * 2 + 1, (x, y), consumer_menu=[_D0_BY_4]
+        )
+        self._assert_close(device, cpu)
+        (nest,) = _nests(tiling).values()
+        model_ops = self._model_ops(nest)
+        self.assertEqual(len(model_ops), 3, _describe(tiling))
+        dim_0_stride = 64 * 128
+        for name in model_ops:
+            splits = CollectTilingPasses.core_splits[name]
+            self.assertGreater(splits.get(dim_0_stride, 1), 1, f"{name}: {splits}")
+
     def test_mutation_op_compiles(self):
         # copy_forced writes through its target's layout, which has no device
         # layout for the enumerator to stick-check a tile against.
@@ -1081,10 +1116,11 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self._assert_close(device, cpu)
 
 
-class ReplanAfterTilingGateTests(unittest.TestCase):
-    """``_materialize_selection`` applies chosen tilings and solves again only
-    for an engine whose ``replans_after_tiling()`` is true; any other engine's
-    first placement stands, whatever tilings its allocation carries."""
+class AppliedTilingGateTests(unittest.TestCase):
+    """``_materialize_selection`` applies chosen tilings and carries the plan
+    onto the tiled graph only for an engine whose
+    ``allocator_applies_tilings()`` is true; any other engine's placement
+    stands, whatever tilings its allocation carries. Nothing is solved again."""
 
     _CHOICES = {"buf0": _D0_BY_4}
 
@@ -1110,32 +1146,80 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
                         "CoarseTilingPass"
                     )
                 )
-                for name, value in patches.items():
-                    stack.enter_context(
+                mocks = {
+                    name: stack.enter_context(
                         patch.object(CoOptimizingAllocator, name, return_value=value)
                     )
+                    for name, value in patches.items()
+                }
                 result = alloc._materialize_selection(graph, solver, allocation)
-            return solver, allocation, result, chosen, apply
+            return solver, allocation, result, chosen, apply, mocks
 
     def test_annealer_placement_stands(self):
-        solver, allocation, result, chosen, apply = self._materialize(
+        solver, allocation, result, chosen, apply, _ = self._materialize(
             "simulated_annealing"
         )
-        self.assertFalse(solver.replans_after_tiling())
+        self.assertFalse(solver.allocator_applies_tilings())
         self.assertIs(result[0], solver)
         self.assertIs(result[1], allocation)
         chosen.assert_not_called()
         apply.assert_not_called()
 
     @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
-    def test_cpsat_applies_and_solves_again(self):
-        second_solver, second_allocation = MagicMock(), [MagicMock()]
-        _, _, result, _, apply = self._materialize(
+    def test_cpsat_applies_and_carries_its_plan_without_solving_again(self):
+        carried = [MagicMock()]
+        solver, allocation, result, _, apply, mocks = self._materialize(
             "cpsat",
-            _prepare_buffers=[],
-            _build_solver=second_solver,
-            _solve=second_allocation,
+            _carry_plan_onto_tiled_graph=carried,
+            _build_solver=MagicMock(),
+            _solve=[MagicMock()],
         )
         apply.assert_called_once_with(self._CHOICES)
-        self.assertIs(result[0], second_solver)
-        self.assertIs(result[1], second_allocation)
+        mocks["_carry_plan_onto_tiled_graph"].assert_called_once()
+        self.assertIs(result[0], solver)
+        self.assertIs(result[1], carried)
+        mocks["_build_solver"].assert_not_called()
+        mocks["_solve"].assert_not_called()
+
+
+class LxOverlapCheckTests(unittest.TestCase):
+    """The carried plan is checked against the tiled graph's own lifetimes: two
+    resident buffers may not hold the same bytes while both are alive."""
+
+    @staticmethod
+    def _resident(name, uses, address, size=128, **kwargs):
+        return CoreDivisionBuffer(
+            name,
+            size,
+            uses,
+            core_divisions=[CoreDivision()],
+            chosen_division=0,
+            address=address,
+            **kwargs,
+        )
+
+    def test_two_live_buffers_on_the_same_bytes_are_refused(self):
+        a = self._resident("a", [0, 2], address=0)
+        b = self._resident("b", [1, 3], address=64)
+        with self.assertRaises(SolveError) as refusal:
+            CoOptimizingAllocator._check_no_lx_overlap([a, b])
+        self.assertIn("would share LX bytes", str(refusal.exception))
+
+    def test_buffers_apart_in_time_or_in_address_pass(self):
+        a = self._resident("a", [0, 2], address=0)
+        later = self._resident("later", [3, 4], address=0)
+        beside = self._resident("beside", [1, 3], address=128)
+        CoOptimizingAllocator._check_no_lx_overlap([a, later, beside])
+
+    def test_an_in_place_child_may_take_its_parents_slot(self):
+        parent = self._resident("parent", [0, 1], address=0)
+        child = self._resident("child", [1, 2], address=0, in_place_parents=["parent"])
+        CoOptimizingAllocator._check_no_lx_overlap([parent, child])
+
+    def test_a_child_that_outlives_the_handoff_is_refused(self):
+        # The parent is read again after the child is written, so the child
+        # cannot have taken over its slot.
+        parent = self._resident("parent", [0, 1, 2], address=0)
+        child = self._resident("child", [1, 3], address=0, in_place_parents=["parent"])
+        with self.assertRaises(SolveError):
+            CoOptimizingAllocator._check_no_lx_overlap([parent, child])

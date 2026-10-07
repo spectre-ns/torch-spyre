@@ -601,6 +601,15 @@ def coarse_tile_local_dim_split_domains(
     is, and pinning them can defeat the per-core span-limit search on a copy
     whose read spans the full, un-tiled source tensor.
 
+    Skips an op the joint solve tiled (``solver_tiled``, stamped by
+    ``CoarseTilingPass``) as well. That solve chooses the op's division along
+    with its tiling, and requires every producer/consumer edge inside a nest
+    to own the shared buffer alike per tile and per core, so the ops of a
+    loop body cannot disagree about a split of the tiled dim. The split still
+    has to divide the per-tile extent, which is the extent this op now has.
+    A nest a ``spyre_hint`` or ``for_each_tile`` loop made is not a group in
+    that solve, so its ops keep the pin.
+
     ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every
     op it tiles. ``loop_tiled_dims``/``loop_tiled_reduction_dims`` name tiled
     dims by *raw position into ``op.data.ranges``/``reduction_ranges``*.
@@ -685,6 +694,9 @@ def coarse_tile_local_dim_split_domains(
         return ConstraintResult()
 
     if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
+        return ConstraintResult()
+
+    if getattr(ctx.op, "solver_tiled", False):
         return ConstraintResult()
 
     raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)

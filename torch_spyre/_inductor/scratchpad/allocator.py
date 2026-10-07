@@ -72,6 +72,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     RelayoutCopyBuffer,
     TileSpec,
     build_relayout_copy,
+    ceil_div,
     relayout_copy_name,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
@@ -372,8 +373,9 @@ class ScratchpadAllocator:
         fixed-division, placement-only flow.
 
         Subclasses override hooks, never this body. A solve that must act on its
-        own result -- coarse tiling applies the tilings it selected and re-plans
-        the mutated graph -- does so through ``_materialize_selection`` rather
+        own result -- coarse tiling applies the tilings it selected and carries
+        its plan onto the mutated graph -- does so through
+        ``_materialize_selection`` rather
         than by copying the skeleton: a copy silently misses every later change
         to the shared steps (it already did, on ``_solve``'s arity).
 
@@ -452,9 +454,9 @@ class ScratchpadAllocator:
         """Act on what the solve *chose* before the choice is committed.
 
         Returns the ``(solver, allocation)`` the rest of :meth:`plan_allocation`
-        commits, so an override that mutates the graph and re-plans hands back
-        the second solve's pair -- ``_get_spill_reasons`` must be asked about the
-        solver that produced the allocation it is passed.
+        commits, so an override that mutates the graph hands back an allocation
+        over the mutated graph's buffers, and a solver whose spill reasons
+        describe it -- ``_get_spill_reasons`` is asked about that pair.
 
         Base: a placement-only solve selects nothing to materialize, so the first
         solve stands.
@@ -2651,9 +2653,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # whichever optimum the multi-worker portfolio reaches first (the
             # same graph drew 1, 2, 3 or 4 cuts run to run at one identical
             # objective value). Worse, it is not merely uninformative there --
-            # #3810 makes it raise on symbolic args once an op is output-tiled,
-            # so the re-plan silently loses the runtime term anyway, and it
-            # prices residency the scheduler later revokes. Hand the solver no
+            # #3810 makes it raise on symbolic args once an op is output-tiled.
+            # Hand the solver no
             # cost expression at all and let its lexicographic ladder rank
             # residency, cuts, parallelism and division shape instead. Off this
             # path the expression is unchanged and still the objective.
@@ -2678,12 +2679,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # ``coarse_underfill_eff``'s result with a plain Python ``min`` / ``>=``,
         # which raises "cannot determine truth value of Relational" as soon as an
         # argument carries a solver variable (``is_lx_*``). That is reachable only
-        # once an op is output-tiled, i.e. on the re-plan after
-        # ``CoarseTilingPass``, so it did not exist before the solver could choose
-        # tilings. Dropping the objective is the documented best-effort fallback,
-        # but it is a real loss -- the re-plan then optimizes placement with no
-        # runtime term at all -- so the cost model should be made symbol-safe
-        # rather than left to this catch.
+        # once an op is output-tiled, by a hint or a ``for_each_tile`` loop.
+        # Dropping the objective is the documented best-effort fallback, but it
+        # is a real loss -- placement is then optimized with no runtime term at
+        # all -- so the cost model should be made symbol-safe rather than left
+        # to this catch.
         except (ValueError, RuntimeError, TypeError) as e:
             logger.warning(
                 "cost objective unavailable (%s: %s); the solver falls back to its "
@@ -2916,33 +2916,30 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         solver: MemoryPlanSolver,
         allocation: Sequence[Any],
     ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
-        """Apply the coarse tilings the joint solve selected, then re-plan.
+        """Apply the coarse tilings the joint solve selected and carry its plan
+        onto the tiled graph.
 
-        The first solve chooses core divisions *and* tilings jointly, pricing the
-        tiled candidates through their predicted (``wsr.tile_prediction``) views.
+        The solve chooses core divisions, tilings and LX placement together, and
+        plans for the graph its tilings produce: tile-sized buffers, a copy op
+        at every cut, lifetimes that follow the loop nests (``_TilingModel``).
         If it picks a non-empty tiling for any op, ``CoarseTilingPass`` applies
-        exactly those choices (mutating the IR the same way a pre-stickification
-        hint would), and the allocation is redone over the materialized graph so
-        new boundary buffers get placed and the applied ops get their final
-        divisions. The second pass enumerates no further tilings
-        (``_suppress_tiling``), so it terminates, and it mirrors the hint path
-        (allocate an already-tiled graph).
+        exactly those choices (mutating the IR the same way a
+        pre-stickification hint would) and the plan is restated over the tiled
+        graph's own buffers (:meth:`_carry_plan_onto_tiled_graph`). Nothing is
+        solved again.
 
-        Ordering is solve-before-apply: a ``SolveError`` from the first solve
-        propagates over the *unmutated* graph, so ``scratchpad_planning``'s greedy
-        fallback never runs on a half-tiled graph (a second-solve ``SolveError``
-        falls back over the fully-tiled graph, which is a valid outcome).
+        Ordering is solve-before-apply: a ``SolveError`` from the solve
+        propagates over the *unmutated* graph, so ``scratchpad_planning``'s
+        greedy fallback never runs on a half-tiled graph. A plan that does not
+        hold on the tiled graph raises ``SolveError`` too, after the apply, and
+        the fallback then places the fully-tiled graph, which is a valid
+        outcome.
 
-        Both the second solver and its allocation are returned: the caller reads
-        spill reasons off the solver that produced the allocation it commits, so
-        returning one without the other would report the first solve's reasons
-        against the second solve's plan.
-
-        Only for an engine that asks for it (``replans_after_tiling()``): for any
-        other, the first placement stands and the pair is returned unchanged.
+        Only for an engine that asks for it (``allocator_applies_tilings()``):
+        for any other the pair is returned unchanged.
         """
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        if not solver.replans_after_tiling():
+        if not solver.allocator_applies_tilings():
             return solver, allocation
         choices = self._chosen_tilings(graph, allocation)
         if logger.isEnabledFor(logging.DEBUG):
@@ -2958,16 +2955,167 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert len(graph.operations) >= op_count, (
             "coarse tiling apply must not drop operations"
         )
-        # Re-plan over the materialized tiling. Pre-passes are empty for this
-        # allocator; suppress further tiling so the second solve only places.
+        return solver, self._carry_plan_onto_tiled_graph(graph, solver, allocation)
+
+    def _carry_plan_onto_tiled_graph(
+        self,
+        graph: GraphLowering,
+        solver: CoreDivisionLayoutSolver,
+        planned: Sequence[CoreDivisionBuffer],
+    ) -> list[CoreDivisionBuffer]:
+        """The solve's plan, restated over the buffers of the tiled graph.
+
+        Applying a tiling keeps every op's name, so each buffer the solve
+        planned is found again here, one tile in size where it was tiled, with
+        the lifetime, in-place parents and residency verdict the tiled graph
+        gives it. It takes the address and the division the solve chose. An op
+        the apply added -- a cut's copy op and the full buffer it fills -- was
+        not in the solve; it takes the division under which it reads its
+        producer the way the producer is sliced, and it never resides.
+
+        The tiled graph has the last word on whether the plan holds. A buffer
+        it bars from LX, or one a reader no longer matches, is demoted to HBM,
+        which is always valid. A division the tiled op does not offer, or two
+        resident buffers that would share an address while both are alive,
+        means the solve planned for a graph the apply did not produce:
+        ``SolveError``, and the caller falls back to greedy placement.
+        """
         self._suppress_tiling = True
         try:
-            buffers = self._prepare_buffers(graph)
-            solver = self._build_solver(buffers)
-            allocation = self._solve(solver, graph)
+            buffers = list(self._prepare_buffers(graph))
         finally:
             self._suppress_tiling = False
-        return solver, allocation
+        planned_by_name = {b.name: b for b in planned}
+        by_name = {b.name: b for b in buffers}
+        reasons: dict[str, str] = {}
+
+        def same_splits(a: CoreDivision, b: CoreDivision) -> bool:
+            def key(cd: CoreDivision) -> set[tuple[str, int]]:
+                return {(str(sym), f) for sym, f in cd.splits.items() if f != 1}
+
+            return key(a) == key(b)
+
+        def demote(buf: CoreDivisionBuffer, reason: str) -> None:
+            if buf.address is not None:
+                logger.debug("tiled graph demotes %s: %s", buf.name, reason)
+            buf.address = None
+            reasons[buf.name] = reason
+
+        added: list[CoreDivisionBuffer] = []
+        for buf in buffers:
+            if isinstance(buf, RelayoutCopyBuffer):
+                continue
+            before = planned_by_name.get(buf.name)
+            if before is None:
+                added.append(buf)
+                continue
+            buf.address = before.address
+            if before.address is None:
+                reasons[buf.name] = solver.spill_reasons.get(
+                    buf.name, "spilled by solver"
+                )
+            if before.chosen_division is None or not buf.core_divisions:
+                continue
+            wanted = before.core_divisions[before.chosen_division]
+            index = next(
+                (
+                    i
+                    for i, cd in enumerate(buf.core_divisions)
+                    if same_splits(cd, wanted)
+                ),
+                None,
+            )
+            if index is None:
+                raise SolveError(
+                    f"{buf.name}: the division {wanted.label} chosen under "
+                    f"{wanted.tiling.label} is not one the tiled op offers"
+                )
+            buf.chosen_division = index
+
+        for buf in added:
+            if not buf.core_divisions:
+                continue
+            # Read each producer the way it is sliced; among the divisions
+            # that do, the most parallel.
+            matching = set(range(len(buf.core_divisions)))
+            for parent_name in buf.parents:
+                parent = by_name.get(parent_name)
+                if parent is None or parent.chosen_division is None:
+                    continue
+                matching &= {
+                    j
+                    for i, j in buf.cd_parent_matches.get(parent_name, [])
+                    if i == parent.chosen_division
+                }
+            candidates = matching or set(range(len(buf.core_divisions)))
+            buf.chosen_division = max(
+                candidates, key=lambda j: (buf.core_divisions[j].cores_used, -j)
+            )
+
+        for buf in buffers:
+            if buf.address is None:
+                reasons.setdefault(
+                    buf.name, solver.excluded(buf) or "added by coarse tiling"
+                )
+                continue
+            barred = solver.excluded(buf)
+            if barred is not None:
+                demote(buf, barred)
+        for buf in buffers:
+            if isinstance(buf, RelayoutCopyBuffer) or buf.chosen_division is None:
+                continue
+            for parent_name in buf.parents:
+                parent = by_name.get(parent_name)
+                if parent is None or parent.address is None:
+                    continue
+                pair = (parent.chosen_division, buf.chosen_division)
+                if pair not in buf.cd_parent_matches.get(parent_name, []):
+                    demote(parent, f"{buf.name} does not read it as it is sliced")
+
+        self._check_no_lx_overlap([b for b in buffers if b.address is not None])
+        solver.spill_reasons = reasons
+        return buffers
+
+    @staticmethod
+    def _check_no_lx_overlap(resident: Sequence[CoreDivisionBuffer]) -> None:
+        """Raise ``SolveError`` if two resident buffers hold the same LX bytes
+        while both are alive.
+
+        An in-place child may sit on its parent's address across the one tick
+        the parent hands its slot over, provided it fits inside that slot.
+        """
+
+        def footprint(buf: CoreDivisionBuffer) -> int:
+            cd = buf.core_divisions[buf.chosen_division or 0]
+            return ceil_div(buf.size, cd.output_partition)
+
+        def hands_over(parent: CoreDivisionBuffer, child: CoreDivisionBuffer) -> bool:
+            return (
+                parent.name in child.in_place_parents
+                and parent.address == child.address
+                and parent.end_time == child.start_time + 1
+                and footprint(child) <= footprint(parent)
+            )
+
+        for i, a in enumerate(resident):
+            for b in resident[i + 1 :]:
+                if not a.overlaps_in_time(b):
+                    continue
+                assert a.address is not None and b.address is not None
+                if (
+                    a.address + footprint(a) <= b.address
+                    or b.address + footprint(b) <= a.address
+                ):
+                    continue
+                if hands_over(a, b) or hands_over(b, a):
+                    continue
+                raise SolveError(
+                    f"{a.name} and {b.name} would share LX bytes on the tiled "
+                    f"graph: [{a.address}, {a.address + footprint(a)}) over "
+                    f"[{a.start_time}, {a.end_time}) and "
+                    f"[{b.address}, {b.address + footprint(b)}) over "
+                    f"[{b.start_time}, {b.end_time})"
+                )
 
     def _chosen_tilings(
         self, graph: GraphLowering, allocation: Sequence[Any]

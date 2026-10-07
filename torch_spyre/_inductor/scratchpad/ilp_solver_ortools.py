@@ -173,6 +173,70 @@ class _PlacementUnit:
     justified_offset: int = 0  # final justified offset
 
 
+# Residency bars that describe the untiled graph only. A tiled op is always
+# read from LX by something -- a consumer in its nest, or the copy op that
+# drains each tile into the full buffer -- and a tiled graph output hands the
+# boundary to that full buffer.
+_BARS_A_TILING_LIFTS = frozenset(
+    {"no consumer reads it from LX", "graph output (no clone)"}
+)
+
+
+@dataclass
+class _TilingModel:
+    """What the tiling the joint solve is choosing means for placement.
+
+    Applying a tiling changes which buffers can reside and for how long, and
+    the placement has to be solved against that graph, not the untiled one.
+    Everything here is a solver variable over the buffers' division choices.
+
+    ``tiled`` and ``cuts`` hold one literal per divided buffer. ``via_full``
+    holds, per producer -> consumer edge of a tileable producer, the literal
+    "the consumer reads the producer's copied-out full buffer": the producer is
+    tiled and the consumer runs outside its nest. That buffer lives in HBM, so
+    the edge no longer ties the consumer to the producer's tile. ``nest_end``
+    is the slot at which a tileable op's nest ends, meaningful while the op is
+    tiled.
+
+    Time is counted in *slots* here: op ``t`` writes in slot ``2 * t`` and the
+    copy op a cut inserts right after it runs in slot ``2 * t + 1``.
+    """
+
+    tiled: dict[str, Any]
+    cuts: dict[str, Any]
+    via_full: dict[tuple[str, str], Any]
+    nest_end: dict[str, Any]
+
+    @staticmethod
+    def readers(
+        children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
+        tensors: dict[str, "_LifetimeBufferWithCpVars"],
+        name: str,
+    ) -> list[tuple[str, list[tuple[int, int]]]]:
+        """``name``'s consumers that are operations. A relayout copy lists the
+        buffer it would copy as its parent too, but it is an option the solve
+        may leave unused, not a reader the buffer has to serve."""
+        return [
+            (child, pairs)
+            for child, pairs in children_of.get(name, [])
+            if not isinstance(tensors[child].buffer, RelayoutCopyBuffer)
+        ]
+
+    @staticmethod
+    def write_slot(time: int) -> int:
+        return 2 * time
+
+    @staticmethod
+    def end_slot(end_time: int) -> int:
+        """The slot form of an exclusive end: the last use's own slot, plus one."""
+        return 2 * end_time - 1
+
+    @staticmethod
+    def horizon(tensors: dict[str, "_LifetimeBufferWithCpVars"]) -> int:
+        """A slot no lifetime reaches: past the last buffer's end and one copy."""
+        return max(_TilingModel.end_slot(sb.end_time) for sb in tensors.values()) + 2
+
+
 def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     """Enforce, when ``enforce_lit`` is true, that ``(src_div, dst_div)`` is
     one of the ``compatible`` (i, j) pairs. With no compatible pairs the
@@ -247,6 +311,9 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         # consumer reads the parent from that copy", which pins the division
         # pair and requires the copy resident.
         self.relayout_reads: dict[str, list[tuple[Any, Any]]] = {}
+        # The (start, end) the placement model gave this buffer's box when its
+        # lifetime depends on the tiling chosen; ``None`` on the untiled axis.
+        self.slot_span: Optional[tuple[Any, Any]] = None
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -281,7 +348,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         reads_served = b.read_count - (1 if b.first_use_is_read else 0)
         return (reads_served + (1 if is_intermediate else 0)) * b.size
 
-    def constrain_residency(self, model, kids, bufs, copies) -> None:
+    def constrain_residency(self, model, kids, bufs, copies, via_full=None) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
 
     def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
@@ -411,10 +478,14 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
     def match_pairs(self, parent: str) -> list[tuple[int, int]]:
         return self.buffer.cd_parent_matches.get(parent, [])
 
-    def constrain_residency(self, model, kids, bufs, copies) -> None:
+    def constrain_residency(self, model, kids, bufs, copies, via_full=None) -> None:
         """Slicing-consistency gate: a resident buffer's division must match
         *every* consumer's division under the ``cd_parent_matches`` pairs, or
         the consumer must read it through a resident relayout copy.
+
+        ``via_full`` (from :class:`_TilingModel`) exempts a consumer that reads
+        this buffer's copied-out full buffer: that buffer is in HBM, so the
+        consumer puts no demand on how the tile is sliced.
 
         This is the part of residency that genuinely depends on the solver's
         free variables, so it stays here as a constraint. The precomputable
@@ -454,7 +525,8 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
                 served.append(lit)
                 child_w.relayout_reads.setdefault(self.name, []).append((lit, copy_w))
                 copy_w.serves.append(lit)
-            if not served:
+            exempt = (via_full or {}).get((self.name, child))
+            if not served and exempt is None:
                 _gate_divisions(
                     model, compatible, self.division, child_w.division, self.in_buffer
                 )
@@ -463,7 +535,10 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
             _gate_divisions(
                 model, compatible, self.division, child_w.division, match_lit
             )
-            model.add_bool_or([match_lit, *served]).only_enforce_if(self.in_buffer)
+            ways = [match_lit, *served]
+            if exempt is not None:
+                ways.append(exempt)
+            model.add_bool_or(ways).only_enforce_if(self.in_buffer)
 
     def constrain_merge(self, model, parent, edge) -> None:
         """An active merge means the child reuses the parent's exact per-core
@@ -1184,7 +1259,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     decides_lx_relayouts = True
 
     @classmethod
-    def replans_after_tiling(cls) -> bool:
+    def allocator_applies_tilings(cls) -> bool:
         return True
 
     def __init__(
@@ -1382,13 +1457,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             }
             return None
 
-    def _cut_literals(
+    def _tiling_model(
         self,
         model: "cp_model.CpModel",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
-    ) -> list["cp_model.IntVar"]:
-        """One bool per buffer, true when that buffer is a coarse-tiling *cut*.
+    ) -> Optional[_TilingModel]:
+        """The loop nests the chosen tilings form, as solver variables.
+
+        One bool per buffer is true when that buffer is a coarse-tiling *cut*.
 
         A cut is a tiled op whose value has to be published into a full-sized
         buffer because some consumer sits outside its loop nest -- the
@@ -1409,9 +1486,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         kernel), is a cut unconditionally, since its value must reach HBM
         either way.
 
-        Returns an empty list when nothing carries a non-empty spec, which is
-        every path except the joint solve with ``auto_coarse_tiling`` on, so the
-        cut stage below vanishes there.
+        The copy op a cut inserts runs right after the tiled op and drains each
+        tile into a full-sized HBM buffer, which is what a consumer outside the
+        nest then reads (``via_full``). The tile itself stays an ordinary LX
+        candidate, read by that copy.
+
+        Returns ``None`` when nothing carries a non-empty spec, which is every
+        path except the joint solve with ``auto_coarse_tiling`` on, so the cut
+        stage and the tiling-dependent placement vanish there and the model is
+        built exactly as before.
         """
         nest_ids: dict[tuple[int, ...], int] = {(): 0}
         divided = {
@@ -1423,7 +1506,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for cd in sb.buffer.core_divisions:
                 nest_ids.setdefault(cd.tiling.level_counts, len(nest_ids))
         if len(nest_ids) == 1:
-            return []
+            return None
 
         max_id = max(nest_ids.values())
         loop_id = {}
@@ -1438,9 +1521,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             model.add(var == 0).only_enforce_if(is_tiled.negated())
             tiled[name] = is_tiled
 
-        group, segment = self._tiling_group_ids(model, divided, loop_id, tiled)
+        group, segment, runs, joined = self._tiling_group_ids(
+            model, divided, loop_id, tiled
+        )
 
-        cuts = []
+        cuts: dict[str, Any] = {}
+        via_full: dict[tuple[str, str], Any] = {}
         for name, is_tiled in tiled.items():
             diffs: list["cp_model.IntVar"] = []
             # A graph output is copied out whatever its consumers do.
@@ -1448,12 +1534,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 getattr(divided[name].buffer, "boundary", None) == BufferType.Output
             )
             seg = segment.get(name)
-            for child, pairs in children_of.get(name, []):
+            for child, pairs in _TilingModel.readers(children_of, tensors, name):
                 # A consumer with no divisions of its own (placement-only), or
                 # one an untileable op separates from this buffer, can never
                 # share its nest, so reading it is always a cut.
                 if seg is None or segment.get(child) != seg:
                     unshareable = True
+                    if seg is not None:
+                        via_full[(name, child)] = is_tiled
                     continue
                 d = model.new_bool_var(f"apart_{name}_{child}")
                 model.add(group[name] != group[child]).only_enforce_if(d)
@@ -1466,6 +1554,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     d.negated(),
                 )
                 diffs.append(d)
+                # An untiled producer's group id also differs from its
+                # consumer's, but there is no full buffer then: the consumer
+                # reads the producer itself.
+                full = model.new_bool_var(f"via_full_{name}_{child}")
+                model.add_bool_and([is_tiled, d]).only_enforce_if(full)
+                model.add_bool_or([is_tiled.negated(), d.negated()]).only_enforce_if(
+                    full.negated()
+                )
+                via_full[(name, child)] = full
 
             cut = model.new_bool_var(f"cut_{name}")
             if unshareable or not diffs:
@@ -1478,8 +1575,33 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.add_bool_or(
                     [is_tiled.negated(), any_diff.negated()]
                 ).only_enforce_if(cut.negated())
-            cuts.append(cut)
-        return cuts
+            cuts[name] = cut
+
+        # Where each tileable op's nest ends: after the last op joined to it,
+        # and after that op's copy when it is cut. Walk each run backwards so
+        # an op takes its successor's end exactly when the two are joined.
+        nest_end: dict[str, Any] = {}
+        for run in runs:
+            last_time = divided[run[-1]].buffer.uses[0]
+            horizon = _TilingModel.write_slot(last_time) + 2
+            following: Optional[str] = None
+            for name in reversed(run):
+                own = _TilingModel.write_slot(divided[name].buffer.uses[0]) + 1
+                end = model.new_int_var(own, horizon, f"nest_end_{name}")
+                if following is None:
+                    model.add(end == own + cuts[name])
+                else:
+                    model.add(end == nest_end[following]).only_enforce_if(
+                        joined[following]
+                    )
+                    model.add(end == own + cuts[name]).only_enforce_if(
+                        joined[following].negated()
+                    )
+                nest_end[name] = end
+                following = name
+        return _TilingModel(
+            tiled=tiled, cuts=cuts, via_full=via_full, nest_end=nest_end
+        )
 
     @staticmethod
     def _tiling_group_ids(
@@ -1487,7 +1609,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         divided: dict[str, _LifetimeBufferWithCpVars],
         loop_id: dict[str, "cp_model.IntVar"],
         tiled: dict[str, "cp_model.IntVar"],
-    ) -> tuple[dict[str, "cp_model.IntVar"], dict[str, int]]:
+    ) -> tuple[
+        dict[str, "cp_model.IntVar"],
+        dict[str, int],
+        list[list[str]],
+        dict[str, "cp_model.IntVar"],
+    ]:
         """The loop group each tileable op lands in, as solver variables.
 
         ``derive_tiling_groups`` fuses only *consecutive* ops that run the same
@@ -1502,8 +1629,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         An op that can never be tiled -- one with only untiled candidates, or
         no op-output buffer in the solve at all -- always breaks the run, so it
         starts a new *segment* instead of a literal. Returns ``(group,
-        segment)``: an op in no segment is untileable, and ops in different
-        segments are split whatever the solve picks.
+        segment, runs, joined)``: an op in no segment is untileable, and ops in
+        different segments are split whatever the solve picks. ``runs`` lists
+        each segment's ops in order, and ``joined`` maps every op but a run's
+        first to the literal that it shares its predecessor's nest.
         """
         position = {
             name: sb.buffer.uses[0]
@@ -1515,6 +1644,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         }
         group: dict[str, "cp_model.IntVar"] = {}
         segment: dict[str, int] = {}
+        runs: list[list[str]] = []
+        joined_to_prev: dict[str, "cp_model.IntVar"] = {}
         segments = 0
         prev: Optional[str] = None
         for name, pos in sorted(position.items(), key=lambda item: item[1]):
@@ -1522,6 +1653,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 group[name] = model.new_constant(0)
                 segment[name] = segments
                 segments += 1
+                runs.append([name])
             else:
                 same = model.new_bool_var(f"samenest_{prev}_{name}")
                 model.add(loop_id[prev] == loop_id[name]).only_enforce_if(same)
@@ -1537,8 +1669,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.add(var == group[prev] + 1 - joined)
                 group[name] = var
                 segment[name] = segment[prev]
+                runs[-1].append(name)
+                joined_to_prev[name] = joined
             prev = name
-        return group, segment
+        return group, segment, runs, joined_to_prev
 
     def _tile_count_terms(
         self,
@@ -1548,8 +1682,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         """One int per buffer: the tile count of its chosen division's tiling.
 
         ``TileSpec.tile_count`` is 1 for the untiled spec, and ``add_element``
-        ties it to the buffer's division the way :meth:`_cut_literals` ties
-        ``tile_id``. A buffer whose candidates all tile alike (every one
+        ties it to the buffer's division the way :meth:`_tiling_model` ties
+        ``loop_id``. A buffer whose candidates all tile alike (every one
         untiled, or a single division) is left out: its count is a constant
         and cannot move the sum.
 
@@ -1568,6 +1702,124 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             var = model.new_int_var(min(counts), max(counts), f"tile_count_{name}")
             model.add_element(sb.division, counts, var)
             terms.append(var)
+        return terms
+
+    @staticmethod
+    def _lifetime_ends(
+        model: "cp_model.CpModel",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+        children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
+        tiling: _TilingModel,
+    ) -> dict[str, Any]:
+        """The slot each buffer stops holding its LX space, for every buffer
+        whose lifetime depends on the tiling chosen.
+
+        The untiled graph gives a buffer one lifetime: from its write to its
+        last read. Tiling changes that in two ways.
+
+        - A tiled buffer holds one tile. A consumer outside its nest reads the
+          copied-out full buffer instead, so only the consumers in the nest keep
+          the tile alive, along with the copy op when the buffer is cut.
+        - An untiled buffer read by a tiled op is read again on every iteration
+          of that op's nest, so it stays alive until the nest ends
+          (``counted_loop_lifetime_overrides`` on the applied graph).
+
+        Each end is bounded from below only. A longer lifetime can only cost
+        space, so the solve has no reason to pick one, and an in-place merge
+        pins its parent's end exactly (see :meth:`_add_inplace_relaxation`).
+        """
+        horizon = _TilingModel.horizon(tensors)
+        ends: dict[str, Any] = {}
+        for name, sb in tensors.items():
+            kids = [
+                child for child, _ in _TilingModel.readers(children_of, tensors, name)
+            ]
+            tileable = name in tiling.nest_end
+            read_by_a_nest = [kid for kid in kids if kid in tiling.nest_end]
+            if not tileable and not read_by_a_nest:
+                continue
+            untiled_end = _TilingModel.end_slot(sb.end_time)
+            if not tileable:
+                end = model.new_int_var(untiled_end, horizon, f"end_{name}")
+                for kid in read_by_a_nest:
+                    model.add(end >= tiling.nest_end[kid]).only_enforce_if(
+                        tiling.tiled[kid]
+                    )
+                ends[name] = end
+                continue
+            is_tiled = tiling.tiled[name]
+            written = _TilingModel.write_slot(sb.buffer.uses[0])
+            end = model.new_int_var(written + 1, horizon, f"end_{name}")
+            model.add(end >= untiled_end).only_enforce_if(is_tiled.negated())
+            # The copy op runs in the slot right after the write.
+            model.add(end >= written + 2).only_enforce_if(tiling.cuts[name])
+            for kid in kids:
+                kid_buffer = tensors[kid].buffer
+                if not kid_buffer.uses or kid_buffer.first_use_is_read:
+                    continue
+                read = _TilingModel.write_slot(kid_buffer.uses[0]) + 1
+                model.add(end >= read).only_enforce_if(
+                    tiling.via_full[(name, kid)].negated()
+                )
+            for kid in read_by_a_nest:
+                model.add(end >= tiling.nest_end[kid]).only_enforce_if(
+                    [tiling.tiled[kid], is_tiled.negated()]
+                )
+            ends[name] = end
+        return ends
+
+    @staticmethod
+    def _cut_traffic_terms(
+        model: "cp_model.CpModel",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+        children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
+        tiling: _TilingModel,
+    ) -> list[Any]:
+        """HBM traffic a cut adds on top of each buffer's own spill cost.
+
+        ``spill_cost`` prices a buffer as resident (free) or spilled (its write
+        and every read). A cut buffer is neither. Its copy op writes the full
+        buffer to HBM and every consumer outside the nest reads it from there,
+        whether or not the tile resides; and a spilled tile is also written to
+        HBM and read back by the copy. Without these terms a resident cut tile
+        would look free and the residency stage would cut everywhere.
+        """
+        terms: list[Any] = []
+        for name, cut in tiling.cuts.items():
+            if name not in tiling.nest_end:
+                continue  # never tiled, so never cut
+            sb = tensors[name]
+            b = sb.buffer
+            kids = [
+                child for child, _ in _TilingModel.readers(children_of, tensors, name)
+            ]
+            is_intermediate = (
+                getattr(b, "boundary", BufferType.Intermediate)
+                == BufferType.Intermediate
+            )
+            resident_cut = model.new_bool_var(f"resident_cut_{name}")
+            model.add_bool_and([cut, sb.in_buffer]).only_enforce_if(resident_cut)
+            model.add_bool_or([cut.negated(), sb.in_buffer.negated()]).only_enforce_if(
+                resident_cut.negated()
+            )
+            # Spilled: the tile's own write and the copy's read of it. The
+            # copy's write is in ``spill_cost`` already, as the buffer's write.
+            terms.append(2 * b.size * (cut - resident_cut))
+            # Resident: the copy's write, unless it is the graph output's own
+            # write-out, and the reads of every consumer the model does not
+            # carry (an extern kernel, say), which can only be outside the nest.
+            unmodelled = max(0, b.read_count - len(kids))
+            copy_out = (1 if is_intermediate else 0) + unmodelled
+            if copy_out:
+                terms.append(copy_out * b.size * resident_cut)
+            for kid in kids:
+                outside = model.new_bool_var(f"reads_full_{name}_{kid}")
+                via_full = tiling.via_full[(name, kid)]
+                model.add_bool_and([via_full, sb.in_buffer]).only_enforce_if(outside)
+                model.add_bool_or(
+                    [via_full.negated(), sb.in_buffer.negated()]
+                ).only_enforce_if(outside.negated())
+                terms.append(b.size * outside)
         return terms
 
     def _solve_and_record(
@@ -1614,8 +1866,20 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # in-place relaxation and its 2D no-overlap need nothing special); the
         # residency gate and the coupling below reference them by group.
         copies = self._relayout_copies(tensors)
-        self._add_inplace_relaxation(model, tensors)
-        self._add_core_division(model, tensors, children_of, forced_reasons, copies)
+        # The nests the chosen tilings form, as solver variables: the ladder
+        # below ranks their boundaries, and placement has to be solved for the
+        # graph those tilings produce. ``None`` unless the joint solve is
+        # actually choosing tilings, which leaves everything below unchanged.
+        tiling = self._tiling_model(model, tensors, children_of)
+        ends = (
+            self._lifetime_ends(model, tensors, children_of, tiling)
+            if tiling is not None
+            else None
+        )
+        self._add_inplace_relaxation(model, tensors, tiling, ends)
+        self._add_core_division(
+            model, tensors, children_of, forced_reasons, copies, tiling
+        )
         self._constrain_relayout_copies(model, tensors, copies)
 
         solver = cp_model.CpSolver()
@@ -1648,10 +1912,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 
-        # Loop-group boundaries the tiling implies, as solver variables, so the
-        # ladder below can rank them. Empty unless the joint solve is actually
-        # choosing tilings, which makes the cut stage inert.
-        cut_terms = self._cut_literals(model, tensors, children_of)
+        # Loop-group boundaries the tiling implies. Empty unless the joint
+        # solve is actually choosing tilings, which makes the cut stage inert.
+        cut_terms = list(tiling.cuts.values()) if tiling is not None else []
         if cut_terms:
             logger.debug(
                 "[CP-SAT layout solver] cut tiebreak over %d candidate cut(s)",
@@ -1709,6 +1972,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             hbm_terms = [
                 sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
             ]
+            if tiling is not None:
+                hbm_terms += self._cut_traffic_terms(
+                    model, tensors, children_of, tiling
+                )
             status = cp_model.INFEASIBLE
             if hbm_terms:
                 model.minimize(sum(hbm_terms))
@@ -1859,6 +2126,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
+        tiling: Optional[_TilingModel] = None,
+        ends: Optional[dict[str, Any]] = None,
     ) -> None:
         """In-place reuse as a relaxation of the no-overlap constraint: each
         parent->child edge gets a merge bool that, when active, pins the pair to
@@ -1870,8 +2139,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         no-overlap (see ``_add_no_overlap_2d``). Chains are induced transitively
         by the shared-offset equalities -- no merge groups, no path enumeration.
         The per-buffer ``merge_vars`` bools are read back in ``_extract`` to
-        reconstruct placement units."""
+        reconstruct placement units.
+
+        With tilings on offer (``tiling``/``ends``) a merge also needs the
+        handoff to exist in the tiled graph: the child reads the parent itself,
+        not its copied-out full buffer, and nothing keeps the parent alive past
+        the child's write."""
         M = self._capacity_units
+        ends = ends or {}
 
         # A storage slot is handed off linearly, so a buffer reuses at most one
         # parent and is reused by at most one child. ``incoming`` also drives the
@@ -1890,6 +2165,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 # under slicing-compatible divisions; nothing extra when the
                 # division is fixed).
                 dst_v.constrain_merge(model, src_v, edge)
+                if tiling is not None and (src, dst) in tiling.via_full:
+                    model.add_implication(edge, tiling.via_full[(src, dst)].negated())
+                if src in ends:
+                    model.add(
+                        ends[src] == _TilingModel.write_slot(dst_v.start_time) + 1
+                    ).only_enforce_if(edge)
                 outgoing.setdefault(src, []).append(edge)
                 incoming.setdefault(dst, []).append(edge)
 
@@ -1901,13 +2182,17 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # if a buffer is resident its top must be below the peak usage.
             model.add(sb.offset + sb.eff_size <= M).OnlyEnforceIf(sb.in_buffer)
 
-        self._add_no_overlap_2d(model, bufs, incoming)
+        self._add_no_overlap_2d(
+            model, bufs, incoming, ends, in_slots=tiling is not None
+        )
 
     def _add_no_overlap_2d(
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
         incoming: dict[str, list],
+        ends: Optional[dict[str, Any]] = None,
+        in_slots: bool = False,
     ) -> None:
         """Global 2D no-overlap: each resident buffer is an optional rectangle
         ``[start_time, end_time) x [offset, offset + eff_size)`` and no two may
@@ -1936,27 +2221,49 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         A child whose entire lifetime is the handoff tick degenerates to a
         zero-width box the 2D propagator ignores, which is safe here: the tick is
         covered by the parent's box, whose footprint contains the child's at the
-        shared offset."""
+        shared offset.
+
+        ``in_slots`` puts the time axis in :class:`_TilingModel` slots, which
+        leave room after every op for the copy a cut inserts there; the mapping
+        is monotone, so it changes no overlap between untiled lifetimes. A
+        buffer in ``ends`` stops at that variable instead of its untiled end."""
+        ends = ends or {}
         x_intervals = []
         y_intervals = []
         for sb in bufs.values():
             ins = incoming.get(sb.name, [])
+            if in_slots:
+                start_time = _TilingModel.write_slot(sb.start_time)
+                last_start = start_time + 1
+                end_time: Any = ends.get(sb.name, _TilingModel.end_slot(sb.end_time))
+            else:
+                start_time, end_time = sb.start_time, sb.end_time
+                last_start = sb.end_time
             if ins:
                 # at most one incoming merge is active (AddAtMostOne), so the
                 # sum is 0 or 1: shorten the child by the handoff tick exactly
                 # when it takes over a parent's slot.
                 start_var = model.new_int_var(
-                    sb.start_time, sb.end_time, f"start_{sb.name}"
+                    start_time, last_start, f"start_{sb.name}"
                 )
-                model.add(start_var == sb.start_time + sum(ins))
-                x_start: object = start_var
-                x_size: object = sb.end_time - start_var
+                model.add(start_var == start_time + sum(ins))
+                x_start: Any = start_var
             else:
-                x_start = sb.start_time
-                x_size = sb.end_time - sb.start_time
+                x_start = start_time
+            if sb.name in ends:
+                # Each interval bound has to be affine in one variable, so a
+                # length between two variables gets a variable of its own.
+                x_size: object = model.new_int_var(
+                    0, _TilingModel.horizon(bufs), f"length_{sb.name}"
+                )
+                model.add(x_size == end_time - x_start)
+            else:
+                x_size = end_time - x_start
+            if in_slots:
+                sb.slot_span = (x_start, end_time)
             x_intervals.append(
                 model.new_optional_interval_var(
-                    x_start, x_size, sb.end_time, sb.in_buffer, f"x_{sb.name}"
+                    x_start, x_size, end_time, sb.in_buffer, f"x_{sb.name}"
                 )
             )
             # An interval's ``end`` must be affine (a single var), so the top
@@ -2005,16 +2312,29 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
         forced: dict[str, str],
         copies: dict[tuple[str, int], _CoreDivisionBufferWithCpVars],
+        tiling: Optional[_TilingModel] = None,
     ) -> None:
         """Pin out every buffer ``forced`` non-resident (decided declaratively by
         :meth:`MemoryPlanSolver.partition`) and install the per-buffer residency
         gate. In the joint model that gate is the slicing match, driven entirely
         by the precomputed ``cd_parent_matches`` pairs; placement-only buffers
-        have no gate."""
-        for name in forced:
-            model.add(bufs[name].in_buffer == 0)
+        have no gate.
+
+        A bar that only describes the untiled graph (``_BARS_A_TILING_LIFTS``)
+        holds a tileable buffer out only while it stays untiled."""
+        for name, reason in forced.items():
+            barred = model.add(bufs[name].in_buffer == 0)
+            if (
+                tiling is not None
+                and name in tiling.nest_end
+                and reason in _BARS_A_TILING_LIFTS
+            ):
+                barred.only_enforce_if(tiling.tiled[name].negated())
+        via_full = tiling.via_full if tiling is not None else None
         for sb in bufs.values():
-            sb.constrain_residency(model, children_of.get(sb.name, []), bufs, copies)
+            sb.constrain_residency(
+                model, children_of.get(sb.name, []), bufs, copies, via_full
+            )
 
     # ------------------------------------------------------------------
     # Extract
@@ -2066,12 +2386,26 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for n in resident:
                 components.setdefault(find(n), []).append(n)
 
+            def lifetime(name: str) -> tuple[int, int]:
+                # With tilings on offer the model placed each buffer over a
+                # lifetime it solved for (``_add_no_overlap_2d``), and the
+                # slide has to keep clear of that one, not the untiled one.
+                span = bufs[name].slot_span
+                if span is None:
+                    return by_name[name].start_time, by_name[name].end_time
+                start, end = (
+                    bound if isinstance(bound, int) else solver.Value(bound)
+                    for bound in span
+                )
+                return start, end
+
+            lifetimes = {n: lifetime(n) for n in resident}
             units = [
                 _PlacementUnit(
                     members=names,
                     footprint=max(footprint[n] for n in names),
-                    start_time=min(by_name[n].start_time for n in names),
-                    end_time=max(by_name[n].end_time for n in names),
+                    start_time=min(lifetimes[n][0] for n in names),
+                    end_time=max(lifetimes[n][1] for n in names),
                     original_offset=solver.Value(bufs[names[0]].offset),
                 )
                 for names in components.values()

@@ -635,3 +635,11 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         coarse_tile_post_stickify(
             graph, groups=groups, group_idx_offset=group_idx_offset
         )
+        # The solve that chose these tilings also chooses each op's division,
+        # and ties the divisions of a nest together edge by edge. That is the
+        # agreement ``coarse_tile_local_dim_split_domains`` otherwise gets by
+        # keeping a tiled dim whole on every core, so these ops may split it.
+        tiled = {name for name, spec in self._choices.items() if not spec.is_untiled}
+        for op in graph.operations:
+            if op.get_operation_name() in tiled:
+                op.solver_tiled = True  # type: ignore[attr-defined]
