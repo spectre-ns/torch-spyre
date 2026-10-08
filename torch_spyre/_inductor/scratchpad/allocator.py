@@ -3072,22 +3072,40 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 if pair not in buf.cd_parent_matches.get(parent_name, []):
                     demote(parent, f"{buf.name} does not read it as it is sliced")
 
-        self._check_no_lx_overlap([b for b in buffers if b.address is not None])
+        overlaps = self._lx_overlaps([b for b in buffers if b.address is not None])
+        if overlaps:
+            a, b = overlaps[0]
+            raise SolveError(
+                f"{a.name} and {b.name} would share LX bytes on the tiled graph: "
+                f"{self._lx_span(a)} and {self._lx_span(b)}"
+            )
         solver.spill_reasons = reasons
         return buffers
 
     @staticmethod
-    def _check_no_lx_overlap(resident: Sequence[CoreDivisionBuffer]) -> None:
-        """Raise ``SolveError`` if two resident buffers hold the same LX bytes
-        while both are alive.
+    def _lx_footprint(buf: CoreDivisionBuffer) -> int:
+        """The LX bytes ``buf`` holds on each core under its chosen division."""
+        cd = buf.core_divisions[buf.chosen_division or 0]
+        return ceil_div(buf.size, cd.output_partition)
+
+    @staticmethod
+    def _lx_span(buf: CoreDivisionBuffer) -> str:
+        """``buf``'s LX bytes and lifetime, for a message."""
+        assert buf.address is not None
+        top = buf.address + CoOptimizingAllocator._lx_footprint(buf)
+        return f"[{buf.address}, {top}) over [{buf.start_time}, {buf.end_time})"
+
+    @staticmethod
+    def _lx_overlaps(
+        resident: Sequence[CoreDivisionBuffer],
+    ) -> list[tuple[CoreDivisionBuffer, CoreDivisionBuffer]]:
+        """The pairs of resident buffers that hold the same LX bytes while both
+        are alive.
 
         An in-place child may sit on its parent's address across the one tick
         the parent hands its slot over, provided it fits inside that slot.
         """
-
-        def footprint(buf: CoreDivisionBuffer) -> int:
-            cd = buf.core_divisions[buf.chosen_division or 0]
-            return ceil_div(buf.size, cd.output_partition)
+        footprint = CoOptimizingAllocator._lx_footprint
 
         def hands_over(parent: CoreDivisionBuffer, child: CoreDivisionBuffer) -> bool:
             return (
@@ -3097,6 +3115,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 and footprint(child) <= footprint(parent)
             )
 
+        overlaps = []
         for i, a in enumerate(resident):
             for b in resident[i + 1 :]:
                 if not a.overlaps_in_time(b):
@@ -3109,13 +3128,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     continue
                 if hands_over(a, b) or hands_over(b, a):
                     continue
-                raise SolveError(
-                    f"{a.name} and {b.name} would share LX bytes on the tiled "
-                    f"graph: [{a.address}, {a.address + footprint(a)}) over "
-                    f"[{a.start_time}, {a.end_time}) and "
-                    f"[{b.address}, {b.address + footprint(b)}) over "
-                    f"[{b.start_time}, {b.end_time})"
-                )
+                overlaps.append((a, b))
+        return overlaps
+
+    @staticmethod
+    def _check_no_lx_overlap(resident: Sequence[CoreDivisionBuffer]) -> bool:
+        """Whether no two resident buffers hold the same LX bytes while both
+        are alive (see :meth:`_lx_overlaps`)."""
+        return not CoOptimizingAllocator._lx_overlaps(resident)
 
     def _chosen_tilings(
         self, graph: GraphLowering, allocation: Sequence[Any]

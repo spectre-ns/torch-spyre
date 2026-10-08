@@ -632,6 +632,7 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         # post-stickify entry point (run_read_copies=False): a read copy-in here
         # would only be a useless HBM-to-HBM copy, exactly as the sibling
         # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
+        before = {op.get_operation_name() for op in graph.operations}
         coarse_tile_post_stickify(
             graph, groups=groups, group_idx_offset=group_idx_offset
         )
@@ -639,7 +640,11 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         # and ties the divisions of a nest together edge by edge. That is the
         # agreement ``coarse_tile_local_dim_split_domains`` otherwise gets by
         # keeping a tiled dim whole on every core, so these ops may split it.
+        # So may an op the apply added to one of these nests, a cut's copy op:
+        # it reads the tile and has to take it as its producer slices it.
         tiled = {name for name, spec in self._choices.items() if not spec.is_untiled}
         for op in graph.operations:
-            if op.get_operation_name() in tiled:
+            name = op.get_operation_name()
+            added = name not in before and getattr(op, "loop_info", None) is not None
+            if name in tiled or added:
                 op.solver_tiled = True  # type: ignore[attr-defined]

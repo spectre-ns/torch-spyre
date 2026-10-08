@@ -610,8 +610,9 @@ along with its core division. It has no effect with any other solver.
   untiled option. Each tiling gets its own division menu, enumerated on the
   per-tile frame. A division may split the tiled dim itself across cores,
   by a factor that divides one tile's extent: the solve owns the divisions
-  of every op it tiles, so the ops of a nest agree on that split. Ops a
-  hint or a `for_each_tile` loop tiled keep their tiled dims whole.
+  of every op it tiles, so the ops of a nest agree on that split, and a
+  cut's copy op follows its producer's. Ops a hint or a `for_each_tile`
+  loop tiled keep their tiled dims whole.
 - **Matching.** A producer/consumer pair of divisions is compatible when
   the two agree on core ownership and on tile ownership of the buffer they
   share, both taken on the untiled buffer: tile `t` must touch the same
@@ -639,7 +640,9 @@ along with its core division. It has no effect with any other solver.
   a tile lives until its last reader in the nest, or its copy; an untiled
   buffer that a tiled op reads is read again on every iteration and lives
   until that op's nest ends. An in-place handoff from a tiled buffer needs
-  its reader in the same nest.
+  its reader in the same nest. The solver records every buffer a tiling
+  holds past its last use in `lifetime_extensions` (the op it is held
+  through, why, and whether it still resides) and logs each at debug level.
 - **Objective.** The cost expression is not used, since it has no term for
   tile size or loop-group boundaries. The solve ranks plans
   lexicographically: HBM traffic, then the number of cuts, then

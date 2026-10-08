@@ -1646,6 +1646,93 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertIsNotNone(res["b"].address)
         self.assertIsNotNone(res["c"].address)
 
+    def test_a_lifetime_a_nest_extends_is_reported(self):
+        # The buffers of the test above. w's last use is b, at op 1, and the
+        # nest b, c ends with c's copy, so w is held through op 2 and that
+        # copy. Neither tile is reported: b ends at its reader c as it would
+        # untiled, and c's is freed by its copy, before the sink would read it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        tiled = [CoreDivision(tiling=spec)]
+        w = CoreDivisionBuffer("w", 40, [0, 1], core_divisions=_whole())
+        b = CoreDivisionBuffer(
+            "b",
+            80,
+            [1, 2],
+            core_divisions=tiled,
+            parents=["w"],
+            cd_parent_matches={"w": [(0, 0)]},
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            80,
+            [2, 3],
+            core_divisions=tiled,
+            parents=["b"],
+            cd_parent_matches={"b": [(0, 0)]},
+        )
+        solver = self.solver_class([w, b, c, self._sink("c")], size=100, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        self.assertEqual(set(solver.lifetime_extensions), {"w"})
+        held = solver.lifetime_extensions["w"]
+        self.assertEqual(
+            (held.last_use, held.held_through, held.through_copy), (1, 2, True)
+        )
+        self.assertIn("b reads it", held.cause)
+        self.assertFalse(held.resident)
+
+    def test_a_tile_held_for_its_copy_is_reported(self):
+        # Untiled, a graph output is needed only at its own write, op 0. Tiled,
+        # the copy op that runs right after has to read the tile.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        out = CoreDivisionBuffer(
+            "out",
+            128,
+            [0],
+            core_divisions=[CoreDivision(tiling=spec)],
+            boundary=BufferType.Output,
+            residency_reason="no consumer reads it from LX",
+        )
+        solver = self.solver_class([out], size=1 << 20, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        held = solver.lifetime_extensions["out"]
+        self.assertEqual(
+            (held.last_use, held.held_through, held.through_copy), (0, 0, True)
+        )
+        self.assertIn("copy", held.cause)
+        self.assertTrue(held.resident)
+
+    def test_a_buffer_barred_from_lx_has_no_lifetime_to_report(self):
+        # w is read by the nest b runs, but it may never reside, so the nest
+        # holds nothing of it in LX.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        w = CoreDivisionBuffer(
+            "w", 40, [0, 1], core_divisions=_whole(), residency_reason="op not allowed"
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            80,
+            [1, 2],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["w"],
+            cd_parent_matches={"w": [(0, 0)]},
+        )
+        solver = self.solver_class([w, b, self._sink("b")], size=1 << 20, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        self.assertNotIn("w", solver.lifetime_extensions)
+
+    def test_a_buffer_its_reader_shuts_out_has_no_lifetime_to_report(self):
+        # The table has no pair for w and its tiled reader b: b walks w slice
+        # by slice, which an untiled w in LX cannot serve. w is out of LX for
+        # that, not for how long the nest would hold it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        w = CoreDivisionBuffer("w", 40, [0, 1], core_divisions=_whole())
+        b = CoreDivisionBuffer(
+            "b", 80, [1, 2], core_divisions=[CoreDivision(tiling=spec)], parents=["w"]
+        )
+        solver = self.solver_class([w, b, self._sink("b")], size=1 << 20, alignment=1)
+        solver.plan_layout_and_core_divisions()
+        self.assertNotIn("w", solver.lifetime_extensions)
+
     def test_a_tiled_graph_output_resides_as_a_tile(self):
         # Nothing reads a graph output from LX while it is untiled. Tiled, its
         # copy op does, so the bar holds only for the untiled candidate.
@@ -1717,6 +1804,37 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             self.assertEqual(chosen.tiling, spec, name)
             self.assertIsNotNone(res[name].address, name)
         self.assertEqual(res["p"].address, res["c"].address)
+
+    def test_a_skip_connection_is_cut_where_an_untiled_op_splits_the_run(self):
+        # Op order a, b, c: b reads a, and c reads a and b. a and c can only be
+        # tiled and b only untiled, so b splits the run although a feeds c
+        # directly. a is then a cut: b and c both read its full copy from HBM,
+        # and its tile is free once the copy has drained it. LX holds one tile
+        # (64), so a's and c's both reside only because a's does not wait for
+        # c, its last reader in op order.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        a = CoreDivisionBuffer(
+            "a", 128, [0, 1, 2], core_divisions=[CoreDivision(tiling=spec)]
+        )
+        b = CoreDivisionBuffer(
+            "b",
+            128,
+            [1, 2],
+            core_divisions=_whole(),
+            parents=["a"],
+            residency_reason="keep b out of the choice",
+        )
+        c = CoreDivisionBuffer(
+            "c",
+            128,
+            [2, 3],
+            core_divisions=[CoreDivision(tiling=spec)],
+            parents=["a", "b"],
+            cd_parent_matches={"a": [(0, 0)]},
+        )
+        res = self._plan([a, b, c, self._sink("c")], size=64)
+        self.assertIsNotNone(res["a"].address)
+        self.assertIsNotNone(res["c"].address)
 
     def test_reciprocal_cost_expr_with_all_core_counts_positive(self):
         # Regression for a ``MODEL_INVALID`` failure ("The domain of the

@@ -607,6 +607,8 @@ def coarse_tile_local_dim_split_domains(
     to own the shared buffer alike per tile and per core, so the ops of a
     loop body cannot disagree about a split of the tiled dim. The split still
     has to divide the per-tile extent, which is the extent this op now has.
+    The copy op of a cut in such a nest carries the stamp too: it is given
+    the division that reads the tile as its producer slices it.
     A nest a ``spyre_hint`` or ``for_each_tile`` loop made is not a group in
     that solve, so its ops keep the pin.
 
