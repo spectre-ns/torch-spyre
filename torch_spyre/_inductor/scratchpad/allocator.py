@@ -627,8 +627,8 @@ def _assert_drain_plan_committed(
     edge = CoOptimizingAllocator._loop_carry_update_edge(update_op, op_by_name, {})
     pairs = (
         edge.match_pairs(
-            [cd.splits for cd in storage_buffer.core_divisions],
-            [cd.splits for cd in update_buffer.core_divisions],
+            storage_buffer.core_divisions,
+            update_buffer.core_divisions,
         )
         if edge is not None
         else []
