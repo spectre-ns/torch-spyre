@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import dataclasses
 import operator
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Optional
 
 import sympy
@@ -60,7 +60,7 @@ from ..wsr.coarse_tile import (
     validate_coarse_tile_groups,
 )
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
-from .plan_solver import CoreDivisionBuffer, RelayoutCopyBuffer, TileSpec, ceil_div
+from .plan_solver import CoreDivisionBuffer, TileSpec
 from .utils import buffer_not_read_in_full
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
@@ -780,144 +780,3 @@ def planned_splits(
             continue
         splits[name] = on_tile
     return splits, violations
-
-
-def carry_plan(
-    planned: Sequence[CoreDivisionBuffer],
-    buffers: Sequence[CoreDivisionBuffer],
-    barred: Callable[[CoreDivisionBuffer], Optional[str]],
-) -> tuple[dict[str, str], list[str]]:
-    """Restate the solve's plan over ``buffers``, the tiled graph's own,
-    and say whether it holds there.
-
-    Applying a tiling keeps every op's name, so each buffer the solve
-    planned is found again in ``buffers``, one tile in size where it was
-    tiled, with the lifetime, in-place parents and residency verdict the
-    tiled graph gives it. It takes the address the solve chose. Its division
-    is not carried here: ``buffers`` are built on the divisions already
-    committed onto the graph's ops. An op the apply added -- a cut's copy op
-    and the full buffer it fills -- was not in the solve and never resides.
-
-    Returns why each buffer outside LX is outside it, as far as the tiled
-    graph can say (``barred`` gives its reason; a buffer the solve spilled is
-    only known here as spilled), and ``validate_plan``'s violations. Nothing
-    is repaired: what to do about a violation is the caller's call.
-    """
-    planned_by_name = {buf.name: buf for buf in planned}
-    reasons: dict[str, str] = {}
-    for buf in buffers:
-        if isinstance(buf, RelayoutCopyBuffer):
-            continue
-        before = planned_by_name.get(buf.name)
-        if before is None:
-            continue
-        buf.address = before.address
-        if before.address is None:
-            reasons[buf.name] = "spilled by solver"
-    for buf in buffers:
-        if buf.address is None:
-            reasons.setdefault(buf.name, barred(buf) or "added by coarse tiling")
-    return reasons, validate_plan(buffers, barred)
-
-
-def validate_plan(
-    buffers: Sequence[CoreDivisionBuffer],
-    barred: Callable[[CoreDivisionBuffer], Optional[str]],
-) -> list[str]:
-    """Why the solve's plan does not hold on the tiled graph, one line for
-    each fault; empty when it holds.
-
-    ``buffers`` are the tiled graph's own, each carrying the address and
-    the division the solve chose for it, and ``barred`` gives the reason
-    the tiled graph keeps a buffer out of LX, if it does. A resident
-    buffer must not be barred, each of its readers must read it as it is
-    sliced, and no two may hold the same LX bytes while both are alive.
-    Nothing is repaired: a fault means the solve planned for a graph the
-    apply did not produce, and what to do about that is the caller's call.
-    """
-    by_name = {buf.name: buf for buf in buffers}
-    resident = [buf for buf in buffers if buf.address is not None]
-    violations = []
-    for buf in resident:
-        reason = barred(buf)
-        if reason is not None:
-            violations.append(
-                f"{buf.name}: placed in LX, but the tiled graph bars it: {reason}"
-            )
-    for buf in buffers:
-        if isinstance(buf, RelayoutCopyBuffer) or buf.chosen_division is None:
-            continue
-        for parent_name in buf.parents:
-            parent = by_name.get(parent_name)
-            if parent is None or parent.address is None:
-                continue
-            pair = (parent.chosen_division, buf.chosen_division)
-            if pair not in buf.cd_parent_matches.get(parent_name, []):
-                violations.append(
-                    f"{parent.name}: placed in LX, but {buf.name} does not "
-                    "read it as it is sliced"
-                )
-    for a, b in _lx_overlaps(resident):
-        violations.append(
-            f"{a.name} and {b.name} would share LX bytes on the tiled graph: "
-            f"{_lx_span_to_str(a)} and {_lx_span_to_str(b)}"
-        )
-    return violations
-
-
-def _lx_footprint(buf: CoreDivisionBuffer) -> int:
-    """The LX bytes ``buf`` holds on each core under its chosen division."""
-    cd = buf.core_divisions[buf.chosen_division or 0]
-    return ceil_div(buf.size, cd.output_partition)
-
-
-def _lx_span_to_str(buf: CoreDivisionBuffer) -> str:
-    """``buf``'s LX bytes and lifetime, for a message."""
-    assert buf.address is not None
-    top = buf.address + _lx_footprint(buf)
-    return f"[{buf.address}, {top}) over [{buf.start_time}, {buf.end_time})"
-
-
-def _lx_overlaps(
-    resident: Sequence[CoreDivisionBuffer],
-) -> list[tuple[CoreDivisionBuffer, CoreDivisionBuffer]]:
-    """The pairs of resident buffers that hold the same LX bytes while both
-    are alive.
-
-    An in-place child may sit on its parent's address across the one tick
-    the parent hands its slot over, provided it fits inside that slot.
-    """
-
-    def check_valid_inplace_assignment(
-        parent: CoreDivisionBuffer, child: CoreDivisionBuffer
-    ) -> bool:
-        return (
-            parent.name in child.in_place_parents
-            and parent.address == child.address
-            and parent.end_time == child.start_time + 1
-            and _lx_footprint(child) <= _lx_footprint(parent)
-        )
-
-    overlaps = []
-    for i, a in enumerate(resident):
-        for b in resident[i + 1 :]:
-            if not a.overlaps_in_time(b):
-                continue
-            assert a.address is not None and b.address is not None
-            if (
-                a.address + _lx_footprint(a) <= b.address
-                or b.address + _lx_footprint(b) <= a.address
-            ):
-                continue
-            if check_valid_inplace_assignment(a, b) or check_valid_inplace_assignment(
-                b, a
-            ):
-                continue
-            overlaps.append((a, b))
-    return overlaps
-
-
-def _check_no_lx_overlap(resident: Sequence[CoreDivisionBuffer]) -> bool:
-    """Whether no two resident buffers hold the same LX bytes while both
-    are alive (see :func:`_lx_overlaps`)."""
-    return not _lx_overlaps(resident)

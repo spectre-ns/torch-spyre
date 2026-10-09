@@ -44,24 +44,27 @@ from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     _spec_within_read_distance,
+    commit_lx_views,
     select_allocator,
 )
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
-    _check_no_lx_overlap,
-    _lx_overlaps,
-    carry_plan,
     splits_on_tile,
 )
+from torch_spyre._inductor.scratchpad.lx_relayout import LXRelayoutPlan
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
+    RelayoutCopyBuffer,
     TileAxis,
     TileSpec,
+    relayout_copy_name,
 )
+from torch_spyre._inductor.scratchpad.utils import get_ncores_for_buffers
 from torch_spyre._inductor.wsr import for_each_tile
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -1209,45 +1212,6 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self._assert_close(device, cpu)
 
 
-class LxOverlapCheckTests(unittest.TestCase):
-    """The carried plan is checked against the tiled graph's own lifetimes: two
-    resident buffers may not hold the same bytes while both are alive."""
-
-    @staticmethod
-    def _resident(name, uses, address, size=128, **kwargs):
-        return CoreDivisionBuffer(
-            name,
-            size,
-            uses,
-            core_divisions=[CoreDivision()],
-            chosen_division=0,
-            address=address,
-            **kwargs,
-        )
-
-    def test_two_live_buffers_on_the_same_bytes_fail_the_check(self):
-        a = self._resident("a", [0, 2], address=0)
-        b = self._resident("b", [1, 3], address=64)
-        self.assertFalse(_check_no_lx_overlap([a, b]))
-        self.assertEqual(_lx_overlaps([a, b]), [(a, b)])
-
-    def test_buffers_apart_in_time_or_in_address_pass(self):
-        a = self._resident("a", [0, 2], address=0)
-        later = self._resident("later", [3, 4], address=0)
-        beside = self._resident("beside", [1, 3], address=128)
-        self.assertTrue(_check_no_lx_overlap([a, later, beside]))
-
-    def test_an_in_place_child_may_take_its_parents_slot(self):
-        parent = self._resident("parent", [0, 1], address=0)
-        child = self._resident("child", [1, 2], address=0, in_place_parents=["parent"])
-        self.assertTrue(_check_no_lx_overlap([parent, child]))
-        # The same lifetimes and address without the in-placement: both hold
-        # the slot at tick 1.
-        child = self._resident("child", [1, 2], address=0)
-        self.assertFalse(_check_no_lx_overlap([parent, child]))
-        self.assertEqual(_lx_overlaps([parent, child]), [(parent, child)])
-
-
 class SplitsOnTileTests(unittest.TestCase):
     """``splits_on_tile`` restates a core division on the symbols the tiled op
     iterates, from the ``symbols_on_tile`` stamp ``apply_tilings`` leaves on
@@ -1270,76 +1234,54 @@ class SplitsOnTileTests(unittest.TestCase):
         self.assertIsNone(splits_on_tile(tile, {self._D0: 2}))
 
 
-class CarryPlanTests(unittest.TestCase):
-    """``carry_plan`` restates the solve's plan over the tiled graph's buffers
-    and reports every way it does not hold there."""
+class CommitLxViewsTests(unittest.TestCase):
+    """``commit_lx_views`` gives each buffer placed in LX the per-core view it
+    is held under: the one the residency judge accepts for it on the graph,
+    or, for the source of an accepted relayout, the one its plan carries."""
+
+    def setUp(self):
+        ops = {name: _pointwise_op((4, 64), name=name) for name in ("a", "b")}
+        self.graph = SimpleNamespace(
+            operations=list(ops.values()), try_get_buffer=ops.get
+        )
+        # What the judge itself accepts for each buffer of this graph.
+        _, _, self.judged = get_ncores_for_buffers(self.graph)
 
     @staticmethod
-    def _buf(name, uses, size=128, **kwargs):
-        # One division, already chosen: the solve's pick for a planned buffer,
-        # the committed division for a buffer of the tiled graph.
+    def _buf(name, address=None):
         return CoreDivisionBuffer(
-            name,
-            size,
-            uses,
+            name, 128, [0, 1], core_divisions=[CoreDivision()], address=address
+        )
+
+    def test_a_resident_buffer_takes_the_view_the_judge_accepted(self):
+        resident, spilled = self._buf("a", address=0), self._buf("b")
+        commit_lx_views(self.graph, [resident, spilled], [])
+        self.assertEqual(resident.lx_view, self.judged["a"])
+        self.assertIsNone(spilled.lx_view)
+
+    def test_a_relayout_source_takes_the_view_its_plan_carries(self):
+        core_id = sympy.Symbol("core_id")
+        plan = LXRelayoutPlan(
+            "a",
+            ("b",),
+            PerCoreView(((0, 4),), ((0, core_id),), num_cores=4),
+            PerCoreView(((0, 2),), ((0, sympy.floor(core_id / 2)),), num_cores=4),
+            4,
+        )
+        self.assertNotEqual(plan.source_view, self.judged["a"])
+        source, consumer = self._buf("a", address=0), self._buf("b", address=128)
+        # The copy is in the allocation but is not a buffer of the graph:
+        # materialize_lx_relayouts gives its destination the plan's view.
+        copy = RelayoutCopyBuffer(
+            relayout_copy_name("a", 0),
+            128,
+            [1, 2],
             core_divisions=[CoreDivision()],
-            chosen_division=0,
-            **kwargs,
+            address=256,
+            relayout_parent="a",
+            group=0,
         )
-
-    def test_a_planned_buffer_keeps_its_address_and_added_ones_stay_out(self):
-        # The solve placed p in LX and spilled q. On the tiled graph p is one
-        # tile in size, and the apply added p's copy and the full buffer.
-        planned = [
-            self._buf("p", [0, 1], address=64),
-            self._buf("q", [1, 2]),
-        ]
-        tile = self._buf("p", [0, 2], size=32)
-        spilled = self._buf("q", [2, 3])
-        copy = self._buf(
-            "coarse_tile_copy_p",
-            [1, 4],
-            parents=["p"],
-            cd_parent_matches={"p": [(0, 0)]},
-        )
-        full = CoreDivisionBuffer("full", 128, [0, 4])
-        reasons, violations = carry_plan(
-            planned, [full, tile, copy, spilled], lambda _: None
-        )
-        self.assertEqual(tile.address, 64)
-        self.assertIsNone(copy.address)
-        self.assertIsNone(full.address)
-        self.assertEqual(
-            reasons,
-            {
-                "q": "spilled by solver",
-                "coarse_tile_copy_p": "added by coarse tiling",
-                "full": "added by coarse tiling",
-            },
-        )
-        self.assertEqual(violations, [])
-
-    def test_every_way_the_plan_fails_on_the_tiled_graph_is_reported(self):
-        # p's copy has no pair with it, and the tiled graph bars r.
-        planned = [
-            self._buf("p", [0, 1], address=0),
-            self._buf("r", [5, 6], address=512),
-        ]
-        tile = self._buf("p", [0, 2])
-        copy = self._buf(
-            "coarse_tile_copy_p", [1, 3], parents=["p"], cd_parent_matches={"p": []}
-        )
-        barred = self._buf("r", [5, 6])
-        _, violations = carry_plan(
-            planned,
-            [tile, copy, barred],
-            lambda buf: "tiled (advancing)" if buf.name == "r" else None,
-        )
-        self.assertEqual(
-            violations,
-            [
-                "r: placed in LX, but the tiled graph bars it: tiled (advancing)",
-                "p: placed in LX, but coarse_tile_copy_p does not read it as it "
-                "is sliced",
-            ],
-        )
+        commit_lx_views(self.graph, [source, copy, consumer], [plan])
+        self.assertIs(source.lx_view, plan.source_view)
+        self.assertEqual(consumer.lx_view, self.judged["b"])
+        self.assertIsNone(copy.lx_view)

@@ -880,16 +880,6 @@ def _check_in_place_relationships(
                         )
 
 
-def excluded_from_lx(buffer: "LifetimeBoundBuffer", limit: int) -> Optional[str]:
-    """Why ``buffer`` may not reside in an LX of ``limit`` bytes, or ``None``
-    if it may."""
-    if buffer.residency_reason is not None:
-        return buffer.residency_reason
-    if buffer.min_footprint > limit:
-        return f"min footprint {buffer.min_footprint} B > LX capacity {limit} B"
-    return None
-
-
 class MemoryPlanSolver(ABC):
     """Solves *placement*: where, if anywhere, each buffer lives in scratchpad.
 
@@ -933,7 +923,13 @@ class MemoryPlanSolver(ABC):
 
     def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
-        return excluded_from_lx(buffer, self.limit)
+        if buffer.residency_reason is not None:
+            return buffer.residency_reason
+        if buffer.min_footprint > self.limit:
+            return (
+                f"min footprint {buffer.min_footprint} B > LX capacity {self.limit} B"
+            )
+        return None
 
     def record_exclusions(self) -> dict[str, str]:
         """Compute, store, and return the ``name -> reason`` map of every buffer

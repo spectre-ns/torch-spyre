@@ -652,19 +652,17 @@ along with its core division. It has no effect with any other solver.
   what a cut moves whether or not its tile resides: the copy's write of
   the full buffer and every outside consumer's read of it, plus the tile's
   own write and the copy's read of it when the tile is spilled.
-- **One solve.** When the solve picks any tiling, `apply_tilings` applies
-  it, and the core divisions are then committed onto the tiled graph's ops
-  as a second pass: each op takes the division the solve chose for it, and
-  an op the apply added, a cut's copy op, takes the division of the op it
-  drains. Nothing is solved again. The tiled graph has the last word, and a
-  plan that does not hold on it is not repaired: its buffers are built once
-  on the committed divisions, with no menu enumerated, and `validate_plan`
-  checks the plan's addresses against them. A resident buffer the tiled
-  graph bars from LX or a reader does not read as it is sliced, two resident
-  buffers that would overlap on its lifetimes, or a division one of its ops
-  cannot take raises `SolveError`. A `SolveError` from the solve falls back
-  to greedy placement over the untouched graph, and one raised after the
-  apply over the tiled graph.
+- **One solve.** When the solve picks any tiling, `apply_chosen_tilings`
+  applies it, and the core divisions are then committed onto the tiled
+  graph's ops as a second pass: each op takes the division the solve chose
+  for it, and an op the apply added, a cut's copy op, takes the division of
+  the op it drains. Nothing is solved again, and the tiled graph's buffers
+  are not built again to check the plan: it is taken as it stands. A
+  division one of the tiled graph's ops cannot take raises `SolveError`
+  before anything is committed, and a resident buffer whose readers do not
+  agree on how it is sliced fails the ownership check that follows. A
+  `SolveError` from the solve falls back to greedy placement over the
+  untouched graph, and one raised after the apply over the tiled graph.
 
 ### Joint SA co-optimization
 

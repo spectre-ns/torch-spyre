@@ -67,7 +67,6 @@ from torch_spyre._inductor.work_division import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     cost_expr_record,
-    excluded_from_lx,
     CoreDivision,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
@@ -116,7 +115,6 @@ from torch_spyre._inductor.scratchpad.utils import (
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     apply_chosen_tilings,
-    carry_plan,
     planned_splits,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
@@ -2598,6 +2596,43 @@ def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int
     return index
 
 
+def commit_lx_views(
+    graph: GraphLowering,
+    allocation: Sequence[LifetimeBoundBuffer],
+    accepted_lx_relayouts: Sequence[LXRelayoutPlan],
+) -> None:
+    """Set ``lx_view``, the per-core view LX holds it under, on every resident
+    buffer of ``allocation``.
+
+    A buffer takes the view the residency judge accepted for it on ``graph``
+    (``get_ncores_for_buffers``); the source of an accepted relayout takes its
+    plan's ``source_view`` instead. Raises ``Unsupported`` for a resident
+    buffer that has neither.
+    """
+    # A solver-fired relayout source stays resident under ITS committed view
+    # while the consumer it feeds will read the shuffled copy under another.
+    # The judge runs on the pre-materialization graph, where that consumer
+    # still reads the source directly, so it reports the pair as a
+    # mismatch and withholds a view. The plan carries the source view the
+    # enumeration priced and the solver committed, so it is authoritative
+    # here - the same precedence the fixed-division allocator gives
+    # ``plan.source_view`` when it builds its buffers.
+    source_views = {
+        plan.source_name: plan.source_view for plan in accepted_lx_relayouts
+    }
+    _, reasons, views = get_ncores_for_buffers(graph)
+    for buffer in allocation:
+        # A relayout copy is not a graph buffer: materialize_lx_relayouts
+        # creates its destination, carrying the plan's view.
+        if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
+            continue
+        view = source_views.get(buffer.name) or views.get(buffer.name)
+        if view is None:
+            reason = reasons.get(buffer.name, "physical ownership was not accepted")
+            raise Unsupported(f"{buffer.name}: {reason}")
+        buffer.lx_view = view
+
+
 class _DivisionMap(NamedTuple):
     """Every op's core-division candidates, and which of those lists are the
     whole legal space.
@@ -2653,9 +2688,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # function rather than a class. Engines that cannot are never handed a
         # copy, and their objective never carries a relayout term.
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
-        # Why each buffer of a graph the solve's tilings produced is outside
-        # LX, as that graph has it; empty when no tiling was applied.
-        self._tiled_graph_reasons: dict[str, str] = {}
+        # The ops a tiling added to the graph, which the solve never saw, each
+        # with why it is outside LX; empty when no tiling was applied.
+        self._added_op_reasons: dict[str, str] = {}
         self._decides_lx_relayouts: bool = bool(
             getattr(layout_planning([], size), "decides_lx_relayouts", False)
         )
@@ -3021,43 +3056,36 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         so the divisions are committed, as a second pass, onto the ops of the
         graph that will run.
 
+        The plan is taken as it stands: the tiled graph's buffers are not built
+        again to check it. What does get checked is what the graph itself can
+        say, a division one of its ops cannot take (``_commit_divisions``) and
+        a resident buffer its readers do not agree on (``commit_lx_views``).
+
         Ordering is solve-before-apply: a ``SolveError`` from the solve
         propagates over the *unmutated* graph, so ``scratchpad_planning``'s
-        greedy fallback never runs on a half-tiled graph. A plan that does not
-        hold on the tiled graph raises ``SolveError`` too, after the apply, and
-        the fallback then places the fully-tiled graph, which is a valid
-        outcome.
+        greedy fallback never runs on a half-tiled graph. A division the tiled
+        graph cannot take raises ``SolveError`` too, after the apply, and the
+        fallback then places the fully-tiled graph, which is a valid outcome.
         """
-        self._tiled_graph_reasons = {}
         tiled = apply_chosen_tilings(graph, allocation)
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        self._added_op_reasons = {}
         if tiled:
-            self._validate_on_tiled_graph(graph, allocation)
-        # A solver-fired relayout source stays resident under ITS committed view
-        # while the consumer it feeds will read the shuffled copy under another.
-        # The judge runs on the pre-materialization graph, where that consumer
-        # still reads the source directly, so it reports the pair as a
-        # mismatch and withholds a view. The plan carries the source view the
-        # enumeration priced and the solver committed, so it is authoritative
-        # here - the same precedence the fixed-division allocator gives
-        # ``plan.source_view`` when it builds its buffers.
-        source_views = {
-            plan.source_name: plan.source_view for plan in accepted_lx_relayouts
-        }
-        _, reasons, views = get_ncores_for_buffers(graph)
-        for buffer in allocation:
-            # A relayout copy is not a graph buffer: materialize_lx_relayouts
-            # creates its destination, carrying the plan's view.
-            if buffer.address is None or isinstance(buffer, RelayoutCopyBuffer):
-                continue
-            view = source_views.get(buffer.name) or views.get(buffer.name)
-            if view is None:
-                reason = reasons.get(buffer.name, "physical ownership was not accepted")
-                raise Unsupported(f"{buffer.name}: {reason}")
-            buffer.lx_view = view
+            # The apply moved ops and added some: the drain plans validated
+            # before the solve describe the graph as it was.
+            self._validated_drain_plans = validated_drain_plans(
+                graph, division_is_fixed=False
+            )
+            planned = {buffer.name for buffer in allocation}
+            self._added_op_reasons = {
+                op.name: "added by coarse tiling"
+                for op in graph.operations
+                if op.name not in planned
+            }
+        commit_lx_views(graph, allocation, accepted_lx_relayouts)
         self._log_solver_decisions(graph, allocation)
 
     def _log_solver_decisions(
@@ -3100,40 +3128,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 else "NO(skipped)",
             )
 
-    def _validate_on_tiled_graph(
-        self, graph: GraphLowering, allocation: Sequence[CoreDivisionBuffer]
-    ) -> None:
-        """Check the solve's plan against the graph its tilings produced.
-
-        The tiled graph's buffers are built for this alone, each on the one
-        division just committed for its op, so no menu is enumerated. They take
-        the plan's addresses (``carry_plan``) and ``validate_plan`` says whether
-        the plan holds on them. A violation means the solve planned for a graph
-        the apply did not produce: ``SolveError``, and the caller falls back to
-        greedy placement. What keeps each of the tiled graph's buffers out of
-        LX is kept for ``_get_spill_reasons``.
-        """
-        self._validated_drain_plans = validated_drain_plans(
-            graph, division_is_fixed=False
-        )
-        buffers = self._build_cd_bound_buffers(
-            graph,
-            self._determine_in_place_division_invariant(graph),
-            _DivisionMap(
-                {op.name: [_fixed_core_division(op)] for op in graph.operations},
-                set(),
-            ),
-        )
-        for buf in buffers:
-            if buf.core_divisions:
-                buf.chosen_division = 0
-        reasons, violations = carry_plan(
-            allocation, buffers, lambda buf: excluded_from_lx(buf, self.size)
-        )
-        if violations:
-            raise SolveError("; ".join(violations))
-        self._tiled_graph_reasons = reasons
-
     def _get_spill_reasons(
         self,
         solver: MemoryPlanSolver,
@@ -3142,11 +3136,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
         # allocators. Both CoreDivisionLayoutSolver implementations expose it.
-        # Where a tiling was applied, the ops it added are not in the solve:
-        # the tiled graph's own reasons cover them, and the solver's stand for
-        # every buffer it spilled.
+        # The ops a tiling added are not in the solve, and the log reads an op
+        # with no reason as resident, so they bring their own.
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        return {**self._tiled_graph_reasons, **solver.spill_reasons}
+        return {**self._added_op_reasons, **solver.spill_reasons}
 
     def _division_map(
         self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False
