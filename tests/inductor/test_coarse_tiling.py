@@ -10986,6 +10986,42 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
         ]
         self.assertEqual(combine.loop_info.squeezed_advance_per_read, [])
 
+    def test_full_buffer_grown_back_from_a_permuted_tile(self):
+        # Where no full layout was planned, the full buffer's is grown back
+        # from the tile's. This op writes its output with dim 1 outermost and
+        # is tiled on dim 0, the inner one, so the outer dim's stride shrinks
+        # with the tile and has to grow back with the full buffer.
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _allocate_full_buffer
+
+        size, stride = [64, 64, 128], [128, 8192, 1]
+        op = _make_real_tiled_op("pw_permuted", size)
+        original = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
+        op.layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [Integer(s) for s in size],
+            [Integer(s) for s in stride],
+            original,
+        )
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        self.assertEqual(
+            op.layout.device_layout,
+            SpyreTensorLayout([16, 64, 128], [128, 2048, 1], torch.float16, [0, 1, 2]),
+        )
+
+        operations = V.graph.operations
+        operations.append(op)
+        full = _allocate_full_buffer(
+            op,
+            [Integer(s) for s in size],
+            tuple(Integer(s) for s in stride),
+            operations,
+            0,
+        )
+        self.assertEqual(full.layout.device_layout, original)
+
 
 class TestDeriveTilingGroups(unittest.TestCase):
     """derive_tiling_groups — consecutive runs of ops running one loop nest."""

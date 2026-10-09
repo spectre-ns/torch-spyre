@@ -4282,11 +4282,16 @@ def _allocate_full_buffer(
         # None falls back to size-based inference inside _resize_device_layout.
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
+            # The tile's real strides and the full buffer's, as _divide_ranges
+            # passes them the other way: a tile written in a permuted order
+            # grows back along the dims it was shrunk on.
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=[int(s) for s in orig_layout.stride],
+                new_host_stride=[int(s) for s in strides],
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
