@@ -774,7 +774,7 @@ class ScratchpadAllocator:
         allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
         self._post_solve(graph, allocation, accepted_lx_relayouts)
-        reasons = self._get_spill_reasons(graph, solver, allocation)
+        reasons = self._get_spill_reasons(graph, allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
         self._run_passes(self.post_optimization_passes, graph)
@@ -868,25 +868,23 @@ class ScratchpadAllocator:
     def _get_spill_reasons(
         self,
         graph: GraphLowering,
-        solver: MemoryPlanSolver,
         allocation: Sequence[LifetimeBoundBuffer],
     ) -> dict:
         """Get spill reasons for every buffer that did not land in LX.
 
-        The solver's own :attr:`spill_reasons` is authoritative -- it carries the
-        declared verdict (``residency_reason``) or its capacity check. Anything
-        spilled without a reason there simply did not fit once the higher-value
-        buffers were placed.
+        The ``spill_reason`` the solver left on a buffer is authoritative -- it
+        carries the declared verdict (``residency_reason``) or its capacity
+        check. Anything spilled without one simply did not fit once the
+        higher-value buffers were placed.
         """
-        solver_reasons = dict(solver.spill_reasons)
+        reasons: dict[str, str] = {}
         for b in allocation:
             if b.address is None:
-                solver_reasons[b.name] = solver_reasons.get(
-                    b.name,
+                reasons[b.name] = b.spill_reason or (
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
-                    f" size={b.size // 1024} KB)",
+                    f" size={b.size // 1024} KB)"
                 )
-        return solver_reasons
+        return reasons
 
     def _get_op_name(self, op: Any) -> str:
         return op_short_name(op)
@@ -2599,6 +2597,63 @@ def _intern_view_group(groups: dict[PerCoreView, int], view: PerCoreView) -> int
     return index
 
 
+def commit_divisions(
+    graph: GraphLowering,
+    allocation: Sequence[CoreDivisionBuffer],
+) -> None:
+    """Commit the solver's chosen symbol-keyed division onto every op.
+
+    The solver optimizes a core division for all buffers, not just resident
+    ones: a resident producer and its consumers are pinned by
+    ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
+    slicing (so those commits are mutually consistent), while a spilled
+    buffer is free of that gate -- its accesses round-trip through HBM,
+    which re-slices on load -- so it takes its most parallel candidate.
+    Committing the spilled buffers' divisions too lets the joint solve
+    optimize work division across the whole graph, not only the LX-resident
+    region.
+
+    Runs on the tiled graph, where ``planned_splits`` restates each
+    division. One a tiled op cannot take raises ``SolveError`` before
+    anything is committed.
+    """
+    splits, violations = planned_splits(graph, allocation)
+    if violations:
+        raise SolveError("; ".join(violations))
+    commits: list[tuple[Operation, dict[sympy.Symbol, int]]] = []
+    for op in graph.operations:
+        op_splits = splits.get(op.name)
+        if op_splits is None:
+            continue
+        if not hasattr(op, "iteration_space_ownership"):
+            # The guard (#4062) means "only refine a division the
+            # work-division pass established", and its real subjects are the
+            # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
+            # they carry no iteration space to own, and the solver leaves
+            # their splits empty, so both tests below skip them.
+            #
+            # An op ``apply_tilings`` synthesises is a different case. It
+            # is created *after* the work-division pass, so it was never
+            # offered ownership -- not deliberately denied it. A cut's copy
+            # has to read the tile as its producer slices it, so mint
+            # ownership for it and let the division land.
+            if not isinstance(op, ComputedBuffer) or not op_splits:
+                continue
+        if getattr(op, "solver_tiled", False):
+            space = build_op_split_space(op, config.sencores)
+            if space is None or not space.admits(op_splits):
+                raise SolveError(
+                    f"{op.name}: the division "
+                    f"{_core_division(op, op_splits).label} the solve chose "
+                    "is not one the tiled graph's op can take"
+                )
+        if not _split_option_is_legal(op, op_splits):
+            raise Unsupported(f"{op.name}: chosen split violates hard domain.")
+        commits.append((op, op_splits))
+    for op, op_splits in commits:
+        commit_iteration_space_ownership(op, op_splits)
+
+
 def commit_lx_views(
     graph: GraphLowering,
     allocation: Sequence[LifetimeBoundBuffer],
@@ -3052,7 +3107,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
-        self._commit_divisions(graph, allocation)
+        commit_divisions(graph, allocation)
         commit_lx_views(graph, allocation, accepted_lx_relayouts)
         self._log_solver_decisions(graph, allocation)
 
@@ -3063,7 +3118,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         The solve's own output is otherwise invisible: the spill log reports
         residency but not the chosen division or tiling, and nothing reports
-        whether that choice survived ``_commit_divisions`` -- which silently
+        whether that choice survived ``commit_divisions`` -- which silently
         skips any op lacking ``iteration_space_ownership``, i.e. every op
         synthesised after the work-division pass ran. Pairing this against the
         emitted ``OpSpec`` work slices is how a decided-but-discarded division
@@ -3099,14 +3154,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _get_spill_reasons(
         self,
         graph: GraphLowering,
-        solver: MemoryPlanSolver,
         allocation: Sequence[LifetimeBoundBuffer],
     ) -> dict:
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
-        # allocators. Both CoreDivisionLayoutSolver implementations expose it.
-        assert isinstance(solver, CoreDivisionLayoutSolver)
-        reasons = dict(solver.spill_reasons)
+        # allocators.
+        reasons = {
+            b.name: b.spill_reason for b in allocation if b.spill_reason is not None
+        }
         if any(getattr(op, "solver_tiled", False) for op in graph.operations):
             # The ops a tiling added to the graph were never in the solve, and
             # the log reads an op with no reason as resident.
@@ -3402,63 +3457,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # solve can never choose a tiling that reintroduces the very span
         # violation coarse tiling exists to prevent, and abort when none fit.
         return _drop_read_distance_violations(op, options, max_cores)
-
-    def _commit_divisions(
-        self,
-        graph: GraphLowering,
-        allocation: Sequence[CoreDivisionBuffer],
-    ) -> None:
-        """Commit the solver's chosen symbol-keyed division onto every op.
-
-        The solver optimizes a core division for all buffers, not just resident
-        ones: a resident producer and its consumers are pinned by
-        ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
-        slicing (so those commits are mutually consistent), while a spilled
-        buffer is free of that gate -- its accesses round-trip through HBM,
-        which re-slices on load -- so it takes its most parallel candidate.
-        Committing the spilled buffers' divisions too lets the joint solve
-        optimize work division across the whole graph, not only the LX-resident
-        region.
-
-        Runs on the tiled graph, where ``planned_splits`` restates each
-        division. One a tiled op cannot take raises ``SolveError`` before
-        anything is committed.
-        """
-        splits, violations = planned_splits(graph, allocation)
-        if violations:
-            raise SolveError("; ".join(violations))
-        commits: list[tuple[Operation, dict[sympy.Symbol, int]]] = []
-        for op in graph.operations:
-            op_splits = splits.get(op.name)
-            if op_splits is None:
-                continue
-            if not hasattr(op, "iteration_space_ownership"):
-                # The guard (#4062) means "only refine a division the
-                # work-division pass established", and its real subjects are the
-                # fallback ops (SpyreConstantFallback / SpyreEmptyFallback):
-                # they carry no iteration space to own, and the solver leaves
-                # their splits empty, so both tests below skip them.
-                #
-                # An op ``apply_tilings`` synthesises is a different case. It
-                # is created *after* the work-division pass, so it was never
-                # offered ownership -- not deliberately denied it. A cut's copy
-                # has to read the tile as its producer slices it, so mint
-                # ownership for it and let the division land.
-                if not isinstance(op, ComputedBuffer) or not op_splits:
-                    continue
-            if getattr(op, "solver_tiled", False):
-                space = self._division_space(op)
-                if space is None or not space.admits(op_splits):
-                    raise SolveError(
-                        f"{op.name}: the division "
-                        f"{_core_division(op, op_splits).label} the solve chose "
-                        "is not one the tiled graph's op can take"
-                    )
-            if not _split_option_is_legal(op, op_splits):
-                raise Unsupported(f"{op.name}: chosen split violates hard domain.")
-            commits.append((op, op_splits))
-        for op, op_splits in commits:
-            commit_iteration_space_ownership(op, op_splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering

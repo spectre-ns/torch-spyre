@@ -2594,7 +2594,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 )
                 solver = allocator.layout_planning(built, allocator.size)
                 solved = {b.name: b for b in solver.plan_layout()}
-                # _commit_divisions would record the committed ownership here.
+                # commit_divisions would record the committed ownership here.
                 for op in ops:
                     op.iteration_space_ownership = object()
                 allocator._push_allocation(graph, list(solved.values()), [])
@@ -2931,7 +2931,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ),
             self.assertRaisesRegex(Unsupported, "chosen split violates hard domain"),
         ):
-            allocator._commit_divisions(graph, allocation)
+            allocator_module.commit_divisions(graph, allocation)
 
     def test_no_enumerable_candidates_keeps_legal_fixed_division(self):
         op = MagicMock(spec=ComputedBuffer)
