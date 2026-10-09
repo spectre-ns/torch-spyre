@@ -658,7 +658,7 @@ along with its core division. It has no effect with any other solver.
   for it, and an op the apply added, a cut's copy op, takes the division of
   the op it drains. Nothing is solved again, and the tiled graph's buffers
   are not built again to check the plan: it is taken as it stands. A
-  division one of the tiled graph's ops cannot take raises `SolveError`
+  division that splits a dim its tile no longer iterates raises `SolveError`
   before anything is committed, and a resident buffer whose readers do not
   agree on how it is sliced fails the ownership check that follows. A
   `SolveError` from the solve falls back to greedy placement over the

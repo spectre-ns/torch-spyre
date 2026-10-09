@@ -2614,8 +2614,8 @@ def commit_divisions(
     region.
 
     Runs on the tiled graph, where ``planned_splits`` restates each
-    division. One a tiled op cannot take raises ``SolveError`` before
-    anything is committed.
+    division. One it cannot restate raises ``SolveError`` before anything is
+    committed.
     """
     splits, violations = planned_splits(graph, allocation)
     if violations:
@@ -2639,14 +2639,6 @@ def commit_divisions(
             # ownership for it and let the division land.
             if not isinstance(op, ComputedBuffer) or not op_splits:
                 continue
-        if getattr(op, "solver_tiled", False):
-            space = build_op_split_space(op, config.sencores)
-            if space is None or not space.admits(op_splits):
-                raise SolveError(
-                    f"{op.name}: the division "
-                    f"{_core_division(op, op_splits).label} the solve chose "
-                    "is not one the tiled graph's op can take"
-                )
         if not _split_option_is_legal(op, op_splits):
             raise Unsupported(f"{op.name}: chosen split violates hard domain.")
         commits.append((op, op_splits))
@@ -2685,9 +2677,7 @@ def commit_lx_views(
         buffer.lx_view = view
 
 
-def log_solver_decisions(
-    graph: GraphLowering, allocation: Sequence[Any]
-) -> None:
+def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> None:
     """Dump what the joint solve actually decided, per buffer.
 
     The solve's own output is otherwise invisible: the spill log reports
@@ -2724,6 +2714,7 @@ def log_solver_decisions(
             if getattr(op, "iteration_space_ownership", None) is not None
             else "NO(skipped)",
         )
+
 
 class _DivisionMap(NamedTuple):
     """Every op's core-division candidates, and which of those lists are the
