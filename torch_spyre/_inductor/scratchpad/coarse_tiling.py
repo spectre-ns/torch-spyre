@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import dataclasses
 import operator
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Optional
 
 import sympy
 
@@ -60,7 +61,7 @@ from ..wsr.coarse_tile import (
 )
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
 from .allocator import ScratchpadOptimizationPass
-from .plan_solver import TileSpec
+from .plan_solver import CoreDivisionBuffer, RelayoutCopyBuffer, TileSpec, ceil_div
 from .utils import buffer_not_read_in_full
 
 logger = get_inductor_logger("scratchpad.coarse_tiling")
@@ -648,3 +649,108 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             added = name not in before and getattr(op, "loop_info", None) is not None
             if name in tiled or added:
                 op.solver_tiled = True  # type: ignore[attr-defined]
+
+    @staticmethod
+    def plan_violations(
+        buffers: Sequence[CoreDivisionBuffer],
+        barred: Callable[[CoreDivisionBuffer], Optional[str]],
+    ) -> list[str]:
+        """Why the solve's plan does not hold on the tiled graph, one line for
+        each fault; empty when it holds.
+
+        ``buffers`` are the tiled graph's own, each carrying the address and
+        the division the solve chose for it, and ``barred`` gives the reason
+        the tiled graph keeps a buffer out of LX, if it does. A resident
+        buffer must not be barred, each of its readers must read it as it is
+        sliced, and no two may hold the same LX bytes while both are alive.
+        Nothing is repaired: a fault means the solve planned for a graph the
+        apply did not produce, and what to do about that is the caller's call.
+        """
+        by_name = {buf.name: buf for buf in buffers}
+        resident = [buf for buf in buffers if buf.address is not None]
+        violations = []
+        for buf in resident:
+            reason = barred(buf)
+            if reason is not None:
+                violations.append(
+                    f"{buf.name}: placed in LX, but the tiled graph bars it: {reason}"
+                )
+        for buf in buffers:
+            if isinstance(buf, RelayoutCopyBuffer) or buf.chosen_division is None:
+                continue
+            for parent_name in buf.parents:
+                parent = by_name.get(parent_name)
+                if parent is None or parent.address is None:
+                    continue
+                pair = (parent.chosen_division, buf.chosen_division)
+                if pair not in buf.cd_parent_matches.get(parent_name, []):
+                    violations.append(
+                        f"{parent.name}: placed in LX, but {buf.name} does not "
+                        "read it as it is sliced"
+                    )
+        span = CoarseTilingPass._lx_span_to_str
+        for a, b in CoarseTilingPass._lx_overlaps(resident):
+            violations.append(
+                f"{a.name} and {b.name} would share LX bytes on the tiled graph: "
+                f"{span(a)} and {span(b)}"
+            )
+        return violations
+
+    @staticmethod
+    def _lx_footprint(buf: CoreDivisionBuffer) -> int:
+        """The LX bytes ``buf`` holds on each core under its chosen division."""
+        cd = buf.core_divisions[buf.chosen_division or 0]
+        return ceil_div(buf.size, cd.output_partition)
+
+    @staticmethod
+    def _lx_span_to_str(buf: CoreDivisionBuffer) -> str:
+        """``buf``'s LX bytes and lifetime, for a message."""
+        assert buf.address is not None
+        top = buf.address + CoarseTilingPass._lx_footprint(buf)
+        return f"[{buf.address}, {top}) over [{buf.start_time}, {buf.end_time})"
+
+    @staticmethod
+    def _lx_overlaps(
+        resident: Sequence[CoreDivisionBuffer],
+    ) -> list[tuple[CoreDivisionBuffer, CoreDivisionBuffer]]:
+        """The pairs of resident buffers that hold the same LX bytes while both
+        are alive.
+
+        An in-place child may sit on its parent's address across the one tick
+        the parent hands its slot over, provided it fits inside that slot.
+        """
+        footprint = CoarseTilingPass._lx_footprint
+
+        def check_valid_inplace_assignment(
+            parent: CoreDivisionBuffer, child: CoreDivisionBuffer
+        ) -> bool:
+            return (
+                parent.name in child.in_place_parents
+                and parent.address == child.address
+                and parent.end_time == child.start_time + 1
+                and footprint(child) <= footprint(parent)
+            )
+
+        overlaps = []
+        for i, a in enumerate(resident):
+            for b in resident[i + 1 :]:
+                if not a.overlaps_in_time(b):
+                    continue
+                assert a.address is not None and b.address is not None
+                if (
+                    a.address + footprint(a) <= b.address
+                    or b.address + footprint(b) <= a.address
+                ):
+                    continue
+                if check_valid_inplace_assignment(
+                    a, b
+                ) or check_valid_inplace_assignment(b, a):
+                    continue
+                overlaps.append((a, b))
+        return overlaps
+
+    @staticmethod
+    def _check_no_lx_overlap(resident: Sequence[CoreDivisionBuffer]) -> bool:
+        """Whether no two resident buffers hold the same LX bytes while both
+        are alive (see :meth:`_lx_overlaps`)."""
+        return not CoarseTilingPass._lx_overlaps(resident)

@@ -1658,6 +1658,33 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertIsNotNone(res["p"].address)
         self.assertIsNone(res["q"].address)
 
+    def test_a_cut_tile_resides_only_as_its_copy_can_read_it(self):
+        # p is a cut, so its copy op is the tile's reader. The copy walks p's
+        # output and has no reduction axis: it reads the tile from LX only
+        # where each core holds a slice of that output. Splitting the
+        # reduction axis as well uses twice the cores, and the solve once took
+        # that division for a tile it had placed in LX, which the tiled graph
+        # then spilled, as no division of the copy could read it.
+        spec = TileSpec((TileAxis(host_dim=0, count=2),))
+        out, red = sympy.Symbol("d0"), sympy.Symbol("d1")
+        p = CoreDivisionBuffer(
+            "p",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={out: 2}, tiling=spec),
+                CoreDivision(
+                    splits={out: 2, red: 2},
+                    reduction_syms=frozenset({red}),
+                    tiling=spec,
+                ),
+            ],
+        )
+        c = CoreDivisionBuffer("c", 128, [1, 2], core_divisions=_whole(), parents=["p"])
+        res = self._plan([p, c, self._sink("c")], size=1 << 20)
+        self.assertIsNotNone(res["p"].address)
+        self.assertEqual(res["p"].chosen_division, 0)
+
     def test_a_buffer_read_by_a_nest_lives_until_the_nest_ends(self):
         # w is untiled and read by b, the first op of the nest b, c. Every
         # iteration of the nest reads w again, so it stays alive through c and

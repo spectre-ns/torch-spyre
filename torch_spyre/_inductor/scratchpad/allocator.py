@@ -77,7 +77,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     RelayoutCopyBuffer,
     TileSpec,
     build_relayout_copy,
-    ceil_div,
     relayout_copy_name,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
@@ -3132,11 +3131,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 
         op_count = len(graph.operations)
-        CoarseTilingPass(choices).apply_pass(graph)
+        tiling = CoarseTilingPass(choices)
+        tiling.apply_pass(graph)
         assert len(graph.operations) >= op_count, (
             "coarse tiling apply must not drop operations"
         )
-        return solver, self._carry_plan_onto_tiled_graph(graph, solver, allocation)
+        buffers = self._carry_plan_onto_tiled_graph(graph, solver, allocation)
+        violations = tiling.plan_violations(buffers, solver.excluded)
+        if violations:
+            raise SolveError(violations[0])
+        return solver, buffers
 
     def _carry_plan_onto_tiled_graph(
         self,
@@ -3154,12 +3158,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         not in the solve and never resides. The copy takes the division of the
         op it drains, so each core copies the slice it wrote.
 
-        The tiled graph has the last word on whether the plan holds. A buffer
-        it bars from LX, or one a reader no longer matches, is demoted to HBM,
-        which is always valid. A division the tiled op or its copy does not
-        offer, or two resident buffers that would share an address while both
-        are alive, means the solve planned for a graph the apply did not
-        produce: ``SolveError``, and the caller falls back to greedy placement.
+        A division the tiled op or its copy does not offer means the solve
+        planned for a graph the apply did not produce: ``SolveError``, and the
+        caller falls back to greedy placement. Whether the restated plan holds
+        on the tiled graph is ``CoarseTilingPass.plan_violations``'s to say.
         """
         self._suppress_tiling = True
         try:
@@ -3186,12 +3188,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 ),
                 None,
             )
-
-        def demote(buf: CoreDivisionBuffer, reason: str) -> None:
-            if buf.address is not None:
-                logger.debug("tiled graph demotes %s: %s", buf.name, reason)
-            buf.address = None
-            reasons[buf.name] = reason
 
         added: list[CoreDivisionBuffer] = []
         for buf in buffers:
@@ -3240,89 +3236,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 reasons.setdefault(
                     buf.name, solver.excluded(buf) or "added by coarse tiling"
                 )
-                continue
-            barred = solver.excluded(buf)
-            if barred is not None:
-                demote(buf, barred)
-        for buf in buffers:
-            if isinstance(buf, RelayoutCopyBuffer) or buf.chosen_division is None:
-                continue
-            for parent_name in buf.parents:
-                parent = by_name.get(parent_name)
-                if parent is None or parent.address is None:
-                    continue
-                pair = (parent.chosen_division, buf.chosen_division)
-                if pair not in buf.cd_parent_matches.get(parent_name, []):
-                    demote(parent, f"{buf.name} does not read it as it is sliced")
-
-        overlaps = self._lx_overlaps([b for b in buffers if b.address is not None])
-        if overlaps:
-            a, b = overlaps[0]
-            raise SolveError(
-                f"{a.name} and {b.name} would share LX bytes on the tiled graph: "
-                f"{self._lx_span_to_str(a)} and {self._lx_span_to_str(b)}"
-            )
         solver.spill_reasons = reasons
         return buffers
-
-    @staticmethod
-    def _lx_footprint(buf: CoreDivisionBuffer) -> int:
-        """The LX bytes ``buf`` holds on each core under its chosen division."""
-        cd = buf.core_divisions[buf.chosen_division or 0]
-        return ceil_div(buf.size, cd.output_partition)
-
-    @staticmethod
-    def _lx_span_to_str(buf: CoreDivisionBuffer) -> str:
-        """``buf``'s LX bytes and lifetime, for a message."""
-        assert buf.address is not None
-        top = buf.address + CoOptimizingAllocator._lx_footprint(buf)
-        return f"[{buf.address}, {top}) over [{buf.start_time}, {buf.end_time})"
-
-    @staticmethod
-    def _lx_overlaps(
-        resident: Sequence[CoreDivisionBuffer],
-    ) -> list[tuple[CoreDivisionBuffer, CoreDivisionBuffer]]:
-        """The pairs of resident buffers that hold the same LX bytes while both
-        are alive.
-
-        An in-place child may sit on its parent's address across the one tick
-        the parent hands its slot over, provided it fits inside that slot.
-        """
-        footprint = CoOptimizingAllocator._lx_footprint
-
-        def check_valid_inplace_assignment(
-            parent: CoreDivisionBuffer, child: CoreDivisionBuffer
-        ) -> bool:
-            return (
-                parent.name in child.in_place_parents
-                and parent.address == child.address
-                and parent.end_time == child.start_time + 1
-                and footprint(child) <= footprint(parent)
-            )
-
-        overlaps = []
-        for i, a in enumerate(resident):
-            for b in resident[i + 1 :]:
-                if not a.overlaps_in_time(b):
-                    continue
-                assert a.address is not None and b.address is not None
-                if (
-                    a.address + footprint(a) <= b.address
-                    or b.address + footprint(b) <= a.address
-                ):
-                    continue
-                if check_valid_inplace_assignment(
-                    a, b
-                ) or check_valid_inplace_assignment(b, a):
-                    continue
-                overlaps.append((a, b))
-        return overlaps
-
-    @staticmethod
-    def _check_no_lx_overlap(resident: Sequence[CoreDivisionBuffer]) -> bool:
-        """Whether no two resident buffers hold the same LX bytes while both
-        are alive (see :meth:`_lx_overlaps`)."""
-        return not CoOptimizingAllocator._lx_overlaps(resident)
 
     def _chosen_tilings(
         self, graph: GraphLowering, allocation: Sequence[Any]

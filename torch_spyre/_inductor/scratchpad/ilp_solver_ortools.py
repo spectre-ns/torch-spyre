@@ -1547,7 +1547,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         The copy op a cut inserts runs right after the tiled op and drains each
         tile into a full-sized HBM buffer, which is what a consumer outside the
         nest then reads (``via_full``). The tile itself stays an ordinary LX
-        candidate, read by that copy.
+        candidate, read by that copy. The copy walks the op's output and has
+        no reduction axis, so a cut tile resides only under a division that
+        splits the output alone.
 
         Returns ``None`` when nothing carries a non-empty spec, which is every
         path except the joint solve with ``auto_coarse_tiling`` on, so the cut
@@ -1634,6 +1636,20 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     [is_tiled.negated(), any_diff.negated()]
                 ).only_enforce_if(cut.negated())
             cuts[name] = cut
+            # The copy reads the tile from LX core for core, which it can only
+            # do where each core holds a slice of the output: a division that
+            # also splits a reduction axis puts several cores on one slice.
+            menu = divided[name].buffer.core_divisions
+            if any(cd.reduction_splits for cd in menu):
+                copy_reads_it = model.new_bool_var(f"copy_reads_{name}")
+                model.add_element(
+                    divided[name].division,
+                    [int(not cd.reduction_splits) for cd in menu],
+                    copy_reads_it,
+                )
+                model.add_bool_or(
+                    [cut.negated(), divided[name].in_buffer.negated(), copy_reads_it]
+                )
 
         # Where each tileable op's nest ends: after the last op joined to it,
         # and after that op's copy when it is cut. Walk each run backwards so

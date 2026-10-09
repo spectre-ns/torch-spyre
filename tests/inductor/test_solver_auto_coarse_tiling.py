@@ -50,6 +50,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _spec_within_read_distance,
     select_allocator,
 )
+from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
@@ -1069,6 +1070,22 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         (producer,) = self._model_ops(nest)
         self.assertIn(producer, CollectTilingPasses.lx_resident, _describe(tiling))
 
+    def test_a_matmul_cut_tile_resides_on_the_tiled_graph(self):
+        # The matmul is tiled and is the graph output, so it is a cut and its
+        # copy op is the tile's only reader. The copy has no reduction axis,
+        # and reads the tile from LX only where each core holds a slice of the
+        # output. The solve once split the matmul's reduction axis too, for a
+        # tile it had placed in LX, and the tiled graph spilled the tile.
+        x = torch.rand(64, 64, 128, dtype=torch.float16)
+        w = torch.rand(128, 128, dtype=torch.float16)
+        cpu, device, tiling = self._compile(
+            lambda x, w: x @ w, (x, w), consumer_menu=[TileSpec()]
+        )
+        self._assert_close(device, cpu)
+        (nest,) = _nests(tiling).values()
+        (producer,) = self._model_ops(nest)
+        self.assertIn(producer, CollectTilingPasses.lx_resident, _describe(tiling))
+
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and
         # b, between them, only untiled. Loop groups are consecutive runs, so
@@ -1227,23 +1244,23 @@ class LxOverlapCheckTests(unittest.TestCase):
     def test_two_live_buffers_on_the_same_bytes_fail_the_check(self):
         a = self._resident("a", [0, 2], address=0)
         b = self._resident("b", [1, 3], address=64)
-        self.assertFalse(CoOptimizingAllocator._check_no_lx_overlap([a, b]))
-        self.assertEqual(CoOptimizingAllocator._lx_overlaps([a, b]), [(a, b)])
+        self.assertFalse(CoarseTilingPass._check_no_lx_overlap([a, b]))
+        self.assertEqual(CoarseTilingPass._lx_overlaps([a, b]), [(a, b)])
 
     def test_buffers_apart_in_time_or_in_address_pass(self):
         a = self._resident("a", [0, 2], address=0)
         later = self._resident("later", [3, 4], address=0)
         beside = self._resident("beside", [1, 3], address=128)
-        self.assertTrue(CoOptimizingAllocator._check_no_lx_overlap([a, later, beside]))
+        self.assertTrue(CoarseTilingPass._check_no_lx_overlap([a, later, beside]))
 
     def test_an_in_place_child_may_take_its_parents_slot(self):
         parent = self._resident("parent", [0, 1], address=0)
         child = self._resident("child", [1, 2], address=0, in_place_parents=["parent"])
-        self.assertTrue(CoOptimizingAllocator._check_no_lx_overlap([parent, child]))
+        self.assertTrue(CoarseTilingPass._check_no_lx_overlap([parent, child]))
         # The same lifetimes and address without the in-placement: both hold
         # the slot at tick 1.
         child = self._resident("child", [1, 2], address=0)
-        self.assertFalse(CoOptimizingAllocator._check_no_lx_overlap([parent, child]))
+        self.assertFalse(CoarseTilingPass._check_no_lx_overlap([parent, child]))
         self.assertEqual(
-            CoOptimizingAllocator._lx_overlaps([parent, child]), [(parent, child)]
+            CoarseTilingPass._lx_overlaps([parent, child]), [(parent, child)]
         )
