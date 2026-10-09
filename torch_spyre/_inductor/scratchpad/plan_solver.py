@@ -880,6 +880,16 @@ def _check_in_place_relationships(
                         )
 
 
+def excluded_from_lx(buffer: "LifetimeBoundBuffer", limit: int) -> Optional[str]:
+    """Why ``buffer`` may not reside in an LX of ``limit`` bytes, or ``None``
+    if it may."""
+    if buffer.residency_reason is not None:
+        return buffer.residency_reason
+    if buffer.min_footprint > limit:
+        return f"min footprint {buffer.min_footprint} B > LX capacity {limit} B"
+    return None
+
+
 class MemoryPlanSolver(ABC):
     """Solves *placement*: where, if anywhere, each buffer lives in scratchpad.
 
@@ -923,13 +933,7 @@ class MemoryPlanSolver(ABC):
 
     def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
-        if buffer.residency_reason is not None:
-            return buffer.residency_reason
-        if buffer.min_footprint > self.limit:
-            return (
-                f"min footprint {buffer.min_footprint} B > LX capacity {self.limit} B"
-            )
-        return None
+        return excluded_from_lx(buffer, self.limit)
 
     def record_exclusions(self) -> dict[str, str]:
         """Compute, store, and return the ``name -> reason`` map of every buffer
@@ -992,15 +996,6 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     # enumerates candidates and builds copies only for engines that say so; the
     # others never see a copy and their objective carries no relayout term.
     decides_lx_relayouts: bool = False
-
-    @classmethod
-    def allocator_applies_tilings(cls) -> bool:
-        """Whether the allocator should apply the coarse tilings this engine's
-        solve chose and commit its plan onto the tiled graph
-        (``CoOptimizingAllocator._post_solve``). The engine then has to plan
-        for the graph its tilings produce, since nothing is solved again.
-        Otherwise any tiling it chose is its own to apply."""
-        return False
 
     @abstractmethod
     def plan_layout_and_core_divisions(

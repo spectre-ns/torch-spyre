@@ -67,6 +67,7 @@ from torch_spyre._inductor.work_division import (
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     cost_expr_record,
+    excluded_from_lx,
     CoreDivision,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
@@ -114,7 +115,7 @@ from torch_spyre._inductor.scratchpad.utils import (
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
-    apply_tilings,
+    apply_chosen_tilings,
     carry_plan,
     planned_splits,
 )
@@ -774,7 +775,7 @@ class ScratchpadAllocator:
         solver = self._build_solver(buffers)
         allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
-        self._post_solve(graph, solver, allocation, accepted_lx_relayouts)
+        self._post_solve(graph, allocation, accepted_lx_relayouts)
         reasons = self._get_spill_reasons(solver, allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
@@ -860,14 +861,11 @@ class ScratchpadAllocator:
     def _post_solve(
         self,
         graph: GraphLowering,
-        solver: MemoryPlanSolver,
         allocation: Sequence[Any],
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
         """Hook run after the solve and the relayout finalization, before
-        reasons/push. An override acts on what the solve chose; what it leaves
-        in ``solver.spill_reasons`` is what ``_get_spill_reasons`` reports.
-        Base: nothing to commit."""
+        reasons/push. Base: nothing to commit."""
 
     def _get_spill_reasons(
         self, solver: MemoryPlanSolver, allocation: Sequence[LifetimeBoundBuffer]
@@ -2655,6 +2653,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # function rather than a class. Engines that cannot are never handed a
         # copy, and their objective never carries a relayout term.
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
+        # Why each buffer of a graph the solve's tilings produced is outside
+        # LX, as that graph has it; empty when no tiling was applied.
+        self._tiled_graph_reasons: dict[str, str] = {}
         self._decides_lx_relayouts: bool = bool(
             getattr(layout_planning([], size), "decides_lx_relayouts", False)
         )
@@ -3007,12 +3008,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _post_solve(
         self,
         graph: GraphLowering,
-        solver: MemoryPlanSolver,
         allocation: Sequence[Any],
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
         """Put what the joint solve chose onto the graph: tilings, then core
-        divisions.
+        divisions. The allocation says all of it; the solver is not consulted.
 
         The solve chooses core divisions, tilings and LX placement together, and
         plans for the graph its tilings produce: tile-sized buffers, a copy op
@@ -3028,14 +3028,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         the fallback then places the fully-tiled graph, which is a valid
         outcome.
         """
-        assert isinstance(solver, CoreDivisionLayoutSolver)
-        tiled = self._apply_chosen_tilings(graph, solver, allocation)
+        self._tiled_graph_reasons = {}
+        tiled = apply_chosen_tilings(graph, allocation)
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
         if tiled:
-            self._validate_on_tiled_graph(graph, solver, allocation)
+            self._validate_on_tiled_graph(graph, allocation)
         # A solver-fired relayout source stays resident under ITS committed view
         # while the consumer it feeds will read the shuffled copy under another.
         # The judge runs on the pre-materialization graph, where that consumer
@@ -3100,39 +3100,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 else "NO(skipped)",
             )
 
-    def _apply_chosen_tilings(
-        self,
-        graph: GraphLowering,
-        solver: CoreDivisionLayoutSolver,
-        allocation: Sequence[Any],
-    ) -> bool:
-        """Apply the coarse tilings the joint solve chose; whether any was.
-
-        ``apply_tilings`` mutates the IR the same way a pre-stickification hint
-        would. Only for an engine that asks for it
-        (``allocator_applies_tilings()``): for any other the graph is left as
-        it is, whatever tilings its allocation carries.
-        """
-        if not solver.allocator_applies_tilings():
-            return False
-        choices = self._chosen_tilings(graph, allocation)
-        if logger.isEnabledFor(logging.DEBUG):
-            for name, spec in choices.items():
-                logger.debug("chosen_tiling: %s -> %s", name, spec.label)
-        if not choices:
-            return False
-        op_count = len(graph.operations)
-        apply_tilings(choices, graph)
-        assert len(graph.operations) >= op_count, (
-            "coarse tiling apply must not drop operations"
-        )
-        return True
-
     def _validate_on_tiled_graph(
-        self,
-        graph: GraphLowering,
-        solver: CoreDivisionLayoutSolver,
-        allocation: Sequence[CoreDivisionBuffer],
+        self, graph: GraphLowering, allocation: Sequence[CoreDivisionBuffer]
     ) -> None:
         """Check the solve's plan against the graph its tilings produced.
 
@@ -3141,8 +3110,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         the plan's addresses (``carry_plan``) and ``validate_plan`` says whether
         the plan holds on them. A violation means the solve planned for a graph
         the apply did not produce: ``SolveError``, and the caller falls back to
-        greedy placement. ``solver.spill_reasons`` is left describing the tiled
-        graph.
+        greedy placement. What keeps each of the tiled graph's buffers out of
+        LX is kept for ``_get_spill_reasons``.
         """
         self._validated_drain_plans = validated_drain_plans(
             graph, division_is_fixed=False
@@ -3159,27 +3128,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if buf.core_divisions:
                 buf.chosen_division = 0
         reasons, violations = carry_plan(
-            allocation, buffers, solver.spill_reasons, solver.excluded
+            allocation, buffers, lambda buf: excluded_from_lx(buf, self.size)
         )
         if violations:
             raise SolveError("; ".join(violations))
-        solver.spill_reasons = reasons
-
-    def _chosen_tilings(
-        self, graph: GraphLowering, allocation: Sequence[Any]
-    ) -> dict[str, TileSpec]:
-        """The non-empty tiling the solve chose for each op, keyed by operation
-        name (the key ``apply_tilings``/``derive_tiling_groups`` consume)."""
-        op_by_name = {op.name: op for op in graph.operations}
-        choices: dict[str, TileSpec] = {}
-        for buf in allocation:
-            op = op_by_name.get(buf.name)
-            if op is None or buf.chosen_division is None:
-                continue
-            cd = buf.core_divisions[buf.chosen_division]
-            if not cd.tiling.is_untiled:
-                choices[op.get_operation_name()] = cd.tiling
-        return choices
+        self._tiled_graph_reasons = reasons
 
     def _get_spill_reasons(
         self,
@@ -3189,8 +3142,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
         # allocators. Both CoreDivisionLayoutSolver implementations expose it.
+        # Where a tiling was applied, the ops it added are not in the solve:
+        # the tiled graph's own reasons cover them, and the solver's stand for
+        # every buffer it spilled.
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        return solver.spill_reasons
+        return {**self._tiled_graph_reasons, **solver.spill_reasons}
 
     def _division_map(
         self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False

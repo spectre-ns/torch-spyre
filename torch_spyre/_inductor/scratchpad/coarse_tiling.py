@@ -673,6 +673,47 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
             op.solver_tiled = True  # type: ignore[attr-defined]
 
 
+def chosen_tilings(
+    graph: GraphLowering, planned: Sequence[CoreDivisionBuffer]
+) -> dict[str, TileSpec]:
+    """The non-empty tiling the solve's plan carries for each op, keyed by
+    operation name (the key :func:`apply_tilings` and
+    :func:`derive_tiling_groups` consume)."""
+    op_by_name = {op.name: op for op in graph.operations}
+    choices: dict[str, TileSpec] = {}
+    for buf in planned:
+        op = op_by_name.get(buf.name)
+        if op is None or buf.chosen_division is None:
+            continue
+        cd = buf.core_divisions[buf.chosen_division]
+        if not cd.tiling.is_untiled:
+            choices[op.get_operation_name()] = cd.tiling
+    return choices
+
+
+def apply_chosen_tilings(
+    graph: GraphLowering, planned: Sequence[CoreDivisionBuffer]
+) -> bool:
+    """Apply the coarse tilings ``planned`` carries; whether any was.
+
+    The plan is the whole of what there is to apply: each buffer's chosen
+    division names the tiling of its op, whichever engine chose it. With no
+    tiling in it, as when ``auto_coarse_tiling`` is off, ``graph`` is left as
+    it is.
+    """
+    choices = chosen_tilings(graph, planned)
+    if not choices:
+        return False
+    for name, spec in choices.items():
+        logger.debug("chosen_tiling: %s -> %s", name, spec.label)
+    op_count = len(graph.operations)
+    apply_tilings(choices, graph)
+    assert len(graph.operations) >= op_count, (
+        "coarse tiling apply must not drop operations"
+    )
+    return True
+
+
 def splits_on_tile(
     op: Operation, splits: Mapping[sympy.Symbol, int]
 ) -> Optional[dict[sympy.Symbol, int]]:
@@ -744,7 +785,6 @@ def planned_splits(
 def carry_plan(
     planned: Sequence[CoreDivisionBuffer],
     buffers: Sequence[CoreDivisionBuffer],
-    spill_reasons: Mapping[str, str],
     barred: Callable[[CoreDivisionBuffer], Optional[str]],
 ) -> tuple[dict[str, str], list[str]]:
     """Restate the solve's plan over ``buffers``, the tiled graph's own,
@@ -758,10 +798,10 @@ def carry_plan(
     committed onto the graph's ops. An op the apply added -- a cut's copy op
     and the full buffer it fills -- was not in the solve and never resides.
 
-    Returns why each buffer outside LX is outside it (``spill_reasons`` are
-    the solve's own, ``barred`` gives the tiled graph's), and
-    ``validate_plan``'s violations. Nothing is repaired: what to do about
-    a violation is the caller's call.
+    Returns why each buffer outside LX is outside it, as far as the tiled
+    graph can say (``barred`` gives its reason; a buffer the solve spilled is
+    only known here as spilled), and ``validate_plan``'s violations. Nothing
+    is repaired: what to do about a violation is the caller's call.
     """
     planned_by_name = {buf.name: buf for buf in planned}
     reasons: dict[str, str] = {}
@@ -773,7 +813,7 @@ def carry_plan(
             continue
         buf.address = before.address
         if before.address is None:
-            reasons[buf.name] = spill_reasons.get(buf.name, "spilled by solver")
+            reasons[buf.name] = "spilled by solver"
     for buf in buffers:
         if buf.address is None:
             reasons.setdefault(buf.name, barred(buf) or "added by coarse tiling")

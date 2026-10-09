@@ -1313,10 +1313,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     decides_lx_relayouts = True
 
-    @classmethod
-    def allocator_applies_tilings(cls) -> bool:
-        return True
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],

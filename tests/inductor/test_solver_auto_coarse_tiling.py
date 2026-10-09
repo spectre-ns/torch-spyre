@@ -841,6 +841,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Loop nests follow tile ownership, not TileSpec equality
 # ---------------------------------------------------------------------------
+_CHOSEN_TILINGS = "torch_spyre._inductor.scratchpad.coarse_tiling.chosen_tilings"
 _D0_BY_4 = TileSpec((TileAxis(host_dim=0, count=4),))
 _D1_BY_4 = TileSpec((TileAxis(host_dim=1, count=4),))
 
@@ -932,14 +933,14 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         out-of-step group is ``apply_tilings`` itself.
         """
 
-        def chosen(alloc, graph, allocation):
+        def chosen(graph, allocation):
             return {
                 op.get_operation_name(): _D0_BY_4
                 for op in graph.operations
                 if isinstance(op, ComputedBuffer)
             }
 
-        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+        with patch(_CHOSEN_TILINGS, chosen):
             return self._compile(fn, args)
 
     def _assert_group_refused(self, fn):
@@ -972,7 +973,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
 
-        def chosen(alloc, graph, allocation):
+        def chosen(graph, allocation):
             return {
                 op.get_operation_name(): _D1_BY_4
                 for op in graph.operations
@@ -980,7 +981,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             }
 
         with (
-            patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen),
+            patch(_CHOSEN_TILINGS, chosen),
             self.assertRaises(Exception) as refusal,
         ):
             self._compile(lambda x, y: (x + y).repeat(1, 2, 1) * 2, (x, y))
@@ -1010,14 +1011,14 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         y = torch.randn(1, 64, 2048, dtype=torch.float16)
         unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
 
-        def chosen(alloc, graph, allocation):
+        def chosen(graph, allocation):
             return {
                 op.get_operation_name(): unit_tile
                 for op in graph.operations
                 if isinstance(op, ComputedBuffer) and _reads_graph_inputs_only(op)
             }
 
-        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+        with patch(_CHOSEN_TILINGS, chosen):
             cpu, device, _ = self._compile(lambda x, y: (x + y) * 2, (x, y))
         self._assert_close(device, cpu)
 
@@ -1208,43 +1209,6 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         self._assert_close(device, cpu)
 
 
-class AppliedTilingGateTests(unittest.TestCase):
-    """``_post_solve`` applies chosen tilings only for an engine whose
-    ``allocator_applies_tilings()`` is true; any other engine's graph is left
-    as it is, whatever tilings its allocation carries."""
-
-    _CHOICES = {"buf0": _D0_BY_4}
-
-    def _apply_chosen(self, layout_solver):
-        with ts_inductor_config.patch(
-            co_optimizing_lx_planning=True, layout_solver=layout_solver
-        ):
-            alloc = select_allocator()
-            solver = alloc._build_solver([])
-            allocation = [MagicMock()]
-            graph = SimpleNamespace(operations=[])
-            with contextlib.ExitStack() as stack:
-                chosen = stack.enter_context(
-                    patch.object(
-                        CoOptimizingAllocator,
-                        "_chosen_tilings",
-                        return_value=self._CHOICES,
-                    )
-                )
-                apply = stack.enter_context(
-                    patch("torch_spyre._inductor.scratchpad.allocator.apply_tilings")
-                )
-                applied = alloc._apply_chosen_tilings(graph, solver, allocation)
-            return solver, applied, chosen, apply
-
-    def test_annealer_placement_stands(self):
-        solver, applied, chosen, apply = self._apply_chosen("simulated_annealing")
-        self.assertFalse(solver.allocator_applies_tilings())
-        self.assertFalse(applied)
-        chosen.assert_not_called()
-        apply.assert_not_called()
-
-
 class LxOverlapCheckTests(unittest.TestCase):
     """The carried plan is checked against the tiled graph's own lifetimes: two
     resident buffers may not hold the same bytes while both are alive."""
@@ -1340,7 +1304,7 @@ class CarryPlanTests(unittest.TestCase):
         )
         full = CoreDivisionBuffer("full", 128, [0, 4])
         reasons, violations = carry_plan(
-            planned, [full, tile, copy, spilled], {"q": "does not fit"}, lambda _: None
+            planned, [full, tile, copy, spilled], lambda _: None
         )
         self.assertEqual(tile.address, 64)
         self.assertIsNone(copy.address)
@@ -1348,7 +1312,7 @@ class CarryPlanTests(unittest.TestCase):
         self.assertEqual(
             reasons,
             {
-                "q": "does not fit",
+                "q": "spilled by solver",
                 "coarse_tile_copy_p": "added by coarse tiling",
                 "full": "added by coarse tiling",
             },
@@ -1369,7 +1333,6 @@ class CarryPlanTests(unittest.TestCase):
         _, violations = carry_plan(
             planned,
             [tile, copy, barred],
-            {},
             lambda buf: "tiled (advancing)" if buf.name == "r" else None,
         )
         self.assertEqual(
