@@ -2685,6 +2685,46 @@ def commit_lx_views(
         buffer.lx_view = view
 
 
+def log_solver_decisions(
+    graph: GraphLowering, allocation: Sequence[Any]
+) -> None:
+    """Dump what the joint solve actually decided, per buffer.
+
+    The solve's own output is otherwise invisible: the spill log reports
+    residency but not the chosen division or tiling, and nothing reports
+    whether that choice survived ``commit_divisions`` -- which silently
+    skips any op lacking ``iteration_space_ownership``, i.e. every op
+    synthesised after the work-division pass ran. Pairing this against the
+    emitted ``OpSpec`` work slices is how a decided-but-discarded division
+    shows up.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    op_by_name = {op.name: op for op in graph.operations}
+    for buf in allocation:
+        divisions = getattr(buf, "core_divisions", None) or []
+        chosen = getattr(buf, "chosen_division", None)
+        cd = divisions[chosen] if chosen is not None and divisions else None
+        op = op_by_name.get(buf.name)
+        info = getattr(op, "loop_info", None)
+        group = getattr(info, "loop_group_id", None)
+        propagation = getattr(info, "propagation", None)
+        logger.debug(
+            "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
+            "size=%s committed=%s",
+            buf.name,
+            group if group is not None else "-",
+            getattr(propagation, "kind", "-"),
+            getattr(info, "loop_count", "-"),
+            cd.label if cd is not None else "-",
+            cd.tiling.label if cd is not None else "-",
+            buf.address,
+            buf.size,
+            "yes"
+            if getattr(op, "iteration_space_ownership", None) is not None
+            else "NO(skipped)",
+        )
+
 class _DivisionMap(NamedTuple):
     """Every op's core-division candidates, and which of those lists are the
     whole legal space.
@@ -3097,59 +3137,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> None:
         """Put what the joint solve chose onto the graph: tilings, then core
         divisions, then LX views.
-
-        A ``SolveError`` from the solve reaches ``scratchpad_planning``'s greedy
-        fallback over the unmutated graph. One raised here, for a division the
-        tiled graph cannot take, reaches it over the fully tiled graph, which
-        the fallback can place as well.
         """
         apply_chosen_tilings(graph, allocation)
-        # The divisions must be committed such that any buffer clones can correctly
-        # pull the selected core division from the dependent buffers when the graph
-        # is updated with clones in ``_push_allocation``.
         commit_divisions(graph, allocation)
         commit_lx_views(graph, allocation, accepted_lx_relayouts)
-        self._log_solver_decisions(graph, allocation)
-
-    def _log_solver_decisions(
-        self, graph: GraphLowering, allocation: Sequence[Any]
-    ) -> None:
-        """Dump what the joint solve actually decided, per buffer.
-
-        The solve's own output is otherwise invisible: the spill log reports
-        residency but not the chosen division or tiling, and nothing reports
-        whether that choice survived ``commit_divisions`` -- which silently
-        skips any op lacking ``iteration_space_ownership``, i.e. every op
-        synthesised after the work-division pass ran. Pairing this against the
-        emitted ``OpSpec`` work slices is how a decided-but-discarded division
-        shows up.
-        """
-        if not logger.isEnabledFor(logging.DEBUG):
-            return
-        op_by_name = {op.name: op for op in graph.operations}
-        for buf in allocation:
-            divisions = getattr(buf, "core_divisions", None) or []
-            chosen = getattr(buf, "chosen_division", None)
-            cd = divisions[chosen] if chosen is not None and divisions else None
-            op = op_by_name.get(buf.name)
-            info = getattr(op, "loop_info", None)
-            group = getattr(info, "loop_group_id", None)
-            propagation = getattr(info, "propagation", None)
-            logger.debug(
-                "solver_out: %s group=%s kind=%s loop=%s div=%s tiling=%s lx=%s "
-                "size=%s committed=%s",
-                buf.name,
-                group if group is not None else "-",
-                getattr(propagation, "kind", "-"),
-                getattr(info, "loop_count", "-"),
-                cd.label if cd is not None else "-",
-                cd.tiling.label if cd is not None else "-",
-                buf.address,
-                buf.size,
-                "yes"
-                if getattr(op, "iteration_space_ownership", None) is not None
-                else "NO(skipped)",
-            )
+        log_solver_decisions(graph, allocation)
 
     def _get_spill_reasons(
         self,
