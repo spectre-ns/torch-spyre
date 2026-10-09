@@ -602,7 +602,7 @@ def coarse_tile_local_dim_split_domains(
     whose read spans the full, un-tiled source tensor.
 
     Skips an op the joint solve tiled (``solver_tiled``, stamped by
-    ``CoarseTilingPass``) as well. That solve chooses the op's division along
+    ``apply_tilings``) as well. That solve chooses the op's division along
     with its tiling, and requires every producer/consumer edge inside a nest
     to own the shared buffer alike per tile and per core, so the ops of a
     loop body cannot disagree about a split of the tiled dim. The split still

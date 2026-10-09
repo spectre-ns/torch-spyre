@@ -630,7 +630,7 @@ along with its core division. It has no effect with any other solver.
 - **Loop groups.** Consecutive ops that run the same loop nest (the same
   trip count at each level) share a loop group. The solve requires every
   producer/consumer edge inside a group to be a compatible pair, and
-  `CoarseTilingPass` checks each such edge again before it applies the
+  `apply_tilings` checks each such edge again before it applies the
   tiling.
 - **Placement under a tiling.** The solve places the graph its tilings
   produce, not the untiled one. A *cut* is a tiled op whose value must be
@@ -652,8 +652,9 @@ along with its core division. It has no effect with any other solver.
   what a cut moves whether or not its tile resides: the copy's write of
   the full buffer and every outside consumer's read of it, plus the tile's
   own write and the copy's read of it when the tile is spilled.
-- **One solve.** When the solve picks any tiling, `CoarseTilingPass`
-  applies it and restates the plan over the tiled graph: each buffer keeps
+- **One solve.** When the solve picks any tiling, `apply_tilings` applies
+  it and `planned_splits` and `carry_plan` restate the plan over the tiled
+  graph (functions in `scratchpad/coarse_tiling.py`): each buffer keeps
   its name, and takes the address and division the solve chose for it. An
   op the apply added, a cut's copy op, takes the division of the op it
   drains. The tiled graph's buffers are built with those divisions alone;

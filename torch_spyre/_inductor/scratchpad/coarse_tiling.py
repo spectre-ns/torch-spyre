@@ -606,9 +606,7 @@ def apply_tilings(
     # loop_info.  Candidate selection is expected to hold region ops
     # untiled, so reaching this is a bug upstream of the pass.
     region_ops = {
-        name
-        for region in prescribed_regions(graph.operations)
-        for name in region.names
+        name for region in prescribed_regions(graph.operations) for name in region.names
     }
     for group_ops, _nest in groups_specs:
         clash = [
@@ -636,8 +634,7 @@ def apply_tilings(
         hint_ids = list(range(next_hint_id, next_hint_id + len(nest)))
         next_hint_id += len(nest)
         levels = [
-            (hint_id, sympy.Integer(count))
-            for hint_id, count in zip(hint_ids, nest)
+            (hint_id, sympy.Integer(count)) for hint_id, count in zip(hint_ids, nest)
         ]
         for op in group_ops:
             op.dim_hints = tile_spec_to_dim_hints(
@@ -657,9 +654,7 @@ def apply_tilings(
         for group_ops, _levels in groups
         for op in group_ops
     }
-    coarse_tile_post_stickify(
-        graph, groups=groups, group_idx_offset=group_idx_offset
-    )
+    coarse_tile_post_stickify(graph, groups=groups, group_idx_offset=group_idx_offset)
     for op in graph.operations:
         was = untiled_symbols.get(op.get_name())
         if was is None or not isinstance(op, ComputedBuffer):
@@ -890,9 +885,9 @@ def _lx_overlaps(
                 or b.address + _lx_footprint(b) <= a.address
             ):
                 continue
-            if check_valid_inplace_assignment(
-                a, b
-            ) or check_valid_inplace_assignment(b, a):
+            if check_valid_inplace_assignment(a, b) or check_valid_inplace_assignment(
+                b, a
+            ):
                 continue
             overlaps.append((a, b))
     return overlaps

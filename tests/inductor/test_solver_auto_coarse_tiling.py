@@ -50,7 +50,12 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _spec_within_read_distance,
     select_allocator,
 )
-from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    _check_no_lx_overlap,
+    _lx_overlaps,
+    carry_plan,
+    splits_on_tile,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
@@ -752,7 +757,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         self.assertEqual(options, [TileSpec()])
 
     def test_reshaping_reader_drops_the_unit_tile(self):
-        # d3:64 leaves a 1-extent tile, which CoarseTilingPass cannot retile
+        # d3:64 leaves a 1-extent tile, which apply_tilings cannot retile
         # for a reader that views the output through another rank.
         op = _pointwise_op((2, 8, 5, 64, 128))
         reader = MagicMock(spec=ComputedBuffer)
@@ -860,7 +865,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
     ``consumer_menu`` replaces the discovered menus: the producer ``a = x + y``
     (the one op that reads only graph inputs) is offered ``d0:4`` alone, and
     every other op ``consumer_menu``. The ``_apply`` cases skip the solve's
-    choice instead, so they check ``CoarseTilingPass``'s own refusal.
+    choice instead, so they check ``apply_tilings``'s own refusal.
     """
 
     def setUp(self):
@@ -924,7 +929,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         """Compile ``fn`` as though the solve had tiled every op ``d0:4``.
 
         Bypasses the solve's own pairing, so what is left to refuse an
-        out-of-step group is ``CoarseTilingPass`` itself.
+        out-of-step group is ``apply_tilings`` itself.
         """
 
         def chosen(alloc, graph, allocation):
@@ -1227,10 +1232,7 @@ class AppliedTilingGateTests(unittest.TestCase):
                     )
                 )
                 apply = stack.enter_context(
-                    patch(
-                        "torch_spyre._inductor.scratchpad.coarse_tiling."
-                        "CoarseTilingPass"
-                    )
+                    patch("torch_spyre._inductor.scratchpad.allocator.apply_tilings")
                 )
                 result = alloc._materialize_selection(graph, solver, allocation)
             return solver, allocation, result, chosen, apply
@@ -1265,31 +1267,51 @@ class LxOverlapCheckTests(unittest.TestCase):
     def test_two_live_buffers_on_the_same_bytes_fail_the_check(self):
         a = self._resident("a", [0, 2], address=0)
         b = self._resident("b", [1, 3], address=64)
-        self.assertFalse(CoarseTilingPass._check_no_lx_overlap([a, b]))
-        self.assertEqual(CoarseTilingPass._lx_overlaps([a, b]), [(a, b)])
+        self.assertFalse(_check_no_lx_overlap([a, b]))
+        self.assertEqual(_lx_overlaps([a, b]), [(a, b)])
 
     def test_buffers_apart_in_time_or_in_address_pass(self):
         a = self._resident("a", [0, 2], address=0)
         later = self._resident("later", [3, 4], address=0)
         beside = self._resident("beside", [1, 3], address=128)
-        self.assertTrue(CoarseTilingPass._check_no_lx_overlap([a, later, beside]))
+        self.assertTrue(_check_no_lx_overlap([a, later, beside]))
 
     def test_an_in_place_child_may_take_its_parents_slot(self):
         parent = self._resident("parent", [0, 1], address=0)
         child = self._resident("child", [1, 2], address=0, in_place_parents=["parent"])
-        self.assertTrue(CoarseTilingPass._check_no_lx_overlap([parent, child]))
+        self.assertTrue(_check_no_lx_overlap([parent, child]))
         # The same lifetimes and address without the in-placement: both hold
         # the slot at tick 1.
         child = self._resident("child", [1, 2], address=0)
-        self.assertFalse(CoarseTilingPass._check_no_lx_overlap([parent, child]))
+        self.assertFalse(_check_no_lx_overlap([parent, child]))
+        self.assertEqual(_lx_overlaps([parent, child]), [(parent, child)])
+
+
+class SplitsOnTileTests(unittest.TestCase):
+    """``splits_on_tile`` restates a core division on the symbols the tiled op
+    iterates, from the symbol map ``apply_tilings`` returns."""
+
+    _D0, _D1 = sympy.symbols("d0 d1")
+
+    def test_an_op_the_apply_did_not_tile_keeps_its_symbols(self):
+        self.assertEqual(splits_on_tile("buf0", {self._D1: 2}, {}), {self._D1: 2})
+
+    def test_a_unit_tile_renumbers_the_dims_after_it(self):
+        # A (64, 64, 128) op tiled d0:64 is a (1, 64, 128) tile: it no longer
+        # iterates dim 0, and what was d1 is its d0.
+        symbols_on_tile = {"buf0": {self._D1: self._D0}}
         self.assertEqual(
-            CoarseTilingPass._lx_overlaps([parent, child]), [(parent, child)]
+            splits_on_tile("buf0", {self._D1: 2}, symbols_on_tile), {self._D0: 2}
         )
+
+    def test_a_split_of_a_dim_the_tile_no_longer_iterates_is_refused(self):
+        symbols_on_tile = {"buf0": {self._D1: self._D0}}
+        self.assertIsNone(splits_on_tile("buf0", {self._D0: 2}, symbols_on_tile))
 
 
 class CarryPlanTests(unittest.TestCase):
-    """``CoarseTilingPass.carry_plan`` restates the solve's plan over the tiled
-    graph's buffers and reports every way it does not hold there."""
+    """``carry_plan`` restates the solve's plan over the tiled graph's buffers
+    and reports every way it does not hold there."""
 
     @staticmethod
     def _buf(name, uses, size=128, **kwargs):
@@ -1313,7 +1335,7 @@ class CarryPlanTests(unittest.TestCase):
             cd_parent_matches={"p": [(0, 0)]},
         )
         full = CoreDivisionBuffer("full", 128, [0, 4])
-        reasons, violations = CoarseTilingPass.carry_plan(
+        reasons, violations = carry_plan(
             planned, [full, tile, copy, spilled], {"q": "does not fit"}, lambda _: None
         )
         self.assertEqual((tile.address, tile.chosen_division), (64, 0))
@@ -1340,7 +1362,7 @@ class CarryPlanTests(unittest.TestCase):
             "coarse_tile_copy_p", [1, 3], parents=["p"], cd_parent_matches={"p": []}
         )
         barred = self._buf("r", [5, 6])
-        _, violations = CoarseTilingPass.carry_plan(
+        _, violations = carry_plan(
             planned,
             [tile, copy, barred],
             {},

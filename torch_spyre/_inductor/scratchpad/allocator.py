@@ -113,6 +113,11 @@ from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_lifetime_overrides,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+from torch_spyre._inductor.scratchpad.coarse_tiling import (
+    apply_tilings,
+    carry_plan,
+    planned_splits,
+)
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
@@ -3102,9 +3107,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         The solve chooses core divisions, tilings and LX placement together, and
         plans for the graph its tilings produce: tile-sized buffers, a copy op
         at every cut, lifetimes that follow the loop nests (``_TilingModel``).
-        If it picks a non-empty tiling for any op, ``CoarseTilingPass`` applies
+        If it picks a non-empty tiling for any op, ``apply_tilings`` applies
         exactly those choices (mutating the IR the same way a
-        pre-stickification hint would) and restates the plan over the tiled
+        pre-stickification hint would) and the plan is restated over the tiled
         graph's own buffers (``planned_splits``, ``carry_plan``), which this
         allocator builds for it (:meth:`_buffers_for_splits`). Nothing is
         solved again.
@@ -3129,19 +3134,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         if not choices:
             return solver, allocation
 
-        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
-
         op_count = len(graph.operations)
-        tiling = CoarseTilingPass()
-        tiling.apply_pass(choices, graph)
+        symbols_on_tile = apply_tilings(choices, graph)
         assert len(graph.operations) >= op_count, (
             "coarse tiling apply must not drop operations"
         )
-        splits, violations = tiling.planned_splits(graph, allocation)
+        splits, violations = planned_splits(graph, allocation, symbols_on_tile)
         if violations:
             raise SolveError("; ".join(violations))
         buffers = self._buffers_for_splits(graph, splits)
-        reasons, violations = tiling.carry_plan(
+        reasons, violations = carry_plan(
             allocation, buffers, solver.spill_reasons, solver.excluded
         )
         if violations:
@@ -3191,7 +3193,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self, graph: GraphLowering, allocation: Sequence[Any]
     ) -> dict[str, TileSpec]:
         """The non-empty tiling the solve chose for each op, keyed by operation
-        name (the key ``CoarseTilingPass``/``derive_tiling_groups`` consume)."""
+        name (the key ``apply_tilings``/``derive_tiling_groups`` consume)."""
         op_by_name = {op.name: op for op in graph.operations}
         choices: dict[str, TileSpec] = {}
         for buf in allocation:
@@ -3531,7 +3533,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # they carry no iteration space to own, and the solver leaves
                 # their splits empty, so both tests below skip them.
                 #
-                # An op ``CoarseTilingPass`` synthesises is a different case. It
+                # An op ``apply_tilings`` synthesises is a different case. It
                 # is created *after* the work-division pass, so it was never
                 # offered ownership -- not deliberately denied it -- yet the
                 # joint solve still enumerates candidates for it, gates it
