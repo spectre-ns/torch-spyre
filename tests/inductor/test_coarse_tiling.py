@@ -11147,16 +11147,14 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
 
         # apply_tilings: same tiling expressed as a TileSpec.
         got = self._bare([256], "op0")
-        symbols_on_tile = apply_tilings(
-            {"op0": TileSpec((TileAxis(0, 4),))}, _graph([got])
-        )
+        apply_tilings({"op0": TileSpec((TileAxis(0, 4),))}, _graph([got]))
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(got.data.ranges[0], ref_range)
         # And the win is visible: dim 0 divided by 4.
         self.assertEqual(got.data.ranges[0], Integer(64))
         # The tile still iterates dim 0, so its one symbol is the one it had.
         c0 = sympy.Symbol("c0")
-        self.assertEqual(symbols_on_tile, {got.get_name(): {c0: c0}})
+        self.assertEqual(got.symbols_on_tile, {c0: c0})
 
     def test_nested_two_level_matches_hint_path(self):
         ref = _make_hinted_op(
@@ -11202,7 +11200,7 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         # (untiled/absent choices).
         ops = [self._bare([64], "op0"), self._bare([64], "op1")]
         g = _graph(ops)
-        self.assertEqual(apply_tilings({}, g), {})
+        apply_tilings({}, g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
             self.assertFalse(

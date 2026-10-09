@@ -996,10 +996,10 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     @classmethod
     def allocator_applies_tilings(cls) -> bool:
         """Whether the allocator should apply the coarse tilings this engine's
-        solve chose and carry its plan onto the tiled graph
-        (``CoOptimizingAllocator._materialize_selection``). The engine then
-        has to plan for the graph its tilings produce, since nothing is solved
-        again. Otherwise any tiling it chose is its own to apply."""
+        solve chose and commit its plan onto the tiled graph
+        (``CoOptimizingAllocator._post_solve``). The engine then has to plan
+        for the graph its tilings produce, since nothing is solved again.
+        Otherwise any tiling it chose is its own to apply."""
         return False
 
     @abstractmethod

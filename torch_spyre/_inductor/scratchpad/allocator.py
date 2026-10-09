@@ -747,19 +747,18 @@ class ScratchpadAllocator:
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
 
         This is a template method: the skeleton (pre-passes ->
-        generate buffers -> solve -> materialize -> commit -> record reasons ->
+        generate buffers -> solve -> commit -> record reasons ->
         push -> log -> post-passes) is fixed, while subclasses override the
-        ``_prepare_buffers`` / ``_solve`` / ``_materialize_selection`` /
-        ``_post_solve`` / ``_record_spill_reasons`` hooks to swap in their buffer
-        type, solver call, and post-solve commit. The base hooks implement the
+        ``_prepare_buffers`` / ``_solve`` / ``_post_solve`` /
+        ``_record_spill_reasons`` hooks to swap in their buffer type, solver
+        call, and post-solve commit. The base hooks implement the
         fixed-division, placement-only flow.
 
         Subclasses override hooks, never this body. A solve that must act on its
-        own result -- coarse tiling applies the tilings it selected and carries
-        its plan onto the mutated graph -- does so through
-        ``_materialize_selection`` rather
-        than by copying the skeleton: a copy silently misses every later change
-        to the shared steps (it already did, on ``_solve``'s arity).
+        own result -- coarse tiling applies the tilings it selected -- does so
+        in ``_post_solve`` rather than by copying the skeleton: a copy silently
+        misses every later change to the shared steps (it already did, on
+        ``_solve``'s arity).
 
         Args:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
@@ -774,9 +773,8 @@ class ScratchpadAllocator:
         buffers = self._prepare_buffers(graph, lx_relayout_plans=lx_relayout_plans)
         solver = self._build_solver(buffers)
         allocation = self._solve(solver, graph)
-        solver, allocation = self._materialize_selection(graph, solver, allocation)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
-        self._post_solve(graph, allocation, accepted_lx_relayouts)
+        self._post_solve(graph, solver, allocation, accepted_lx_relayouts)
         reasons = self._get_spill_reasons(solver, allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
@@ -827,24 +825,6 @@ class ScratchpadAllocator:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
         return solver.plan_layout(log_lx_usage=True)
 
-    def _materialize_selection(
-        self,
-        graph: GraphLowering,
-        solver: MemoryPlanSolver,
-        allocation: Sequence[Any],
-    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
-        """Act on what the solve *chose* before the choice is committed.
-
-        Returns the ``(solver, allocation)`` the rest of :meth:`plan_allocation`
-        commits, so an override that mutates the graph hands back an allocation
-        over the mutated graph's buffers, and a solver whose spill reasons
-        describe it -- ``_get_spill_reasons`` is asked about that pair.
-
-        Base: a placement-only solve selects nothing to materialize, so the first
-        solve stands.
-        """
-        return solver, allocation
-
     def _finalize_lx_relayout_allocation(
         self,
         allocation: Sequence[LifetimeBoundBuffer],
@@ -880,11 +860,14 @@ class ScratchpadAllocator:
     def _post_solve(
         self,
         graph: GraphLowering,
+        solver: MemoryPlanSolver,
         allocation: Sequence[Any],
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
         """Hook run after the solve and the relayout finalization, before
-        reasons/push. Base: nothing to commit."""
+        reasons/push. An override acts on what the solve chose; what it leaves
+        in ``solver.spill_reasons`` is what ``_get_spill_reasons`` reports.
+        Base: nothing to commit."""
 
     def _get_spill_reasons(
         self, solver: MemoryPlanSolver, allocation: Sequence[LifetimeBoundBuffer]
@@ -3024,13 +3007,35 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _post_solve(
         self,
         graph: GraphLowering,
+        solver: MemoryPlanSolver,
         allocation: Sequence[Any],
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
+        """Put what the joint solve chose onto the graph: tilings, then core
+        divisions.
+
+        The solve chooses core divisions, tilings and LX placement together, and
+        plans for the graph its tilings produce: tile-sized buffers, a copy op
+        at every cut, lifetimes that follow the loop nests (``_TilingModel``).
+        Nothing is solved again. ``apply_tilings`` applies the tilings first,
+        so the divisions are committed, as a second pass, onto the ops of the
+        graph that will run.
+
+        Ordering is solve-before-apply: a ``SolveError`` from the solve
+        propagates over the *unmutated* graph, so ``scratchpad_planning``'s
+        greedy fallback never runs on a half-tiled graph. A plan that does not
+        hold on the tiled graph raises ``SolveError`` too, after the apply, and
+        the fallback then places the fully-tiled graph, which is a valid
+        outcome.
+        """
+        assert isinstance(solver, CoreDivisionLayoutSolver)
+        tiled = self._apply_chosen_tilings(graph, solver, allocation)
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
+        if tiled:
+            self._validate_on_tiled_graph(graph, solver, allocation)
         # A solver-fired relayout source stays resident under ITS committed view
         # while the consumer it feeds will read the shuffled copy under another.
         # The judge runs on the pre-materialization graph, where that consumer
@@ -3095,99 +3100,70 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 else "NO(skipped)",
             )
 
-    def _materialize_selection(
+    def _apply_chosen_tilings(
         self,
         graph: GraphLowering,
-        solver: MemoryPlanSolver,
+        solver: CoreDivisionLayoutSolver,
         allocation: Sequence[Any],
-    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
-        """Apply the coarse tilings the joint solve selected and carry its plan
-        onto the tiled graph.
+    ) -> bool:
+        """Apply the coarse tilings the joint solve chose; whether any was.
 
-        The solve chooses core divisions, tilings and LX placement together, and
-        plans for the graph its tilings produce: tile-sized buffers, a copy op
-        at every cut, lifetimes that follow the loop nests (``_TilingModel``).
-        If it picks a non-empty tiling for any op, ``apply_tilings`` applies
-        exactly those choices (mutating the IR the same way a
-        pre-stickification hint would) and the plan is restated over the tiled
-        graph's own buffers (``planned_splits``, ``carry_plan``), which this
-        allocator builds for it (:meth:`_buffers_for_splits`). Nothing is
-        solved again.
-
-        Ordering is solve-before-apply: a ``SolveError`` from the solve
-        propagates over the *unmutated* graph, so ``scratchpad_planning``'s
-        greedy fallback never runs on a half-tiled graph. A plan that does not
-        hold on the tiled graph raises ``SolveError`` too, after the apply, and
-        the fallback then places the fully-tiled graph, which is a valid
-        outcome.
-
-        Only for an engine that asks for it (``allocator_applies_tilings()``):
-        for any other the pair is returned unchanged.
+        ``apply_tilings`` mutates the IR the same way a pre-stickification hint
+        would. Only for an engine that asks for it
+        (``allocator_applies_tilings()``): for any other the graph is left as
+        it is, whatever tilings its allocation carries.
         """
-        assert isinstance(solver, CoreDivisionLayoutSolver)
         if not solver.allocator_applies_tilings():
-            return solver, allocation
+            return False
         choices = self._chosen_tilings(graph, allocation)
         if logger.isEnabledFor(logging.DEBUG):
             for name, spec in choices.items():
                 logger.debug("chosen_tiling: %s -> %s", name, spec.label)
         if not choices:
-            return solver, allocation
-
+            return False
         op_count = len(graph.operations)
-        symbols_on_tile = apply_tilings(choices, graph)
+        apply_tilings(choices, graph)
         assert len(graph.operations) >= op_count, (
             "coarse tiling apply must not drop operations"
         )
-        splits, violations = planned_splits(graph, allocation, symbols_on_tile)
-        if violations:
-            raise SolveError("; ".join(violations))
-        buffers = self._buffers_for_splits(graph, splits)
+        return True
+
+    def _validate_on_tiled_graph(
+        self,
+        graph: GraphLowering,
+        solver: CoreDivisionLayoutSolver,
+        allocation: Sequence[CoreDivisionBuffer],
+    ) -> None:
+        """Check the solve's plan against the graph its tilings produced.
+
+        The tiled graph's buffers are built for this alone, each on the one
+        division just committed for its op, so no menu is enumerated. They take
+        the plan's addresses (``carry_plan``) and ``validate_plan`` says whether
+        the plan holds on them. A violation means the solve planned for a graph
+        the apply did not produce: ``SolveError``, and the caller falls back to
+        greedy placement. ``solver.spill_reasons`` is left describing the tiled
+        graph.
+        """
+        self._validated_drain_plans = validated_drain_plans(
+            graph, division_is_fixed=False
+        )
+        buffers = self._build_cd_bound_buffers(
+            graph,
+            self._determine_in_place_division_invariant(graph),
+            _DivisionMap(
+                {op.name: [_fixed_core_division(op)] for op in graph.operations},
+                set(),
+            ),
+        )
+        for buf in buffers:
+            if buf.core_divisions:
+                buf.chosen_division = 0
         reasons, violations = carry_plan(
             allocation, buffers, solver.spill_reasons, solver.excluded
         )
         if violations:
             raise SolveError("; ".join(violations))
         solver.spill_reasons = reasons
-        return solver, buffers
-
-    def _buffers_for_splits(
-        self, graph: GraphLowering, splits: Mapping[str, dict[sympy.Symbol, int]]
-    ) -> list[CoreDivisionBuffer]:
-        """``graph``'s buffers, each op built on one division that is already
-        decided.
-
-        ``splits`` gives that division for every op it names; any other op
-        keeps the division it carries. No menu is enumerated, so there is none
-        to find a choice in. A division that an op the tiling pass tiled or
-        added cannot take means the solve planned for a graph the apply did not
-        produce: ``SolveError``, and the caller falls back to greedy placement.
-        """
-        divisions: dict[str, list[CoreDivision]] = {}
-        for op in graph.operations:
-            op_splits = splits.get(op.name)
-            if op_splits is None:
-                divisions[op.name] = [_fixed_core_division(op)]
-                continue
-            division = _core_division(op, op_splits)
-            if getattr(op, "solver_tiled", False):
-                # Its split space says whether it can take this one division.
-                space = self._division_space(op)
-                if space is None or not space.admits(op_splits):
-                    raise SolveError(
-                        f"{op.name}: the division {division.label} the solve "
-                        "chose is not one the tiled graph's op can take"
-                    )
-            divisions[op.name] = [division]
-
-        self._validated_drain_plans = validated_drain_plans(
-            graph, division_is_fixed=False
-        )
-        return self._build_cd_bound_buffers(
-            graph,
-            self._determine_in_place_division_invariant(graph),
-            _DivisionMap(divisions, set()),
-        )
 
     def _chosen_tilings(
         self, graph: GraphLowering, allocation: Sequence[Any]
@@ -3508,7 +3484,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph: GraphLowering,
         allocation: Sequence[CoreDivisionBuffer],
     ) -> None:
-        """Commit the solver's chosen symbol-keyed division for every buffer.
+        """Commit the solver's chosen symbol-keyed division onto every op.
 
         The solver optimizes a core division for all buffers, not just resident
         ones: a resident producer and its consumers are pinned by
@@ -3519,13 +3495,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         Committing the spilled buffers' divisions too lets the joint solve
         optimize work division across the whole graph, not only the LX-resident
         region.
+
+        This runs after ``apply_tilings``, on the graph that will run. An op
+        the apply tiled takes its division restated on the tile's symbols, and
+        a cut's copy op, which the solve never saw, takes the division of the
+        op it drains (``planned_splits``). A division one of those ops cannot
+        take means the solve planned for a graph the apply did not produce:
+        ``SolveError``, raised before anything is committed.
         """
-        op_by_name = {op.name: op for op in graph.operations}
-        for buf in allocation:
-            op = op_by_name.get(buf.name)
-            if op is None or buf.chosen_division is None:
+        splits, violations = planned_splits(graph, allocation)
+        if violations:
+            raise SolveError("; ".join(violations))
+        commits: list[tuple[Operation, dict[sympy.Symbol, int]]] = []
+        for op in graph.operations:
+            op_splits = splits.get(op.name)
+            if op_splits is None:
                 continue
-            cd = buf.core_divisions[buf.chosen_division]
             if not hasattr(op, "iteration_space_ownership"):
                 # The guard (#4062) means "only refine a division the
                 # work-division pass established", and its real subjects are the
@@ -3535,21 +3520,29 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 #
                 # An op ``apply_tilings`` synthesises is a different case. It
                 # is created *after* the work-division pass, so it was never
-                # offered ownership -- not deliberately denied it -- yet the
-                # joint solve still enumerates candidates for it, gates it
-                # through ``cd_parent_matches`` against its producer, and picks
-                # a division consistent with that producer's. Skipping it here
-                # drops a decision the solve made: the copy stays undivided
-                # while its producer commits divided, and ``_post_solve``'s
-                # ownership check then rejects a pair the solver never made
-                # inconsistent ("op 'bufN' ref PerCoreView(... num_cores=32) !=
-                # 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
-                # Mint ownership for it so the choice lands.
-                if not isinstance(op, ComputedBuffer) or not cd.splits:
+                # offered ownership -- not deliberately denied it. A cut's copy
+                # has to read the tile as its producer slices it, so skipping
+                # it here would leave the copy undivided while its producer
+                # commits divided, and ``_post_solve``'s ownership check would
+                # reject the pair ("op 'bufN' ref PerCoreView(... num_cores=32)
+                # != 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
+                # Mint ownership for it so the division lands.
+                if not isinstance(op, ComputedBuffer) or not op_splits:
                     continue
-            if not _split_option_is_legal(op, cd.splits):
+            if getattr(op, "solver_tiled", False):
+                # Its split space says whether it can take this one division.
+                space = self._division_space(op)
+                if space is None or not space.admits(op_splits):
+                    raise SolveError(
+                        f"{op.name}: the division "
+                        f"{_core_division(op, op_splits).label} the solve chose "
+                        "is not one the tiled graph's op can take"
+                    )
+            if not _split_option_is_legal(op, op_splits):
                 raise Unsupported(f"{op.name}: chosen split violates hard domain.")
-            commit_iteration_space_ownership(op, cd.splits)
+            commits.append((op, op_splits))
+        for op, op_splits in commits:
+            commit_iteration_space_ownership(op, op_splits)
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering

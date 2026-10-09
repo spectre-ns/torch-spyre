@@ -560,9 +560,7 @@ def _symbols_by_dim(op: ComputedBuffer) -> Optional[dict[int, sympy.Symbol]]:
     return dict(zip(walked, symbols)) if len(walked) == len(symbols) else None
 
 
-def apply_tilings(
-    choices: Mapping[str, TileSpec], graph: GraphLowering
-) -> dict[str, dict[sympy.Symbol, sympy.Symbol]]:
+def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None:
     """Apply a declared coarse tiling to ``graph``, inside the scratchpad pass.
 
     The tiling is an *input* (``choices``: operation name -> TileSpec),
@@ -574,16 +572,13 @@ def apply_tilings(
     (or all-untiled) ``choices`` it is a no-op and the op count is unchanged --
     which is what keeps it inert while ``auto_coarse_tiling`` is off.
 
-    It keeps no state of its own, but it is not free of side effects: it
-    rewrites ``graph`` in place, which is its job. What a caller needs
-    afterwards is returned: for each op it tiled, by buffer name, the symbol
-    each of that op's iteration symbols became (empty when nothing was tiled).
-    :func:`planned_splits` takes that to restate a core division on the tiled
-    graph.
+    It applies the tiling and nothing else: it keeps no state of its own and
+    returns nothing, and rewrites ``graph`` in place, which is its job. Core
+    divisions are committed afterwards, as a pass of their own
+    (:func:`planned_splits`). For that pass each op it tiled is stamped with
+    ``symbols_on_tile``, the symbol each of its iteration symbols became, and
+    each op it tiled or added to a nest with ``solver_tiled``.
     """
-    # Buffer name of each op the apply tiled -> the symbol each of its
-    # iteration symbols became (see ``splits_on_tile``).
-    symbols_on_tile: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
     groups_specs = derive_tiling_groups(graph, choices)
     # The group partition is the whole shape of the plan -- which ops share
     # one loop nest, and therefore where the boundaries (and their full
@@ -600,7 +595,7 @@ def apply_tilings(
             ),
         )
     if not groups_specs:
-        return symbols_on_tile
+        return
     # A for_each_tile region's tiling is the user's and already stamped;
     # re-tiling one of its ops would overwrite that op's dim_hints and
     # loop_info.  Candidate selection is expected to hold region ops
@@ -661,7 +656,7 @@ def apply_tilings(
             continue
         now = _symbols_by_dim(op)
         if now is not None:
-            symbols_on_tile[op.get_name()] = {
+            op.symbols_on_tile = {  # type: ignore[attr-defined]
                 symbol: now[dim] for dim, symbol in was.items() if dim in now
             }
     # The solve that chose these tilings also chooses each op's division,
@@ -676,26 +671,22 @@ def apply_tilings(
         added = name not in before and getattr(op, "loop_info", None) is not None
         if name in tiled or added:
             op.solver_tiled = True  # type: ignore[attr-defined]
-    return symbols_on_tile
 
 
 def splits_on_tile(
-    name: str,
-    splits: Mapping[sympy.Symbol, int],
-    symbols_on_tile: Mapping[str, Mapping[sympy.Symbol, sympy.Symbol]],
+    op: Operation, splits: Mapping[sympy.Symbol, int]
 ) -> Optional[dict[sympy.Symbol, int]]:
-    """``splits``, a core division chosen for the op that writes ``name``
-    as it was before the apply, keyed by the symbols that op iterates now.
+    """``splits``, a core division chosen for ``op`` as it was before
+    :func:`apply_tilings`, keyed by the symbols ``op`` iterates now.
 
-    ``symbols_on_tile`` is what :func:`apply_tilings` returned. An op's
-    iteration symbols are numbered over the dims it iterates. A tile one
-    element long on its tiled dim no longer iterates that dim, so every dim
-    after it moves down a number: ``d1`` of a ``(64, 64, 128)`` op is ``d0``
-    of its ``(1, 64, 128)`` tile. An op the apply did not tile keeps its
+    An op's iteration symbols are numbered over the dims it iterates. A tile
+    one element long on its tiled dim no longer iterates that dim, so every
+    dim after it moves down a number: ``d1`` of a ``(64, 64, 128)`` op is
+    ``d0`` of its ``(1, 64, 128)`` tile. An op the apply did not tile keeps its
     symbols. ``None`` when ``splits`` divides a dim the tile no longer
     iterates.
     """
-    on_tile = symbols_on_tile.get(name)
+    on_tile = getattr(op, "symbols_on_tile", None)
     if on_tile is None:
         return dict(splits)
     if not splits.keys() <= on_tile.keys():
@@ -704,21 +695,19 @@ def splits_on_tile(
 
 
 def planned_splits(
-    graph: GraphLowering,
-    planned: Sequence[CoreDivisionBuffer],
-    symbols_on_tile: Mapping[str, Mapping[sympy.Symbol, sympy.Symbol]],
+    graph: GraphLowering, planned: Sequence[CoreDivisionBuffer]
 ) -> tuple[dict[str, dict[sympy.Symbol, int]], list[str]]:
-    """The core division each op of the tiled graph takes from the solve's
-    plan, as split factors keyed by the symbols the op iterates now, and
-    one line for each division that could not be restated.
+    """The core division each op of ``graph`` takes from the solve's plan, as
+    split factors keyed by the symbols the op iterates now, and one line for
+    each division that cannot be stated on its op.
 
-    ``graph`` is the graph :func:`apply_tilings` tiled and ``symbols_on_tile``
-    what it returned. An op the solve planned keeps the division chosen for
-    it. Of the ops the apply added, only a cut's copy is divided: the full
-    buffer it fills is an allocation that reads nothing. The copy walks the
-    output of the one op it drains, so it takes that op's division over its
-    output and each core copies the slice it wrote. An op without an entry is
-    not divided by the plan.
+    An op the solve planned takes the division chosen for it, restated on the
+    tile's symbols where :func:`apply_tilings` tiled the op. Of the ops the
+    apply added, only a cut's copy is divided: the full buffer it fills is an
+    allocation that reads nothing. The copy walks the output of the one op it
+    drains, so it takes that op's division over its output and each core
+    copies the slice it wrote. An op without an entry is not divided by the
+    plan.
     """
     chosen = {
         buf.name: buf.core_divisions[buf.chosen_division]
@@ -726,26 +715,25 @@ def planned_splits(
         if buf.chosen_division is not None
     }
     planned_names = {buf.name for buf in planned}
+    ops = {op.get_name(): op for op in graph.operations}
     splits: dict[str, dict[sympy.Symbol, int]] = {}
     violations: list[str] = []
-    for op in graph.operations:
-        name = op.get_name()
+    for name, op in ops.items():
         if name in chosen:
-            source, wanted = name, chosen[name].splits
-        elif name not in planned_names:
+            source, division, wanted = op, chosen[name], chosen[name].splits
+        elif name not in planned_names and getattr(op, "solver_tiled", False):
             reads = {dep.name for dep in op_read_writes(op).reads}
-            if not reads:
+            if len(reads) != 1 or not reads <= chosen.keys():
                 continue
-            (source,) = reads
-            if source not in chosen:
-                continue
-            wanted = chosen[source].output_splits
+            (drained,) = reads
+            source, division = ops[drained], chosen[drained]
+            wanted = division.output_splits
         else:
             continue
-        on_tile = splits_on_tile(source, wanted, symbols_on_tile)
+        on_tile = splits_on_tile(source, wanted)
         if on_tile is None:
             violations.append(
-                f"{name}: the division {chosen[source].label} the solve chose "
+                f"{name}: the division {division.label} the solve chose "
                 "splits a dim its tile no longer iterates"
             )
             continue
@@ -765,10 +753,10 @@ def carry_plan(
     Applying a tiling keeps every op's name, so each buffer the solve
     planned is found again in ``buffers``, one tile in size where it was
     tiled, with the lifetime, in-place parents and residency verdict the
-    tiled graph gives it. It takes the address the solve chose; its
-    division is the one it was built with (``planned_splits``). An op the
-    apply added -- a cut's copy op and the full buffer it fills -- was not
-    in the solve and never resides.
+    tiled graph gives it. It takes the address the solve chose. Its division
+    is not carried here: ``buffers`` are built on the divisions already
+    committed onto the graph's ops. An op the apply added -- a cut's copy op
+    and the full buffer it fills -- was not in the solve and never resides.
 
     Returns why each buffer outside LX is outside it (``spill_reasons`` are
     the solve's own, ``barred`` gives the tiled graph's), and
@@ -782,14 +770,10 @@ def carry_plan(
             continue
         before = planned_by_name.get(buf.name)
         if before is None:
-            if buf.core_divisions and buf.parents:
-                buf.chosen_division = 0
             continue
         buf.address = before.address
         if before.address is None:
             reasons[buf.name] = spill_reasons.get(buf.name, "spilled by solver")
-        if before.chosen_division is not None and buf.core_divisions:
-            buf.chosen_division = 0
     for buf in buffers:
         if buf.address is None:
             reasons.setdefault(buf.name, barred(buf) or "added by coarse tiling")

@@ -1209,13 +1209,13 @@ class TileOwnershipGroupingTests(unittest.TestCase):
 
 
 class AppliedTilingGateTests(unittest.TestCase):
-    """``_materialize_selection`` applies chosen tilings only for an engine
-    whose ``allocator_applies_tilings()`` is true; any other engine's placement
-    stands, whatever tilings its allocation carries."""
+    """``_post_solve`` applies chosen tilings only for an engine whose
+    ``allocator_applies_tilings()`` is true; any other engine's graph is left
+    as it is, whatever tilings its allocation carries."""
 
     _CHOICES = {"buf0": _D0_BY_4}
 
-    def _materialize(self, layout_solver):
+    def _apply_chosen(self, layout_solver):
         with ts_inductor_config.patch(
             co_optimizing_lx_planning=True, layout_solver=layout_solver
         ):
@@ -1234,16 +1234,13 @@ class AppliedTilingGateTests(unittest.TestCase):
                 apply = stack.enter_context(
                     patch("torch_spyre._inductor.scratchpad.allocator.apply_tilings")
                 )
-                result = alloc._materialize_selection(graph, solver, allocation)
-            return solver, allocation, result, chosen, apply
+                applied = alloc._apply_chosen_tilings(graph, solver, allocation)
+            return solver, applied, chosen, apply
 
     def test_annealer_placement_stands(self):
-        solver, allocation, result, chosen, apply = self._materialize(
-            "simulated_annealing"
-        )
+        solver, applied, chosen, apply = self._apply_chosen("simulated_annealing")
         self.assertFalse(solver.allocator_applies_tilings())
-        self.assertIs(result[0], solver)
-        self.assertIs(result[1], allocation)
+        self.assertFalse(applied)
         chosen.assert_not_called()
         apply.assert_not_called()
 
@@ -1289,24 +1286,24 @@ class LxOverlapCheckTests(unittest.TestCase):
 
 class SplitsOnTileTests(unittest.TestCase):
     """``splits_on_tile`` restates a core division on the symbols the tiled op
-    iterates, from the symbol map ``apply_tilings`` returns."""
+    iterates, from the ``symbols_on_tile`` stamp ``apply_tilings`` leaves on
+    it."""
 
     _D0, _D1 = sympy.symbols("d0 d1")
 
     def test_an_op_the_apply_did_not_tile_keeps_its_symbols(self):
-        self.assertEqual(splits_on_tile("buf0", {self._D1: 2}, {}), {self._D1: 2})
+        untiled = SimpleNamespace()
+        self.assertEqual(splits_on_tile(untiled, {self._D1: 2}), {self._D1: 2})
 
     def test_a_unit_tile_renumbers_the_dims_after_it(self):
         # A (64, 64, 128) op tiled d0:64 is a (1, 64, 128) tile: it no longer
         # iterates dim 0, and what was d1 is its d0.
-        symbols_on_tile = {"buf0": {self._D1: self._D0}}
-        self.assertEqual(
-            splits_on_tile("buf0", {self._D1: 2}, symbols_on_tile), {self._D0: 2}
-        )
+        tile = SimpleNamespace(symbols_on_tile={self._D1: self._D0})
+        self.assertEqual(splits_on_tile(tile, {self._D1: 2}), {self._D0: 2})
 
     def test_a_split_of_a_dim_the_tile_no_longer_iterates_is_refused(self):
-        symbols_on_tile = {"buf0": {self._D1: self._D0}}
-        self.assertIsNone(splits_on_tile("buf0", {self._D0: 2}, symbols_on_tile))
+        tile = SimpleNamespace(symbols_on_tile={self._D1: self._D0})
+        self.assertIsNone(splits_on_tile(tile, {self._D0: 2}))
 
 
 class CarryPlanTests(unittest.TestCase):
@@ -1315,16 +1312,23 @@ class CarryPlanTests(unittest.TestCase):
 
     @staticmethod
     def _buf(name, uses, size=128, **kwargs):
+        # One division, already chosen: the solve's pick for a planned buffer,
+        # the committed division for a buffer of the tiled graph.
         return CoreDivisionBuffer(
-            name, size, uses, core_divisions=[CoreDivision()], **kwargs
+            name,
+            size,
+            uses,
+            core_divisions=[CoreDivision()],
+            chosen_division=0,
+            **kwargs,
         )
 
     def test_a_planned_buffer_keeps_its_address_and_added_ones_stay_out(self):
         # The solve placed p in LX and spilled q. On the tiled graph p is one
         # tile in size, and the apply added p's copy and the full buffer.
         planned = [
-            self._buf("p", [0, 1], chosen_division=0, address=64),
-            self._buf("q", [1, 2], chosen_division=0),
+            self._buf("p", [0, 1], address=64),
+            self._buf("q", [1, 2]),
         ]
         tile = self._buf("p", [0, 2], size=32)
         spilled = self._buf("q", [2, 3])
@@ -1338,8 +1342,8 @@ class CarryPlanTests(unittest.TestCase):
         reasons, violations = carry_plan(
             planned, [full, tile, copy, spilled], {"q": "does not fit"}, lambda _: None
         )
-        self.assertEqual((tile.address, tile.chosen_division), (64, 0))
-        self.assertEqual((copy.address, copy.chosen_division), (None, 0))
+        self.assertEqual(tile.address, 64)
+        self.assertIsNone(copy.address)
         self.assertIsNone(full.address)
         self.assertEqual(
             reasons,
@@ -1354,8 +1358,8 @@ class CarryPlanTests(unittest.TestCase):
     def test_every_way_the_plan_fails_on_the_tiled_graph_is_reported(self):
         # p's copy has no pair with it, and the tiled graph bars r.
         planned = [
-            self._buf("p", [0, 1], chosen_division=0, address=0),
-            self._buf("r", [5, 6], chosen_division=0, address=512),
+            self._buf("p", [0, 1], address=0),
+            self._buf("r", [5, 6], address=512),
         ]
         tile = self._buf("p", [0, 2])
         copy = self._buf(
