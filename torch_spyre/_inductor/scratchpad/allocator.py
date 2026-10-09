@@ -774,7 +774,7 @@ class ScratchpadAllocator:
         allocation = self._solve(solver, graph)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
         self._post_solve(graph, allocation, accepted_lx_relayouts)
-        reasons = self._get_spill_reasons(solver, allocation)
+        reasons = self._get_spill_reasons(graph, solver, allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
         self._run_passes(self.post_optimization_passes, graph)
@@ -866,14 +866,18 @@ class ScratchpadAllocator:
         reasons/push. Base: nothing to commit."""
 
     def _get_spill_reasons(
-        self, solver: MemoryPlanSolver, allocation: Sequence[LifetimeBoundBuffer]
+        self,
+        graph: GraphLowering,
+        solver: MemoryPlanSolver,
+        allocation: Sequence[LifetimeBoundBuffer],
     ) -> dict:
         """Get spill reasons for every buffer that did not land in LX.
 
         The solver's own :attr:`spill_reasons` is authoritative -- it carries the
         declared verdict (``residency_reason``) or its capacity check. Anything
         spilled without a reason there simply did not fit once the higher-value
-        buffers were placed.
+        buffers were placed. ``graph`` is the graph as ``_post_solve`` left it,
+        for an override whose reasons depend on it.
         """
         solver_reasons = dict(solver.spill_reasons)
         for b in allocation:
@@ -2688,9 +2692,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # function rather than a class. Engines that cannot are never handed a
         # copy, and their objective never carries a relayout term.
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
-        # The ops a tiling added to the graph, which the solve never saw, each
-        # with why it is outside LX; empty when no tiling was applied.
-        self._added_op_reasons: dict[str, str] = {}
         self._decides_lx_relayouts: bool = bool(
             getattr(layout_planning([], size), "decides_lx_relayouts", False)
         )
@@ -3067,19 +3068,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph cannot take raises ``SolveError`` too, after the apply, and the
         fallback then places the fully-tiled graph, which is a valid outcome.
         """
-        tiled = apply_chosen_tilings(graph, allocation)
+        apply_chosen_tilings(graph, allocation)
         # The divisions must be committed such that any buffer clones can correctly
         # pull the selected core division from the dependent buffers when the graph
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
-        self._added_op_reasons = {}
-        if tiled:
-            planned = {buffer.name for buffer in allocation}
-            self._added_op_reasons = {
-                op.name: "added by coarse tiling"
-                for op in graph.operations
-                if op.name not in planned
-            }
         commit_lx_views(graph, allocation, accepted_lx_relayouts)
         self._log_solver_decisions(graph, allocation)
 
@@ -3125,16 +3118,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
     def _get_spill_reasons(
         self,
+        graph: GraphLowering,
         solver: MemoryPlanSolver,
         allocation: Sequence[LifetimeBoundBuffer],
     ) -> dict:
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
         # allocators. Both CoreDivisionLayoutSolver implementations expose it.
-        # The ops a tiling added are not in the solve, and the log reads an op
-        # with no reason as resident, so they bring their own.
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        return {**self._added_op_reasons, **solver.spill_reasons}
+        reasons = dict(solver.spill_reasons)
+        if any(getattr(op, "solver_tiled", False) for op in graph.operations):
+            # The ops a tiling added to the graph were never in the solve, and
+            # the log reads an op with no reason as resident.
+            planned = {buffer.name for buffer in allocation}
+            for op in graph.operations:
+                if op.name not in planned:
+                    reasons.setdefault(op.name, "added by coarse tiling")
+        return reasons
 
     def _division_map(
         self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False
