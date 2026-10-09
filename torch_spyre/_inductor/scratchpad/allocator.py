@@ -3394,15 +3394,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         the lifetime, in-place parents and residency verdict the tiled graph
         gives it. It takes the address and the division the solve chose. An op
         the apply added -- a cut's copy op and the full buffer it fills -- was
-        not in the solve; it takes the division under which it reads its
-        producer the way the producer is sliced, and it never resides.
+        not in the solve and never resides. The copy takes the division of the
+        op it drains, so each core copies the slice it wrote.
 
         The tiled graph has the last word on whether the plan holds. A buffer
         it bars from LX, or one a reader no longer matches, is demoted to HBM,
-        which is always valid. A division the tiled op does not offer, or two
-        resident buffers that would share an address while both are alive,
-        means the solve planned for a graph the apply did not produce:
-        ``SolveError``, and the caller falls back to greedy placement.
+        which is always valid. A division the tiled op or its copy does not
+        offer, or two resident buffers that would share an address while both
+        are alive, means the solve planned for a graph the apply did not
+        produce: ``SolveError``, and the caller falls back to greedy placement.
         """
         self._suppress_tiling = True
         try:
@@ -3413,11 +3413,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         by_name = {b.name: b for b in buffers}
         reasons: dict[str, str] = {}
 
-        def same_splits(a: CoreDivision, b: CoreDivision) -> bool:
-            def key(cd: CoreDivision) -> set[tuple[str, int]]:
-                return {(str(sym), f) for sym, f in cd.splits.items() if f != 1}
+        def offered(
+            buf: CoreDivisionBuffer, splits: dict[sympy.Symbol, int]
+        ) -> Optional[int]:
+            """Which of ``buf``'s divisions splits exactly as ``splits`` does."""
 
-            return key(a) == key(b)
+            def key(of: dict[sympy.Symbol, int]) -> set[tuple[str, int]]:
+                return {(str(sym), f) for sym, f in of.items() if f != 1}
+
+            return next(
+                (
+                    i
+                    for i, cd in enumerate(buf.core_divisions)
+                    if key(cd.splits) == key(splits)
+                ),
+                None,
+            )
 
         def demote(buf: CoreDivisionBuffer, reason: str) -> None:
             if buf.address is not None:
@@ -3441,14 +3452,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if before.chosen_division is None or not buf.core_divisions:
                 continue
             wanted = before.core_divisions[before.chosen_division]
-            index = next(
-                (
-                    i
-                    for i, cd in enumerate(buf.core_divisions)
-                    if same_splits(cd, wanted)
-                ),
-                None,
-            )
+            index = offered(buf, wanted.splits)
             if index is None:
                 raise SolveError(
                     f"{buf.name}: the division {wanted.label} chosen under "
@@ -3457,24 +3461,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             buf.chosen_division = index
 
         for buf in added:
-            if not buf.core_divisions:
+            # Of the ops the apply adds, only a cut's copy is divided: the full
+            # buffer it fills is an allocation that reads nothing. The copy
+            # walks the output of the one op it drains, so it takes that op's
+            # division over its output and each core copies the slice it wrote.
+            if not buf.core_divisions or not buf.parents:
                 continue
-            # Read each producer the way it is sliced; among the divisions
-            # that do, the most parallel.
-            matching = set(range(len(buf.core_divisions)))
-            for parent_name in buf.parents:
-                parent = by_name.get(parent_name)
-                if parent is None or parent.chosen_division is None:
-                    continue
-                matching &= {
-                    j
-                    for i, j in buf.cd_parent_matches.get(parent_name, [])
-                    if i == parent.chosen_division
-                }
-            candidates = matching or set(range(len(buf.core_divisions)))
-            buf.chosen_division = max(
-                candidates, key=lambda j: (buf.core_divisions[j].cores_used, -j)
-            )
+            (drained,) = (by_name[name] for name in buf.parents)
+            assert drained.chosen_division is not None, drained.name
+            wanted = drained.core_divisions[drained.chosen_division]
+            index = offered(buf, wanted.output_splits)
+            if index is None:
+                raise SolveError(
+                    f"{buf.name}: the division {wanted.label} of {drained.name}, "
+                    "the op it drains, is not one the copy offers"
+                )
+            buf.chosen_division = index
 
         for buf in buffers:
             if buf.address is None:
@@ -3501,7 +3503,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             a, b = overlaps[0]
             raise SolveError(
                 f"{a.name} and {b.name} would share LX bytes on the tiled graph: "
-                f"{self._lx_span(a)} and {self._lx_span(b)}"
+                f"{self._lx_span_to_str(a)} and {self._lx_span_to_str(b)}"
             )
         solver.spill_reasons = reasons
         return buffers
@@ -3513,7 +3515,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         return ceil_div(buf.size, cd.output_partition)
 
     @staticmethod
-    def _lx_span(buf: CoreDivisionBuffer) -> str:
+    def _lx_span_to_str(buf: CoreDivisionBuffer) -> str:
         """``buf``'s LX bytes and lifetime, for a message."""
         assert buf.address is not None
         top = buf.address + CoOptimizingAllocator._lx_footprint(buf)
@@ -3531,7 +3533,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         footprint = CoOptimizingAllocator._lx_footprint
 
-        def hands_over(parent: CoreDivisionBuffer, child: CoreDivisionBuffer) -> bool:
+        def check_valid_inplace_assignment(
+            parent: CoreDivisionBuffer, child: CoreDivisionBuffer
+        ) -> bool:
             return (
                 parent.name in child.in_place_parents
                 and parent.address == child.address
@@ -3550,7 +3554,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     or b.address + footprint(b) <= a.address
                 ):
                     continue
-                if hands_over(a, b) or hands_over(b, a):
+                if check_valid_inplace_assignment(
+                    a, b
+                ) or check_valid_inplace_assignment(b, a):
                     continue
                 overlaps.append((a, b))
         return overlaps

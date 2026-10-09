@@ -698,6 +698,9 @@ def coarse_tile_local_dim_split_domains(
     if ctx.op.get_name().startswith(_GENERATED_COPY_OP_PREFIXES):
         return ConstraintResult()
 
+    # TODO: the stamp stands in for "the divisions of this op's nest were
+    # chosen together". Drop it, and with it this pin, once a nest a
+    # spyre_hint or for_each_tile loop made is a group in the joint solve too.
     if getattr(ctx.op, "solver_tiled", False):
         return ConstraintResult()
 
