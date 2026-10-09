@@ -1298,13 +1298,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         working = {b.name: self._wrap(model, b) for b in buffers}
 
         solved = self._run(model, working, forced_reasons, cost_expr=cost_expr)
-        # Surface a drop cause for every spilled buffer: the pre-solve forced
-        # reason when we have one, otherwise the solver chose to spill it.
-        self.spill_reasons = {
-            name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL)
-            for name, sb in solved.items()
-            if sb.address is None
-        }
 
         # Copy the solved results back onto the caller's buffers. Offsets come
         # back in alignment units (the solver works in aligned units), so scale
@@ -1312,6 +1305,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         for b in buffers:
             sb = solved[b.name]
             b.address = None if sb.address is None else sb.address * self.alignment
+            # Surface a drop cause for every spilled buffer: the pre-solve forced
+            # reason when we have one, otherwise the solver chose to spill it.
+            b.spill_reason = (
+                forced_reasons.get(b.name, _SOLVER_CHOSE_SPILL)
+                if sb.address is None
+                else None
+            )
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
                 b.chosen_relayouts = {
