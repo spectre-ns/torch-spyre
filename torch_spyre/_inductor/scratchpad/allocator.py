@@ -771,7 +771,7 @@ class ScratchpadAllocator:
         solver, allocation = self._materialize_selection(graph, solver, allocation)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
         self._post_solve(graph, allocation, accepted_lx_relayouts)
-        reasons = self._get_spill_reasons(solver, allocation)
+        reasons = self._get_spill_reasons(allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
         self._run_passes(self.post_optimization_passes, graph)
@@ -831,8 +831,7 @@ class ScratchpadAllocator:
 
         Returns the ``(solver, allocation)`` the rest of :meth:`plan_allocation`
         commits, so an override that mutates the graph and re-plans hands back
-        the second solve's pair -- ``_get_spill_reasons`` must be asked about the
-        solver that produced the allocation it is passed.
+        the second solve's pair.
 
         Base: a placement-only solve selects nothing to materialize, so the first
         solve stands.
@@ -880,25 +879,22 @@ class ScratchpadAllocator:
         """Hook run after the solve and the relayout finalization, before
         reasons/push. Base: nothing to commit."""
 
-    def _get_spill_reasons(
-        self, solver: MemoryPlanSolver, allocation: Sequence[LifetimeBoundBuffer]
-    ) -> dict:
+    def _get_spill_reasons(self, allocation: Sequence[LifetimeBoundBuffer]) -> dict:
         """Get spill reasons for every buffer that did not land in LX.
 
-        The solver's own :attr:`spill_reasons` is authoritative -- it carries the
-        declared verdict (``residency_reason``) or its capacity check. Anything
-        spilled without a reason there simply did not fit once the higher-value
-        buffers were placed.
+        The ``spill_reason`` the solver left on a buffer is authoritative -- it
+        carries the declared verdict (``residency_reason``) or its capacity
+        check. Anything spilled without one simply did not fit once the
+        higher-value buffers were placed.
         """
-        solver_reasons = dict(solver.spill_reasons)
+        reasons: dict[str, str] = {}
         for b in allocation:
             if b.address is None:
-                solver_reasons[b.name] = solver_reasons.get(
-                    b.name,
+                reasons[b.name] = b.spill_reason or (
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
-                    f" size={b.size // 1024} KB)",
+                    f" size={b.size // 1024} KB)"
                 )
-        return solver_reasons
+        return reasons
 
     def _get_op_name(self, op: Any) -> str:
         return op_short_name(op)
@@ -3166,16 +3162,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 choices[op.get_operation_name()] = cd.tiling
         return choices
 
-    def _get_spill_reasons(
-        self,
-        solver: MemoryPlanSolver,
-        allocation: Sequence[LifetimeBoundBuffer],
-    ) -> dict:
+    def _get_spill_reasons(self, allocation: Sequence[LifetimeBoundBuffer]) -> dict:
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
-        # allocators. Both CoreDivisionLayoutSolver implementations expose it.
-        assert isinstance(solver, CoreDivisionLayoutSolver)
-        return solver.spill_reasons
+        # allocators.
+        return {
+            b.name: b.spill_reason for b in allocation if b.spill_reason is not None
+        }
 
     def _division_map(
         self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False

@@ -29,7 +29,11 @@ import sympy
 from unittest import TestCase
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
+from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
+    ScratchpadAllocator,
+    _lx_planning_size,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -144,7 +148,35 @@ class TestExhaustiveSearchResidency(TestCase):
 
         self.assertIsNone(result["producer"].address)
         self.assertIsNotNone(result["consumer"].address)
-        self.assertEqual(solver.spill_reasons["producer"], "core div mismatch")
+        self.assertEqual(result["producer"].spill_reason, "core div mismatch")
+
+
+class TestAllocatorSpillReasons(TestCase):
+    """The allocator reports spill reasons from the solved buffers alone."""
+
+    def _solve(self, *extra):
+        barred = LifetimeBoundBuffer(
+            "barred", 64, [0, 1], residency_reason="op not allowed"
+        )
+        first = LifetimeBoundBuffer("first", 128, [0, 2])
+        return GreedyLayoutSolver([barred, first, *extra], 128, 1).plan_layout()
+
+    def test_placement_allocator(self):
+        # "late" is live while "first" fills the scratchpad.
+        allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        reasons = ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+            allocation
+        )
+        self.assertEqual(set(reasons), {"barred", "late"})
+        self.assertEqual(reasons["barred"], "op not allowed")
+        self.assertIn("no room on scratchpad", reasons["late"])
+
+    def test_joint_allocator_reports_only_what_the_solver_said(self):
+        allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
+        reasons = CoOptimizingAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+            allocation
+        )
+        self.assertEqual(reasons, {"barred": "op not allowed"})
 
 
 class TestLxPlanningContract(TestCase):
@@ -395,8 +427,8 @@ class BaseLayoutSolverTests:
 
         self.assertIsNone(result["barred"].address)
         self.assertIsNotNone(result["free"].address)
-        self.assertEqual(self.last_solver.spill_reasons["barred"], reason)
-        self.assertNotIn("free", self.last_solver.spill_reasons)
+        self.assertEqual(result["barred"].spill_reason, reason)
+        self.assertIsNone(result["free"].spill_reason)
 
     def test_barred_in_place_parent_does_not_orphan_its_child(self):
         # A barred parent leaves a dangling in_place_parents name once it is
@@ -1205,7 +1237,7 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         solver = self.solver_class([leaf], size=256, alignment=1)
         result = solver.plan_layout_and_core_divisions()
         self.assertIsNone(result[0].address)
-        self.assertEqual(solver.spill_reasons["leaf"], "no consumer reads it from LX")
+        self.assertEqual(result[0].spill_reason, "no consumer reads it from LX")
 
     def test_oversized_min_footprint_is_spilled(self):
         # Even the smallest candidate footprint (total/4 = 250) exceeds the
@@ -1367,15 +1399,13 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         solver = self.solver_class([leaf, big, C], size=200, alignment=1)
         result = {b.name: b for b in solver.plan_layout_and_core_divisions()}
 
-        # All three spill; each carries a reason keyed by buffer name.
+        # All three spill; each carries its reason.
         self.assertIsNone(result["big"].address)
-        self.assertIn("big", solver.spill_reasons)
-        self.assertIn("capacity", solver.spill_reasons["big"])
-        self.assertIn("leaf", solver.spill_reasons)
-        self.assertIn("no consumer", solver.spill_reasons["leaf"])
+        self.assertIn("capacity", result["big"].spill_reason)
+        self.assertIn("no consumer", result["leaf"].spill_reason)
         # A resident buffer gets no spill reason.
-        for name, buf in result.items():
-            self.assertEqual(buf.address is None, name in solver.spill_reasons)
+        for buf in result.values():
+            self.assertEqual(buf.address is None, buf.spill_reason is not None)
 
     def test_balance_prefers_balanced_division(self):
         # verify the solver prefers the balanced core split
@@ -2031,7 +2061,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         solver = self.solver_class([LifetimeBoundBuffer("solo", 40, [0, 1])], 256, 1)
         (buf,) = solver.plan_layout()
         self.assertIsNotNone(buf.address)
-        self.assertNotIn("solo", solver.spill_reasons)
+        self.assertIsNone(buf.spill_reason)
 
     def test_spilled_buffer_records_reason(self):
         # A buffer larger than capacity is pinned out up front and carries the
@@ -2041,9 +2071,9 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         solver = self.solver_class([small, huge], 256, 1)
         result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["huge"].address)
-        self.assertIn("capacity", solver.spill_reasons["huge"])
+        self.assertIn("capacity", result["huge"].spill_reason)
         self.assertIsNotNone(result["small"].address)
-        self.assertNotIn("small", solver.spill_reasons)
+        self.assertIsNone(result["small"].spill_reason)
 
     def test_allocator_residency_reason_is_honoured(self):
         # The allocator's hard bars (e.g. the restickify cross-frame barrier)
@@ -2061,7 +2091,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         result = {b.name: b for b in solver.plan_layout()}
         self.assertIsNone(result["barred"].address)
         self.assertEqual(
-            solver.spill_reasons["barred"], "read by restickify (cross-frame barrier)"
+            result["barred"].spill_reason, "read by restickify (cross-frame barrier)"
         )
         self.assertIsNotNone(result["free"].address)
 
