@@ -2202,6 +2202,55 @@ class TestDivideRanges(unittest.TestCase):
         self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
         self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
 
+    def test_resize_device_layout_follows_permuted_host_strides(self):
+        """A buffer written in a permuted order: host dim 1 is the outer one,
+        as on the output of ``(x + y).permute(1, 0, 2) * 2``.
+
+        The contiguous strides of its size put the outer stride on host dim 0
+        instead. Standing in for the real ones, they name the wrong host dim
+        for a device dim where two host dims are the same size, and leave the
+        outer dim's stride as it was where an inner dim shrinks under it. With
+        the buffer's own strides, the resized layout is the one the tile would
+        be given if it were laid out directly.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.wsr.tile import compute_tile_stride
+
+        cases = [
+            # (size, stride, tile size)
+            (
+                "same size, outer dim tiled",
+                [64, 64, 128],
+                [128, 8192, 1],
+                [64, 16, 128],
+            ),
+            (
+                "same size, inner dim tiled",
+                [64, 64, 128],
+                [128, 8192, 1],
+                [16, 64, 128],
+            ),
+            ("inner dim tiled", [32, 64, 128], [128, 4096, 1], [8, 64, 128]),
+        ]
+        for name, size, stride, tile_size in cases:
+            with self.subTest(name):
+                tile_stride = [
+                    int(s) for s in compute_tile_stride(size, stride, tile_size)
+                ]
+                stl = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
+                result = _resize_device_layout(
+                    stl,
+                    size,
+                    tile_size,
+                    old_host_stride=stride,
+                    new_host_stride=tile_stride,
+                )
+                expected = SpyreTensorLayout(
+                    tile_size, tile_stride, torch.float16, [0, 1, 2]
+                )
+                self.assertEqual(result, expected)
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""

@@ -2922,8 +2922,15 @@ def _divide_ranges(
     # _resize_device_layout does not have to infer it by size (ambiguous for
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
+    # The real strides, not the contiguous ones of the two sizes: this op may
+    # write its output in a permuted order, and its stride_map follows that.
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        old_host_stride=[int(s) for s in old_stride],
+        new_host_stride=[int(s) for s in layout.stride],
     )
     return _DivideRangesResult(retiled_info, symbol_remap)
 
