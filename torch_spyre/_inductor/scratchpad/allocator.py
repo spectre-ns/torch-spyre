@@ -3074,11 +3074,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self._commit_divisions(graph, allocation)
         self._added_op_reasons = {}
         if tiled:
-            # The apply moved ops and added some: the drain plans validated
-            # before the solve describe the graph as it was.
-            self._validated_drain_plans = validated_drain_plans(
-                graph, division_is_fixed=False
-            )
             planned = {buffer.name for buffer in allocation}
             self._added_op_reasons = {
                 op.name: "added by coarse tiling"
