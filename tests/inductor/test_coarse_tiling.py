@@ -99,6 +99,7 @@ from torch_spyre._inductor.wsr.tile_prediction import (
     _rejection_reason,
     predict_frame,
 )
+from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     _derive_group_idx_offset,
     _derive_hint_id_base,
@@ -11040,6 +11041,7 @@ class TestDeriveTilingGroups(unittest.TestCase):
         choices = {"op1": spec, "op2": spec, "op4": spec}
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+        self.assertEqual([nest for _, nest in groups], [(4,), (4,)])
 
     def test_nest_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
@@ -11064,6 +11066,75 @@ class TestDeriveTilingGroups(unittest.TestCase):
         g = self._graph_of(["op0", "op1"])
         self.assertEqual(derive_tiling_groups(g, {}), [])
         self.assertEqual(derive_tiling_groups(g, {"op0": TileSpec()}), [])
+
+
+class TestDeriveTilingGroupsMisreads(unittest.TestCase):
+    """A run of one nest breaks at a consumer that does not read a producer of
+    its stretch tile by tile; the stretch outlives the break and ends where the
+    nest changes. ``tile_misread`` is the per-edge test (covered on the card
+    in ``test_solver_auto_coarse_tiling``); here it is a table."""
+
+    def _groups(self, nests, reads, misreads):
+        """``nests``: op name -> nest; ``reads``: op name -> producers it
+        reads; ``misreads``: the ``(producer, consumer)`` pairs that misread."""
+        ops = []
+        for name in nests:
+            op = MagicMock()
+            op.get_name.return_value = name
+            op.get_operation_name.return_value = name
+            ops.append(op)
+        choices = {
+            name: TileSpec(tuple(TileAxis(i, c) for i, c in enumerate(nest)))
+            for name, nest in nests.items()
+            if nest
+        }
+
+        def read_writes(op):
+            names = reads.get(op.get_name(), ())
+            return SimpleNamespace(reads=[SimpleNamespace(name=n) for n in names])
+
+        def misread(graph, producer, _ps, consumer, _cs, _read):
+            pair = (producer.get_name(), consumer.get_name())
+            return "misread" if pair in misreads else None
+
+        with (
+            patch.object(coarse_tiling_module, "op_read_writes", read_writes),
+            patch.object(coarse_tiling_module, "tile_misread", misread),
+        ):
+            groups = derive_tiling_groups(_graph(ops), choices)
+        return [[o.get_name() for o in group] for group, _ in groups]
+
+    def test_a_misread_starts_a_new_group(self):
+        self.assertEqual(
+            self._groups({"p": (2,), "c": (2,)}, {"c": ["p"]}, {("p", "c")}),
+            [["p"], ["c"]],
+        )
+
+    def test_a_reader_in_step_shares_the_group(self):
+        self.assertEqual(
+            self._groups({"p": (2,), "c": (2,)}, {"c": ["p"]}, set()), [["p", "c"]]
+        )
+
+    def test_the_stretch_outlives_a_split(self):
+        # c misreads a, which is already in an earlier group; c still breaks.
+        self.assertEqual(
+            self._groups(
+                {"a": (2,), "b": (2,), "c": (2,)},
+                {"b": ["a"], "c": ["a", "b"]},
+                {("a", "b"), ("a", "c")},
+            ),
+            [["a"], ["b"], ["c"]],
+        )
+
+    def test_a_nest_change_ends_the_stretch(self):
+        self.assertEqual(
+            self._groups(
+                {"a": (2,), "b": (4,), "c": (2,), "d": (2,)},
+                {"d": ["a", "c"]},
+                {("a", "d")},
+            ),
+            [["a"], ["b"], ["c", "d"]],
+        )
 
 
 class TestDerivedBases(unittest.TestCase):
@@ -11173,6 +11244,21 @@ class TestApplyTilingsEquivalence(unittest.TestCase):
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+
+    def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
+        spec = TileSpec((TileAxis(0, 4),))
+        ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
+        g = _graph(ops)
+        apply_tilings({"op0": spec, "op2": spec}, g)
+        hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
+        self.assertEqual(hint_ids, [[0], [1]])
+        self.assertNotEqual(
+            tuple(ops[0].loop_info.loop_group_id),
+            tuple(ops[2].loop_info.loop_group_id),
+        )
+        # op1 was never in a group, so it is untiled and unhinted.
+        self.assertEqual(getattr(ops[1], "dim_hints", []), [])
+        self.assertEqual(ops[1].data.ranges[0], Integer(256))
 
     def test_pass_inputs_match_hint_path_structurally(self):
         # Two independent ops in one group: prove the group derivation and
@@ -11329,13 +11415,26 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             _drain_lifetime_end_overrides,
         )
 
-        plan = SimpleNamespace(storage_name="buf2")
+        plan = SimpleNamespace(storage_name="buf2", collective=None)
         overrides = {"buf2": 3, "other": 9}
         _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 7)
         self.assertEqual(overrides, {"buf2": 7, "other": 9})
         # max(): a later shorter measurement never shrinks a longer end.
         _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 5)
         self.assertEqual(overrides["buf2"], 7)
+
+    def test_collective_drain_keeps_the_storage_lifetime(self):
+        """The collective reads the storage after the drain, so the storage's
+        own lifetime already covers the drain; extending it to the graph exit
+        would hold every layer's carry in LX until the last layer."""
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _drain_lifetime_end_overrides,
+        )
+
+        plan = SimpleNamespace(storage_name="buf2", collective=_SentinelOp("ar"))
+        overrides = {"buf2": 3}
+        _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 7)
+        self.assertEqual(overrides, {"buf2": 3})
 
     def test_drain_lifetime_extension_rejects_stale_in_place_handoff(self):
         """A post-loop reader cannot reuse a carry kept live for its drain."""
@@ -11381,7 +11480,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
 
         allocator = CoOptimizingAllocator(MagicMock(), size=4096)
         allocator._validated_drain_plans = {
-            "carry": SimpleNamespace(storage_name="carry")
+            "carry": SimpleNamespace(storage_name="carry", collective=None)
         }
         divisions = {op.name: [CoreDivision(splits={})] for op in ops}
         with (
@@ -11604,6 +11703,125 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         self.assertEqual(calls[1].args, (storage_op, []))
         self.assertEqual(calls[1].kwargs["lower_anchor"], plan.anchor_op)
         self.assertIs(plan.anchor_op, graph.operations[-1])
+
+
+class TestDrainedCollective(unittest.TestCase):
+    """A loop carry whose only post-loop use is a collective, drained for it.
+
+    The plan accepts only the shape the push can rewrite -- one collective
+    reading the storage directly, after the whole loop -- and the rewrite moves
+    only that collective onto the drain.  The solve around it is exercised in
+    ``test_work_division.py``.
+    """
+
+    @staticmethod
+    def _buffer(name, size=(8, 64)):
+        from torch._inductor.ir import ComputedBuffer
+
+        buf = MagicMock(spec=ComputedBuffer)
+        buf.get_name.return_value = name
+        buf.get_layout.return_value = SimpleNamespace(
+            dtype=torch.float16,
+            size=list(size),
+            stride=[size[1], 1],
+            offset=0,
+            device_layout="device_layout",
+        )
+        return buf
+
+    @staticmethod
+    def _collective(operand, cls=None, name="all_reduce"):
+        from torch_spyre._inductor.ir import AllReduceAsyncFallback
+
+        cls = cls or AllReduceAsyncFallback
+        op = cls.__new__(cls)
+        op.name = name
+        op.inputs = [operand]
+        return op
+
+    def test_only_a_sole_direct_collective_after_the_loop_is_planned(self):
+        from torch._inductor.ir import ReinterpretView, StorageBox, TensorBox
+
+        from torch_spyre._inductor.ir import AllGatherAsyncFallback
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _sole_post_loop_collective,
+        )
+
+        carry = self._buffer("carry")
+        anchor = _LoopOp("anchor", (0,))
+        all_reduce = self._collective(TensorBox(StorageBox(carry)))
+        reader = _LoopOp("reader")
+
+        def plan(operations, accessors):
+            graph = SimpleNamespace(operations=operations)
+            return _sole_post_loop_collective(graph, "carry", accessors, anchor)
+
+        with self.subTest("all_reduce after the loop"):
+            self.assertIs(plan([carry, anchor, all_reduce], [all_reduce]), all_reduce)
+        with self.subTest("a second post-loop reader"):
+            ops = [carry, anchor, all_reduce, reader]
+            self.assertIsNone(plan(ops, [all_reduce, reader]))
+        with self.subTest("all_reduce before the loop ends"):
+            self.assertIsNone(plan([carry, all_reduce, anchor], [all_reduce]))
+        with self.subTest("the reader is not a collective"):
+            self.assertIsNone(plan([carry, anchor, reader], [reader]))
+        with self.subTest("the operand is a view of the carry"):
+            view = MagicMock(spec=ReinterpretView)
+            through_view = self._collective(TensorBox(view))
+            self.assertIsNone(plan([carry, anchor, through_view], [through_view]))
+        with self.subTest("all_gather is not rewritten yet"):
+            gather = self._collective(
+                TensorBox(StorageBox(carry)), cls=AllGatherAsyncFallback
+            )
+            self.assertIsNone(plan([carry, anchor, gather], [gather]))
+
+    def test_rewrite_moves_only_the_collective_onto_the_drain(self):
+        """The all_reduce reads and mutates the drain; the carry's own wrappers
+        and its other users are untouched."""
+        from collections import defaultdict
+
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+
+        carry, drain = self._buffer("carry"), self._buffer("drain")
+        operand = TensorBox(StorageBox(carry))
+        all_reduce = self._collective(operand)
+        as_user = TensorBox(StorageBox(all_reduce))
+        other_user = TensorBox(StorageBox(self._buffer("other")))
+        editor = GraphEditor.__new__(GraphEditor)
+        editor.lowering = SimpleNamespace(
+            name_to_users=defaultdict(list, {"carry": [as_user, other_user]})
+        )
+        self.assertEqual(all_reduce.get_mutation_names(), ["carry"])
+
+        editor.replace_collective_operand(all_reduce, "carry", drain)
+
+        self.assertEqual(GraphEditor.collective_operand_name(all_reduce), "drain")
+        self.assertEqual(all_reduce.get_mutation_names(), ["drain"])
+        self.assertIsNot(all_reduce.inputs[0], operand)
+        self.assertIs(operand.data.data, carry)
+        self.assertEqual(editor.lowering.name_to_users["carry"], [other_user])
+        self.assertEqual(editor.lowering.name_to_users["drain"], [as_user])
+
+    def test_rewrite_rejects_a_drain_with_another_layout(self):
+        """The collective's plan is sized from its operand's layout."""
+        from collections import defaultdict
+
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+
+        carry = self._buffer("carry")
+        operand = TensorBox(StorageBox(carry))
+        all_reduce = self._collective(operand)
+        editor = GraphEditor.__new__(GraphEditor)
+        editor.lowering = SimpleNamespace(name_to_users=defaultdict(list))
+        with self.assertRaisesRegex(ValueError, "not addressing-equivalent"):
+            editor.replace_collective_operand(
+                all_reduce, "carry", self._buffer("drain", size=(16, 64))
+            )
+        self.assertIs(all_reduce.inputs[0], operand)
 
 
 class _LoopOp:

@@ -629,9 +629,10 @@ along with its core division. It has no effect with any other solver.
   producer and consumer never share a nest.
 - **Loop groups.** Consecutive ops that run the same loop nest (the same
   trip count at each level) share a loop group. The solve requires every
-  producer/consumer edge inside a group to be a compatible pair, and
-  `apply_tilings` checks each such edge again before it applies the
-  tiling.
+  producer/consumer edge inside a group to be a compatible pair.
+  `apply_tilings` checks each such edge again and starts a new group at a
+  consumer that does not read its producer tile by tile, which then reads the
+  producer's full buffer; a plan from this solve never has one.
 - **Placement under a tiling.** The solve places the graph its tilings
   produce, not the untiled one. A *cut* is a tiled op whose value must be
   copied out of its nest, for a consumer outside it or as a graph output:
