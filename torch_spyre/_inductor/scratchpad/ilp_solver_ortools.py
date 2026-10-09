@@ -2084,22 +2084,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             status = self._minimize_cost_expr(model, solver, tensors, cost_expr)
 
         if status is None:
-            # TODO: Update objective to a maxmin optimization to optimize overall
-            # throughput.
-            #
-            # One lexicographic ladder, in priority order:
-            #
-            #   1. LX residency   -- minimize total HBM transfer traffic.
-            #   2. cut count      -- fewest coarse-tiling loop-group boundaries.
-            #   3. parallelism    -- maximize total core usage.
-            #   4. division shape -- minimize summed squared split factors.
-            #   5. tile count     -- minimize the summed tile count.
-            #
-            # Each stage pins the previous optimum as a constraint before
-            # optimizing the next, so a later stage only breaks ties the earlier
-            # ones leave open: never trade a spill for fewer cuts, cuts for
-            # parallelism, or anything for a coarser tiling.
-
             # Fallback discipline: the traffic objective below knows no relayout
             # price, and an unpriced shuffle looks free - the exact degeneracy
             # the cost term exists to remove. No relayout decision may be made
