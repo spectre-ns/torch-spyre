@@ -2639,7 +2639,11 @@ def commit_divisions(
             # ownership for it and let the division land.
             if not isinstance(op, ComputedBuffer) or not op_splits:
                 continue
-        if not _split_option_is_legal(op, op_splits):
+        # The solve chose the divisions of a nest together, so an op it tiled
+        # may split its tiled dim, which the hard domains keep whole.
+        if not getattr(op, "solver_tiled", False) and not _split_option_is_legal(
+            op, op_splits
+        ):
             raise Unsupported(f"{op.name}: chosen split violates hard domain.")
         commits.append((op, op_splits))
     for op, op_splits in commits:

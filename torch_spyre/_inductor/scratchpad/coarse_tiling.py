@@ -656,10 +656,11 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
             op.symbols_on_tile = {  # type: ignore[attr-defined]
                 symbol: now[dim] for dim, symbol in was.items() if dim in now
             }
-    # The solve ties the divisions of a nest together edge by edge, so these
-    # ops may split a tiled dim ``coarse_tile_local_dim_split_domains``
-    # otherwise keeps whole on every core. So may a cut's copy op, which has
-    # to read the tile as its producer slices it.
+    # The solve ties the divisions of a nest together edge by edge, so
+    # ``commit_divisions`` takes them as chosen for these ops, where
+    # ``coarse_tile_local_dim_split_domains`` would keep a tiled dim whole on
+    # every core. The same holds for a cut's copy op, which has to read the
+    # tile as its producer slices it.
     tiled = {name for name, spec in choices.items() if not spec.is_untiled}
     for op in graph.operations:
         name = op.get_operation_name()
