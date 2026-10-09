@@ -1548,9 +1548,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         splits the output alone.
 
         Returns ``None`` when nothing carries a non-empty spec, which is every
-        path except the joint solve with ``auto_coarse_tiling`` on, so the cut
-        stage and the tiling-dependent placement vanish there and the model is
-        built exactly as before.
+        path except the joint solve with ``auto_coarse_tiling`` on: the model
+        is then built exactly as before.
         """
         nest_ids: dict[tuple[int, ...], int] = {(): 0}
         divided = {
@@ -2008,10 +2007,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # in-place relaxation and its 2D no-overlap need nothing special); the
         # residency gate and the coupling below reference them by group.
         copies = self._relayout_copies(tensors)
-        # The nests the chosen tilings form, as solver variables: the ladder
-        # below ranks their boundaries, and placement has to be solved for the
-        # graph those tilings produce. ``None`` unless the joint solve is
-        # actually choosing tilings, which leaves everything below unchanged.
+        # ``None`` unless the joint solve is actually choosing tilings, which
+        # leaves everything below unchanged.
         tiling = self._tiling_model(model, tensors, children_of)
         ends, holds = (
             self._lifetime_ends(model, tensors, children_of, tiling)

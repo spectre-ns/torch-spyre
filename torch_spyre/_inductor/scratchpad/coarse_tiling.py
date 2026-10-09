@@ -572,10 +572,7 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
     (or all-untiled) ``choices`` it is a no-op and the op count is unchanged --
     which is what keeps it inert while ``auto_coarse_tiling`` is off.
 
-    It applies the tiling and nothing else: it keeps no state of its own and
-    returns nothing, and rewrites ``graph`` in place, which is its job. Core
-    divisions are committed afterwards, as a pass of their own
-    (:func:`planned_splits`). For that pass each op it tiled is stamped with
+    For :func:`planned_splits`, each op it tiled is stamped with
     ``symbols_on_tile``, the symbol each of its iteration symbols became, and
     each op it tiled or added to a nest with ``solver_tiled``.
     """
@@ -659,12 +656,10 @@ def apply_tilings(choices: Mapping[str, TileSpec], graph: GraphLowering) -> None
             op.symbols_on_tile = {  # type: ignore[attr-defined]
                 symbol: now[dim] for dim, symbol in was.items() if dim in now
             }
-    # The solve that chose these tilings also chooses each op's division,
-    # and ties the divisions of a nest together edge by edge. That is the
-    # agreement ``coarse_tile_local_dim_split_domains`` otherwise gets by
-    # keeping a tiled dim whole on every core, so these ops may split it.
-    # So may an op the apply added to one of these nests, a cut's copy op:
-    # it reads the tile and has to take it as its producer slices it.
+    # The solve ties the divisions of a nest together edge by edge, so these
+    # ops may split a tiled dim ``coarse_tile_local_dim_split_domains``
+    # otherwise keeps whole on every core. So may a cut's copy op, which has
+    # to read the tile as its producer slices it.
     tiled = {name for name, spec in choices.items() if not spec.is_untiled}
     for op in graph.operations:
         name = op.get_operation_name()
@@ -694,13 +689,7 @@ def chosen_tilings(
 def apply_chosen_tilings(
     graph: GraphLowering, planned: Sequence[CoreDivisionBuffer]
 ) -> bool:
-    """Apply the coarse tilings ``planned`` carries; whether any was.
-
-    The plan is the whole of what there is to apply: each buffer's chosen
-    division names the tiling of its op, whichever engine chose it. With no
-    tiling in it, as when ``auto_coarse_tiling`` is off, ``graph`` is left as
-    it is.
-    """
+    """Apply the coarse tilings ``planned`` carries; whether any was."""
     choices = chosen_tilings(graph, planned)
     if not choices:
         return False
@@ -720,12 +709,10 @@ def splits_on_tile(
     """``splits``, a core division chosen for ``op`` as it was before
     :func:`apply_tilings`, keyed by the symbols ``op`` iterates now.
 
-    An op's iteration symbols are numbered over the dims it iterates. A tile
-    one element long on its tiled dim no longer iterates that dim, so every
-    dim after it moves down a number: ``d1`` of a ``(64, 64, 128)`` op is
-    ``d0`` of its ``(1, 64, 128)`` tile. An op the apply did not tile keeps its
-    symbols. ``None`` when ``splits`` divides a dim the tile no longer
-    iterates.
+    A tile one element long on its tiled dim no longer iterates that dim, so
+    every dim after it moves down a number: ``d1`` of a ``(64, 64, 128)`` op is
+    ``d0`` of its ``(1, 64, 128)`` tile. ``None`` when ``splits`` divides a dim
+    the tile no longer iterates.
     """
     on_tile = getattr(op, "symbols_on_tile", None)
     if on_tile is None:
@@ -742,13 +729,9 @@ def planned_splits(
     split factors keyed by the symbols the op iterates now, and one line for
     each division that cannot be stated on its op.
 
-    An op the solve planned takes the division chosen for it, restated on the
-    tile's symbols where :func:`apply_tilings` tiled the op. Of the ops the
-    apply added, only a cut's copy is divided: the full buffer it fills is an
-    allocation that reads nothing. The copy walks the output of the one op it
-    drains, so it takes that op's division over its output and each core
-    copies the slice it wrote. An op without an entry is not divided by the
-    plan.
+    A cut's copy op, which the solve never saw, walks the output of the one op
+    it drains: it takes that op's division over its output, so each core
+    copies the slice it wrote.
     """
     chosen = {
         buf.name: buf.core_divisions[buf.chosen_division]

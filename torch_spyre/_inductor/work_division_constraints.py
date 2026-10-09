@@ -602,14 +602,9 @@ def coarse_tile_local_dim_split_domains(
     whose read spans the full, un-tiled source tensor.
 
     Skips an op the joint solve tiled (``solver_tiled``, stamped by
-    ``apply_tilings``) as well. That solve chooses the op's division along
-    with its tiling, and requires every producer/consumer edge inside a nest
-    to own the shared buffer alike per tile and per core, so the ops of a
-    loop body cannot disagree about a split of the tiled dim. The split still
-    has to divide the per-tile extent, which is the extent this op now has.
-    The copy op of a cut in such a nest carries the stamp too: it is given
-    the division that reads the tile as its producer slices it.
-    A nest a ``spyre_hint`` or ``for_each_tile`` loop made is not a group in
+    ``apply_tilings``) as well: that solve chooses the divisions of a nest
+    together, so its ops cannot disagree about a split of the tiled dim. A
+    nest a ``spyre_hint`` or ``for_each_tile`` loop made is not a group in
     that solve, so its ops keep the pin.
 
     ``coarse_tile.py`` stamps ``op.loop_info`` (a ``CoarseTileInfo``) on every

@@ -876,8 +876,7 @@ class ScratchpadAllocator:
         The solver's own :attr:`spill_reasons` is authoritative -- it carries the
         declared verdict (``residency_reason``) or its capacity check. Anything
         spilled without a reason there simply did not fit once the higher-value
-        buffers were placed. ``graph`` is the graph as ``_post_solve`` left it,
-        for an override whose reasons depend on it.
+        buffers were placed.
         """
         solver_reasons = dict(solver.spill_reasons)
         for b in allocation:
@@ -2606,13 +2605,7 @@ def commit_lx_views(
     accepted_lx_relayouts: Sequence[LXRelayoutPlan],
 ) -> None:
     """Set ``lx_view``, the per-core view LX holds it under, on every resident
-    buffer of ``allocation``.
-
-    A buffer takes the view the residency judge accepted for it on ``graph``
-    (``get_ncores_for_buffers``); the source of an accepted relayout takes its
-    plan's ``source_view`` instead. Raises ``Unsupported`` for a resident
-    buffer that has neither.
-    """
+    buffer of ``allocation``."""
     # A solver-fired relayout source stays resident under ITS committed view
     # while the consumer it feeds will read the shuffled copy under another.
     # The judge runs on the pre-materialization graph, where that consumer
@@ -2859,10 +2852,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # same graph drew 1, 2, 3 or 4 cuts run to run at one identical
             # objective value). Worse, it is not merely uninformative there --
             # #3810 makes it raise on symbolic args once an op is output-tiled.
-            # Hand the solver no
-            # cost expression at all and let its lexicographic ladder rank
-            # residency, cuts, parallelism and division shape instead. Off this
-            # path the expression is unchanged and still the objective.
+            # Hand the solver no cost expression at all and let its
+            # lexicographic ladder rank residency, cuts, parallelism and
+            # division shape instead. Off this path the expression is unchanged
+            # and still the objective.
             logger.debug(
                 "cost objective skipped: auto_coarse_tiling makes tile size and "
                 "cut count decision axes the cost model cannot score"
@@ -3048,25 +3041,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
         """Put what the joint solve chose onto the graph: tilings, then core
-        divisions. The allocation says all of it; the solver is not consulted.
+        divisions, then LX views.
 
-        The solve chooses core divisions, tilings and LX placement together, and
-        plans for the graph its tilings produce: tile-sized buffers, a copy op
-        at every cut, lifetimes that follow the loop nests (``_TilingModel``).
-        Nothing is solved again. ``apply_tilings`` applies the tilings first,
-        so the divisions are committed, as a second pass, onto the ops of the
-        graph that will run.
-
-        The plan is taken as it stands: the tiled graph's buffers are not built
-        again to check it. What does get checked is what the graph itself can
-        say, a division one of its ops cannot take (``_commit_divisions``) and
-        a resident buffer its readers do not agree on (``commit_lx_views``).
-
-        Ordering is solve-before-apply: a ``SolveError`` from the solve
-        propagates over the *unmutated* graph, so ``scratchpad_planning``'s
-        greedy fallback never runs on a half-tiled graph. A division the tiled
-        graph cannot take raises ``SolveError`` too, after the apply, and the
-        fallback then places the fully-tiled graph, which is a valid outcome.
+        A ``SolveError`` from the solve reaches ``scratchpad_planning``'s greedy
+        fallback over the unmutated graph. One raised here, for a division the
+        tiled graph cannot take, reaches it over the fully tiled graph, which
+        the fallback can place as well.
         """
         apply_chosen_tilings(graph, allocation)
         # The divisions must be committed such that any buffer clones can correctly
@@ -3440,12 +3420,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         optimize work division across the whole graph, not only the LX-resident
         region.
 
-        This runs after ``apply_tilings``, on the graph that will run. An op
-        the apply tiled takes its division restated on the tile's symbols, and
-        a cut's copy op, which the solve never saw, takes the division of the
-        op it drains (``planned_splits``). A division one of those ops cannot
-        take means the solve planned for a graph the apply did not produce:
-        ``SolveError``, raised before anything is committed.
+        Runs on the tiled graph, where ``planned_splits`` restates each
+        division. One a tiled op cannot take raises ``SolveError`` before
+        anything is committed.
         """
         splits, violations = planned_splits(graph, allocation)
         if violations:
@@ -3465,16 +3442,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 # An op ``apply_tilings`` synthesises is a different case. It
                 # is created *after* the work-division pass, so it was never
                 # offered ownership -- not deliberately denied it. A cut's copy
-                # has to read the tile as its producer slices it, so skipping
-                # it here would leave the copy undivided while its producer
-                # commits divided, and ``_post_solve``'s ownership check would
-                # reject the pair ("op 'bufN' ref PerCoreView(... num_cores=32)
-                # != 'coarse_tile_copy_bufN' PerCoreView((), (), num_cores=1)").
-                # Mint ownership for it so the division lands.
+                # has to read the tile as its producer slices it, so mint
+                # ownership for it and let the division land.
                 if not isinstance(op, ComputedBuffer) or not op_splits:
                     continue
             if getattr(op, "solver_tiled", False):
-                # Its split space says whether it can take this one division.
                 space = self._division_space(op)
                 if space is None or not space.admits(op_splits):
                     raise SolveError(
