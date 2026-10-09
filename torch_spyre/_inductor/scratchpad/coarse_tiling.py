@@ -16,7 +16,7 @@
 
 The tiling is stated as data (a
 :class:`~torch_spyre._inductor.scratchpad.plan_solver.TileSpec` per op) and
-*applied* to a real graph through a :class:`ScratchpadOptimizationPass`. The
+*applied* to a real graph through :class:`CoarseTilingPass`. The
 tiling is an input here, not a search -- candidate enumeration and the solver
 that chooses among tilings live elsewhere.
 
@@ -60,7 +60,6 @@ from ..wsr.coarse_tile import (
     validate_coarse_tile_groups,
 )
 from ..wsr.span_overflow_hint_analysis import _layout_has_static_span_metadata
-from .allocator import ScratchpadOptimizationPass
 from .plan_solver import CoreDivisionBuffer, RelayoutCopyBuffer, TileSpec, ceil_div
 from .utils import buffer_not_read_in_full
 
@@ -549,7 +548,19 @@ def _derive_group_idx_offset(graph: GraphLowering) -> int:
     return max(used, default=-1) + 1
 
 
-class CoarseTilingPass(ScratchpadOptimizationPass):
+def _symbols_by_dim(op: ComputedBuffer) -> Optional[dict[int, sympy.Symbol]]:
+    """``op``'s iteration symbols, each under the dim it walks, counting output
+    dims and then reduction dims; ``None`` where the two cannot be matched up.
+
+    A dim of extent 1 is not iterated and has no symbol.
+    """
+    extents = [*op.data.ranges, *getattr(op.data, "reduction_ranges", ())]
+    walked = [dim for dim, extent in enumerate(extents) if extent != 1]
+    symbols = list(iteration_space_from_op(op))
+    return dict(zip(walked, symbols)) if len(walked) == len(symbols) else None
+
+
+class CoarseTilingPass:
     """Apply a declared coarse tiling to a graph, inside the scratchpad pass.
 
     The tiling is an *input* (``choices``: operation name -> TileSpec),
@@ -560,13 +571,17 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
     spec, validates group contiguity, then calls ``coarse_tile``. With empty (or all-untiled) ``choices`` it is a no-op and
     the op count is unchanged -- which is what keeps it inert while
     ``auto_coarse_tiling`` is off.
+
+    Not a ``ScratchpadOptimizationPass``: the allocator runs those from its
+    pass lists with the graph alone, and this one also takes the tilings the
+    solve chose.
     """
 
-    def __init__(self, choices: Mapping[str, TileSpec]):
-        self._choices = dict(choices)
-
-    def apply_pass(self, graph: GraphLowering) -> None:
-        groups_specs = derive_tiling_groups(graph, self._choices)
+    def apply_pass(self, choices: Mapping[str, TileSpec], graph: GraphLowering) -> None:
+        # Buffer name of each op the apply tiled -> the symbol each of its
+        # iteration symbols became (see ``splits_on_tile``).
+        self._symbols_on_tile: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
+        groups_specs = derive_tiling_groups(graph, choices)
         # The group partition is the whole shape of the plan -- which ops share
         # one loop nest, and therefore where the boundaries (and their full
         # buffers and copy ops) fall. Nothing else reports it before the tiling
@@ -577,7 +592,7 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                 idx,
                 nest,
                 ", ".join(
-                    f"{op.get_name()}:{self._choices[op.get_operation_name()].label}"
+                    f"{op.get_name()}:{choices[op.get_operation_name()].label}"
                     for op in group_ops
                 ),
             )
@@ -603,7 +618,7 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
                     f"coarse tiling would re-tile {', '.join(clash)}, "
                     "which a for_each_tile loop already tiles."
                 )
-            reason = _misaligned_group_edge(graph, group_ops, self._choices)
+            reason = _misaligned_group_edge(graph, group_ops, choices)
             if reason is not None:
                 raise Unsupported(
                     f"coarse tiling: {reason}, so they cannot share a loop nest."
@@ -623,7 +638,7 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             ]
             for op in group_ops:
                 op.dim_hints = tile_spec_to_dim_hints(
-                    op, self._choices[op.get_operation_name()], hint_ids
+                    op, choices[op.get_operation_name()], hint_ids
                 )
             groups.append((group_ops, levels))
         validate_coarse_tile_groups(groups)
@@ -634,24 +649,147 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
         # would only be a useless HBM-to-HBM copy, exactly as the sibling
         # post-stickify consumer (_maybe_coarse_tile_span_overflow) does.
         before = {op.get_operation_name() for op in graph.operations}
+        untiled_symbols = {
+            op.get_name(): _symbols_by_dim(op)
+            for group_ops, _levels in groups
+            for op in group_ops
+        }
         coarse_tile_post_stickify(
             graph, groups=groups, group_idx_offset=group_idx_offset
         )
+        for op in graph.operations:
+            was = untiled_symbols.get(op.get_name())
+            if was is None or not isinstance(op, ComputedBuffer):
+                continue
+            now = _symbols_by_dim(op)
+            if now is not None:
+                self._symbols_on_tile[op.get_name()] = {
+                    symbol: now[dim] for dim, symbol in was.items() if dim in now
+                }
         # The solve that chose these tilings also chooses each op's division,
         # and ties the divisions of a nest together edge by edge. That is the
         # agreement ``coarse_tile_local_dim_split_domains`` otherwise gets by
         # keeping a tiled dim whole on every core, so these ops may split it.
         # So may an op the apply added to one of these nests, a cut's copy op:
         # it reads the tile and has to take it as its producer slices it.
-        tiled = {name for name, spec in self._choices.items() if not spec.is_untiled}
+        tiled = {name for name, spec in choices.items() if not spec.is_untiled}
         for op in graph.operations:
             name = op.get_operation_name()
             added = name not in before and getattr(op, "loop_info", None) is not None
             if name in tiled or added:
                 op.solver_tiled = True  # type: ignore[attr-defined]
 
+    def splits_on_tile(
+        self, name: str, splits: Mapping[sympy.Symbol, int]
+    ) -> Optional[dict[sympy.Symbol, int]]:
+        """``splits``, a core division chosen for the op that writes ``name``
+        as it was before the apply, keyed by the symbols that op iterates now.
+
+        An op's iteration symbols are numbered over the dims it iterates. A
+        tile one element long on its tiled dim no longer iterates that dim, so
+        every dim after it moves down a number: ``d1`` of a ``(64, 64, 128)``
+        op is ``d0`` of its ``(1, 64, 128)`` tile. An op the pass did not tile
+        keeps its symbols. ``None`` when ``splits`` divides a dim the tile no
+        longer iterates.
+        """
+        on_tile = self._symbols_on_tile.get(name)
+        if on_tile is None:
+            return dict(splits)
+        if not splits.keys() <= on_tile.keys():
+            return None
+        return {on_tile[symbol]: factor for symbol, factor in splits.items()}
+
+    def planned_splits(
+        self, graph: GraphLowering, planned: Sequence[CoreDivisionBuffer]
+    ) -> tuple[dict[str, dict[sympy.Symbol, int]], list[str]]:
+        """The core division each op of the tiled graph takes from the solve's
+        plan, as split factors keyed by the symbols the op iterates now, and
+        one line for each division that could not be restated.
+
+        An op the solve planned keeps the division chosen for it. Of the ops
+        the apply added, only a cut's copy is divided: the full buffer it fills
+        is an allocation that reads nothing. The copy walks the output of the
+        one op it drains, so it takes that op's division over its output and
+        each core copies the slice it wrote. An op without an entry is not
+        divided by the plan.
+        """
+        chosen = {
+            buf.name: buf.core_divisions[buf.chosen_division]
+            for buf in planned
+            if buf.chosen_division is not None
+        }
+        planned_names = {buf.name for buf in planned}
+        splits: dict[str, dict[sympy.Symbol, int]] = {}
+        violations: list[str] = []
+        for op in graph.operations:
+            name = op.get_name()
+            if name in chosen:
+                source, wanted = name, chosen[name].splits
+            elif name not in planned_names:
+                reads = {dep.name for dep in op_read_writes(op).reads}
+                if not reads:
+                    continue
+                (source,) = reads
+                if source not in chosen:
+                    continue
+                wanted = chosen[source].output_splits
+            else:
+                continue
+            on_tile = self.splits_on_tile(source, wanted)
+            if on_tile is None:
+                violations.append(
+                    f"{name}: the division {chosen[source].label} the solve chose "
+                    "splits a dim its tile no longer iterates"
+                )
+                continue
+            splits[name] = on_tile
+        return splits, violations
+
     @staticmethod
-    def plan_violations(
+    def carry_plan(
+        planned: Sequence[CoreDivisionBuffer],
+        buffers: Sequence[CoreDivisionBuffer],
+        spill_reasons: Mapping[str, str],
+        barred: Callable[[CoreDivisionBuffer], Optional[str]],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Restate the solve's plan over ``buffers``, the tiled graph's own,
+        and say whether it holds there.
+
+        Applying a tiling keeps every op's name, so each buffer the solve
+        planned is found again in ``buffers``, one tile in size where it was
+        tiled, with the lifetime, in-place parents and residency verdict the
+        tiled graph gives it. It takes the address the solve chose; its
+        division is the one it was built with (``planned_splits``). An op the
+        apply added -- a cut's copy op and the full buffer it fills -- was not
+        in the solve and never resides.
+
+        Returns why each buffer outside LX is outside it (``spill_reasons`` are
+        the solve's own, ``barred`` gives the tiled graph's), and
+        ``validate_plan``'s violations. Nothing is repaired: what to do about
+        a violation is the caller's call.
+        """
+        planned_by_name = {buf.name: buf for buf in planned}
+        reasons: dict[str, str] = {}
+        for buf in buffers:
+            if isinstance(buf, RelayoutCopyBuffer):
+                continue
+            before = planned_by_name.get(buf.name)
+            if before is None:
+                if buf.core_divisions and buf.parents:
+                    buf.chosen_division = 0
+                continue
+            buf.address = before.address
+            if before.address is None:
+                reasons[buf.name] = spill_reasons.get(buf.name, "spilled by solver")
+            if before.chosen_division is not None and buf.core_divisions:
+                buf.chosen_division = 0
+        for buf in buffers:
+            if buf.address is None:
+                reasons.setdefault(buf.name, barred(buf) or "added by coarse tiling")
+        return reasons, CoarseTilingPass.validate_plan(buffers, barred)
+
+    @staticmethod
+    def validate_plan(
         buffers: Sequence[CoreDivisionBuffer],
         barred: Callable[[CoreDivisionBuffer], Optional[str]],
     ) -> list[str]:

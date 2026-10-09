@@ -3104,8 +3104,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         at every cut, lifetimes that follow the loop nests (``_TilingModel``).
         If it picks a non-empty tiling for any op, ``CoarseTilingPass`` applies
         exactly those choices (mutating the IR the same way a
-        pre-stickification hint would) and the plan is restated over the tiled
-        graph's own buffers (:meth:`_carry_plan_onto_tiled_graph`). Nothing is
+        pre-stickification hint would) and restates the plan over the tiled
+        graph's own buffers (``planned_splits``, ``carry_plan``), which this
+        allocator builds for it (:meth:`_buffers_for_splits`). Nothing is
         solved again.
 
         Ordering is solve-before-apply: a ``SolveError`` from the solve
@@ -3131,113 +3132,60 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
 
         op_count = len(graph.operations)
-        tiling = CoarseTilingPass(choices)
-        tiling.apply_pass(graph)
+        tiling = CoarseTilingPass()
+        tiling.apply_pass(choices, graph)
         assert len(graph.operations) >= op_count, (
             "coarse tiling apply must not drop operations"
         )
-        buffers = self._carry_plan_onto_tiled_graph(graph, solver, allocation)
-        violations = tiling.plan_violations(buffers, solver.excluded)
+        splits, violations = tiling.planned_splits(graph, allocation)
         if violations:
-            raise SolveError(violations[0])
+            raise SolveError("; ".join(violations))
+        buffers = self._buffers_for_splits(graph, splits)
+        reasons, violations = tiling.carry_plan(
+            allocation, buffers, solver.spill_reasons, solver.excluded
+        )
+        if violations:
+            raise SolveError("; ".join(violations))
+        solver.spill_reasons = reasons
         return solver, buffers
 
-    def _carry_plan_onto_tiled_graph(
-        self,
-        graph: GraphLowering,
-        solver: CoreDivisionLayoutSolver,
-        planned: Sequence[CoreDivisionBuffer],
+    def _buffers_for_splits(
+        self, graph: GraphLowering, splits: Mapping[str, dict[sympy.Symbol, int]]
     ) -> list[CoreDivisionBuffer]:
-        """The solve's plan, restated over the buffers of the tiled graph.
+        """``graph``'s buffers, each op built on one division that is already
+        decided.
 
-        Applying a tiling keeps every op's name, so each buffer the solve
-        planned is found again here, one tile in size where it was tiled, with
-        the lifetime, in-place parents and residency verdict the tiled graph
-        gives it. It takes the address and the division the solve chose. An op
-        the apply added -- a cut's copy op and the full buffer it fills -- was
-        not in the solve and never resides. The copy takes the division of the
-        op it drains, so each core copies the slice it wrote.
-
-        A division the tiled op or its copy does not offer means the solve
-        planned for a graph the apply did not produce: ``SolveError``, and the
-        caller falls back to greedy placement. Whether the restated plan holds
-        on the tiled graph is ``CoarseTilingPass.plan_violations``'s to say.
+        ``splits`` gives that division for every op it names; any other op
+        keeps the division it carries. No menu is enumerated, so there is none
+        to find a choice in. A division that an op the tiling pass tiled or
+        added cannot take means the solve planned for a graph the apply did not
+        produce: ``SolveError``, and the caller falls back to greedy placement.
         """
-        self._suppress_tiling = True
-        try:
-            buffers = list(self._prepare_buffers(graph))
-        finally:
-            self._suppress_tiling = False
-        planned_by_name = {b.name: b for b in planned}
-        by_name = {b.name: b for b in buffers}
-        reasons: dict[str, str] = {}
-
-        def offered(
-            buf: CoreDivisionBuffer, splits: dict[sympy.Symbol, int]
-        ) -> Optional[int]:
-            """Which of ``buf``'s divisions splits exactly as ``splits`` does."""
-
-            def key(of: dict[sympy.Symbol, int]) -> set[tuple[str, int]]:
-                return {(str(sym), f) for sym, f in of.items() if f != 1}
-
-            return next(
-                (
-                    i
-                    for i, cd in enumerate(buf.core_divisions)
-                    if key(cd.splits) == key(splits)
-                ),
-                None,
-            )
-
-        added: list[CoreDivisionBuffer] = []
-        for buf in buffers:
-            if isinstance(buf, RelayoutCopyBuffer):
+        divisions: dict[str, list[CoreDivision]] = {}
+        for op in graph.operations:
+            op_splits = splits.get(op.name)
+            if op_splits is None:
+                divisions[op.name] = [_fixed_core_division(op)]
                 continue
-            before = planned_by_name.get(buf.name)
-            if before is None:
-                added.append(buf)
-                continue
-            buf.address = before.address
-            if before.address is None:
-                reasons[buf.name] = solver.spill_reasons.get(
-                    buf.name, "spilled by solver"
-                )
-            if before.chosen_division is None or not buf.core_divisions:
-                continue
-            wanted = before.core_divisions[before.chosen_division]
-            index = offered(buf, wanted.splits)
-            if index is None:
-                raise SolveError(
-                    f"{buf.name}: the division {wanted.label} chosen under "
-                    f"{wanted.tiling.label} is not one the tiled op offers"
-                )
-            buf.chosen_division = index
+            division = _core_division(op, op_splits)
+            if getattr(op, "solver_tiled", False):
+                # Its split space says whether it can take this one division.
+                space = self._division_space(op)
+                if space is None or not space.admits(op_splits):
+                    raise SolveError(
+                        f"{op.name}: the division {division.label} the solve "
+                        "chose is not one the tiled graph's op can take"
+                    )
+            divisions[op.name] = [division]
 
-        for buf in added:
-            # Of the ops the apply adds, only a cut's copy is divided: the full
-            # buffer it fills is an allocation that reads nothing. The copy
-            # walks the output of the one op it drains, so it takes that op's
-            # division over its output and each core copies the slice it wrote.
-            if not buf.core_divisions or not buf.parents:
-                continue
-            (drained,) = (by_name[name] for name in buf.parents)
-            assert drained.chosen_division is not None, drained.name
-            wanted = drained.core_divisions[drained.chosen_division]
-            index = offered(buf, wanted.output_splits)
-            if index is None:
-                raise SolveError(
-                    f"{buf.name}: the division {wanted.label} of {drained.name}, "
-                    "the op it drains, is not one the copy offers"
-                )
-            buf.chosen_division = index
-
-        for buf in buffers:
-            if buf.address is None:
-                reasons.setdefault(
-                    buf.name, solver.excluded(buf) or "added by coarse tiling"
-                )
-        solver.spill_reasons = reasons
-        return buffers
+        self._validated_drain_plans = validated_drain_plans(
+            graph, division_is_fixed=False
+        )
+        return self._build_cd_bound_buffers(
+            graph,
+            self._determine_in_place_division_invariant(graph),
+            _DivisionMap(divisions, set()),
+        )
 
     def _chosen_tilings(
         self, graph: GraphLowering, allocation: Sequence[Any]
@@ -3523,8 +3471,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         hints of its own.
         """
         untiled = [TileSpec()]
-        if getattr(self, "_suppress_tiling", False):
-            return untiled
         if not _solver_picks_tilings():
             return untiled
         if getattr(op, "loop_info", None) is not None:

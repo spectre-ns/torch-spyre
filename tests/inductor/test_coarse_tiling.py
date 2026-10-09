@@ -11147,7 +11147,9 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
 
         # CoarseTilingPass: same tiling expressed as a TileSpec.
         got = self._bare([256], "op0")
-        CoarseTilingPass({"op0": TileSpec((TileAxis(0, 4),))}).apply_pass(_graph([got]))
+        CoarseTilingPass().apply_pass(
+            {"op0": TileSpec((TileAxis(0, 4),))}, _graph([got])
+        )
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(got.data.ranges[0], ref_range)
         # And the win is visible: dim 0 divided by 4.
@@ -11164,9 +11166,9 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         ref_ranges = list(ref.data.ranges)
 
         got = self._bare([256, 128], "op0")
-        CoarseTilingPass(
-            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}
-        ).apply_pass(_graph([got]))
+        CoarseTilingPass().apply_pass(
+            {"op0": TileSpec((TileAxis(0, 4), TileAxis(1, 2)))}, _graph([got])
+        )
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
@@ -11197,7 +11199,7 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         # (untiled/absent choices).
         ops = [self._bare([64], "op0"), self._bare([64], "op1")]
         g = _graph(ops)
-        CoarseTilingPass({}).apply_pass(g)
+        CoarseTilingPass().apply_pass({}, g)
         self.assertEqual(len(g.operations), 2)
         for op in ops:
             self.assertFalse(
@@ -11273,7 +11275,7 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op0, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op0": self._SPEC}).apply_pass(_graph(ops))
+            CoarseTilingPass().apply_pass({"op0": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_refuses_unstamped_op_inside_the_loop(self):
@@ -11283,13 +11285,13 @@ class TestCoarseTilingPassRegionRefusal(unittest.TestCase):
         with self.assertRaisesRegex(
             Unsupported, "would re-tile op1, which a for_each_tile loop already tiles"
         ):
-            CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+            CoarseTilingPass().apply_pass({"op1": self._SPEC}, _graph(ops))
         self.assertEqual(self._state(ops), before)
 
     def test_tiles_op_after_the_loop(self):
         ops = [self._stamped("op0"), self._bare("op1")]
         loop_before = self._state(ops[:1])
-        CoarseTilingPass({"op1": self._SPEC}).apply_pass(_graph(ops))
+        CoarseTilingPass().apply_pass({"op1": self._SPEC}, _graph(ops))
         self.assertIsInstance(ops[1].loop_info, CoarseTileInfo)
         self.assertEqual(ops[1].loop_info.loop_count, [Integer(4)])
         self.assertEqual(ops[1].data.ranges[0], Integer(64))

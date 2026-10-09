@@ -876,8 +876,6 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             if consumer_menu is not None:
 
                 def offered(alloc, op, max_cores):
-                    if getattr(alloc, "_suppress_tiling", False):
-                        return [TileSpec()]
                     if _reads_graph_inputs_only(op):
                         return [_D0_BY_4]
                     return consumer_menu
@@ -1086,6 +1084,29 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         (producer,) = self._model_ops(nest)
         self.assertIn(producer, CollectTilingPasses.lx_resident, _describe(tiling))
 
+    def test_a_unit_tile_keeps_the_plan_the_solve_made(self):
+        # Every op is offered d0:64 alone, a tile one row long. Such a tile no
+        # longer iterates dim 0, so its iteration symbols are numbered from
+        # dim 1: what the solve called d1 is the tile's d0. The division the
+        # solve chose is carried onto the tile under the tile's own symbols.
+        # Taken under the old ones it did not fit the tile, and the whole plan
+        # was given up for greedy placement, which left every tile in HBM.
+        x = torch.randn(64, 64, 128, dtype=torch.float16)
+        y = torch.randn(64, 64, 128, dtype=torch.float16)
+        unit_tile = TileSpec((TileAxis(host_dim=0, count=64),))
+
+        def offered(alloc, op, max_cores):
+            return [unit_tile]
+
+        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
+            cpu, device, tiling = self._compile(lambda x, y: (x + y) * 2 + 1, (x, y))
+        self._assert_close(device, cpu)
+        (nest,) = _nests(tiling).values()
+        model_ops = self._model_ops(nest)
+        self.assertEqual(len(model_ops), 3, _describe(tiling))
+        for name in model_ops:
+            self.assertIn(name, CollectTilingPasses.lx_resident, _describe(tiling))
+
     def test_untiled_op_splits_a_skip_connection_into_two_nests(self):
         # a -> b -> c with a -> c as well. a and c may only be tiled d0:4 and
         # b, between them, only untiled. Loop groups are consecutive runs, so
@@ -1102,7 +1123,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         def offered(alloc, op, max_cores):
             # b is the one op with a single buffer to read.
             reads = {dep.name for dep in op.get_read_writes().reads}
-            if getattr(alloc, "_suppress_tiling", False) or len(reads) == 1:
+            if len(reads) == 1:
                 return [TileSpec()]
             return [_D0_BY_4]
 
@@ -1263,4 +1284,73 @@ class LxOverlapCheckTests(unittest.TestCase):
         self.assertFalse(CoarseTilingPass._check_no_lx_overlap([parent, child]))
         self.assertEqual(
             CoarseTilingPass._lx_overlaps([parent, child]), [(parent, child)]
+        )
+
+
+class CarryPlanTests(unittest.TestCase):
+    """``CoarseTilingPass.carry_plan`` restates the solve's plan over the tiled
+    graph's buffers and reports every way it does not hold there."""
+
+    @staticmethod
+    def _buf(name, uses, size=128, **kwargs):
+        return CoreDivisionBuffer(
+            name, size, uses, core_divisions=[CoreDivision()], **kwargs
+        )
+
+    def test_a_planned_buffer_keeps_its_address_and_added_ones_stay_out(self):
+        # The solve placed p in LX and spilled q. On the tiled graph p is one
+        # tile in size, and the apply added p's copy and the full buffer.
+        planned = [
+            self._buf("p", [0, 1], chosen_division=0, address=64),
+            self._buf("q", [1, 2], chosen_division=0),
+        ]
+        tile = self._buf("p", [0, 2], size=32)
+        spilled = self._buf("q", [2, 3])
+        copy = self._buf(
+            "coarse_tile_copy_p",
+            [1, 4],
+            parents=["p"],
+            cd_parent_matches={"p": [(0, 0)]},
+        )
+        full = CoreDivisionBuffer("full", 128, [0, 4])
+        reasons, violations = CoarseTilingPass.carry_plan(
+            planned, [full, tile, copy, spilled], {"q": "does not fit"}, lambda _: None
+        )
+        self.assertEqual((tile.address, tile.chosen_division), (64, 0))
+        self.assertEqual((copy.address, copy.chosen_division), (None, 0))
+        self.assertIsNone(full.address)
+        self.assertEqual(
+            reasons,
+            {
+                "q": "does not fit",
+                "coarse_tile_copy_p": "added by coarse tiling",
+                "full": "added by coarse tiling",
+            },
+        )
+        self.assertEqual(violations, [])
+
+    def test_every_way_the_plan_fails_on_the_tiled_graph_is_reported(self):
+        # p's copy has no pair with it, and the tiled graph bars r.
+        planned = [
+            self._buf("p", [0, 1], chosen_division=0, address=0),
+            self._buf("r", [5, 6], chosen_division=0, address=512),
+        ]
+        tile = self._buf("p", [0, 2])
+        copy = self._buf(
+            "coarse_tile_copy_p", [1, 3], parents=["p"], cd_parent_matches={"p": []}
+        )
+        barred = self._buf("r", [5, 6])
+        _, violations = CoarseTilingPass.carry_plan(
+            planned,
+            [tile, copy, barred],
+            {},
+            lambda buf: "tiled (advancing)" if buf.name == "r" else None,
+        )
+        self.assertEqual(
+            violations,
+            [
+                "r: placed in LX, but the tiled graph bars it: tiled (advancing)",
+                "p: placed in LX, but coarse_tile_copy_p does not read it as it "
+                "is sliced",
+            ],
         )

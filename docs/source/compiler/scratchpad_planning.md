@@ -653,15 +653,17 @@ along with its core division. It has no effect with any other solver.
   the full buffer and every outside consumer's read of it, plus the tile's
   own write and the copy's read of it when the tile is spilled.
 - **One solve.** When the solve picks any tiling, `CoarseTilingPass`
-  applies it and the plan is carried onto the tiled graph: each buffer
-  keeps its name, and takes the address and division the solve chose for
-  it. An op the apply added, a cut's copy op, takes the division that reads
-  its producer as the producer is sliced. Nothing is solved again. The
-  tiled graph has the last word: a buffer it bars from LX, or one a reader
-  no longer matches, is demoted to HBM, and a plan whose resident buffers
-  would overlap on the tiled graph's lifetimes raises `SolveError`. A
-  `SolveError` from the solve falls back to greedy placement over the
-  untouched graph, and one raised after the apply over the tiled graph.
+  applies it and restates the plan over the tiled graph: each buffer keeps
+  its name, and takes the address and division the solve chose for it. An
+  op the apply added, a cut's copy op, takes the division of the op it
+  drains. The tiled graph's buffers are built with those divisions alone;
+  no menu is enumerated again and nothing is solved again. The tiled graph
+  has the last word, and a plan that does not hold on it is not repaired:
+  a resident buffer it bars from LX or a reader does not read as it is
+  sliced, two resident buffers that would overlap on its lifetimes, or a
+  division one of its ops cannot take raises `SolveError`. A `SolveError`
+  from the solve falls back to greedy placement over the untouched graph,
+  and one raised after the apply over the tiled graph.
 
 ### Joint SA co-optimization
 
