@@ -1236,9 +1236,9 @@ class SplitsOnTileTests(unittest.TestCase):
 
 
 class CommitLxViewsTests(unittest.TestCase):
-    """``commit_lx_views`` gives each buffer placed in LX the per-core view it
-    is held under: the one the residency judge accepts for it on the graph,
-    or, for the source of an accepted relayout, the one its plan carries."""
+    """``commit_lx_views`` sets ``lx_view`` on each buffer placed in LX. A
+    buffer takes the view the residency judge accepts for it; the source of
+    an accepted relayout takes the source view of its plan instead."""
 
     def setUp(self):
         ops = {name: _pointwise_op((4, 64), name=name) for name in ("a", "b")}
