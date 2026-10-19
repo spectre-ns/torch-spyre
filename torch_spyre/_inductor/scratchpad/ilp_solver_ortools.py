@@ -214,6 +214,9 @@ def _op_readers(
     ]
 
 
+# TODO: replace the synthetic copy slots with variable lifetime bounds, so a
+# cut's copy op gets a position of its own instead of a slot reserved after
+# every op.
 class _Slots:
     """Time in the placement model: op ``t`` writes in slot ``2 * t`` and the
     copy op a cut inserts right after it runs in slot ``2 * t + 1``."""
@@ -1875,22 +1878,27 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         variables then stay ``None`` and every method that reads them is a
         no-op.
         """
-        nest_ids: dict[tuple[int, ...], int] = {(): 0}
         divided = {
             name: sb
             for name, sb in tensors.items()
             if getattr(sb.buffer, "core_divisions", None)
         }
+        # Tiled nests take ids from 1; 0 is the untiled nest.
+        nest_ids: dict[tuple[int, ...], int] = {}
         for sb in divided.values():
             for cd in sb.buffer.core_divisions:
-                nest_ids.setdefault(cd.tiling.level_counts, len(nest_ids))
-        if len(nest_ids) == 1:
+                if not cd.tiling.is_untiled:
+                    nest_ids.setdefault(cd.tiling.level_counts, len(nest_ids) + 1)
+        if not nest_ids:
             return
 
-        max_id = max(nest_ids.values())
+        max_id = len(nest_ids)
         tiled: dict[str, cp_model.IntVar] = {}
         for name, sb in divided.items():
-            ids = [nest_ids[cd.tiling.level_counts] for cd in sb.buffer.core_divisions]
+            ids = [
+                0 if cd.tiling.is_untiled else nest_ids[cd.tiling.level_counts]
+                for cd in sb.buffer.core_divisions
+            ]
             sb.loop_id = model.new_int_var(0, max_id, f"loop_id_{name}")
             model.add_element(sb.division, ids, sb.loop_id)
             is_tiled = model.new_bool_var(f"tiled_{name}")
