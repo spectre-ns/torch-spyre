@@ -215,8 +215,8 @@ def _op_readers(
 
 
 class _Slots:
-    """Time in a solve that chooses tilings: op ``t`` writes in slot ``2 * t``
-    and the copy op a cut inserts right after it runs in slot ``2 * t + 1``."""
+    """Time in the placement model: op ``t`` writes in slot ``2 * t`` and the
+    copy op a cut inserts right after it runs in slot ``2 * t + 1``."""
 
     @staticmethod
     def write_slot(time: int) -> int:
@@ -342,8 +342,8 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         # consumer reads the parent from that copy", which pins the division
         # pair and requires the copy resident.
         self.relayout_reads: dict[str, list[tuple[Any, Any]]] = {}
-        # The (start, end) the placement model gave this buffer's box when its
-        # lifetime depends on the tiling chosen; ``None`` on the untiled axis.
+        # The (start, end) in slots the placement model gave this buffer's box,
+        # set by ``_add_no_overlap_2d``.
         self.slot_span: Optional[tuple[_Bound, _Bound]] = None
         # Tiling variables. ``_add_tiling`` sets all but ``end`` on a buffer
         # with core divisions, and only when the menus offer a tiling; they
@@ -1838,7 +1838,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         tensors: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
-    ) -> bool:
+    ) -> None:
         """The loop nests the chosen tilings form, as solver variables on the
         buffers (``loop_id``, ``tiled``, ``cut``, ``via_full``, ``nest_end``).
 
@@ -1870,10 +1870,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         no reduction axis, so a cut tile resides only under a division that
         splits the output alone.
 
-        Returns whether the solve chooses tilings. It does not when nothing
-        carries a non-empty spec, which is every path except the joint solve
-        with ``auto_coarse_tiling`` on: the model is then built exactly as
-        before.
+        Adds nothing when no buffer carries a non-empty spec, which is every
+        path except the joint solve with ``auto_coarse_tiling`` on; the tiling
+        variables then stay ``None`` and every method that reads them is a
+        no-op.
         """
         nest_ids: dict[tuple[int, ...], int] = {(): 0}
         divided = {
@@ -1885,7 +1885,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for cd in sb.buffer.core_divisions:
                 nest_ids.setdefault(cd.tiling.level_counts, len(nest_ids))
         if len(nest_ids) == 1:
-            return False
+            return
 
         max_id = max(nest_ids.values())
         tiled: dict[str, cp_model.IntVar] = {}
@@ -1982,7 +1982,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     )
                 sb.nest_end = end
                 following = sb
-        return True
 
     @staticmethod
     def _tiling_group_ids(
@@ -2234,12 +2233,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # in-place relaxation and its 2D no-overlap need nothing special); the
         # residency gate and the coupling below reference them by group.
         copies = self._relayout_copies(tensors)
-        # False unless the joint solve is actually choosing tilings, which
-        # leaves everything below unchanged.
-        tiles = self._add_tiling(model, tensors, children_of)
-        if tiles:
-            self._add_lifetime_ends(model, tensors, children_of)
-        self._add_inplace_relaxation(model, tensors, in_slots=tiles)
+        self._add_tiling(model, tensors, children_of)
+        self._add_lifetime_ends(model, tensors, children_of)
+        self._add_inplace_relaxation(model, tensors)
         self._add_core_division(model, tensors, children_of, forced_reasons, copies)
         self._constrain_relayout_copies(model, tensors, copies)
 
@@ -2319,8 +2315,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             hbm_terms = [
                 sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()
             ]
-            if tiles:
-                hbm_terms += self._cut_traffic_terms(model, tensors, children_of)
+            hbm_terms += self._cut_traffic_terms(model, tensors, children_of)
             status = cp_model.INFEASIBLE
             if hbm_terms:
                 model.minimize(sum(hbm_terms))
@@ -2471,7 +2466,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
-        in_slots: bool = False,
     ) -> None:
         """In-place reuse as a relaxation of the no-overlap constraint: each
         parent->child edge gets a merge bool that, when active, pins the pair to
@@ -2485,10 +2479,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         The per-buffer ``merge_vars`` bools are read back in ``_extract`` to
         reconstruct placement units.
 
-        With tilings on offer (``in_slots``) a merge also needs the handoff to
-        exist in the tiled graph: the child reads the parent itself,
-        not its copied-out full buffer, and nothing keeps the parent alive past
-        the child's write."""
+        Under a tiling a merge also needs the handoff to exist in the tiled
+        graph: the child reads the parent itself, not its copied-out full
+        buffer, and nothing keeps the parent alive past the child's write."""
         M = self._capacity_units
 
         # A storage slot is handed off linearly, so a buffer reuses at most one
@@ -2525,14 +2518,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # if a buffer is resident its top must be below the peak usage.
             model.add(sb.offset + sb.eff_size <= M).OnlyEnforceIf(sb.in_buffer)
 
-        self._add_no_overlap_2d(model, bufs, incoming, in_slots=in_slots)
+        self._add_no_overlap_2d(model, bufs, incoming)
 
     def _add_no_overlap_2d(
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
         incoming: dict[str, list],
-        in_slots: bool = False,
     ) -> None:
         """Global 2D no-overlap: each resident buffer is an optional rectangle
         ``[start_time, end_time) x [offset, offset + eff_size)`` and no two may
@@ -2563,29 +2555,24 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         covered by the parent's box, whose footprint contains the child's at the
         shared offset.
 
-        ``in_slots`` puts the time axis in :class:`_Slots`, which leave room
-        after every op for the copy a cut inserts there; the mapping is
-        monotone, so it changes no overlap between untiled lifetimes. A buffer
-        with an ``end`` stops at that variable instead of its untiled end."""
+        The time axis is in :class:`_Slots`, which leave room after every op
+        for the copy a cut inserts there; the mapping is monotone, so it
+        changes no overlap between untiled lifetimes. A buffer with an ``end``
+        stops at that variable instead of its untiled end."""
         x_intervals = []
         y_intervals = []
         for sb in bufs.values():
             ins = incoming.get(sb.name, [])
-            if in_slots:
-                start_time = _Slots.write_slot(sb.start_time)
-                last_start = start_time + 1
-                end_time: _Bound = (
-                    sb.end if sb.end is not None else _Slots.end_slot(sb.end_time)
-                )
-            else:
-                start_time, end_time = sb.start_time, sb.end_time
-                last_start = sb.end_time
+            start_time = _Slots.write_slot(sb.start_time)
+            end_time: _Bound = (
+                sb.end if sb.end is not None else _Slots.end_slot(sb.end_time)
+            )
             if ins:
                 # at most one incoming merge is active (AddAtMostOne), so the
                 # sum is 0 or 1: shorten the child by the handoff tick exactly
                 # when it takes over a parent's slot.
                 start_var = model.new_int_var(
-                    start_time, last_start, f"start_{sb.name}"
+                    start_time, start_time + 1, f"start_{sb.name}"
                 )
                 model.add(start_var == start_time + sum(ins))
                 x_start: _Bound = start_var
@@ -2600,8 +2587,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.add(x_size == end_time - x_start)
             else:
                 x_size = end_time - x_start
-            if in_slots:
-                sb.slot_span = (x_start, end_time)
+            sb.slot_span = (x_start, end_time)
             x_intervals.append(
                 model.new_optional_interval_var(
                     x_start, x_size, end_time, sb.in_buffer, f"x_{sb.name}"
@@ -2726,12 +2712,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 components.setdefault(find(n), []).append(n)
 
             def lifetime(name: str) -> tuple[int, int]:
-                # With tilings on offer the model placed each buffer over a
-                # lifetime it solved for (``_add_no_overlap_2d``), and the
-                # slide has to keep clear of that one, not the untiled one.
+                # The slide keeps clear of the lifetime the model placed, which
+                # a tiling can change (``_add_no_overlap_2d``).
                 span = bufs[name].slot_span
-                if span is None:
-                    return by_name[name].start_time, by_name[name].end_time
+                assert span is not None, "_add_no_overlap_2d sets every span"
                 start, end = (
                     bound if isinstance(bound, int) else solver.Value(bound)
                     for bound in span
