@@ -346,18 +346,30 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         # The (start, end) the placement model gave this buffer's box when its
         # lifetime depends on the tiling chosen; ``None`` on the untiled axis.
         self.slot_span: Optional[tuple[_Bound, _Bound]] = None
-        # Set by ``_add_tiling`` when the solve chooses tilings, else ``None``.
-        # ``loop_id`` is the chosen nest (0: untiled); ``tiled`` and ``cut``
-        # say the op is tiled and copied out; ``nest_end`` is the slot its nest
-        # ends, for a tileable op only. ``via_full[child]`` says ``child``
-        # reads the copied-out full buffer, which lives in HBM, so the edge no
-        # longer ties ``child`` to this buffer's tile. ``end`` is the slot this
-        # buffer stops holding LX space, when the tiling decides it.
+        # Tiling variables. ``_add_tiling`` sets all but ``end`` on a buffer
+        # with core divisions, and only when the menus offer a tiling; they
+        # stay ``None``/empty otherwise.
+        # Id of the loop nest the chosen division runs in, one id per distinct
+        # ``tiling.level_counts``; 0 is the untiled nest.
         self.loop_id: Optional[cp_model.IntVar] = None
+        # True iff ``loop_id != 0``: the op runs tile by tile.
         self.tiled: Optional[cp_model.IntVar] = None
+        # True iff the op is tiled and some reader does not share its nest, so
+        # a copy op writes each tile out to the full buffer in HBM. The
+        # objective charges each cut.
         self.cut: Optional[cp_model.IntVar] = None
+        # Slot at which this op's nest finishes: right after its own write
+        # (plus one slot for the copy when cut), or the end of the next op's
+        # nest when the two are joined in one nest. ``None`` marks an op that
+        # cannot be tiled.
         self.nest_end: Optional[cp_model.IntVar] = None
+        # Per reader: true iff the reader takes the copied-out full buffer from
+        # HBM instead of this buffer's tile. That waives the division match a
+        # resident buffer owes the reader and lets it free LX before the read.
         self.via_full: dict[str, cp_model.IntVar] = {}
+        # Slot at which the buffer frees its LX space, set by
+        # ``_add_lifetime_ends`` when a tiling can change its lifetime: a tiled
+        # buffer can free early, and one read inside a nest stays to its end.
         self.end: Optional[cp_model.IntVar] = None
 
     def lifts_bar(self, reason: str) -> Optional[cp_model.IntVar]:
