@@ -139,7 +139,6 @@ after work division has stamped per-op core splits:
 deadcode_elimination
 propagate_named_dims                  # named-dimension metadata (pre-stickification)
 assign_dim_hints
-_maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints produce groups
 insert_bmm_padding                    # pad matmul y's K (pre-stickification)
 split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
@@ -275,8 +274,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
-| `permutation_layout.py` | `PermutationBasedLayoutSolver` |
-| `contact_profile.py` | `Profile`, buffer-contact profiling |
+| `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
 | `graph_editor.py` | `GraphEditor`, the clone/rewrite helper used by input- and output-boundary cloning |
 | `allocator.py` | `ScratchpadAllocator`, `CoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |
@@ -461,8 +459,7 @@ without co-optimization always degrades to a correct plan. Without
 co-optimization the CP-SAT solver only *places* buffers on each op's
 pre-determined core division; with `co_optimizing_lx_planning` it is driven
 by the joint `CoOptimizingAllocator` (below), which additionally chooses
-each op's core division -- see
-[Joint CP-SAT co-optimization](#joint-cp-sat-co-optimization) for what
+each op's core division -- see [The co-optimizer](co_optimizer.md) for what
 happens to that fallback when `ortools` is missing *and* co-optimization is
 requested.
 
@@ -489,189 +486,14 @@ Work division optimizes each op independently for parallelism. Adjacent
 ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
-
 `CoOptimizingAllocator` (the default; gated by
 `config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING`)
-treats split choices and LX placement jointly:
-
-:::{figure} ../_static/images/lx/co-optimization.svg
-:alt: Co-optimization searches over alternative split assignments, scoring each by HBM bytes left unpinned
-:width: 700px
-:align: center
-
-The co-optimizer enumerates split variants per op, scores each
-combination by counting HBM bytes the solver could not pin, and commits
-the winning assignment back before the standard allocator flow.
-:::
-
-Each op's candidate list is built by `_enum_split_options`, dispatching
-on op type. Generated alternatives are deduped by canonical key and filtered
-through `_split_fits_sticks`, which rejects factors that overflow a stickified
-dim's stick count (those would abort the SuperDSC bundler) or that land on a
-collapsed/broadcast dim. The upstream seed is already stick-valid from work
-division. Every candidate, including the seed, must satisfy hard
-work-division constraints: blocked axes remain unsplit and split domains
-restrict legal factors. Candidate divisions remain symbol-keyed in their
-producing operation's iteration space. Fixed candidates and the solver's
-selected candidate are revalidated from that symbol-keyed map before commit;
-LX planning never decodes candidates through the legacy coefficient-keyed
-Scheduler transport. Cross-operation compatibility is derived from physical
-`PerCoreView` ownership rather than comparing those local symbols, so an LX
-candidate remains faithful through selection and commit even when adjacent
-operations use different iteration-symbol names.
-
-**Pointwise ops** get their seed, dim-flip variants (move the seed's
-single output-dim factor onto each compatible alternative output dim,
-bounded by `DEFAULT_VARIANT_CAP = 6`), and the matmul tilings from the
-shared pool (below). Adopting a neighbouring matmul's tiling makes the
-op's per-core view match the matmul's, so the shared buffer pins to LX
-*and* the op runs at the matmul's high-utilization shape.
-
-**Matmul splits are not overridden onto a single dim, but neighbours'
-tilings and a batch-major split are offered.** Concentrating a balanced
-`M/4×N/8` split onto one dim (`M/32`) pins the matmul output and the
-surrounding chain to LX but is a poor matmul shape: on `mlp-linear-kn.t`
-(SENCORES=32) it regressed kernel time ~2.5× as process-engine
-utilization fell from 66% to 33%. So the rule remains **prioritize compute
-utilization for compute-bound ops**: the seed split is never flipped onto
-one dim. Instead, `_check_and_add_matmul_option` offers each matmul its
-seed plus (a) every *other* matmul's split transferred into this op's
-coordinates by axis role (so two matmuls whose work-division splits
-disagree can find a consistent assignment), and (b) a factored batch-major
-`B/M` split. All of these are full-core splits, so compute utilization is
-preserved.
-
-**Batch-major `B/M` tiling reconciles attention.** Two attention matmuls
-(`Q·Kᵀ` and `scores·V`) contract different axes, so neither can adopt the
-other's `N`/`K` tiling, but both keep the batch (`B`) and `M` output
-axes. `_factored_bm_splits` emits a single full-core `B/b · M/m` split
-(largest batch factor that fits, from `(8, 4, 2)` with `m = ncores / b`),
-valid for both matmuls and divisible into both stick-count extents. This
-shared tiling is also offered to the **softmax reductions** (`max`/`sum`)
-in their own output coordinates via `_reduction_bm_axes`. Reductions are
-otherwise left on their seed, but offering them the `B/M` split lets the
-whole softmax chain between the two matmuls reconcile to one tiling. On
-`mha_4h` (SENCORES=32) this converges both matmuls and the entire
-softmax chain on `B/4·M/8`, pinning the scores matrix and the chain to LX.
-Reductions are not given dim-flip variants (their reduced axis is fixed),
-and any candidate that fails to reconcile a shared buffer's per-core view
-self-eliminates during scoring.
-
-The shared matmul-tiling pool is collected once by
-`_find_distinct_matmul_splits`: each distinct matmul seed split plus each
-matmul's factored `B/M` split, deduped. This pool seeds both the pointwise
-candidate lists and the cross-matmul transfer.
-
-On `mlp-linear-kn.t` (SENCORES=32) the pointwise-seeding path lifted
-process-engine utilization from ~66% to ~79% and cut fused kernel time by
-~17% (about 2× faster than the sendnn reference).
-
-The leaf-scoring function is intentionally cheap and solver-agnostic. It
-runs the full `_generate_buffers + plan_layout` pass on the candidate
-splits and counts the HBM bytes of every buffer the solver could not pin.
-Repeated `_per_core_view_on_buf` work is memoized across leaves, and the
-split-invariant liveness / filtered-op-view / mem-usage computations are
-hoisted out of the per-leaf path.
-
-### Joint CP-SAT co-optimization
-
-Setting `layout_solver = "cpsat"` together with
-`co_optimizing_lx_planning` routes co-optimization through
-`CoOptimizingAllocator` instead of the search above. Rather than
-enumerating split variants and scoring leaves, it hands every op's
-candidate core divisions (from `enumerate_work_division_candidates`) and
-the producer/consumer slicing-match constraints to the CP-SAT solver,
-which chooses the core divisions and LX placements jointly in one
-constraint model.
-
-When `ortools` is unavailable, the underlying `cpsat` factory itself
-degrades to the greedy solver -- but greedy has no core-division-capable
-solver to co-optimize with, so `select_allocator` cannot proceed by simply
-handing it to `CoOptimizingAllocator`. The only way to still get a plan is
-to fall back further, wrapping that greedy solver in `ExhaustiveSearchSolver`
-(an expensive DFS over core-division candidates per op). That extra
-fallback is opt-in: it raises `ValueError` unless
-`config.allow_exhaustive_search` (env var `ALLOW_EXHAUSTIVE_SEARCH`) is set.
-The same gate applies to `layout_solver` values of `"greedy"`, `"bestfit"`,
-or `"firstfit"` combined with `co_optimizing_lx_planning`, since none of
-those solvers is core-division-capable either.
-
-#### Solver-driven coarse tiling
-
-`config.auto_coarse_tiling` (env var `AUTO_COARSE_TILING=1`, off by
-default) lets the joint CP-SAT solve choose a coarse tiling for each op
-along with its core division. It has no effect with any other solver.
-
-- **Candidates.** An op is offered the output-axis tilings
-  `enumerate_tile_options` finds: never the stick dim, never a reduction
-  axis, never an axis one of its reads repeats along (the repeated dim of
-  `x.repeat`, whose tiles would have to wrap back over `x`), and none that
-  leave a per-core read over the read-distance limit.
-  Ops a `spyre_hint` or `for_each_tile` loop already tiles, every op inside
-  a `for_each_tile` region, restickifies and mutations are offered only the
-  untiled option. Each tiling gets its own division menu, enumerated on the
-  per-tile frame. A division may split the tiled dim itself across cores,
-  by a factor that divides one tile's extent: the solve owns the divisions
-  of every op it tiles, so the ops of a nest agree on that split, and a
-  cut's copy op follows its producer's. Ops a hint or a `for_each_tile`
-  loop tiled keep their tiled dims whole.
-- **Matching.** A producer/consumer pair of divisions is compatible when
-  the two agree on core ownership and on tile ownership of the buffer they
-  share, both taken on the untiled buffer: tile `t` must touch the same
-  slice on both sides. `TileSpec` equality is not the test. `host_dim` is
-  positional in each op's own output, so equal specs can tile different
-  dims of a shared buffer (a permuted or reducing consumer), and unequal
-  specs the same one. A consumer that reads the buffer more than once has to
-  agree through every read: `a + a.permute(1, 0, 2)` pairs with `a` only
-  under a division or tiling on a dim both reads walk alike. A buffer that
-  may not live in LX gets no compatible pairs, one that some reader takes
-  only in part included: tiling exists to keep buffers in LX, so its
-  producer and consumer never share a nest.
-- **Loop groups.** Consecutive ops that run the same loop nest (the same
-  trip count at each level) share a loop group. The solve requires every
-  producer/consumer edge inside a group to be a compatible pair.
-  `apply_tilings` checks each such edge again and starts a new group at a
-  consumer that does not read its producer tile by tile, which then reads the
-  producer's full buffer; a plan from this solve never has one.
-- **Placement under a tiling.** The solve places the graph its tilings
-  produce, not the untiled one. A *cut* is a tiled op whose value must be
-  copied out of its nest, for a consumer outside it or as a graph output:
-  a copy op right after it drains each tile into a full-sized HBM buffer,
-  which the outside consumer reads. The tile itself stays an LX candidate,
-  read by that copy, so a consumer outside the nest does not hold it out
-  of LX and neither does being a graph output. Lifetimes follow the nest:
-  a tile lives until its last reader in the nest, or its copy; an untiled
-  buffer that a tiled op reads is read again on every iteration and lives
-  until that op's nest ends. An in-place handoff from a tiled buffer needs
-  its reader in the same nest. The solver records every buffer a tiling
-  holds past its last use in `lifetime_extensions` (the op it is held
-  through, why, and whether it still resides) and logs each at debug level.
-- **Objective.** The cost expression is not used, since it has no term for
-  tile size or loop-group boundaries. The solve ranks plans
-  lexicographically: HBM traffic, then the number of cuts, then
-  parallelism, division shape and, last, the fewest tiles. Traffic counts
-  what a cut moves whether or not its tile resides: the copy's write of
-  the full buffer and every outside consumer's read of it, plus the tile's
-  own write and the copy's read of it when the tile is spilled.
-- **One solve.** When the solve picks any tiling, `apply_chosen_tilings`
-  applies it, and the core divisions are then committed onto the tiled
-  graph's ops as a second pass: each op takes the division the solve chose
-  for it, and an op the apply added, a cut's copy op, takes the division of
-  the op it drains. Nothing is solved again, and the tiled graph's buffers
-  are not built again to check the plan: it is taken as it stands. A
-  division that splits a dim its tile no longer iterates raises `SolveError`
-  before anything is committed, and a resident buffer whose readers do not
-  agree on how it is sliced fails the ownership check that follows. A
-  `SolveError` from the solve falls back to greedy placement over the
-  untouched graph, and one raised after the apply over the tiled graph.
-
-### Joint SA co-optimization
-
-Setting `layout_solver = "simulated_annealing"` together with
-`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
-driven by `SaCoOptimizingSolver`, which anneals the division vector and the
-layout permutation as one joint state and scores it with the cost model. See
-[Joint core-division + LX placement](sa_co_optimization.md).
+treats split choices and LX placement jointly instead of leaving this
+interaction to two independent passes. See [The co-optimizer](co_optimizer.md)
+for why this joint search exists, how its production solvers (CP-SAT and
+simulated annealing), the pruned exhaustive-search fallback, and (for CP-SAT)
+solver-driven coarse tiling each work, and which decisions -- scratchpad
+placement, work division, and coarse tiling -- it covers today.
 
 ## LX context switching
 
@@ -769,8 +591,9 @@ utilization). Remaining gaps:
 - **No performance model.** The "honor compute-bound ops, search the
   rest" rule is still a heuristic; the trade between compute throughput
   and memory traffic is not scored.
-- **No coarse-tiling integration** when that pass also drives split
-  decisions.
+- **Coarse-tiling integration**: landed for CP-SAT (`#4768`) and simulated annealing
+  (`#4456`-`#4894`) — see [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling)
+  for current status.
 
 The factored-`B/M` and cross-matmul transfer code is marked TEMP/TODO:
 the intent is for work division to assign consistent splits directly, at
@@ -832,8 +655,10 @@ and softmax reductions. Planned extensions:
 - **Remove the compensating options** once work division assigns
   consistent splits directly (the factored-`B/M` and cross-matmul
   transfer code is marked TEMP/TODO for exactly this).
-- **Joint operation with the `coarse_tiling` pass** when that pass also
-  drives split decisions.
+- **Joint operation with the `coarse_tiling` pass**: landed for CP-SAT (`#4768`) and simulated
+  annealing (`#4456`-`#4894`) — see
+  [The co-optimizer](co_optimizer.md#b-lx-placement-work-division-and-coarse-tiling) for
+  current status.
 
 ### Solver-driven graph mutations
 

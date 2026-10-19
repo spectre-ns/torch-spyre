@@ -73,6 +73,7 @@ def test_each_dimension_precedes_its_fact():
         ("capabilities", "capability_runs"),
         ("artifacts", "artifact_results"),
         ("artifacts", "artifact_tags"),
+        ("artifacts", "artifact_dispatches"),
         ("pipeline_runs", "pipeline_run_legs"),
         ("pipeline_runs", "ci_run_timings"),
     ):
@@ -94,6 +95,7 @@ def test_seed_covers_every_base_table_in_schema():
         "oss_ci_benchmark_v3_by_tag",
         "oss_ci_benchmark_metadata_by_tag",
         "benchmark_metric_verdicts",
+        "artifact_subscription_versions",
     }
     unseeded = declared - {t for t, _, _ in Sandbox.SEED} - filled_by_mv
     assert {t for t in unseeded if not t.startswith("otel_")} == set()

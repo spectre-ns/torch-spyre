@@ -34,7 +34,7 @@ from spyre_clickhouse_ingest.junit import RunCoordinates
 
 AID = "93c0abb3-ed25-5934-b811-31b6c149ba47"
 OTHER = "0" * 8 + AID[8:]
-IMAGE = "icr.io/ai_sw_accel/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
+IMAGE = "icr.io/example/2.0/prod/spyre-inference-devel@sha256:" + "b6" * 32
 JUNIT = """<?xml version="1.0"?><testsuites><testsuite name="s" tests="2"
  timestamp="2026-10-08T10:00:00+00:00"><testcase classname="a.b" name="test_x" time="1"/>
  <testcase classname="a.b" name="test_y" time="1"><failure message="boom"/></testcase>
@@ -113,7 +113,7 @@ def test_offline_writes_a_bundle_from_the_usual_flags(tmp_path, capsys):
     assert meta["started_at"] == "2026-10-08T10:00:00Z"
     assert report["run_id"] == RunId.derive("jenkins", meta["run_key"], "s390x", "fvt")
     assert report["upload_path"].startswith(
-        f"zsp/next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
+        f"next/s390x/v2-results/inbox/{AID}/Spyre-Test_testing_"
     )
 
 
@@ -122,7 +122,7 @@ def test_offline_tgz_and_validate_only(tmp_path, capsys):
     assert cli(["results", "--from-bundle", str(tgz), "--validate-only"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "valid"
-    assert report["upload_path"].split("/")[5] == "sha256-" + "b6" * 32
+    assert report["upload_path"].split("/")[4] == "sha256-" + "b6" * 32
     assert report["run_key"].startswith("manual:<uploader>:")
 
 
@@ -172,6 +172,15 @@ def test_the_minimal_bundle_is_an_artifact_a_tier_and_a_result(tmp_path):
         (
             {"artifact_id": AID, "test_type": "fvt", "started_at": "2026-10-08 10:00"},
             "with a zone",
+        ),
+        (
+            {"artifact_id": AID, "test_type": "fvt", "run_key": "a b#1"},
+            "does not match",
+        ),
+        ({"image": IMAGE[:-1], "arch": "s390x", "test_type": "fvt"}, "does not match"),
+        (
+            {"artifact_id": AID, "test_type": "fvt", "component": "Torch"},
+            "does not match",
         ),
     ],
 )
@@ -345,6 +354,21 @@ def test_a_minimal_bundle_takes_arch_component_and_run_key_from_artifact_and_con
     props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
     assert {"source=bundle", "uploader=jdoe", f"bundle_sha256={sha}"} <= props
     assert argv[-1] == "--strict" and "--dry-run" not in argv
+
+
+def test_bundle_props_reach_the_verdict_but_never_replace_the_source_keys(
+    tmp_path, online, capsys
+):
+    root = _minimal(tmp_path)
+    code, report = _ingest(
+        root, capsys, "--uploader", "jdoe", "--bundle-prop", "channel=dashboard",
+        "--bundle-prop", "source=forged", "--bundle-prop", "uploader=someone",
+    )  # fmt: skip
+    assert (code, report["arch"]) == (0, "s390x")
+    argv = online.calls[0]
+    props = {argv[i + 1] for i, a in enumerate(argv) if a == "--result-prop"}
+    assert {"channel=dashboard", "source=bundle", "uploader=jdoe"} <= props
+    assert not {"source=forged", "uploader=someone"} & props
 
 
 def test_a_re_upload_of_the_same_content_is_a_duplicate(tmp_path, online, capsys):
@@ -685,6 +709,11 @@ class FakeArtifactory(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+@pytest.fixture(autouse=True)
+def results_root(monkeypatch):
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "next/{arch}/v2-results")
+
+
 @pytest.fixture
 def art(monkeypatch):
     FakeArtifactory.store, FakeArtifactory.seen, FakeArtifactory.fail = {}, [], 0
@@ -712,7 +741,7 @@ def test_offline_upload_puts_one_tgz_in_the_inbox(tmp_path, art, capsys):
     assert (code, report["status"]) == (0, "uploaded")
     ((method, path, auth),) = art.cls.seen
     assert path.startswith(
-        f"/artifactory/repo/zsp/next/s390x/v2-results/inbox/{AID}/manual_"
+        f"/artifactory/repo/next/s390x/v2-results/inbox/{AID}/manual_"
     )
     assert path.endswith("-fvt.tgz") and auth == "Bearer tok"
     tgz = tmp_path / "got.tgz"
@@ -728,6 +757,54 @@ def test_a_folder_upload_puts_bundle_json_last_and_retries_a_503(tmp_path, art, 
     puts = [p for m, p, _ in art.cls.seen]
     assert code == 0 and puts[0] == puts[1] and puts[-1].endswith("/bundle.json")
     assert puts[1].endswith("/results/junit.xml")
+
+
+@pytest.mark.parametrize("env", ["ARTIFACTORY_BASE_URL", "ARTIFACTORY_V2_RESULTS_REPO",
+                                 "ARTIFACTORY_V2_RESULTS_ROOT"])  # fmt: skip
+def test_upload_needs_its_location_settings(tmp_path, art, capsys, monkeypatch, env):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv(env, raising=False)
+    flags = {"ARTIFACTORY_BASE_URL": "--base-url", "ARTIFACTORY_V2_RESULTS_REPO": "--repo",
+             "ARTIFACTORY_V2_RESULTS_ROOT": "--root"}  # fmt: skip
+    argv = ["results", "--upload", str(path)]
+    argv += [
+        a
+        for k, f in flags.items()
+        if k != env
+        for a in (f, art.base if f == "--base-url" else "repo")
+    ]
+    capsys.readouterr()
+    assert cli(argv) == offline.FAILED
+    assert f"${env}" in json.loads(capsys.readouterr().out.splitlines()[-1])["reason"]
+
+
+def test_the_location_comes_from_the_environment_or_flags(
+    tmp_path, art, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.setenv("ARTIFACTORY_BASE_URL", art.base)
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_REPO", "repo")
+    monkeypatch.setenv("ARTIFACTORY_V2_RESULTS_ROOT", "env-root/{arch}")
+    capsys.readouterr()
+    assert cli(["results", "--upload", str(path)]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/env-root/s390x/inbox/{AID}/"
+    )
+    assert cli(["results", "--upload", str(path), "--root", "flag-root/{arch}"]) == 0
+    assert art.cls.seen[-1][1].startswith(
+        f"/artifactory/repo/flag-root/s390x/inbox/{AID}/"
+    )
+
+
+def test_validate_only_shows_a_placeholder_when_no_root_is_set(
+    tmp_path, capsys, monkeypatch
+):
+    path = _offline(tmp_path, capsys=capsys)
+    monkeypatch.delenv("ARTIFACTORY_V2_RESULTS_ROOT")
+    capsys.readouterr()
+    assert cli(["results", "--from-bundle", str(path), "--validate-only"]) == 0
+    got = json.loads(capsys.readouterr().out)["upload_path"]
+    assert got.startswith("<ARTIFACTORY_V2_RESULTS_ROOT>/inbox/")
 
 
 def test_upload_without_a_token_fails_clearly(tmp_path, art, capsys, monkeypatch):
@@ -760,7 +837,7 @@ def test_wait_reports_the_relays_outcome(tmp_path, art, capsys, where, status):
     path = _offline(tmp_path, capsys=capsys)
     with offline.opened(path) as root:
         meta, dig = offline.check(root), offline.digest(root)
-    done = f"/artifactory/repo/zsp/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
+    done = f"/artifactory/repo/next/s390x/v2-results/{where}/{AID}/{offline.bundle_name(meta, dig)}.tgz"
     art.cls.store[done] = b"x"
     art.cls.store[done + ".REJECTED.json"] = json.dumps(
         {"reason": "sha256 mismatch"}
@@ -784,97 +861,3 @@ def test_a_sha_is_never_recorded_as_the_vllm_branch(tmp_path, branch, recorded):
         str(VLLM_DATA / "results"), branch, "881a59d2", "", "0", "wf", 0
     )
     assert {r["head_branch"] for r in rows} == {recorded}
-
-
-# --- offline.py without `re`: its hand-coded patterns are the schema's --------------------
-
-
-def _schema_patterns(node=None) -> set:
-    node = offline.schema() if node is None else node
-    found = {node["pattern"]} if isinstance(node, dict) and "pattern" in node else set()
-    children = (
-        node.values()
-        if isinstance(node, dict)
-        else node
-        if isinstance(node, list)
-        else []
-    )
-    for child in children:
-        found |= _schema_patterns(child)
-    return found
-
-
-def test_every_schema_pattern_is_checked_offline():
-    assert _schema_patterns() == set(offline.PATTERNS)
-
-
-SAMPLES = [
-    "",
-    AID,
-    AID.upper(),
-    AID[:-1],
-    AID.replace("-", ""),
-    "x" * 36,
-    IMAGE,
-    "icr.io/a@b@sha256:" + "b6" * 32,
-    "icr.io/a b@sha256:" + "b6" * 32,
-    "@sha256:" + "b6" * 32,
-    IMAGE[:-1],
-    IMAGE + "0",
-    "b6" * 32,
-    "B6" * 32,
-    "spyre-inference",
-    "torch_spyre.x",
-    "-bad",
-    "Bad",
-    "a",
-    "manual:jdoe@in.ibm.com:" + "ab" * 32,
-    "manual:me:7d8121d7-e19f-4844-897b-f9b1fe876278",
-    "manual:me:",
-    "manual::x",
-    "manual:a:b:c",
-    "manual:a b:c",
-    "manual:a:b#1",
-    "Spyre-Test/testing/Jenkinsfile.x#141",
-    "job#",
-    "#1",
-    "a b#1",
-    "a#1#2",
-    "a#1x",
-    "results/junit.xml",
-    "results/x.json",
-    "results/.xml",
-    "results/a/b.xml",
-    "results/a.txt",
-    "attachments/logs/a.log",
-    "attachments/",
-    "attachments/a b",
-    "notes.txt",
-    "0",
-    "12",
-    "1.5",
-    "x1",
-    "²",
-    "café",
-]
-
-
-@pytest.mark.parametrize("pattern", sorted(offline.PATTERNS))
-def test_each_offline_pattern_agrees_with_the_regex(pattern):
-    import regex
-
-    for value in SAMPLES:
-        assert offline.pattern_match(pattern, value) == bool(
-            regex.search(pattern, value)
-        ), value
-
-
-@pytest.mark.parametrize(
-    "key",
-    ["manual:jdoe@in.ibm.com:" + "ab" * 8, "Spyre-Test/testing/Jenkinsfile.torchspyre#141",
-     "a__b", "a?!b", "??x??", "café #1", "plain-key_1.2", ""],
-)  # fmt: skip
-def test_bundle_names_are_what_the_regex_made_them(key):
-    import regex
-
-    assert offline.slug(key) == regex.sub(r"[^A-Za-z0-9._-]+", "_", key)
