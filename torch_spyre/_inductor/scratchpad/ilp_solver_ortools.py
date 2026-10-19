@@ -191,13 +191,12 @@ class _PlacementUnit:
     justified_offset: int = 0  # final justified offset
 
 
-# Residency bars that describe the untiled graph only. A tiled op is always
-# read from LX by something -- a consumer in its nest, or the copy op that
-# drains each tile into the full buffer -- and a tiled graph output hands the
-# boundary to that full buffer.
-_BARS_A_TILING_LIFTS = frozenset(
-    {"no consumer reads it from LX", "graph output (no clone)"}
-)
+def _chose_a_tiling(buffer: LifetimeBoundBuffer) -> bool:
+    return (
+        isinstance(buffer, CoreDivisionBuffer)
+        and buffer.chosen_division is not None
+        and not buffer.core_divisions[buffer.chosen_division].tiling.is_untiled
+    )
 
 
 def _op_readers(
@@ -371,14 +370,6 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         # ``_add_lifetime_ends`` when a tiling can change its lifetime: a tiled
         # buffer can free early, and one read inside a nest stays to its end.
         self.end: Optional[cp_model.IntVar] = None
-
-    def lifts_bar(self, reason: str) -> Optional[cp_model.IntVar]:
-        """The literal under which ``reason`` stops barring this buffer from
-        LX: its tiled literal when the bar only describes the untiled graph
-        (``_BARS_A_TILING_LIFTS``) and the buffer can be tiled, else ``None``."""
-        if self.nest_end is not None and reason in _BARS_A_TILING_LIFTS:
-            return self.tiled
-        return None
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -1760,11 +1751,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             sb = solved[b.name]
             b.address = None if sb.address is None else sb.address * self.alignment
             # Surface a drop cause for every spilled buffer: the pre-solve forced
-            # reason when we have one, otherwise the solver chose to spill it.
+            # reason when we have one, the untiled bar when the op stayed
+            # untiled, otherwise the solver chose to spill it.
+            reason = forced_reasons.get(b.name)
+            if reason is None and not _chose_a_tiling(sb):
+                reason = b.untiled_bar
             b.spill_reason = (
-                forced_reasons.get(b.name, _SOLVER_CHOSE_SPILL)
-                if sb.address is None
-                else None
+                (reason or _SOLVER_CHOSE_SPILL) if sb.address is None else None
             )
             if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
                 b.chosen_division = sb.chosen_division
@@ -2667,13 +2660,18 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         by the precomputed ``cd_parent_matches`` pairs; placement-only buffers
         have no gate.
 
-        A bar that only describes the untiled graph (``_BARS_A_TILING_LIFTS``)
-        holds a tileable buffer out only while it stays untiled."""
-        for name, reason in forced.items():
-            barred = model.add(bufs[name].in_buffer == 0)
-            lifted = bufs[name].lifts_bar(reason)
-            if lifted is not None:
-                barred.only_enforce_if(lifted.negated())
+        A buffer with an ``untiled_bar`` resides only tiled; one the model
+        cannot tile (no ``nest_end``) stays out."""
+        for name in forced:
+            model.add(bufs[name].in_buffer == 0)
+        for sb in bufs.values():
+            if sb.buffer.untiled_bar is None:
+                continue
+            if sb.nest_end is None:
+                model.add(sb.in_buffer == 0)
+            else:
+                assert sb.tiled is not None, "a tileable op has a tiled literal"
+                model.add_implication(sb.in_buffer, sb.tiled)
         for sb in bufs.values():
             sb.constrain_residency(model, children_of.get(sb.name, []), bufs, copies)
 

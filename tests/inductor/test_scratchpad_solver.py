@@ -1823,7 +1823,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             [0],
             core_divisions=[CoreDivision(tiling=spec)],
             boundary=BufferType.Output,
-            residency_reason=reason,
+            untiled_bar=reason,
         )
         untiled_out = CoreDivisionBuffer(
             "untiled_out",
@@ -1831,11 +1831,19 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             [1],
             core_divisions=_whole(),
             boundary=BufferType.Output,
-            residency_reason=reason,
+            untiled_bar=reason,
         )
         res = self._plan([tiled_out, untiled_out], size=1 << 20)
         self.assertIsNotNone(res["tiled_out"].address)
         self.assertIsNone(res["untiled_out"].address)
+        self.assertEqual(res["untiled_out"].spill_reason, reason)
+
+    def test_an_untiled_bar_is_absolute_for_a_solver_without_tilings(self):
+        buf = CoreDivisionBuffer(
+            "out", 128, [0], untiled_bar="no consumer reads it from LX"
+        )
+        solver = GreedyLayoutSolver([buf], size=1 << 20)
+        self.assertEqual(solver.excluded(buf), "no consumer reads it from LX")
 
     def test_a_cut_is_charged_the_traffic_of_its_copy(self):
         # Untiled, p (128) does not fit in 100 and spills: one write and c's

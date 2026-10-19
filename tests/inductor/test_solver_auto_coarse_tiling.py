@@ -1003,22 +1003,22 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         # [1, 32, 1, 64] for [64, 32, 1, 64]. The apply instead gives the full
         # buffer the producer's own device layout, read before the tile is
         # divided, so the untiled consumer reads a buffer of the size it
-        # expects. The enumerator does not offer this tiling; forcing it checks
-        # the apply itself.
+        # expects. The enumerator does not offer this tiling, so the menu
+        # offers it alone: the solve then picks a division the tile can state,
+        # which forcing ``chosen_tilings`` after the solve would not.
         x = torch.randn(1, 64, 2048, dtype=torch.float16)
         y = torch.randn(1, 64, 2048, dtype=torch.float16)
         unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
 
-        def chosen(graph, allocation):
-            return {
-                op.get_operation_name(): unit_tile
-                for op in graph.operations
-                if isinstance(op, ComputedBuffer) and _reads_graph_inputs_only(op)
-            }
+        def offered(alloc, op, max_cores):
+            return [unit_tile] if _reads_graph_inputs_only(op) else [TileSpec()]
 
-        with patch(_CHOSEN_TILINGS, chosen):
-            cpu, device, _ = self._compile(lambda x, y: (x + y) * 2, (x, y))
+        with patch.object(CoOptimizingAllocator, "_tiling_candidates", offered):
+            cpu, device, tiling = self._compile(lambda x, y: (x + y) * 2, (x, y))
         self._assert_close(device, cpu)
+        nests = list(_nests(tiling).values())
+        self.assertEqual(len(nests), 1, _describe(tiling))
+        self.assertIsNone(_nest_mismatch(nests[0], (64,)), _describe(tiling))
 
     def test_permuted_consumer_shares_the_nest_on_the_matching_dim(self):
         # d1:4 is the consumer tiling that walks the producer's dim 0, so the

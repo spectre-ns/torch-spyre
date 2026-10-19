@@ -1045,6 +1045,7 @@ class ScratchpadAllocator:
         planned_lx_buffers: frozenset[str] = frozenset(),
         lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
         drain_plans: Collection[str] = (),
+        tileable: bool = False,
     ) -> Optional[str]:
         """The first check ``name`` fails, or ``None`` if it clears them all.
 
@@ -1067,6 +1068,8 @@ class ScratchpadAllocator:
                 the division and its slicing gate decides instead.
             buf_user_deps: every buffer's ``(op, dep)`` users, from
                 :func:`_get_buffer_user_deps`, for the read-side advancing check.
+            tileable: the solve may tile ``name``'s op, which skips the
+                :meth:`_untiled_residency_bar` checks; the solver applies them.
         """
         if op is None or not self._op_output_good_for_lx_reuse(op, planned_lx_buffers):
             return "op not allowed"
@@ -1137,13 +1140,10 @@ class ScratchpadAllocator:
             # Index tensors and the value tensors they index into are read via
             # data-dependent (indirect) addressing, must stay in hbm.
             return "index tensor or indirectly accessed"
-        if name in graph_output_names:
-            # A graph output normally can't reside (the value must land back in
-            # HBM), but with boundary cloning on it is pinned via an output clone
-            # that still writes HBM once; that unavoidable write cancels from the
-            # CP-SAT differential spill cost, so allow residency then.
-            if not clone_at_graph_boundaries():
-                return "graph output (no clone)"
+        if name in graph_output_names and clone_at_graph_boundaries():
+            # With boundary cloning on a graph output is pinned via an output
+            # clone that still writes HBM once; that unavoidable write cancels
+            # from the CP-SAT differential spill cost, so allow residency then.
             if name in reinterpret_output_names:
                 return "graph output is a ReinterpretView"
             if name in mutated_buffers and name not in drain_plans:
@@ -1158,13 +1158,29 @@ class ScratchpadAllocator:
         if division_is_fixed and ncores.get(name, -1) < 0:
             reason = ncores_reasons.get(name, "core div mismatch")
             return f"core div mismatch: {reason}"
-        if self._read_count(uses) == 0:
-            # Only the producer's write touches it, so residency saves nothing.
-            return "no consumer reads it from LX"
+        if not tileable:
+            untiled_bar = self._untiled_residency_bar(name, uses, graph_output_names)
+            if untiled_bar is not None:
+                return untiled_bar
         if _would_produce_lx_back_gap(graph, name, uses):
             # backGap fires when device_size[d] > it_dim_size; the backend
             # supports it for HBM but not for LX.
             return "lx back gap"
+        return None
+
+    def _untiled_residency_bar(
+        self, name: str, uses: list[int], graph_output_names: set[str]
+    ) -> Optional[str]:
+        """Why ``name`` cannot reside while its op is untiled, among the reasons
+        a tiling removes: a tiled op is always read from LX (by a consumer in
+        its nest, or by the copy that drains each tile into the full buffer),
+        and a tiled graph output hands the boundary to that full buffer."""
+        if name in graph_output_names and not clone_at_graph_boundaries():
+            # The value must land back in HBM.
+            return "graph output (no clone)"
+        if self._read_count(uses) == 0:
+            # Only the producer's write touches it, so residency saves nothing.
+            return "no consumer reads it from LX"
         return None
 
     def _input_residency_reason(
@@ -1237,6 +1253,7 @@ class ScratchpadAllocator:
         planned_lx_buffers: frozenset[str] = frozenset(),
         lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
         drain_plans: Collection[str] = (),
+        tileable: Collection[str] = (),
     ) -> dict[str, Optional[str]]:
         """:meth:`_buffer_residency_reason` over ``names``, as ``name -> reason``.
 
@@ -1284,6 +1301,7 @@ class ScratchpadAllocator:
                 planned_lx_buffers=planned_lx_buffers,
                 lx_relayout_plans=lx_relayout_plans,
                 drain_plans=drain_plans,
+                tileable=name in tileable,
             )
             for name in names
         }
@@ -3716,6 +3734,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         mem_usage: dict,
         lifetimes: dict[str, list[int]],
         drain_plans: Collection[str] = (),
+        tileable: Collection[str] = (),
     ) -> dict[str, Optional[str]]:
         """Per-buffer residency verdict: ``None`` if the buffer may be pinned in
         LX, else the reason it may not.
@@ -3735,6 +3754,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             division_is_fixed=False,
             lifetimes=lifetimes,
             drain_plans=drain_plans,
+            tileable=tileable,
         )
 
     def _build_cd_bound_buffers(
@@ -3792,8 +3812,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         prep_cache: dict = {}
         buffers: list[CoreDivisionBuffer] = []
+        # Ops whose menu offers a tiling: the solve decides their untiled-only
+        # bars (``untiled_bar``) instead of the allocator.
+        tileable = {
+            name
+            for name, divs in divisions.items()
+            if any(not cd.tiling.is_untiled for cd in divs)
+        }
         residency_by_buf = self._residency_by_buf(
-            graph, mem_usage, lifetimes, drain_plans
+            graph, mem_usage, lifetimes, drain_plans, tileable
         )
 
         # Resolve every compiler-tagged carry before constructing any buffer.
@@ -4065,6 +4092,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 cd_parent_relayouts=cd_parent_relayouts,
                 residency_edges=residency_edges,
                 residency_reason=residency_reason,
+                untiled_bar=self._untiled_residency_bar(
+                    output_name, uses, graph_output_names
+                )
+                if output_name in tileable
+                else None,
                 lifetime_start_override=lifetime_start_overrides.get(output_name),
                 lifetime_end_override=lifetime_end_overrides.get(output_name),
                 op_position=position_by_name.get(output_name),

@@ -354,6 +354,12 @@ The checks, in evaluation order (the first failure is the reason reported):
 That last distinction is the only difference between the two allocators,
 and it is a parameter (`division_is_fixed`) rather than a second predicate.
 
+With `auto_coarse_tiling` on, the joint path does not bar an op whose menu
+offers a tiling for `graph output (no clone)` or `no consumer reads it from
+LX`: both hold only while the op is untiled. The buffer carries the reason as
+`untiled_bar` instead, and the CP-SAT solve keeps it out of LX unless it tiles
+the op.
+
 ### Per-core size and core-division mismatch
 
 A buffer's LX footprint is its **per-core** size, not its total size: a

@@ -93,6 +93,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Why the buffer cannot reside while its op is untiled, set instead of
+    # ``residency_reason`` when the solve may tile the op: the solver keeps the
+    # buffer out of LX unless it chooses a tiling for it.
+    untiled_bar: Optional[str] = None
     # Optional lifetime bounds for storage reused by a counted loop. Keep these
     # separate from ``uses``: they change address overlap, but must not
     # manufacture reads or inflate residency/spill benefit.
@@ -1099,6 +1103,9 @@ class MemoryPlanSolver(ABC):
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
         if buffer.residency_reason is not None:
             return buffer.residency_reason
+        if buffer.untiled_bar is not None and not self.tilings_from_menu():
+            # Only a solver choosing among the menu's tilings can lift it.
+            return buffer.untiled_bar
         if buffer.min_footprint > self.limit:
             return (
                 f"min footprint {buffer.min_footprint} B > LX capacity {self.limit} B"
