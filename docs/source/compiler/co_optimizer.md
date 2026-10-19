@@ -594,8 +594,9 @@ Open items from drafting this page that are worth resolving before calling it do
 ### Tiling-related:
 
 - Both solvers decide by the cost model whether a tiling pays, and can decide against it:
-  `test_solver_auto_coarse_tiling.py`'s MLP stays untiled (`may_stay_untiled`). How closely the tile-count symbols track the device is not covered
-  by the sweep plan (see the sweep-coverage item above).
+  `test_solver_auto_coarse_tiling.py`'s MLP stays untiled (`stays_untiled`). How closely
+  the tile-count symbols track the device is not covered by the sweep plan (see the
+  sweep-coverage item above).
 - The existing docs use "tiling" for two different things — `CoreDivision.tiling` (coarse
   tiling proper, a `TileSpec`), and `scratchpad_planning.md`'s co-optimization section calling
   core-division splits for matmuls "the matmuls' tilings." The code no longer does:
