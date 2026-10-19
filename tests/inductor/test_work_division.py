@@ -3118,14 +3118,38 @@ class TestCoOptimizingAllocator(unittest.TestCase):
                 chosen_division=0,
             )
         ]
+        ctx = MagicMock(span_min_splits={batch: 8})
+        ctx.obeys_op_constraints.return_value = True
+        ctx.meets_span_floors.return_value = False
         with (
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
                 return_value=False,
             ),
-            self.assertRaisesRegex(Unsupported, "chosen split violates hard domain"),
+            patch.object(
+                allocator_module, "work_division_context_for_op", return_value=ctx
+            ),
+            self.assertRaises(Unsupported) as caught,
         ):
             allocator_module.commit_divisions(graph, allocation)
+        message = str(caught.exception)
+        self.assertIn("chosen split {batch: 4} violates hard domain", message)
+        self.assertIn("fails span floors {batch: 8}", message)
+        self.assertNotIn("op constraints", message)
+        label = allocation[0].core_divisions[0].label
+        self.assertIn(f"division {label}, tiling untiled", message)
+
+    def test_a_division_the_tiled_graph_cannot_state_is_unsupported(self):
+        # The tilings are applied by then, so a SolveError would send the
+        # greedy fallback onto a graph the solve rewrote.
+        violation = "buf0: the division d0:4 splits a dim its tile no longer iterates"
+        with (
+            patch.object(
+                allocator_module, "planned_splits", return_value=({}, [violation])
+            ),
+            self.assertRaisesRegex(Unsupported, violation),
+        ):
+            allocator_module.commit_divisions(MagicMock(operations=[]), [])
 
     def test_no_enumerable_candidates_keeps_legal_fixed_division(self):
         op = MagicMock(spec=ComputedBuffer)

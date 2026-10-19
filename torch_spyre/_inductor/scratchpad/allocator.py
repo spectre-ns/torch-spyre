@@ -58,6 +58,7 @@ from torch_spyre._inductor.work_division import (
     build_residency_edge,
     enumerate_work_division_candidates,
     has_resolved_work_div_hint,
+    work_division_context_for_op,
     work_division_splits_are_legal,
     _core_division,
     _view_for_div,
@@ -2203,6 +2204,32 @@ def _split_option_is_legal(op: Operation, splits: dict[sympy.Symbol, int]) -> bo
     )
 
 
+def _hard_domain_violation(
+    op: Operation,
+    splits: dict[sympy.Symbol, int],
+    division: Optional[CoreDivision],
+) -> str:
+    """The ``Unsupported`` message for ``splits`` failing ``op``'s hard domains."""
+    assert isinstance(op, ComputedBuffer), "only a ComputedBuffer has hard domains"
+    ctx = work_division_context_for_op(op)
+    assert ctx is not None, "an op with no context passes every hard domain"
+    failed = []
+    if not ctx.obeys_op_constraints(splits):
+        failed.append("op constraints")
+    if not ctx.meets_span_floors(splits):
+        failed.append(f"span floors {ctx.span_min_splits}")
+    chosen = (
+        f"division {division.label}, tiling {division.tiling.label}, "
+        if division is not None
+        else ""
+    )
+    return (
+        f"{op.name}: chosen split {splits} violates hard domain "
+        f"(fails {' and '.join(failed)}; {chosen}"
+        f"ranges {[str(r) for r in op.data.ranges]})"
+    )
+
+
 def _legal_split_options(
     op: Operation, options: Iterable[dict[sympy.Symbol, int]]
 ) -> list[dict[sympy.Symbol, int]]:
@@ -2684,12 +2711,18 @@ def commit_divisions(
     region.
 
     Runs on the tiled graph, where ``planned_splits`` restates each
-    division. One it cannot restate raises ``SolveError`` before anything is
-    committed.
+    division. One it cannot restate raises ``Unsupported``, not
+    ``SolveError``: the tilings are already applied, so the greedy fallback
+    in ``scratchpad_planning`` would replan a graph it did not see.
     """
     splits, violations = planned_splits(graph, allocation)
     if violations:
-        raise SolveError("; ".join(violations))
+        raise Unsupported("; ".join(violations))
+    chosen = {
+        buf.name: buf.core_divisions[buf.chosen_division]
+        for buf in allocation
+        if buf.chosen_division is not None
+    }
     commits: list[tuple[Operation, dict[sympy.Symbol, int]]] = []
     for op in graph.operations:
         op_splits = splits.get(op.name)
@@ -2714,7 +2747,9 @@ def commit_divisions(
         if not getattr(
             op, JOINT_TILING_AND_DIVISION_ATTR, False
         ) and not _split_option_is_legal(op, op_splits):
-            raise Unsupported(f"{op.name}: chosen split violates hard domain.")
+            raise Unsupported(
+                _hard_domain_violation(op, op_splits, chosen.get(op.name))
+            )
         commits.append((op, op_splits))
     for op, op_splits in commits:
         commit_iteration_space_ownership(op, op_splits)
