@@ -107,7 +107,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from functools import cache
-from typing import TYPE_CHECKING, Any, Generic, NamedTuple, Optional, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Optional,
+    TypeVar,
+    Union,
+    cast,
+)
 import numpy as np
 import sympy
 from sympy.printing.printer import Printer
@@ -155,6 +163,9 @@ _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
 _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
+# A lifetime bound: fixed by op order, or chosen by the solve.
+_Bound = Union[int, "cp_model.IntVar"]
+
 # constant to scale log of core split. error ~0.5%
 _CORE_LOG_SCALE = 32.0
 # cap on the scale for the inverse of a core split, and the scale itself when
@@ -191,10 +202,10 @@ _BARS_A_TILING_LIFTS = frozenset(
 
 @dataclass
 class _TilingModel:
-    """What the tiling the joint solve is choosing means for placement.
+    """How the tilings the joint solve may choose change placement.
 
-    Applying a tiling changes which buffers can reside and for how long, and
-    the placement has to be solved against that graph, not the untiled one.
+    A tiling changes which buffers can reside and for how long, so placement
+    is solved against the tiled graph, not the untiled one.
     Everything here is a solver variable over the buffers' division choices.
 
     ``tiled`` and ``cuts`` hold one literal per divided buffer. ``via_full``
@@ -209,10 +220,10 @@ class _TilingModel:
     copy op a cut inserts right after it runs in slot ``2 * t + 1``.
     """
 
-    tiled: dict[str, Any]
-    cuts: dict[str, Any]
-    via_full: dict[tuple[str, str], Any]
-    nest_end: dict[str, Any]
+    tiled: dict[str, cp_model.IntVar]
+    cuts: dict[str, cp_model.IntVar]
+    via_full: dict[tuple[str, str], cp_model.IntVar]
+    nest_end: dict[str, cp_model.IntVar]
 
     @staticmethod
     def readers(
@@ -229,7 +240,7 @@ class _TilingModel:
             if not isinstance(tensors[child].buffer, RelayoutCopyBuffer)
         ]
 
-    def lifts_bar(self, name: str, reason: str) -> Optional[Any]:
+    def lifts_bar(self, name: str, reason: str) -> Optional[cp_model.IntVar]:
         """The literal under which ``reason`` stops barring ``name`` from LX:
         its tiled literal when the bar only describes the untiled graph
         (``_BARS_A_TILING_LIFTS``) and the buffer can be tiled, else ``None``."""
@@ -250,35 +261,6 @@ class _TilingModel:
     def horizon(tensors: dict[str, "_LifetimeBufferWithCpVars"]) -> int:
         """A slot no lifetime reaches: past the last buffer's end and one copy."""
         return max(_TilingModel.end_slot(sb.end_time) for sb in tensors.values()) + 2
-
-
-class _Hold(NamedTuple):
-    """One thing a tiling can make a buffer wait for past its untiled lifetime:
-    the buffer lives ``until`` (a slot, exclusive) while every literal of
-    ``when`` holds."""
-
-    until: Any
-    when: tuple[Any, ...]
-    cause: str
-
-
-@dataclass(frozen=True)
-class LifetimeExtension:
-    """A buffer the chosen tilings keep alive past its last use in op order.
-
-    Times are op positions, as in ``LifetimeBoundBuffer.uses``. ``last_use`` is
-    where the untiled graph stops needing the buffer. ``held_through`` is the
-    op it has to outlast under the tilings, and ``through_copy`` says it also
-    outlasts the copy op a cut inserts right after that op. A buffer that may
-    reside is reported whether or not it does (``resident``): the longer
-    lifetime is often why it did not fit. One that cannot reside is not.
-    """
-
-    last_use: int
-    held_through: int
-    through_copy: bool
-    cause: str
-    resident: bool
 
 
 def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
@@ -392,7 +374,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         self.relayout_reads: dict[str, list[tuple[Any, Any]]] = {}
         # The (start, end) the placement model gave this buffer's box when its
         # lifetime depends on the tiling chosen; ``None`` on the untiled axis.
-        self.slot_span: Optional[tuple[Any, Any]] = None
+        self.slot_span: Optional[tuple[_Bound, _Bound]] = None
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -429,10 +411,6 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
 
     def constrain_residency(self, model, kids, bufs, copies, via_full=None) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
-
-    def shut_out_by_a_reader(self, solver, kids, bufs, via_full=None) -> bool:
-        """Placement-only: no slicing gate, so no reader shuts the buffer out."""
-        return False
 
     def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
         """Extra conditions on an active in-place merge. None when the division
@@ -642,20 +620,6 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
             if exempt is not None:
                 ways.append(exempt)
             model.add_bool_or(ways).only_enforce_if(self.in_buffer)
-
-    def shut_out_by_a_reader(self, solver, kids, bufs, via_full=None) -> bool:
-        """The gate of :meth:`constrain_residency`, read off a solution: whether
-        some consumer neither matches this buffer's division nor reads its
-        full copy. A relayout copy is not counted; a buffer one serves resides,
-        and this is asked only of buffers that do not."""
-        mine = solver.Value(self.division)
-        for child, compatible in kids:
-            exempt = (via_full or {}).get((self.name, child))
-            if exempt is not None and solver.BooleanValue(exempt):
-                continue
-            if (mine, solver.Value(bufs[child].division)) not in compatible:
-                return True
-        return False
 
     def constrain_merge(self, model, parent, edge) -> None:
         """An active merge means the child reuses the parent's exact per-core
@@ -1694,9 +1658,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # contract does not change. Empty until a solve, so a reader can tell
         # "not recorded" from "no solve".
         self.last_solve_stats: dict = {}
-        # The buffers the last solve's tilings keep alive past their untiled
-        # lifetime, by name. Empty when no tiling was chosen.
-        self.lifetime_extensions: dict[str, LifetimeExtension] = {}
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
@@ -1944,8 +1905,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             model, divided, loop_id, tiled
         )
 
-        cuts: dict[str, Any] = {}
-        via_full: dict[tuple[str, str], Any] = {}
+        cuts: dict[str, cp_model.IntVar] = {}
+        via_full: dict[tuple[str, str], cp_model.IntVar] = {}
         for name, is_tiled in tiled.items():
             diffs: list["cp_model.IntVar"] = []
             # A graph output is copied out whatever its consumers do.
@@ -2013,7 +1974,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Where each tileable op's nest ends: after the last op joined to it,
         # and after that op's copy when it is cut. Walk each run backwards so
         # an op takes its successor's end exactly when the two are joined.
-        nest_end: dict[str, Any] = {}
+        nest_end: dict[str, cp_model.IntVar] = {}
         for run in runs:
             last_time = divided[run[-1]].buffer.uses[0]
             horizon = _TilingModel.write_slot(last_time) + 2
@@ -2143,7 +2104,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         tensors: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
         tiling: _TilingModel,
-    ) -> tuple[dict[str, Any], dict[str, list[_Hold]]]:
+    ) -> dict[str, cp_model.IntVar]:
         """The slot each buffer stops holding its LX space, for every buffer
         whose lifetime depends on the tiling chosen.
 
@@ -2160,17 +2121,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         Each end is bounded from below only. A longer lifetime can only cost
         space, so the solve has no reason to pick one, and an in-place merge
         pins its parent's end exactly (see :meth:`_add_inplace_relaxation`).
-
-        Returns the ends and, per buffer, the bounds that can carry it past its
-        untiled lifetime (:class:`_Hold`), for :meth:`_lifetime_extensions`.
         """
         horizon = _TilingModel.horizon(tensors)
-        ends: dict[str, Any] = {}
-        holds: dict[str, list[_Hold]] = {}
-
-        def hold(name: str, end: Any, until: Any, when: list[Any], cause: str) -> None:
-            model.add(end >= until).only_enforce_if(when)
-            holds.setdefault(name, []).append(_Hold(until, tuple(when), cause))
+        ends: dict[str, cp_model.IntVar] = {}
 
         for name, sb in tensors.items():
             kids = [
@@ -2184,12 +2137,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if not tileable:
                 end = model.new_int_var(untiled_end, horizon, f"end_{name}")
                 for kid in read_by_a_nest:
-                    hold(
-                        name,
-                        end,
-                        tiling.nest_end[kid],
-                        [tiling.tiled[kid]],
-                        f"{kid} reads it on every pass of its nest",
+                    # It is read again on every pass of the kid's nest.
+                    model.add(end >= tiling.nest_end[kid]).only_enforce_if(
+                        tiling.tiled[kid]
                     )
                 ends[name] = end
                 continue
@@ -2198,7 +2148,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             end = model.new_int_var(written + 1, horizon, f"end_{name}")
             model.add(end >= untiled_end).only_enforce_if(is_tiled.negated())
             # The copy op runs in the slot right after the write.
-            hold(name, end, written + 2, [tiling.cuts[name]], "its copy op reads it")
+            model.add(end >= written + 2).only_enforce_if(tiling.cuts[name])
             for kid in kids:
                 kid_buffer = tensors[kid].buffer
                 if not kid_buffer.uses or kid_buffer.first_use_is_read:
@@ -2208,70 +2158,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     tiling.via_full[(name, kid)].negated()
                 )
             for kid in read_by_a_nest:
-                hold(
-                    name,
-                    end,
-                    tiling.nest_end[kid],
-                    [tiling.tiled[kid], is_tiled.negated()],
-                    f"{kid} reads it on every pass of its nest",
+                model.add(end >= tiling.nest_end[kid]).only_enforce_if(
+                    [tiling.tiled[kid], is_tiled.negated()]
                 )
             ends[name] = end
-        return ends, holds
-
-    @staticmethod
-    def _lifetime_extensions(
-        solver: "cp_model.CpSolver",
-        tensors: dict[str, _LifetimeBufferWithCpVars],
-        holds: dict[str, list[_Hold]],
-        tiling: Optional[_TilingModel],
-        forced: dict[str, str],
-        children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
-    ) -> dict[str, LifetimeExtension]:
-        """The buffers the solved tilings keep alive past their untiled lifetime.
-
-        Read from the holds in force in the solution, not from the solved end:
-        an end is only bounded from below, so its value can sit anywhere above
-        what the tilings require. A buffer that cannot reside in the solution
-        has no LX lifetime and is left out: one barred from LX, or one a
-        reader's division shuts out.
-        """
-        extensions: dict[str, LifetimeExtension] = {}
-        for name, bounds in holds.items():
-            assert tiling is not None, "holds come from a tiling model"
-            if name in forced:
-                lifted = tiling.lifts_bar(name, forced[name])
-                if lifted is None or not solver.BooleanValue(lifted):
-                    continue
-            sb = tensors[name]
-            resident = bool(solver.BooleanValue(sb.in_buffer))
-            if not resident and sb.shut_out_by_a_reader(
-                solver,
-                _TilingModel.readers(children_of, tensors, name),
-                tensors,
-                tiling.via_full,
-            ):
-                continue
-            in_force = [
-                (b.until if isinstance(b.until, int) else solver.Value(b.until), b)
-                for b in bounds
-                if all(solver.BooleanValue(literal) for literal in b.when)
-            ]
-            if not in_force:
-                continue
-            until, longest = max(in_force, key=lambda item: item[0])
-            if until <= _TilingModel.end_slot(sb.end_time):
-                continue
-            # ``until`` is exclusive: the last slot held is an op's own (even)
-            # or that of the copy right after it (odd).
-            op, through_copy = divmod(until - 1, 2)
-            extensions[name] = LifetimeExtension(
-                last_use=sb.end_time - 1,
-                held_through=op,
-                through_copy=bool(through_copy),
-                cause=longest.cause,
-                resident=resident,
-            )
-        return extensions
+        return ends
 
     @staticmethod
     def _cut_traffic_terms(
@@ -2279,7 +2170,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         tensors: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
         tiling: _TilingModel,
-    ) -> list[Any]:
+    ) -> list[cp_model.LinearExprT]:
         """HBM traffic a cut adds on top of each buffer's own spill cost.
 
         ``spill_cost`` prices a buffer as resident (free) or spilled (its write
@@ -2289,7 +2180,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         HBM and read back by the copy. Without these terms a resident cut tile
         would look free and the residency stage would cut everywhere.
         """
-        terms: list[Any] = []
+        terms: list[cp_model.LinearExprT] = []
         for name, cut in tiling.cuts.items():
             if name not in tiling.nest_end:
                 continue  # never tiled, so never cut
@@ -2374,10 +2265,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # ``None`` unless the joint solve is actually choosing tilings, which
         # leaves everything below unchanged.
         tiling = self._tiling_model(model, tensors, children_of)
-        ends, holds = (
+        ends = (
             self._lifetime_ends(model, tensors, children_of, tiling)
             if tiling is not None
-            else (None, {})
+            else None
         )
         self._add_inplace_relaxation(model, tensors, tiling, ends)
         self._add_core_division(
@@ -2529,9 +2420,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     status = _solve_stage("tile count")
 
         final_tensors = self._extract(solver, tensors)
-        self.lifetime_extensions = self._lifetime_extensions(
-            solver, tensors, holds, tiling, forced_reasons, children_of
-        )
 
         if logger.isEnabledFor(logging.DEBUG):
             if status is None:
@@ -2566,17 +2454,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     "[CP-SAT layout solver]   %s -> HBM: %s",
                     name,
                     forced_reasons.get(name, _SOLVER_CHOSE_SPILL),
-                )
-            for name, extension in sorted(self.lifetime_extensions.items()):
-                logger.debug(
-                    "[CP-SAT layout solver]   %s lifetime (%s): last use at op "
-                    "%d, held through op %d%s: %s",
-                    name,
-                    "resident" if extension.resident else "spilled",
-                    extension.last_use,
-                    extension.held_through,
-                    " and its copy" if extension.through_copy else "",
-                    extension.cause,
                 )
 
         return final_tensors
@@ -2630,7 +2507,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
         tiling: Optional[_TilingModel] = None,
-        ends: Optional[dict[str, Any]] = None,
+        ends: Optional[dict[str, cp_model.IntVar]] = None,
     ) -> None:
         """In-place reuse as a relaxation of the no-overlap constraint: each
         parent->child edge gets a merge bool that, when active, pins the pair to
@@ -2694,7 +2571,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
         incoming: dict[str, list],
-        ends: Optional[dict[str, Any]] = None,
+        ends: Optional[dict[str, cp_model.IntVar]] = None,
         in_slots: bool = False,
     ) -> None:
         """Global 2D no-overlap: each resident buffer is an optional rectangle
@@ -2738,7 +2615,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if in_slots:
                 start_time = _TilingModel.write_slot(sb.start_time)
                 last_start = start_time + 1
-                end_time: Any = ends.get(sb.name, _TilingModel.end_slot(sb.end_time))
+                end_time: _Bound = ends.get(sb.name, _TilingModel.end_slot(sb.end_time))
             else:
                 start_time, end_time = sb.start_time, sb.end_time
                 last_start = sb.end_time
@@ -2750,7 +2627,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     start_time, last_start, f"start_{sb.name}"
                 )
                 model.add(start_var == start_time + sum(ins))
-                x_start: Any = start_var
+                x_start: _Bound = start_var
             else:
                 x_start = start_time
             if sb.name in ends:
