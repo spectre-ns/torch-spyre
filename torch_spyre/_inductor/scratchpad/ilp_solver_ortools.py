@@ -122,7 +122,7 @@ else:
         cp_model = None
         _CP_MODEL_IMPORT_ERROR = str(exc)
 
-from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+from torch_spyre._inductor.scratchpad.cpsat_expr_printer import cost_expr_to_cpsat
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -694,7 +694,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
-            cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
+            cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution

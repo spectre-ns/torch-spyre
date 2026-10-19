@@ -16,7 +16,7 @@
 objective, kept apart from the layout model in ``ilp_solver_ortools`` that
 calls it.
 
-:class:`_SympyExprToCpSat` reads the solver only through the two maps it is
+:func:`cost_expr_to_cpsat` reads the solver only through the two maps it is
 given: ``sym_map`` (symbol name -> CP-SAT var, plus ``_division_of_<sym>`` ->
 the division-choosing buffer wrapper) and ``buffer_map`` (split or tile symbol
 name -> ``(wrapper, candidate values)``). A wrapper supplies ``buffer``,
@@ -44,6 +44,8 @@ else:
         from ortools.sat.python import cp_model, cp_model_helper
     except ImportError:  # pragma: no cover - only when ortools is absent
         cp_model = cp_model_helper = None
+
+__all__ = ["cost_expr_to_cpsat"]
 
 logger = logging.getLogger(__name__)
 
@@ -1065,3 +1067,12 @@ class _SympyExprToCpSat(Printer):
         self._model.AddMinEquality(min_var, args)
         self._count += 1
         return min_var
+
+
+def cost_expr_to_cpsat(
+    model: "cp_model.CpModel", sym_map: dict, buffer_map: dict, cost_expr: sympy.Expr
+) -> "cp_model.LinearExpr":
+    """``cost_expr`` as a CP-SAT expression over ``model``; the variables and
+    constraints the lowering needs are added to ``model``, and ``sym_map`` gains
+    the helper variables it creates."""
+    return _SympyExprToCpSat(model, sym_map, buffer_map).convert(cost_expr)
