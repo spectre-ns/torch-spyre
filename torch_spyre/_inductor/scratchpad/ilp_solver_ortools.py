@@ -1895,6 +1895,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         max_id = len(nest_ids)
         tiled: dict[str, cp_model.IntVar] = {}
         for name, sb in divided.items():
+            # Map each candidate in the buffer's division menu to its global
+            # nest id, so ``loop_id`` follows the division the solve picks.
             ids = [
                 0 if cd.tiling.is_untiled else nest_ids[cd.tiling.level_counts]
                 for cd in sb.buffer.core_divisions
