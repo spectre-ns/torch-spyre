@@ -869,6 +869,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         variables then stay ``None`` and every method that reads them is a
         no-op.
         """
+        UNTILED_ID = 0
         divided = {
             name: sb
             for name, sb in tensors.items()
@@ -889,14 +890,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # Map each candidate in the buffer's division menu to its global
             # nest id, so ``loop_id`` follows the division the solve picks.
             ids = [
-                0 if cd.tiling.is_untiled else nest_ids[cd.tiling.level_counts]
+                UNTILED_ID if cd.tiling.is_untiled else nest_ids[cd.tiling.level_counts]
                 for cd in sb.buffer.core_divisions
             ]
             sb.loop_id = model.new_int_var(0, max_id, f"loop_id_{name}")
             model.add_element(sb.division, ids, sb.loop_id)
             is_tiled = model.new_bool_var(f"tiled_{name}")
-            model.add(sb.loop_id != 0).only_enforce_if(is_tiled)
-            model.add(sb.loop_id == 0).only_enforce_if(is_tiled.negated())
+            model.add(sb.loop_id != UNTILED_ID).only_enforce_if(is_tiled)
+            model.add(sb.loop_id == UNTILED_ID).only_enforce_if(is_tiled.negated())
             sb.tiled = tiled[name] = is_tiled
 
         group, segment, runs, joined = self._tiling_group_ids(model, divided, tiled)
