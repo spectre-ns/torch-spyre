@@ -186,6 +186,23 @@ class _PlacementUnit:
     justified_offset: int = 0  # final justified offset
 
 
+@dataclass(frozen=True)
+class _TilingGroups:
+    """The loop nests the solve may form, as built by ``_add_tiling_groups``."""
+
+    # Loop group id per tileable op. Two ops share a nest exactly when their
+    # ids agree; ids are only comparable within one segment.
+    group: dict[str, "cp_model.IntVar"]
+    # Segment index per tileable op: a maximal stretch of tileable ops at
+    # consecutive positions. Ops in different segments never share a nest, and
+    # an op with no entry can never be tiled.
+    segment: dict[str, int]
+    # Each segment's ops in op order: the longest nest they could form.
+    runs: list[list[str]]
+    # Per op except a run's first: true iff it shares its predecessor's nest.
+    joined: dict[str, "cp_model.IntVar"]
+
+
 def _chose_a_tiling(buffer: LifetimeBoundBuffer) -> bool:
     return (
         isinstance(buffer, CoreDivisionBuffer)
@@ -900,7 +917,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             model.add(sb.loop_id == UNTILED_ID).only_enforce_if(is_tiled.negated())
             sb.tiled = tiled[name] = is_tiled
 
-        group, segment, runs, joined = self._add_tiling_groups(model, divided, tiled)
+        groups = self._add_tiling_groups(model, divided, tiled)
 
         cuts: dict[str, cp_model.IntVar] = {}
         for name, is_tiled in tiled.items():
@@ -908,19 +925,21 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             diffs: list["cp_model.IntVar"] = []
             # A graph output is copied out whatever its consumers do.
             unshareable = getattr(sb.buffer, "boundary", None) == BufferType.Output
-            seg = segment.get(name)
+            seg = groups.segment.get(name)
             for child, pairs in _op_readers(children_of, tensors, name):
                 # A consumer with no divisions of its own (placement-only), or
                 # one an untileable op separates from this buffer, can never
                 # share its nest, so reading it is always a cut.
-                if seg is None or segment.get(child) != seg:
+                if seg is None or groups.segment.get(child) != seg:
                     unshareable = True
                     if seg is not None:
                         sb.via_full[child] = is_tiled
                     continue
                 d = model.new_bool_var(f"apart_{name}_{child}")
-                model.add(group[name] != group[child]).only_enforce_if(d)
-                model.add(group[name] == group[child]).only_enforce_if(d.negated())
+                model.add(groups.group[name] != groups.group[child]).only_enforce_if(d)
+                model.add(groups.group[name] == groups.group[child]).only_enforce_if(
+                    d.negated()
+                )
                 _gate_divisions(
                     model, pairs, sb.division, divided[child].division, d.negated()
                 )
@@ -965,7 +984,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # Where each tileable op's nest ends: after the last op joined to it,
         # and after that op's copy when it is cut. Walk each run backwards so
         # an op takes its successor's end exactly when the two are joined.
-        for run in runs:
+        for run in groups.runs:
             last_time = divided[run[-1]].buffer.uses[0]
             horizon = _Slots.write_slot(last_time) + 2
             following: Optional[_LifetimeBufferWithCpVars] = None
@@ -977,10 +996,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     model.add(end == own + cuts[name])
                 else:
                     model.add(end == following.nest_end).only_enforce_if(
-                        joined[following.name]
+                        groups.joined[following.name]
                     )
                     model.add(end == own + cuts[name]).only_enforce_if(
-                        joined[following.name].negated()
+                        groups.joined[following.name].negated()
                     )
                 sb.nest_end = end
                 following = sb
@@ -990,12 +1009,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         model: "cp_model.CpModel",
         divided: dict[str, _LifetimeBufferWithCpVars],
         tiled: dict[str, "cp_model.IntVar"],
-    ) -> tuple[
-        dict[str, "cp_model.IntVar"],
-        dict[str, int],
-        list[list[str]],
-        dict[str, "cp_model.IntVar"],
-    ]:
+    ) -> _TilingGroups:
         """The loop group each tileable op lands in, as solver variables.
 
         ``derive_tiling_groups`` fuses only *consecutive* ops that run the same
@@ -1009,11 +1023,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         An op that can never be tiled -- one with only untiled candidates, or
         no op-output buffer in the solve at all -- always breaks the run, so it
-        starts a new *segment* instead of a literal. Returns ``(group,
-        segment, runs, joined)``: an op in no segment is untileable, and ops in
-        different segments are split whatever the solve picks. ``runs`` lists
-        each segment's ops in order, and ``joined`` maps every op but a run's
-        first to the literal that it shares its predecessor's nest.
+        starts a new *segment* instead of a literal.
         """
         position = {
             name: sb.buffer.uses[0]
@@ -1053,7 +1063,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 runs[-1].append(name)
                 joined_to_prev[name] = joined
             prev = name
-        return group, segment, runs, joined_to_prev
+        return _TilingGroups(group, segment, runs, joined_to_prev)
 
     def _tile_count_terms(
         self,
