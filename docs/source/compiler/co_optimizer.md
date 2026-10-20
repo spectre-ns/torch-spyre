@@ -352,11 +352,14 @@ the tiled graph's ops, and the placement stands.
   inside one must be compatible. The solve ranks plans with the lexicographic ladder described
   above, not `cost_expr`. It places the graph its tilings produce: a *cut* (a tiled op whose
   value must leave its nest) gets a copy op that drains each tile into a full-sized HBM
-  buffer, the tile itself stays an LX candidate, and a buffer a tiled op reads lives until
-  that op's nest ends. Once it picks a tiling, `apply_chosen_tilings` applies it and each op
-  takes the division the solve chose for it, a cut's copy op that of the op it drains. A
-  division that splits a dim its tile no longer iterates raises `SolveError` before anything
-  is committed.
+  buffer, and the first ladder stage charges that copy's traffic. The tile itself stays an LX
+  candidate, but only under a division with no reduction split, since the copy reads it core
+  for core. A buffer a tiled op reads lives until that op's nest ends, and an input clone it
+  reads is held from the nest's start. Once it picks a tiling, `apply_chosen_tilings`
+  applies it and each op takes the division the solve chose for it, a cut's copy op that of
+  the op it drains. A division that splits a dim its tile no longer iterates raises
+  `Unsupported`: the tilings are already applied by then, so the greedy fallback, which
+  catches only `SolveError`, cannot replan the graph.
 
 - **Simulated annealing**: landed via `#4456` through `#4894`. `OpSplitSpace`'s `TilingSpace`
   half offers each op its tilings; the **flip** move shifts a tiled run's boundary, and the

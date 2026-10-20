@@ -41,7 +41,8 @@ constraint model over :class:`CoreDivisionBuffer`s:
   level's optimum as a constraint before optimizing the next). *Residency
   is the hard priority.* It first minimizes total **HBM transfer traffic** via
   ``spill_cost(b) * (1 - in_buffer)`` -- the *differential* traffic a spill adds
-  over residency (resident buffers contribute 0). An intermediate costs
+  over residency (resident buffers contribute 0) -- plus, when the solve chooses
+  tilings, each cut's copy traffic (``_cut_traffic_terms``). An intermediate costs
   ``(num_consumers + 1) * size`` (the producer's HBM write, which residency turns
   into a free LX write, plus one re-read per consumer); a graph input drops the
   producer write it never had and the clone-in read residency cannot avoid
@@ -160,18 +161,6 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
 # A lifetime bound: fixed by op order, or chosen by the solve.
 _Bound = Union[int, "cp_model.IntVar"]
-
-# constant to scale log of core split. error ~0.5%
-_CORE_LOG_SCALE = 32.0
-# cap on the scale for the inverse of a core split, and the scale itself when
-# the split has no candidate values (see _SympyExprToCpSat._inv_scale).
-# error <= ~4%
-_CORE_INV_SCALE = 1024
-# largest value _CORE_INV_SCALE is sized for: the core count. Past it (a tile
-# count can be any divisor of its axis) the cap grows in step, see _inv_scale.
-_CORE_INV_SCALE_MAX_VALUE = 32
-# constant limit on product terms to avoid int32 overflow in CP-SAT
-_MAX_PRODUCT_BOUND = 2**30
 
 
 @dataclass
@@ -1175,9 +1164,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
           clone read by a tiled op may also be hoisted to the nest's entry, so
           its ``start`` reaches back to that op's ``nest_start``.
 
-        Each end is bounded from below only, and each start from above only. A longer lifetime can only cost
-        space, so the solve has no reason to pick one, and an in-place merge
-        pins its parent's end exactly (see :meth:`_add_inplace_relaxation`).
+        Each end is bounded from below only, and each start from above only. A
+        longer lifetime can only cost space, so the solve has no reason to pick
+        one, and an in-place merge pins its parent's end exactly (see
+        :meth:`_add_inplace_relaxation`).
         """
         horizon = _Slots.horizon(tensors)
         for name, sb in tensors.items():
@@ -1199,6 +1189,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 if sb.buffer.first_use_is_read:
                     # An input clone may be hoisted to the entry of the nest
                     # that reads it, so its slot is held from the nest's start.
+                    # Defense in depth: today a resident clone forces its readers
+                    # untiled (``_views_for_divs``), so this never binds.
                     untiled_start = _Slots.write_slot(sb.start_time)
                     sb.start = model.new_int_var(0, untiled_start, f"start_{name}")
                     for kid in read_by_a_nest:

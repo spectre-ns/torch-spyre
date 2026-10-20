@@ -2864,9 +2864,7 @@ def log_solver_decisions(graph: GraphLowering, allocation: Sequence[Any]) -> Non
 
     The solve's own output is otherwise invisible: the spill log reports
     residency but not the chosen division or tiling, and nothing reports
-    whether that choice survived ``commit_divisions`` -- which silently
-    skips any op lacking ``iteration_space_ownership``, i.e. every op
-    synthesised after the work-division pass ran. Pairing this against the
+    whether that choice survived ``commit_divisions``. Pairing this against the
     emitted ``OpSpec`` work slices is how a decided-but-discarded division
     shows up.
     """

@@ -155,7 +155,7 @@ Nothing gives that residency back yet; a tile-local staging copy, placed by the 
 before the divisions are committed, so the ownership is built against the already-tiled op, the
 same apply the CP-SAT solve uses. `check_priced_footprints` then checks that each tiled buffer's
 applied per-core footprint is the one it was placed at, and `commit_divisions` restates each
-tiled op's splits on the symbols its tile iterates (`planned_splits`), refusing with `SolveError`
+tiled op's splits on the symbols its tile iterates (`planned_splits`), refusing with `Unsupported`
 only a split above 1 on an axis the tiling squeezed away; a copy-out takes the division of the op
 it drains. The anneal's placement stands, and the companion buffers the apply mints stay in HBM.
 A refusal from the apply raises: it is a defect in `OpSplitSpace.admits`, not a graph to route
