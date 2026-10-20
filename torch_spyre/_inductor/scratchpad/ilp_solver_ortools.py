@@ -1186,6 +1186,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             ]
             read_by_a_nest = [kid for kid in kids if kid.nest_end is not None]
             if sb.nest_end is None and not read_by_a_nest:
+                # Neither this buffer nor any reader can be tiled, so no tiling
+                # choice can move its end (or start): it keeps its untiled
+                # lifetime and ``end`` stays None.
                 continue
             untiled_end = _Slots.end_slot(sb.end_time)
             if sb.nest_end is None:
