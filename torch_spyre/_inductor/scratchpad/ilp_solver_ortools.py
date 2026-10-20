@@ -981,9 +981,21 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     [cut.negated(), sb.in_buffer.negated(), copy_reads_it]
                 )
 
-        # Where each tileable op's nest ends: after the last op joined to it,
-        # and after that op's copy when it is cut. Walk each run backwards so
-        # an op takes its successor's end exactly when the two are joined.
+        self._add_lifetime_extension(model, divided, groups, cuts)
+
+    @staticmethod
+    def _add_lifetime_extension(
+        model: "cp_model.CpModel",
+        divided: dict[str, _LifetimeBufferWithCpVars],
+        groups: _TilingGroups,
+        cuts: dict[str, "cp_model.IntVar"],
+    ) -> None:
+        """Set ``nest_end`` on every tileable op: the slot its nest ends, after
+        the last op joined to it and after that op's copy when it is cut.
+
+        Each run is walked backwards so an op takes its successor's end exactly
+        when the two are joined.
+        """
         for run in groups.runs:
             last_time = divided[run[-1]].buffer.uses[0]
             horizon = _Slots.write_slot(last_time) + 2
