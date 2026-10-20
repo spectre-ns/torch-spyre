@@ -966,25 +966,35 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     [is_tiled.negated(), any_diff.negated()]
                 ).only_enforce_if(cut.negated())
             sb.cut = cuts[name] = cut
-            # The copy reads the tile from LX core for core, which it can only
-            # do where each core holds a slice of the output: a division that
-            # also splits a reduction axis puts several cores on one slice.
-            menu = sb.buffer.core_divisions
-            if any(cd.reduction_splits for cd in menu):
-                copy_reads_it = model.new_bool_var(f"copy_reads_{name}")
-                model.add_element(
-                    sb.division,
-                    [int(not cd.reduction_splits) for cd in menu],
-                    copy_reads_it,
-                )
-                model.add_bool_or(
-                    [cut.negated(), sb.in_buffer.negated(), copy_reads_it]
-                )
+            self._add_partial_reduction_cut_guard(model, sb)
 
-        self._add_lifetime_extension(model, divided, groups, cuts)
+        self._add_nest_ends(model, divided, groups, cuts)
 
     @staticmethod
-    def _add_lifetime_extension(
+    def _add_partial_reduction_cut_guard(
+        model: "cp_model.CpModel", sb: _LifetimeBufferWithCpVars
+    ) -> None:
+        """A cut tile resides only under a division with no reduction split.
+
+        A split reduction is not realized through HBM: its partial sums are
+        combined core to core and the finished slice stays in LX on one core of
+        each reduction group. The copy is a pointwise op that reads the tile
+        core for core, so no division of its can read that layout.
+        """
+        menu = sb.buffer.core_divisions
+        if not any(cd.reduction_splits for cd in menu):
+            return
+        assert sb.cut is not None, "a tileable op has a cut literal"
+        copy_reads_it = model.new_bool_var(f"copy_reads_{sb.name}")
+        model.add_element(
+            sb.division,
+            [int(not cd.reduction_splits) for cd in menu],
+            copy_reads_it,
+        )
+        model.add_bool_or([sb.cut.negated(), sb.in_buffer.negated(), copy_reads_it])
+
+    @staticmethod
+    def _add_nest_ends(
         model: "cp_model.CpModel",
         divided: dict[str, _LifetimeBufferWithCpVars],
         groups: _TilingGroups,
