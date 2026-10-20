@@ -849,7 +849,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         0`` means "tiled"), and ``add_element`` ties a buffer's id to its
         chosen division exactly as ``eff_size`` and ``cores`` are already tied.
         Which ops share a nest is decided over op order, not the edge alone:
-        see :meth:`_tiling_group_ids`. A consumer that shares its producer's
+        see :meth:`_add_tiling_groups`. A consumer that shares its producer's
         nest reads it one tile at a time, so their chosen divisions must be a
         ``cd_parent_matches`` pair, whose views are owned per (tile, core); a
         pair that is not must be split by a cut. A tiled graph output, or a
@@ -900,7 +900,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             model.add(sb.loop_id == UNTILED_ID).only_enforce_if(is_tiled.negated())
             sb.tiled = tiled[name] = is_tiled
 
-        group, segment, runs, joined = self._tiling_group_ids(model, divided, tiled)
+        group, segment, runs, joined = self._add_tiling_groups(model, divided, tiled)
 
         cuts: dict[str, cp_model.IntVar] = {}
         for name, is_tiled in tiled.items():
@@ -986,7 +986,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 following = sb
 
     @staticmethod
-    def _tiling_group_ids(
+    def _add_tiling_groups(
         model: "cp_model.CpModel",
         divided: dict[str, _LifetimeBufferWithCpVars],
         tiled: dict[str, "cp_model.IntVar"],
