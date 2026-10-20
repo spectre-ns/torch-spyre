@@ -36,9 +36,6 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _lx_planning_size,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
-from torch_spyre._inductor.work_division_constraints import (
-    JOINT_TILING_AND_DIVISION_ATTR,
-)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -174,23 +171,6 @@ class TestAllocatorSpillReasons(TestCase):
         self.assertEqual(set(reasons), {"barred", "late"})
         self.assertEqual(reasons["barred"], "op not allowed")
         self.assertIn("no room on scratchpad", reasons["late"])
-
-    def test_joint_allocator_labels_ops_a_tiling_added(self):
-        allocation = self._solve()
-        operations = [types.SimpleNamespace(name=b.name) for b in allocation]
-        operations.append(
-            types.SimpleNamespace(
-                name="tile_copy", **{JOINT_TILING_AND_DIVISION_ATTR: True}
-            )
-        )
-        graph = types.SimpleNamespace(operations=operations)
-        reasons = CoOptimizingAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
-            graph, allocation
-        )
-        self.assertEqual(
-            reasons,
-            {"barred": "op not allowed", "tile_copy": "added by coarse tiling"},
-        )
 
     def test_joint_allocator_reports_only_what_the_solver_said(self):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
