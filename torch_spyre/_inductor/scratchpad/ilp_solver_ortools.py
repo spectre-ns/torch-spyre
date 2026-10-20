@@ -112,7 +112,6 @@ from typing import (
     Union,
     cast,
 )
-import numpy as np
 import sympy
 import torch
 
@@ -553,6 +552,9 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
                 served.append(lit)
                 child_w.relayout_reads.setdefault(self.name, []).append((lit, copy_w))
                 copy_w.serves.append(lit)
+            # A consumer outside this tiled buffer's nest reads the copied-out
+            # full buffer in HBM, not the tile, so its edge puts no division
+            # demand on the tile (``via_full``; None when it cannot be tiled).
             exempt = self.via_full.get(child)
             if not served and exempt is None:
                 _gate_divisions(
