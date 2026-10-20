@@ -340,6 +340,10 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         # nest when the two are joined in one nest. ``None`` marks an op that
         # cannot be tiled.
         self.nest_end: Optional[cp_model.IntVar] = None
+        # Slot at which this op's nest begins: its own write, or the previous
+        # op's ``nest_start`` when the two are joined. ``None`` as for
+        # ``nest_end``.
+        self.nest_start: Optional[cp_model.IntVar] = None
         # Per reader: true iff the reader takes the copied-out full buffer from
         # HBM instead of this buffer's tile. That waives the division match a
         # resident buffer owes the reader and lets it free LX before the read.
@@ -348,6 +352,10 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         # ``_add_lifetime_ends`` when a tiling can change its lifetime: a tiled
         # buffer can free early, and one read inside a nest stays to its end.
         self.end: Optional[cp_model.IntVar] = None
+        # Slot at which an input clone starts holding its LX space, set by
+        # ``_add_lifetime_ends`` when a tiled op reads it: a clone hoisted to
+        # the nest entry is written before the nest's first op.
+        self.start: Optional[cp_model.IntVar] = None
 
     # -- producer/consumer edges (joint model only; none when division-fixed) --
     @property
@@ -969,6 +977,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             self._add_partial_reduction_cut_guard(model, sb)
 
         self._add_nest_ends(model, divided, groups, cuts)
+        self._add_nest_starts(model, divided, groups)
 
     @staticmethod
     def _add_partial_reduction_cut_guard(
@@ -1025,6 +1034,34 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     )
                 sb.nest_end = end
                 following = sb
+
+    @staticmethod
+    def _add_nest_starts(
+        model: "cp_model.CpModel",
+        divided: dict[str, _LifetimeBufferWithCpVars],
+        groups: _TilingGroups,
+    ) -> None:
+        """Set ``nest_start`` on every tileable op: the write slot of the first
+        op in its nest. Each run is walked forwards so an op takes its
+        predecessor's start exactly when the two are joined."""
+        for run in groups.runs:
+            first = _Slots.write_slot(divided[run[0]].buffer.uses[0])
+            previous: Optional[_LifetimeBufferWithCpVars] = None
+            for name in run:
+                sb = divided[name]
+                own = _Slots.write_slot(sb.buffer.uses[0])
+                start = model.new_int_var(first, own, f"nest_start_{name}")
+                if previous is None:
+                    model.add(start == own)
+                else:
+                    model.add(start == previous.nest_start).only_enforce_if(
+                        groups.joined[name]
+                    )
+                    model.add(start == own).only_enforce_if(
+                        groups.joined[name].negated()
+                    )
+                sb.nest_start = start
+                previous = sb
 
     @staticmethod
     def _add_tiling_groups(
@@ -1134,9 +1171,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
           the tile alive, along with the copy op when the buffer is cut.
         - An untiled buffer read by a tiled op is read again on every iteration
           of that op's nest, so it stays alive until the nest ends
-          (``counted_loop_lifetime_overrides`` on the applied graph).
+          (``counted_loop_lifetime_overrides`` on the applied graph). An input
+          clone read by a tiled op may also be hoisted to the nest's entry, so
+          its ``start`` reaches back to that op's ``nest_start``.
 
-        Each end is bounded from below only. A longer lifetime can only cost
+        Each end is bounded from below only, and each start from above only. A longer lifetime can only cost
         space, so the solve has no reason to pick one, and an in-place merge
         pins its parent's end exactly (see :meth:`_add_inplace_relaxation`).
         """
@@ -1154,6 +1193,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 for kid in read_by_a_nest:
                     # It is read again on every pass of the kid's nest.
                     model.add(sb.end >= kid.nest_end).only_enforce_if(kid.tiled)
+                if sb.buffer.first_use_is_read:
+                    # An input clone may be hoisted to the entry of the nest
+                    # that reads it, so its slot is held from the nest's start.
+                    untiled_start = _Slots.write_slot(sb.start_time)
+                    sb.start = model.new_int_var(0, untiled_start, f"start_{name}")
+                    for kid in read_by_a_nest:
+                        model.add(sb.start <= kid.nest_start).only_enforce_if(kid.tiled)
                 continue
             assert sb.tiled is not None, "a tileable op has a tiled literal"
             untiled = sb.tiled.negated()
@@ -1597,6 +1643,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         y_intervals = []
         for sb in bufs.values():
             ins = incoming.get(sb.name, [])
+            assert sb.start is None or not ins, "an input clone has no parent"
             start_time = _Slots.write_slot(sb.start_time)
             end_time: _Bound = (
                 sb.end if sb.end is not None else _Slots.end_slot(sb.end_time)
@@ -1611,8 +1658,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.add(start_var == start_time + sum(ins))
                 x_start: _Bound = start_var
             else:
-                x_start = start_time
-            if sb.end is not None:
+                x_start = sb.start if sb.start is not None else start_time
+            if sb.end is not None or sb.start is not None:
                 # Each interval bound has to be affine in one variable, so a
                 # length between two variables gets a variable of its own.
                 x_size: object = model.new_int_var(
