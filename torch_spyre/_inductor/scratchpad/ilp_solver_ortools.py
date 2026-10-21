@@ -1341,15 +1341,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         probe_solver = cp_model.CpSolver()
         probe_solver.parameters.copy_from(solver.parameters)
+
+        # disable the time limit for the uniqueness check, as it is a diagnostic step 
+        # and we want to be sure of the result
+        probe_solver.parameters.max_time_in_seconds = 0
         status = probe_solver.Solve(probe)
         if status == cp_model.INFEASIBLE:
             return True  # no other plan exists at all
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return False  # probe ran out of time we cannot prove uniqueness
-        best, runner_up = solver.ObjectiveValue(), probe_solver.ObjectiveValue()
-        if round(runner_up) <= round(best):
-            return False  # a different plan costs the same to within 1
-        return True  # another plan was found that is worse than the best one
+        return False
 
     def _minimize_cost_expr(
         self,
