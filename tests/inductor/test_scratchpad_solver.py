@@ -2603,7 +2603,7 @@ class UniquenessCheckTest(TestCase):
         with self.assertLogs(self._LOGGER, level="WARNING") as logs:
             solver.plan_layout_and_core_divisions(self._spill_cost(solver.buffers[:1]))
         self.assertTrue(
-            any("Non-unique optimal solution" in line for line in logs.output),
+            any("cannot prove uniqueness" in line for line in logs.output),
             logs.output,
         )
 
