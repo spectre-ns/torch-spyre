@@ -413,7 +413,9 @@ _cpsat_warn_on_cost_expr: bool = True
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
 # Enable or disable uniqueness checks for optimal CP-SAT solutions to determine
-# if an optimal solution is fully priced.
+# if an optimal solution is fully priced. The check is a second solve with no
+# time limit, so it can run well past ``cpsat_time_limit_seconds`` on a hard model;
+# not for production compiles.
 enable_uniqueness_check: bool = (
     os.environ.get("SPYRE_ENABLE_UNIQUENESS_CHECK", "0") == "1"
 )

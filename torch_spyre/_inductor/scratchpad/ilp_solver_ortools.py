@@ -286,7 +286,9 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         when the division is fixed)."""
 
     def decision_variables(self) -> list:
-        """The CP-SAT variables that define this buffer's plan."""
+        """The CP-SAT variables that define this buffer's plan. The LX offset is
+        left out: no objective prices an address, so every legal shift of a
+        resident buffer would read as a tie."""
         served = [lit for reads in self.relayout_reads.values() for lit, _ in reads]
         return [self.in_buffer, *self.merge_vars.values(), *served]
 
@@ -674,8 +676,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         tensors: dict[str, _LifetimeBufferWithCpVars],
     ) -> bool:
         """Whether the optimum ``solver`` holds is the only one over the plan's
-        decision variables. False when a different plan costs the same, or when
-        the probe ends without proving either way.
+        decision variables (residency, merges, served relayouts and division,
+        not placement). False when a different plan costs the same, or when the
+        probe ends without proving either way.
         """
         decision = [v for sb in tensors.values() for v in sb.decision_variables()]
         probe = model.clone()
