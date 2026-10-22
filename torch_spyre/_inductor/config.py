@@ -339,22 +339,18 @@ cpsat_time_limit_seconds: float = float(
 # (``EnumerationFactory``). "table": a pair table over the two ends' candidate
 # indices, built by the allocator (today's model). "derived": equality of
 # per-node view ids, tile-view ids and core counts, derived by the strategy
-# from each edge's ResidencyEdge; the allocator builds no pair tables for those
-# edges, and relayout candidates are not generated. Experimental.
+# from each edge's ResidencyEdge (an input clone's from its CloneRead); the
+# allocator builds no pair tables for those edges. Experimental.
 lx_view_relation: Literal["table", "derived"] = os.environ.get(  # type: ignore[assignment]
     "LX_VIEW_RELATION", "table"
 )
-
-# Whether the co-optimizing solve is offered relayout candidates at all. Under
-# ``lx_view_relation = "derived"`` only ``lx_relayout_encoding = "lazy"``
-# offers them.
-lx_solver_relayouts: bool = os.environ.get("LX_SOLVER_RELAYOUTS", "1") == "1"
 
 # How the CP-SAT layout solve encodes relayouts: "table" (the allocator's
 # capped, priced copy groups over division pairs) or "lazy" (per edge, a
 # legality and price table over the two ends' view ids, copies shared by
 # reified view equality, each owner's lifetime a variable; no cap). "lazy"
-# needs lx_view_relation = "derived". Experimental.
+# needs lx_view_relation = "derived", under which "table" offers none.
+# Experimental.
 lx_relayout_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
     "LX_RELAYOUT_ENCODING", "table"
 )
@@ -362,29 +358,12 @@ lx_relayout_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore
 # How the CP-SAT layout solve encodes an open work split: "table" (an index
 # into the candidate menu) or "lazy" (one split var per axis and a tiling
 # choice, legality posted from each tiling frame's WorkDivisionContext, every
-# per-division quantity a table over the axes it depends on). "lazy" needs
-# lx_view_relation = "derived"; nodes on a pair-table edge stay "table".
+# per-division quantity a table over the axes it depends on, views related in
+# digit form where they have one). "lazy" needs lx_view_relation = "derived";
+# nodes on a pair-table edge stay "table", and the allocator hands a Lazy
+# node its space's points instead of enumerating its legal menu.
 lx_division_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
     "LX_DIVISION_ENCODING", "table"
-)
-
-# With lx_division_encoding = "lazy": hand a Lazy-eligible op's space points to
-# the solver as its menu instead of enumerating its legal divisions. Ops whose
-# menu a pair table or read-copy pricing indexes still get the legal menu.
-lx_lazy_menus: bool = os.environ.get("LX_LAZY_MENUS", "0") == "1"
-
-# How a Lazy node's per-core views are related across an edge: "points" (a
-# view-id table over its points, one view computation per point) or "digits"
-# (per-device-dim factor and core-stride equalities over the split vars, where
-# the view has a digit form; else the view-id table).
-lx_lazy_views: Literal["points", "digits"] = os.environ.get(  # type: ignore[assignment]
-    "LX_LAZY_VIEWS", "points"
-)
-
-# How coarse-tiling nests are compared: "id" (an interned loop id per nest) or
-# "levels" (per-level tile-count vars, same_nest as their equality).
-lx_nest_encoding: Literal["id", "levels"] = os.environ.get(  # type: ignore[assignment]
-    "LX_NEST_ENCODING", "id"
 )
 
 

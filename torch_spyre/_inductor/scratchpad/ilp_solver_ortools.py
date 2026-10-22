@@ -98,6 +98,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     build_graph,
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
+    EnumerationFactory,
     TableStrategy,
     _gate_divisions,
 )
@@ -238,6 +239,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             list(self._plan_layout_generic(cost_expr=cost_expr)),
         )
 
+    posts_model = True
+
     def graph_solver(self) -> Any:
         """The CP-SAT backend: the graph is encoded through a strategy and
         solved by the objective ladder."""
@@ -274,19 +277,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         graph = build_graph(
             buffers, self.alignment, self._capacity_units, settings, forced_reasons
         )
-        strategy_cls: type[TableStrategy] = TableStrategy
-        if config.lx_division_encoding == "lazy":
-            from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
-
-            assert config.lx_view_relation == "derived", (
-                "lx_division_encoding='lazy' needs lx_view_relation='derived'"
-            )
-            strategy_cls = LazyStrategy
-        assert (
-            config.lx_relayout_encoding == "table"
-            or config.lx_view_relation == "derived"
-        ), "lx_relayout_encoding='lazy' needs lx_view_relation='derived'"
-        strategy = strategy_cls.from_buffers(buffers, forced_reasons)
+        strategy = EnumerationFactory.from_config().strategy(buffers, forced_reasons)
         graph.solve(_backend(), cost_expr, strategy)
 
         # Write the decisions back onto the caller's buffers, in bytes.

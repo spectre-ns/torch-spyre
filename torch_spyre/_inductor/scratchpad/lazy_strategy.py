@@ -279,8 +279,10 @@ class LazyStrategy(TableStrategy):
         self.point_menus: set[str] = set()
 
     @classmethod
-    def from_buffers(cls, buffers, reasons=None, **settings) -> LazyStrategy:
-        strategy = super().from_buffers(buffers, reasons, **settings)
+    def from_buffers(
+        cls, buffers, reasons=None, relation: str = "table", **settings
+    ) -> LazyStrategy:
+        strategy = super().from_buffers(buffers, reasons, relation, **settings)
         assert isinstance(strategy, LazyStrategy)
         strategy.spaces = {
             b.name: b.lazy_space
@@ -414,12 +416,7 @@ class LazyStrategy(TableStrategy):
     def _relate(self, edge: DependencyEdge, lit, model: Model) -> None:
         re = self.residency.get((edge.src.name, edge.dst.name))
         digits = None
-        if (
-            re is not None
-            and config.lx_lazy_views == "digits"
-            and edge.src in self._lazy
-            and edge.dst in self._lazy
-        ):
+        if re is not None and edge.src in self._lazy and edge.dst in self._lazy:
             digits = self._edge_digits(edge, re)
         if digits is None:
             super()._relate(edge, lit, model)

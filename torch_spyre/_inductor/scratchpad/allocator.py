@@ -809,12 +809,15 @@ class ScratchpadAllocator:
                 layout_planning.__name__,
             )
         # Candidate generation belongs to the solve's table encoding; this
-        # allocator dispatches the solve and applies the result.
+        # allocator dispatches the solve and applies the result. The factory
+        # rejects a solver that cannot realize the configured enumerations.
         from torch_spyre._inductor.scratchpad.encoding_strategy import (
             EnumerationFactory,
         )
 
-        self.candidates = EnumerationFactory().candidates(self)
+        self.factory = EnumerationFactory.from_config()
+        self.factory.check(layout_planning)
+        self.candidates = self.factory.candidates(self)
 
     @property
     def joint(self) -> bool:

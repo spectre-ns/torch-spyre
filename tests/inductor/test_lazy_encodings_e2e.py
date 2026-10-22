@@ -36,8 +36,6 @@ _MODES = {
     "lazy": {
         "lx_view_relation": "derived",
         "lx_division_encoding": "lazy",
-        "lx_lazy_views": "digits",
-        "lx_lazy_menus": True,
     },
     "lazy_relayouts": {
         "lx_view_relation": "derived",
@@ -46,8 +44,6 @@ _MODES = {
     "all": {
         "lx_view_relation": "derived",
         "lx_division_encoding": "lazy",
-        "lx_lazy_views": "digits",
-        "lx_lazy_menus": True,
         "lx_relayout_encoding": "lazy",
     },
 }

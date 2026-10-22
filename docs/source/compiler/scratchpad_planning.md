@@ -259,8 +259,9 @@ Scratchpad planning has three layers with separate concerns:
 
 `ScratchpadAllocator` runs pre-passes (clone insertion), gathers
 `LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
-chosen LX addresses onto buffer layouts. `CoOptimizingAllocator`
-extends this flow with a split-search step before the solver runs.
+chosen LX addresses onto buffer layouts. In its open division mode
+(`division_mode="open"`) the same allocator also chooses each op's core
+division, jointly with placement.
 :::
 
 The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
@@ -272,15 +273,20 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT): builds the solve graph from the allocator's buffers and writes its decisions back |
+| `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat`, `Decomposed`, `Mip`, `BruteForce`, `Annealing`, and the `GraphSolver` protocol |
+| `graph_solvers.py` | Graph solvers: `PlacementSolver` (placement views), `DecomposedPlacement` (the exhaustive search), `BufferSolver`; `solve_buffers`, the one way the allocator solves |
+| `ir_graph.py` | The solve graph built straight from the IR, and its agreement check against the buffer graph |
+| `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
+| `lazy_relayout.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
 | `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
 | `encoding_strategy.py` | `EncodingStrategy` / `TableStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
-| `table_candidates.py` | `TableCandidates`: the table encoding's candidates (division menus, view tables, priced relayouts and copies), built for `CoOptimizingAllocator`'s solvers |
+| `table_candidates.py` | `TableCandidates`: the table encoding's candidates (division menus, view tables, priced relayouts and copies), built for the joint allocator's solvers |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
 | `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
 | `graph_editor.py` | `GraphEditor`, the clone/rewrite helper used by input- and output-boundary cloning |
-| `allocator.py` | `ScratchpadAllocator`, `CoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
+| `allocator.py` | `ScratchpadAllocator` (committed and open division modes) and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |
 
 ### Entry point
@@ -462,7 +468,7 @@ a warning and falls back to the greedy solver, so a `"cpsat"` request
 without co-optimization always degrades to a correct plan. Without
 co-optimization the CP-SAT solver only *places* buffers on each op's
 pre-determined core division; with `co_optimizing_lx_planning` it is driven
-by the joint `CoOptimizingAllocator` (below), which additionally chooses
+by the allocator's open division mode (below), which additionally chooses
 each op's core division -- see [The co-optimizer](co_optimizer.md) for what
 happens to that fallback when `ortools` is missing *and* co-optimization is
 requested.
@@ -490,7 +496,7 @@ Work division optimizes each op independently for parallelism. Adjacent
 ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
-`CoOptimizingAllocator` (the default; gated by
+The allocator's open division mode (the default; gated by
 `config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING`)
 treats split choices and LX placement jointly instead of leaving this
 interaction to two independent passes. See [The co-optimizer](co_optimizer.md)
@@ -574,7 +580,7 @@ compact the address space. Allocate/deallocate cycles fragment LX.
 
 ### Co-optimization is still limited
 
-`CoOptimizingAllocator` implements the joint
+The open division mode implements the joint
 work-division + LX planning idea. It searches pointwise dim-flips, the
 matmuls' tilings offered to neighbours, cross-matmul split transfer, and a
 shared batch-major `B/M` split for matmuls and reductions. It still never

@@ -121,6 +121,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+    from torch_spyre._inductor.scratchpad.encoding_strategy import EnumerationFactory
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
 
 
@@ -381,8 +382,11 @@ def _has_legal_division(context) -> bool:
 class TableCandidates:
     """The candidate derivations of one the joint :class:`ScratchpadAllocator`."""
 
-    def __init__(self, allocator: ScratchpadAllocator) -> None:
+    def __init__(
+        self, allocator: ScratchpadAllocator, factory: EnumerationFactory
+    ) -> None:
         self.allocator = allocator
+        self.factory = factory
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         # Per enumerated op, its divisions as a space (lx_division_encoding).
         self.lazy_spaces: dict[str, Any] = {}
@@ -633,7 +637,7 @@ class TableCandidates:
             op.data, (Pointwise, Reduction)
         ):
             return fixed, False
-        if config.lx_division_encoding == "lazy" and config.lx_lazy_menus:
+        if self.factory.division == "lazy":
             points = self._point_menu(op, max_cores)
             if points is not None:
                 return points, True
@@ -680,7 +684,7 @@ class TableCandidates:
                         exc,
                     )
                     continue
-            if config.lx_division_encoding == "lazy":
+            if self.factory.division == "lazy":
                 from torch_spyre._inductor.scratchpad.lazy_division import LazyOption
                 from torch_spyre._inductor.work_division import (
                     work_division_context_for_op,
@@ -716,7 +720,7 @@ class TableCandidates:
         self, op: ComputedBuffer, max_cores: int
     ) -> Optional[list[CoreDivision]]:
         """The op's space, and its points as its menu, without enumerating the
-        legal divisions (``lx_lazy_menus``): the Lazy strategy posts legality
+        legal divisions (a Lazy work split): the Lazy strategy posts legality
         instead. ``None`` sends the op to the ordinary enumeration."""
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
             try_resolve_tile_axis_loop_vars,
@@ -1039,7 +1043,7 @@ class TableCandidates:
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         input_clone_reads: dict[str, dict[str, CloneRead]] = {}
-        derived = config.lx_view_relation == "derived"
+        derived = self.factory.relation == "derived"
         # Consumer op name -> input clones for which it is the last reader, and so
         # may reuse the clone's LX slot in place (reverse-parent, #3212). Stays
         # empty unless cloning is on, making the reverse-parent block in the output
@@ -1254,9 +1258,7 @@ class TableCandidates:
             )
             relayout_edges: dict[str, RelayoutEdge] = {}
             if (
-                derived
-                and config.lx_relayout_encoding == "lazy"
-                and config.lx_solver_relayouts
+                self.factory.relayout == "lazy"
                 and self.allocator._decides_lx_relayouts
                 and not config.ktir_emitter
                 and op is not None
@@ -1848,8 +1850,7 @@ class TableCandidates:
         if (
             not self.allocator._decides_lx_relayouts
             or config.ktir_emitter
-            or config.lx_view_relation == "derived"
-            or not config.lx_solver_relayouts
+            or self.factory.relation == "derived"
         ):
             return {}
         if consumer_op is None:

@@ -367,6 +367,7 @@ class TableStrategy(EncodingStrategy):
         cls,
         buffers: Sequence[LifetimeBoundBuffer],
         reasons: Mapping[str, str] | None = None,
+        relation: str = "table",
         **settings,
     ) -> TableStrategy:
         """The allocator's final candidates, read once from its buffers: the
@@ -376,7 +377,7 @@ class TableStrategy(EncodingStrategy):
         names = {b.name for b in buffers}
         copies = [b for b in buffers if isinstance(b, RelayoutCopyBuffer)]
         groups = {c.group_key for c in copies}
-        derived = config.lx_view_relation == "derived"
+        derived = relation == "derived"
         menus, matches, relayouts, residency, clone_reads = {}, {}, {}, {}, {}
         relayout_edges = {}
         for b in buffers:
@@ -479,8 +480,9 @@ class TableStrategy(EncodingStrategy):
 
             self._lazy_relayouts = LazyRelayouts(self, self.relayout_edges)
             self.transforms += tuple(self._lazy_relayouts.prepare(graph))
-        # Coarse-tiling nests, interned over every item with a work split; the
-        # untiled nest is 0, so loop_id != 0 means tiled.
+        # Coarse-tiling nests over every item with a work split: their depth
+        # sets the level vars, and any nest besides the untiled one turns
+        # tiling on.
         self._nest_ids: dict[tuple[int, ...], int] = {(): 0}
         for node in graph.get_nodes():
             if self.chooses_split(node):
@@ -493,7 +495,6 @@ class TableStrategy(EncodingStrategy):
                 transform.division.tiling.level_counts, len(self._nest_ids)
             )
         self._tiling_on = len(self._nest_ids) > 1
-        self._loop_id: dict[Item, Var] = {}
         self._levels: dict[Item, list[Var]] = {}
         self._tiled: dict[Item, Var] = {}
         self._group: dict[Item, Var] = {}
@@ -941,35 +942,26 @@ class TableStrategy(EncodingStrategy):
     # ---- 7. coarse tiling ----
 
     def encode_tiling_vars(self, item: Item, model: Model) -> None:
-        """The item's loop nest id (tied to its division like ``eff_size``)
-        and whether it is tiled."""
+        """The item's tile count per nest level (0 past its depth; tied to its
+        division like ``eff_size``) and whether it is tiled."""
         if not self._tiling_on or self._is_lazy_copy(item):
             return
         v = self.vars[item]
         cands = self._candidates(item)
-        if config.lx_nest_encoding == "levels":
-            depth = max(len(k) for k in self._nest_ids)
-            levels = []
-            for k in range(depth):
-                vals = [
-                    cd.tiling.level_counts[k] if k < len(cd.tiling.level_counts) else 0
-                    for cd in cands
-                ]
-                lk = model.IntVar(min(vals), max(vals), f"L{k}_{item.name}")
-                v.tie(vals, lk)
-                levels.append(lk)
-            tiled = model.BoolVar(f"tiled_{item.name}")
-            model.Add(levels[0] != 0).OnlyEnforceIf(tiled)
-            model.Add(levels[0] == 0).OnlyEnforceIf(tiled.Not())
-            self._levels[item] = levels
-        else:
-            ids = [self._nest_ids[cd.tiling.level_counts] for cd in cands]
-            var = model.IntVar(0, max(self._nest_ids.values()), f"loop_id_{item.name}")
-            v.tie(ids, var)
-            tiled = model.BoolVar(f"tiled_{item.name}")
-            model.Add(var != 0).OnlyEnforceIf(tiled)
-            model.Add(var == 0).OnlyEnforceIf(tiled.Not())
-            self._loop_id[item] = var
+        depth = max(len(k) for k in self._nest_ids)
+        levels = []
+        for k in range(depth):
+            vals = [
+                cd.tiling.level_counts[k] if k < len(cd.tiling.level_counts) else 0
+                for cd in cands
+            ]
+            lk = model.IntVar(min(vals), max(vals), f"L{k}_{item.name}")
+            v.tie(vals, lk)
+            levels.append(lk)
+        tiled = model.BoolVar(f"tiled_{item.name}")
+        model.Add(levels[0] != 0).OnlyEnforceIf(tiled)
+        model.Add(levels[0] == 0).OnlyEnforceIf(tiled.Not())
+        self._levels[item] = levels
         self._tiled[item] = tiled
 
     def tileable(self, node: ResourceNode) -> bool:
@@ -1023,21 +1015,15 @@ class TableStrategy(EncodingStrategy):
             return
         a, b = prev.name, node.name
         same = model.BoolVar(f"samenest_{a}_{b}")
-        if self._levels:
-            # Same nest: every level's tile count equal (0 past a nest's depth).
-            eqs = []
-            for k, (la, lb) in enumerate(zip(self._levels[prev], self._levels[node])):
-                e = model.BoolVar(f"eq{k}_{a}_{b}")
-                model.Add(la == lb).OnlyEnforceIf(e)
-                model.Add(la != lb).OnlyEnforceIf(e.Not())
-                eqs.append(e)
-            model.AddBoolAnd(eqs).OnlyEnforceIf(same)
-            model.AddBoolOr([e.Not() for e in eqs]).OnlyEnforceIf(same.Not())
-        else:
-            model.Add(self._loop_id[prev] == self._loop_id[node]).OnlyEnforceIf(same)
-            model.Add(self._loop_id[prev] != self._loop_id[node]).OnlyEnforceIf(
-                same.Not()
-            )
+        # Same nest: every level's tile count equal (0 past a nest's depth).
+        eqs = []
+        for k, (la, lb) in enumerate(zip(self._levels[prev], self._levels[node])):
+            e = model.BoolVar(f"eq{k}_{a}_{b}")
+            model.Add(la == lb).OnlyEnforceIf(e)
+            model.Add(la != lb).OnlyEnforceIf(e.Not())
+            eqs.append(e)
+        model.AddBoolAnd(eqs).OnlyEnforceIf(same)
+        model.AddBoolOr([e.Not() for e in eqs]).OnlyEnforceIf(same.Not())
         joined = model.BoolVar(f"joined_{a}_{b}")
         model.AddBoolAnd([same, self._tiled[node]]).OnlyEnforceIf(joined)
         model.AddBoolOr([same.Not(), self._tiled[node].Not()]).OnlyEnforceIf(
@@ -1197,12 +1183,15 @@ class TableStrategy(EncodingStrategy):
 
 @dataclass(frozen=True)
 class EnumerationFactory:
-    """Built from configuration only: how each axis is enumerated. The
-    defaults reproduce the table model."""
+    """Built from configuration only: how each axis is enumerated and how
+    each relation is encoded. The defaults reproduce the table model. It is
+    validated once, here and against the solver it will feed (``check``), and
+    never sees a graph."""
 
     division: AxisSetting = "table"
     tiling: AxisSetting = "table"
     relayout: RelayoutSetting = "data"
+    relation: Literal["table", "derived"] = "table"
 
     def __post_init__(self) -> None:
         for axis in ("division", "tiling"):
@@ -1210,6 +1199,50 @@ class EnumerationFactory:
                 raise ValueError(f"unknown {axis} enumeration {getattr(self, axis)!r}")
         if self.relayout not in ("data", "pruned", "lazy"):
             raise ValueError(f"unknown relayout enumeration {self.relayout!r}")
+        if self.relation not in ("table", "derived"):
+            raise ValueError(f"unknown view relation {self.relation!r}")
+        # A Lazy split carries its tiling option with it; a separate tiling
+        # axis and a pruned shortlist have no strategy.
+        if self.tiling != "table" or "pruned" in (self.division, self.relayout):
+            raise NotImplementedError(
+                f"no strategy for division={self.division} tiling={self.tiling} "
+                f"relayout={self.relayout}"
+            )
+        if (self.division == "lazy" or self.relayout == "lazy") and (
+            self.relation != "derived"
+        ):
+            raise ValueError(
+                "a lazy work split or lazy relayouts need the derived view relation"
+            )
+
+    @classmethod
+    def from_config(cls) -> EnumerationFactory:
+        return cls(
+            division=config.lx_division_encoding,
+            relayout="lazy" if config.lx_relayout_encoding == "lazy" else "data",
+            relation=config.lx_view_relation,
+        )
+
+    @property
+    def is_table(self) -> bool:
+        """Every axis a table over candidates and every relation a pair table:
+        what a solver that reads menus and match tables needs."""
+        return (self.division, self.relayout, self.relation) == (
+            "table",
+            "data",
+            "table",
+        )
+
+    def check(self, solver: type) -> None:
+        """Reject a solver that cannot realize these enumerations: anything
+        but the table model needs a solver that posts a model
+        (``MemoryPlanSolver.posts_model``)."""
+        if not self.is_table and not getattr(solver, "posts_model", False):
+            raise ValueError(
+                f"{solver.__name__} reads candidate menus and match tables; "
+                f"division={self.division}, relayout={self.relayout}, "
+                f"relation={self.relation} needs the CP-SAT solver"
+            )
 
     def candidates(self, allocator: ScratchpadAllocator) -> TableCandidates:
         """What generates the table candidates for ``allocator``'s solves."""
@@ -1217,16 +1250,25 @@ class EnumerationFactory:
             TableCandidates,
         )
 
-        return TableCandidates(allocator)
+        return TableCandidates(allocator, self)
 
-    def strategy(self, **candidates) -> EncodingStrategy:
-        if self.division == "table" and self.tiling == "table":
-            return TableStrategy(
-                division=self.division,
-                tiling=self.tiling,
-                relayout=self.relayout,
-                **candidates,
-            )
-        raise NotImplementedError(
-            f"no strategy for division={self.division} tiling={self.tiling}"
+    def strategy(
+        self,
+        buffers: Sequence[LifetimeBoundBuffer] = (),
+        reasons: Mapping[str, str] | None = None,
+    ) -> TableStrategy:
+        """The strategy for these settings over ``buffers``' candidates: a
+        ``Lazy`` work split wherever a node can take one, else tables."""
+        cls: type[TableStrategy] = TableStrategy
+        if self.division == "lazy":
+            from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+
+            cls = LazyStrategy
+        return cls.from_buffers(
+            buffers,
+            reasons,
+            relation=self.relation,
+            division=self.division,
+            tiling=self.tiling,
+            relayout=self.relayout,
         )

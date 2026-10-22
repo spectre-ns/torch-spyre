@@ -15,7 +15,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, ClassVar, Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
 import itertools
 import math
@@ -988,6 +988,11 @@ class MemoryPlanSolver(ABC):
     # What a solver can do, asked of its class before any instance exists. Every
     # concrete solver answers each abstract one itself; __init_subclass__ fails
     # the class definition otherwise, or on a combination that makes no sense.
+
+    # Posts the graph through an encoding strategy to a backend, so it can
+    # realize any enumeration the factory allows; the others read the table
+    # model's menus and match tables.
+    posts_model: ClassVar[bool] = False
 
     @classmethod
     def chooses_core_divisions(cls) -> bool:

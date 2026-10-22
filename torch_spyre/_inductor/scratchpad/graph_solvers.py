@@ -314,10 +314,12 @@ def solve_buffers(
         # The allocator's reasons; the capacity check is the solver's own.
         {b.name: b.residency_reason for b in solver.buffers if b.residency_reason},
     )
-    from torch_spyre._inductor.scratchpad.encoding_strategy import TableStrategy
+    from torch_spyre._inductor.scratchpad.encoding_strategy import (
+        EnumerationFactory,
+    )
 
     graph.set_solver(spec)
-    strategy = TableStrategy.from_buffers(solver.buffers)
+    strategy = EnumerationFactory().strategy(solver.buffers)
     graph.solve(cost_expr=cost_expr, strategy=strategy)
     if isinstance(spec, BufferSolver):
         return list(spec.result)

@@ -94,15 +94,15 @@ different solver backends can drive this search; the sections below cover each i
 [Cost model](#cost-model) covers the model itself — how it plugs into the solvers, how to
 inspect it, and how to recalibrate it.
 
-The co-optimizer is reached through `CoOptimizingAllocator`
-(`torch_spyre/_inductor/scratchpad/allocator.py`), gated by `config.co_optimizing_lx_planning`
+The co-optimizer is reached through `ScratchpadAllocator` in its open division mode
+(`division_mode="open"`, `torch_spyre/_inductor/scratchpad/allocator.py`), gated by `config.co_optimizing_lx_planning`
 (env `CO_OPTIMIZING_LX_PLANNING`, **on by default**) and selected via `config.layout_solver`. It
 runs as a pre-scheduling pass: `V.graph` is live but `V.graph.scheduler` is still `None`, so
 fusion hasn't happened yet. The cost model therefore can't read a kernel's real fused grouping
 off the scheduler — it has to *estimate* one from the flat, ordered operation list instead.
 Without `co_optimizing_lx_planning`, each solver can still be selected on its own, but then it
 only *places* buffers against divisions some earlier pass already fixed — it never searches
-divisions itself. The joint behavior is what `CoOptimizingAllocator` adds on top.
+divisions itself. The joint behavior is what the open division mode adds on top.
 
 `layout_solver`'s options are `"cpsat"`, `"simulated_annealing"`, `"greedy"`, `"firstfit"`, and
 `"bestfit"`, but only `"simulated_annealing"`, and `"cpsat"` *with `ortools` installed*, are
@@ -174,7 +174,7 @@ is kept affordable when it does run.
 **Pruning the DFS's candidate menu: `_enum_split_options`.** The example above assumed each
 buffer's candidate list — its "menu" — was already small (2 candidates). In practice,
 `select_allocator()` always pairs `ExhaustiveSearchSolver` with
-`CoOptimizingAllocator(prune=True)`, which controls exactly that menu: instead of
+`ScratchpadAllocator(division_mode="open", prune=True)`, which controls exactly that menu: instead of
 `enumerate_work_division_candidates()`'s full, standalone-work-division-planner cross product,
 `_enum_split_options` (`allocator.py`) builds a much smaller, heuristic candidate list per op,
 dispatching on op type — the difference between a `2×2`-leaf DFS and one with every legal
@@ -606,7 +606,7 @@ Open items from drafting this page that are worth resolving before calling it do
 ### Solver performance:
 
 - Nothing memoizes a co-optimizer solve across compiles. Every `torch.compile` that reaches
-  `CoOptimizingAllocator` runs a full CP-SAT solve or SA anneal from scratch, even for a graph
+  the joint allocator runs a full CP-SAT solve or SA anneal from scratch, even for a graph
   shape the search has already solved before. The caching that does exist
   (`torch_spyre/execution/kernel_cache.py`) is a different thing: its hash
   (`compute_specs_hash`) covers the *already-resolved* `OpSpec`/`LoopSpec` tree — the solver's

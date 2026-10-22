@@ -13,7 +13,7 @@ allocator and the other solvers, see [Scratchpad Planning](scratchpad_planning.m
 ## Where it sits
 
 `config.layout_solver = "simulated_annealing"` with `co_optimizing_lx_planning` routes to
-`CoOptimizingAllocator(layout_planning=SaCoOptimizingSolver)`. The allocator builds one
+`ScratchpadAllocator(layout_planning=SaCoOptimizingSolver, division_mode="open")`. The allocator builds one
 `CoreDivisionBuffer` per graph buffer — carrying the candidate division menu, the
 `cd_parent_matches` compatibility relation, and, where it could derive them, the per-candidate
 machinery that stands in for both (`division_space` and `residency_edges`) — and hands the list to
@@ -80,7 +80,7 @@ tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as 
 `output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid in the
 HBM traffic residency then frees.
 
-The tiling half is attached only where `CoOptimizingAllocator._solver_chooses_tilings` holds: a
+The tiling half is attached only where `ScratchpadAllocator._solver_chooses_tilings` holds: a
 solver that both `generates_divisions()` and `chooses_tilings()` (this engine), and
 `config.auto_coarse_tiling` (off by default; see its comment).
 
@@ -136,7 +136,7 @@ never one.
 `CoreDivisionBuffer.sym_tile_counts` declares one symbol per tileable axis, keyed
 `(host_dim, is_reduction)`. This engine's menu lists no tiling, so its keys are every output dim the
 buffer's division space may tile, and the annealer binds each through the chosen config's
-`TileSpec.count_for`, 1 for an axis it leaves untiled. `CoOptimizingAllocator._extract_op_features`
+`TileSpec.count_for`, 1 for an axis it leaves untiled. `ScratchpadAllocator._extract_op_features`
 resolves each axis to the op's loop variable and hands the symbols to the extractor as a candidate
 tiling (`dump_cost_model._candidate_tiling`). `tiles_output_dim` is then a condition over them, and
 every branch on it a `Piecewise` (`cost_model._select`). With the derates pinned and the loop
@@ -151,7 +151,7 @@ Nothing gives that residency back yet; a tile-local staging copy, placed by the 
 
 ## The apply round
 
-`CoOptimizingAllocator._apply_chosen_tilings` runs `CoarseTilingPass` on the chosen `TileSpec`s
+`ScratchpadAllocator._apply_chosen_tilings` runs `CoarseTilingPass` on the chosen `TileSpec`s
 before the divisions are committed, so the ownership is built against the already-tiled op;
 `commit_divisions` re-keys each tiled op's splits to its live symbols (`_live_splits`) and refuses
 only a split above 1 on an axis the tiling squeezed away. The anneal's placement stands, and the
@@ -161,7 +161,7 @@ tiled buffer's applied per-core footprint is the one it was placed at.
 
 ## The objective
 
-**`cost_expr`** is `CoOptimizingAllocator._solve`'s symbolic prediction for the whole graph —
+**`cost_expr`** is `ScratchpadAllocator._solve`'s symbolic prediction for the whole graph —
 `sympy.sympify(predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS))`, built from
 every buffer's own `sym_is_lx`/`sym_core_divs` (the same symbols the CP-SAT engine's cost
 expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles it once, per

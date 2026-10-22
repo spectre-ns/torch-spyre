@@ -242,9 +242,7 @@ class TestAllocatorSpillReasons(TestCase):
         )
         self.assertEqual(
             joint._get_spill_reasons(allocation),
-            ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
-                allocation
-            ),
+            ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(allocation),
         )
 
 

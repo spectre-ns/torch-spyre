@@ -54,6 +54,7 @@ class Backend(Protocol):
     model: cp_model.CpModel  # the recorded model (the printer builds on it)
 
     def IntVar(self, lb: int, ub: int, name: str) -> Var: ...
+    def IntVarFromValues(self, values: Sequence[int], name: str) -> Var: ...
     def BoolVar(self, name: str) -> Var: ...
     def Constant(self, value: int) -> Var: ...
     def Add(self, bounded: object) -> Constraint: ...
@@ -68,6 +69,12 @@ class Backend(Protocol):
         self, vars: Sequence[Var], tuples: Sequence[Sequence[int]]
     ) -> Constraint: ...
     def AddMaxEquality(
+        self, target: Var, exprs: Sequence[LinearExpr]
+    ) -> Constraint: ...
+    def AddDivisionEquality(
+        self, target: Var, num: LinearExpr, den: LinearExpr
+    ) -> Constraint: ...
+    def AddMinEquality(
         self, target: Var, exprs: Sequence[LinearExpr]
     ) -> Constraint: ...
     def AddMultiplicationEquality(
@@ -85,6 +92,7 @@ class Backend(Protocol):
     def MarkTableAxis(self, index: Var) -> None: ...
     def Minimize(self, expr: LinearExpr) -> None: ...
     def Maximize(self, expr: LinearExpr) -> None: ...
+    def SetHint(self, vars: Sequence[Var], values: Sequence[int]) -> None: ...
     def Solve(self) -> int: ...
     def StatusName(self, status: int) -> str: ...
     def WallTime(self) -> float: ...
@@ -107,6 +115,11 @@ class CpSat:
     # ---- posting ----
     def IntVar(self, lb, ub, name):
         return self.model.new_int_var(lb, ub, name)
+
+    def IntVarFromValues(self, values, name):
+        return self.model.new_int_var_from_domain(
+            cp_model.Domain.from_values(list(values)), name
+        )
 
     def BoolVar(self, name):
         return self.model.new_bool_var(name)
@@ -141,6 +154,12 @@ class CpSat:
     def AddMultiplicationEquality(self, target, factors):
         return self.model.add_multiplication_equality(target, factors)
 
+    def AddDivisionEquality(self, target, num, den):
+        return self.model.add_division_equality(target, num, den)
+
+    def AddMinEquality(self, target, exprs):
+        return self.model.add_min_equality(target, exprs)
+
     def NewOptionalIntervalVar(self, start, size, end, present, name):
         return self.model.new_optional_interval_var(start, size, end, present, name)
 
@@ -156,6 +175,10 @@ class CpSat:
 
     def Maximize(self, expr):
         self.model.maximize(expr)
+
+    def SetHint(self, vars, values):
+        for var, value in zip(vars, values):
+            self.model.add_hint(var, value)
 
     # ---- solving ----
     def Solve(self, objective: bool = False) -> int:
