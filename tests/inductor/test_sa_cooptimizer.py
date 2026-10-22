@@ -1171,7 +1171,7 @@ class ForeignParentTest(TestCase):
 
 class MemoryOnlyFallbackTest(TestCase):
     """With no ``cost_expr`` -- built by the caller from a live ``V.graph``,
-    see ``CoOptimizingAllocator._solve`` -- the engine falls back to the
+    see ``ScratchpadAllocator._solve`` -- the engine falls back to the
     memory-only spill-traffic objective.
 
     That is the path the whole capture-driven suite above runs on, so it has to be
@@ -1210,7 +1210,7 @@ class CostExprScoringTest(TestCase):
     """``plan_layout_and_core_divisions(cost_expr)`` compiles the caller's
     symbolic cost expression into the per-step scorer (see
     ``SaCoOptimizingSolver._build_score_fn``). ``cost_expr`` is built the same
-    way ``CoOptimizingAllocator._solve`` builds it: a sympy expression over
+    way ``ScratchpadAllocator._solve`` builds it: a sympy expression over
     THESE buffers' own ``sym_is_lx``/``sym_core_divs`` -- so these tests build
     small ones by hand rather than needing a live Inductor graph.
     """
@@ -1911,8 +1911,8 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
 
     @staticmethod
     def _allocator(layout_planning):
-        return allocator_module.CoOptimizingAllocator(
-            layout_planning=layout_planning, size=1
+        return allocator_module.ScratchpadAllocator(
+            layout_planning=layout_planning, size=1, division_mode="open"
         )
 
     def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):

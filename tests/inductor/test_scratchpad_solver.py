@@ -30,7 +30,6 @@ from unittest import TestCase, mock
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
-    CoOptimizingAllocator,
     ScratchpadAllocator,
     _coarse_tile_loop_trip_count,
     _lx_planning_size,
@@ -234,12 +233,19 @@ class TestAllocatorSpillReasons(TestCase):
         self.assertEqual(reasons["barred"], "op not allowed")
         self.assertIn("no room on scratchpad", reasons["late"])
 
-    def test_joint_allocator_reports_only_what_the_solver_said(self):
+    def test_joint_allocator_reports_as_placement_does(self):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
-        reasons = CoOptimizingAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
-            allocation
+        joint = ScratchpadAllocator(
+            ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver),
+            128,
+            division_mode="open",
         )
-        self.assertEqual(reasons, {"barred": "op not allowed"})
+        self.assertEqual(
+            joint._get_spill_reasons(allocation),
+            ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+                allocation
+            ),
+        )
 
 
 class TestLxPlanningContract(TestCase):

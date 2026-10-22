@@ -334,7 +334,7 @@ class NoOpSolverABCTest(TestCase):
 
 
 class SpillCostTest(TestCase):
-    """The duplicated spill-cost formula matches the landed CP-SAT one."""
+    """The spill cost both engines charge (``buffer_graph.spill_cost``)."""
 
     @staticmethod
     def _buf(size, uses, boundary):
@@ -347,25 +347,18 @@ class SpillCostTest(TestCase):
         )
 
     def test_intermediate_pays_the_producer_write(self):
-        b = self._buf(2048, [0, 1, 2, 3], BufferType.Intermediate)
-        # read_count == 3, plus the producer write.
-        self.assertEqual(SaCoOptimizingSolver._spill_cost(b), 4 * 2048)
-
-    def test_boundary_buffers_do_not_pay_the_write(self):
-        for boundary in (BufferType.Input, BufferType.Output):
-            b = self._buf(2048, [0, 1, 2, 3], boundary)
-            self.assertEqual(SaCoOptimizingSolver._spill_cost(b), 3 * 2048)
-
-    def test_matches_the_cpsat_engine_formula(self):
-        """Duplicated formula, so pin it against the original it copies."""
         from torch_spyre._inductor.scratchpad.buffer_graph import spill_cost
 
-        for boundary in BufferType:
-            for uses in ([0, 1], [0, 1, 2, 3], [5]):
-                b = self._buf(2048, uses, boundary)
-                mine = SaCoOptimizingSolver._spill_cost(b)
-                theirs = spill_cost(b)
-                self.assertEqual(mine, theirs, f"{boundary} uses={uses}")
+        b = self._buf(2048, [0, 1, 2, 3], BufferType.Intermediate)
+        # read_count == 3, plus the producer write.
+        self.assertEqual(spill_cost(b), 4 * 2048)
+
+    def test_boundary_buffers_do_not_pay_the_write(self):
+        from torch_spyre._inductor.scratchpad.buffer_graph import spill_cost
+
+        for boundary in (BufferType.Input, BufferType.Output):
+            b = self._buf(2048, [0, 1, 2, 3], boundary)
+            self.assertEqual(spill_cost(b), 3 * 2048)
 
 
 if __name__ == "__main__":

@@ -1245,7 +1245,7 @@ def test_a_read_walked_only_by_the_levels_tiled_dim_is_a_coarse_loop_read(
 
 
 # Through the callers. The allocator builds its objective from
-# ``CoOptimizingAllocator._extract_op_features`` (the legal menu goes in) and prices
+# ``ScratchpadAllocator._extract_op_features`` (the legal menu goes in) and prices
 # with its own ``_COST_PARAMS``; the report calls ``extract_op_features(op)`` with no
 # menu and the default params.
 
@@ -1287,7 +1287,7 @@ def _allocator_features(
     """The allocator's extraction with its legal ``menu``. ``chosen`` is a menu
     index, or a ``{dim: split symbol}`` map that keeps the splits symbolic."""
     from torch_spyre._inductor.scratchpad import sa_cooptimizer
-    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
     monkeypatch.setattr(sa_cooptimizer, "iteration_space_from_op", lambda _: it_space)
@@ -1300,7 +1300,7 @@ def _allocator_features(
         )
     }
     with V.set_graph_handler(graph or _StubGraph()):
-        return CoOptimizingAllocator._extract_op_features(
+        return ScratchpadAllocator._extract_op_features(
             None, None, "buf1", buffers, is_lx or {}, op=op
         )
 

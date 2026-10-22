@@ -54,7 +54,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 
 if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
     from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
     from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
@@ -1211,7 +1211,7 @@ class EnumerationFactory:
         if self.relayout not in ("data", "pruned", "lazy"):
             raise ValueError(f"unknown relayout enumeration {self.relayout!r}")
 
-    def candidates(self, allocator: CoOptimizingAllocator) -> TableCandidates:
+    def candidates(self, allocator: ScratchpadAllocator) -> TableCandidates:
         """What generates the table candidates for ``allocator``'s solves."""
         from torch_spyre._inductor.scratchpad.table_candidates import (
             TableCandidates,

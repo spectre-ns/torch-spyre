@@ -48,7 +48,7 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
-    CoOptimizingAllocator,
+    ScratchpadAllocator,
     _spec_within_read_distance,
     select_allocator,
 )
@@ -908,7 +908,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
                 if isinstance(op, ComputedBuffer)
             }
 
-        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+        with patch.object(ScratchpadAllocator, "_chosen_tilings", chosen):
             return self._compile(fn, args)
 
     def _assert_group_split(self, fn):
@@ -950,7 +950,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             }
 
         with (
-            patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen),
+            patch.object(ScratchpadAllocator, "_chosen_tilings", chosen),
             self.assertRaises(Exception) as refusal,
         ):
             self._compile(lambda x, y: (x + y).repeat(1, 2, 1) * 2, (x, y))
@@ -987,7 +987,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
                 if isinstance(op, ComputedBuffer) and _reads_graph_inputs_only(op)
             }
 
-        with patch.object(CoOptimizingAllocator, "_chosen_tilings", chosen):
+        with patch.object(ScratchpadAllocator, "_chosen_tilings", chosen):
             cpu, device, _ = self._compile(lambda x, y: (x + y) * 2, (x, y))
         self._assert_close(device, cpu)
 
@@ -1095,7 +1095,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 chosen = stack.enter_context(
                     patch.object(
-                        CoOptimizingAllocator,
+                        ScratchpadAllocator,
                         "_chosen_tilings",
                         return_value=self._CHOICES,
                     )
@@ -1108,7 +1108,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
                 )
                 for name, value in patches.items():
                     stack.enter_context(
-                        patch.object(CoOptimizingAllocator, name, return_value=value)
+                        patch.object(ScratchpadAllocator, name, return_value=value)
                     )
                 result = alloc._materialize_selection(graph, solver, allocation)
             return solver, allocation, result, chosen, apply

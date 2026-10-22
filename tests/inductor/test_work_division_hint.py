@@ -812,7 +812,11 @@ def test_fixed_plan_handoff_keeps_feature_gates(mode):
 
 
 def test_joint_allocation_does_not_consume_fixed_plan_handoff():
-    allocator = allocator_module.CoOptimizingAllocator(GreedyLayoutSolver, 256)
+    allocator = allocator_module.ScratchpadAllocator(
+        allocator_module.ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver),
+        256,
+        division_mode="open",
+    )
     graph = _allocation_graph()
     division_map = allocator_module._DivisionMap({}, set())
     with (

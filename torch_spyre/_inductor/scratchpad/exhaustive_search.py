@@ -45,7 +45,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     Bounded by ≤ K^N leaves where N counts buffers with >1 division candidate
     (most carry only the upstream-committed seed).  Per-leaf cost is one
     :meth:`plan_layout` call; ``cd_parent_matches`` (precomputed by
-    :class:`CoOptimizingAllocator`) replaces the graph-level ``get_ncores`` check
+    the joint :class:`ScratchpadAllocator`) replaces the graph-level ``get_ncores`` check
     that was previously rerun per leaf on graph mutations.
 
     The inner solver is a class parameter, so that the wrapper is a class the
@@ -167,7 +167,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
             """Residency verdict for ``b`` under division ``ci``.
 
             Starts from the pre-computed ``b.residency_reason`` (computed by
-            :class:`CoOptimizingAllocator` with ``division_is_fixed=False``), then
+            the joint :class:`ScratchpadAllocator` with ``division_is_fixed=False``), then
             adds the division-compatibility check via ``cd_parent_matches``. A
             resident producer must match every consumer: if no
             ``(producer_div, consumer_div)`` pair matches the selected divisions,

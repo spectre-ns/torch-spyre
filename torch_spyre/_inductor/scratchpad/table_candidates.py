@@ -120,7 +120,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
 )
 
 if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
 
 
@@ -379,9 +379,9 @@ def _has_legal_division(context) -> bool:
 
 
 class TableCandidates:
-    """The candidate derivations of one :class:`CoOptimizingAllocator`."""
+    """The candidate derivations of one the joint :class:`ScratchpadAllocator`."""
 
-    def __init__(self, allocator: CoOptimizingAllocator) -> None:
+    def __init__(self, allocator: ScratchpadAllocator) -> None:
         self.allocator = allocator
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         # Per enumerated op, its divisions as a space (lx_division_encoding).

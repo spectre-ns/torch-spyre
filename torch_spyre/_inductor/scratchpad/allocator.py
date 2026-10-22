@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import logging
+import os
 import math
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Callable, cast, NamedTuple, Optional
+from typing import Any, Callable, cast, Literal, NamedTuple, Optional
 
 import sympy
 from torch._inductor.ir import (
@@ -746,6 +747,8 @@ class ScratchpadAllocator:
         size: int,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
+        division_mode: Literal["open", "committed"] = "committed",
+        prune: bool = False,
     ):
         """Configure the allocator with a solver class and graph passes.
 
@@ -760,7 +763,19 @@ class ScratchpadAllocator:
                 Defaults to no passes.
             post_optimization_passes: Graph passes applied after layout planning.
                 Defaults to no passes.
+            division_mode: ``"committed"`` plans placement over the divisions
+                work division committed upstream; ``"open"`` chooses each
+                buffer's core division (and coarse tiling) jointly with its
+                placement, which needs a solver that chooses divisions (the
+                OR-Tools ``CpSatLayoutSolver``, ``SaCoOptimizingSolver``, or
+                ``ExhaustiveSearchSolver.wrapping`` a placement-only solver).
+            prune: Enable heuristic pruning of the core-division search space.
         """
+        if division_mode == "open" and not layout_planning.chooses_core_divisions():
+            raise ValueError(
+                f"{layout_planning.__name__} cannot choose core divisions; the "
+                "open division mode needs a CoreDivisionLayoutSolver"
+            )
         if pre_optimization_passes is None:
             pre_optimization_passes = []
         if post_optimization_passes is None:
@@ -779,6 +794,32 @@ class ScratchpadAllocator:
         # residency gate, the lifetime extension and the post-solve push.  The
         # placement path leaves this empty, which is its pre-change behavior.
         self._validated_drain_plans: dict[str, DrainPlan] = {}
+        self.division_mode = division_mode
+        self.prune = prune
+        # Per op ``_apply_chosen_tilings`` tiled, its pre-apply iteration
+        # symbols to its live ones; read through :meth:`_live_splits`.
+        self._tiling_symbol_remaps: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
+        self._decides_lx_relayouts = layout_planning.decides_lx_relayouts()
+        self._tilings_from_menu = layout_planning.tilings_from_menu()
+        if not self.joint:
+            return
+        if config.lx_planner_relayout and not self._decides_lx_relayouts:
+            logger.debug(
+                "%s does not decide LX relayouts; continuing without relayout",
+                layout_planning.__name__,
+            )
+        # Candidate generation belongs to the solve's table encoding; this
+        # allocator dispatches the solve and applies the result.
+        from torch_spyre._inductor.scratchpad.encoding_strategy import (
+            EnumerationFactory,
+        )
+
+        self.candidates = EnumerationFactory().candidates(self)
+
+    @property
+    def joint(self) -> bool:
+        """Whether divisions are open: chosen jointly with placement."""
+        return self.division_mode == "open"
 
     @staticmethod
     def _planned_lx_buffer_names(
@@ -826,6 +867,18 @@ class ScratchpadAllocator:
             lx_relayout_plans = None
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph, lx_relayout_plans=lx_relayout_plans)
+        if os.environ.get("LX_IR_GRAPH_CHECK"):
+            from torch_spyre._inductor.scratchpad.ir_graph import record_agreement
+
+            assert self.layout_planning is not None
+            record_agreement(
+                graph,
+                buffers,
+                128,
+                "open"
+                if self.layout_planning.chooses_core_divisions()
+                else "committed",
+            )
         solver = self._build_solver(buffers)
         allocation = self._solve(solver, graph)
         solver, allocation = self._materialize_selection(graph, solver, allocation)
@@ -849,7 +902,12 @@ class ScratchpadAllocator:
         *,
         lx_relayout_plans: list[LXRelayoutPlan] | None = None,
     ) -> Sequence[Any]:
-        """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
+        """Buffers to hand the solver: fixed-division LifetimeBoundBuffers,
+        or in the open mode the table candidates' CoreDivisionBuffers."""
+        if self.joint:
+            return self._joint_prepare_buffers(
+                graph, lx_relayout_plans=lx_relayout_plans
+            )
         assert self.layout_planning is not None
         if not self.layout_planning.supports_paired_buffers():
             if config.lx_planner_relayout:
@@ -873,8 +931,10 @@ class ScratchpadAllocator:
         return buffers
 
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
-        """Assign LX addresses. Base: the placement-only solve of the
-        solver's buffers."""
+        """Assign LX addresses (and in the open mode core divisions) by
+        solving the graph of the solver's buffers."""
+        if self.joint:
+            return self._joint_solve(solver, graph)
         from torch_spyre._inductor.scratchpad.graph_solvers import solve_buffers
 
         return solve_buffers(solver)
@@ -891,9 +951,11 @@ class ScratchpadAllocator:
         commits, so an override that mutates the graph and re-plans hands back
         the second solve's pair.
 
-        Base: a placement-only solve selects nothing to materialize, so the first
+        A placement-only solve selects nothing to materialize, so the first
         solve stands.
         """
+        if self.joint:
+            return self._joint_materialize_selection(graph, solver, allocation)
         return solver, allocation
 
     def _finalize_lx_relayout_allocation(
@@ -901,6 +963,8 @@ class ScratchpadAllocator:
         allocation: Sequence[LifetimeBoundBuffer],
         graph: GraphLowering,
     ) -> list[LXRelayoutPlan]:
+        if self.joint:
+            return self._joint_finalize_lx_relayout_allocation(allocation, graph)
         plans = [plan for buffer in allocation for plan in buffer.lx_relayout_plans]
         if not plans:
             return []
@@ -934,8 +998,11 @@ class ScratchpadAllocator:
         allocation: Sequence[Any],
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
-        """Hook run after the solve and the relayout finalization, before
-        reasons/push. Base: nothing to commit."""
+        """Run after the solve and the relayout finalization, before
+        reasons/push: in the open mode, commit the chosen divisions and
+        tilings; placement-only has nothing to commit."""
+        if self.joint:
+            self._joint_post_solve(graph, allocation, accepted_lx_relayouts)
 
     def _get_spill_reasons(self, allocation: Sequence[LifetimeBoundBuffer]) -> dict:
         """Get spill reasons for every buffer that did not land in LX.
@@ -2017,6 +2084,654 @@ class ScratchpadAllocator:
         layout.allocation["lx"] = address
         layout.lx_view = lx_view
 
+    # ---- the joint (open division mode) solve ----
+
+    def _joint_prepare_buffers(
+        self,
+        graph: GraphLowering,
+        *,
+        lx_relayout_plans: list[LXRelayoutPlan] | None = None,
+    ) -> Sequence[Any]:
+        return self.candidates._prepare_buffers(
+            graph, lx_relayout_plans=lx_relayout_plans
+        )
+
+    def _joint_solve(
+        self, solver: MemoryPlanSolver, graph: GraphLowering
+    ) -> Sequence[Any]:
+        from torch_spyre._inductor.scratchpad.graph_solvers import solve_buffers
+
+        assert isinstance(solver, CoreDivisionLayoutSolver)
+        bufmap = {buf.name: buf for buf in solver.buffers}
+        # Built once here, not per op inside the loop below: every op's residency
+        # lookup is against this same whole-graph map, and rebuilding it per op
+        # turns an O(buffers) cost into O(ops * buffers) on the full graph.
+        default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
+        pricing_ops = self.candidates._pricing_operations(graph, solver.buffers)
+        pricing_by_name = {op.get_name(): op for op in pricing_ops}
+
+        # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
+        # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
+        # on ``op.name`` over ``graph.operations``, so every feature here belongs
+        # to an op the grouping will see -- a feature whose buffer is absent from
+        # ``graph.operations`` would silently drop out of the objective.
+        mem_usage = mem_usage_by_buf(graph)
+        feature_names = [
+            output_name
+            for output_name in mem_usage
+            if isinstance(graph.get_buffer(output_name), ComputedBuffer)
+            and output_name in bufmap
+            and output_name in pricing_by_name
+        ]
+
+        from torch_spyre._inductor.cost_model import predict_bundles
+
+        # Logged, not asserted: dropping a buffer from the objective changes what
+        # the solver optimizes without failing anything, so it has to be visible,
+        # but it is not worth killing a plan over. Empty today.
+        unscored = set(feature_names) - {
+            getattr(op, "name", None) for op in graph.operations
+        }
+        if unscored:
+            logger.debug(
+                "cost objective omits %d buffer(s) absent from graph.operations: %s",
+                len(unscored),
+                sorted(unscored),
+            )
+
+        # Scored one estimated bundle at a time, not as a single whole-graph
+        # kernel: bundle membership decides input dedup, the arity derate and the
+        # underfill derate, so a graph that fuses into several kernels is
+        # mispriced when scored flat.
+        # TypeError is in the set because a cost-model branch over an undecided
+        # `is_lx`/`output_split` raises "cannot determine truth value of Relational"
+        # rather than anything the model raises itself (issue #4233); every tiling
+        # surface that did so now skips a symbolic tile height in `cost_model`, so this
+        # only has to keep a FUTURE symbolic-hostile branch from killing a compile.
+        # Losing the expression costs the objective, not correctness -- but it costs it
+        # in BOTH engines now that #4164 has the annealer consume cost_expr: CP-SAT falls
+        # back to its lexicographic solve and `_build_score_fn` returns None, dropping
+        # the annealer to the memory-only objective. Nothing downstream reports that, so
+        # log it here -- with the traceback, since the message alone ("cannot determine
+        # truth value of Relational") names no op, bundle or term -- and honour
+        # `_cpsat_warn_on_cost_expr` as `buffer_graph._minimize_cost_expr` does.
+        # Without that escape hatch a TypeError from ordinary drift, say a signature
+        # change or a None in a term, is a silent objective loss no test can fail on.
+        if (
+            config.auto_coarse_tiling
+            and solver.chooses_tilings()
+            and solver.linear_cost_only()
+        ):
+            # The cost model is flat in both axes the tiling search moves along:
+            # it has no term for tile size and none for cut count, so every
+            # candidate tiling scores identically and the choice falls to
+            # whichever optimum the multi-worker portfolio reaches first (the
+            # same graph drew 1, 2, 3 or 4 cuts run to run at one identical
+            # objective value). Worse, it is not merely uninformative there --
+            # #3810 makes it raise on symbolic args once an op is output-tiled,
+            # so the re-plan silently loses the runtime term anyway, and it
+            # prices residency the scheduler later revokes. Hand the solver no
+            # cost expression at all and let its lexicographic ladder rank
+            # residency, cuts, parallelism and division shape instead. Off this
+            # path the expression is unchanged and still the objective.
+            logger.debug(
+                "cost objective skipped: auto_coarse_tiling makes tile size and "
+                "cut count decision axes the cost model cannot score"
+            )
+            result = solve_buffers(solver, None, joint=True)
+            assert not any(buffer.lx_relayout_plans for buffer in result), (
+                "the joint allocator does not support LX relayout"
+            )
+            return result
+
+        bundle_terms: list = []
+        # Feature extraction runs inside the same fallback: a candidate tiling
+        # can raise Unsupported (an axis with no resolvable loop variable) or
+        # ValueError (candidates on an already coarse-tiled op), and either
+        # costs the objective, not the compile.
+        try:
+            op_features = {
+                output_name: self._extract_op_features(
+                    graph,
+                    output_name,
+                    bufmap,
+                    default_is_lx,
+                    op=pricing_by_name[output_name],
+                )
+                for output_name in feature_names
+            }
+            bundle_terms = predict_bundles(
+                pricing_ops, op_features, params=_COST_PARAMS
+            )
+            cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
+        except (ValueError, RuntimeError, TypeError) as e:
+            logger.warning(
+                "cost objective unavailable (%s: %s); the solver falls back to its "
+                "own objective",
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
+            if not config._cpsat_warn_on_cost_expr:
+                raise
+            # Both the terms and the objective are the failed build's output, so
+            # neither is dumpable. ``cost_expr = None`` already skips the dump;
+            # clearing the terms too keeps that a local invariant rather than
+            # something a reader has to chase to the dump call below.
+            bundle_terms = []
+            cost_expr = None
+
+        # One price term per relayout copy (a source and one destination view,
+        # however many consumers share it): the fitted shuffle cost of the
+        # source's chosen division, charged while the copy is resident. One
+        # RelayoutCharge node per copy, over symbols every engine binds (is_lx,
+        # division), so the objective stays self-describing and the rewrite
+        # passes never expand it. Skipped when the bundle scoring failed: the
+        # solver then runs its fallback objective, under which every copy is
+        # pinned out.
+        if cost_expr is not None:
+            for copy in sorted(
+                (b for b in solver.buffers if isinstance(b, RelayoutCopyBuffer)),
+                key=lambda b: b.name,
+            ):
+                cost_expr = cost_expr + copy.cost_term()
+        result = solve_buffers(solver, cost_expr, joint=True)
+        if any(buffer.lx_relayout_plans for buffer in result):
+            raise AssertionError("the joint allocator does not support LX relayout")
+        if config.dump_cost_expr_file and cost_expr is not None:
+            # The objective as solved: its terms, the chosen symbol values and
+            # the evaluated prices, for the summarize-sdsc skill.
+            from torch_spyre._inductor.dump_common import (
+                emit_json_line,
+                origin_op_name,
+            )
+
+            # No graph identity: the kernel name and directory hash are
+            # assigned at codegen, and `get_output_names()` is empty here. A
+            # reader pairs records to kernels by position -- they are appended
+            # in solve order -- so a counter would add only process-global state.
+            #
+            # Ops are named twice because the numeric cost dump names them
+            # twice: `op_names` matches its block heading and is what a human
+            # reads, `op_ids` matches its `output opN` line and is unique, so it
+            # is the key that joins the two dumps.
+            op_names, op_ids = {}, {}
+            for op in graph.operations or ():
+                # All three names or none: a half-written pair would leave the
+                # two maps disagreeing about which ops exist.
+                try:
+                    named = (op.get_name(), origin_op_name(op), op.get_operation_name())
+                except Exception:  # pragma: no cover - naming is best-effort
+                    continue
+                op_names[named[0]], op_ids[named[0]] = named[1], named[2]
+            context = {
+                "op_names": op_names,
+                "op_ids": op_ids,
+                "env": {
+                    # Per SOLVE, not per run: the head-major attention path
+                    # caps it for its own compile and leaves the rest at 32.
+                    "sencores": config.sencores,
+                    "lx_capacity": self.size,
+                    "solver": type(solver).__name__,
+                    "allocator": type(self).__name__,
+                },
+                "solve": dict(getattr(solver, "last_solve_stats", {}) or {}),
+            }
+            emit_json_line(
+                config.dump_cost_expr_file,
+                cost_expr_record(
+                    cost_expr,
+                    bundle_terms,
+                    result,
+                    _COST_PARAMS,
+                    solver.off_expression_ns(),
+                    solver.score_ns(),
+                    context=context,
+                ),
+            )
+        return result
+
+    def _extract_op_features(self, graph, output_name, buffers, is_lx, *, op=None):
+        """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
+
+        Same extraction as dump_cost_model.extract_op_features, but keyed off
+        each buffer's *symbolic* core-division vars (sym_core_divs) instead of
+        concrete values, so the resulting OpFeatures can be fed to
+        predict_ops() to build a cost expression over the solver's own
+        decision variables. The extractor reads each arg's symbolic residency
+        from ``is_lx`` (built once by the caller over all of ``buffers``, not
+        per op); ``buffers`` itself supplies this op's own candidate divisions.
+
+        Candidate coarse tilings enter the same way: each tiled axis's
+        symbolic count (``sym_tile_counts``) is keyed on the op's own loop
+        variable for that axis. With no tiled candidate there are none, and the
+        extractor reads the op's committed tiling (``loop_info``) as before.
+        """
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            try_resolve_tile_axis_loop_vars,
+        )
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        op = graph.get_buffer(output_name) if op is None else op
+        buffer = buffers[output_name]
+        division = CoreDivision(splits=buffer.sym_core_divs)
+        ws = _work_slices(op, division)
+        sym_tiling: dict = {}
+        if config.auto_coarse_tiling:
+            for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
+                spec = TileSpec((TileAxis(host_dim, 1, is_reduction),))
+                loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
+                if loop_vars is None:
+                    raise Unsupported(reason)
+                (var,) = loop_vars
+                sym_tiling[var] = sym_tiling.get(var, 1) * symbol
+        return extract_op_features(
+            op,
+            ws,
+            is_lx=is_lx,
+            sym_tiling=sym_tiling or None,
+            candidate_work_slices=[
+                _work_slices(op, candidate) for candidate in buffer.core_divisions
+            ],
+        )
+
+    def _joint_finalize_lx_relayout_allocation(
+        self,
+        allocation: Sequence[LifetimeBoundBuffer],
+        graph: GraphLowering,
+    ) -> list[LXRelayoutPlan]:
+        """Turn the solver's fired relayouts into materializable plans.
+
+        The solver already guaranteed everything the greedy path checks after
+        the fact: the copy's residency IS the decision, the served consumers'
+        division pairs are pinned by the literals that require the copy
+        resident, and the 2D no-overlap kept source and copy disjoint. The
+        fired ``ChosenRelayout`` records carry the views the enumeration
+        priced, so nothing is re-derived here: the fired edges regroup by
+        (source, destination view), the committed divisions and the copy's
+        address are checked against them, and ``materialize_lx_relayouts``
+        gets one plan per fired group.
+        """
+        by_name = {b.name: b for b in allocation}
+        fired = FiredRelayoutGroup.from_chosen(
+            chosen
+            for consumer in allocation
+            for chosen in getattr(consumer, "chosen_relayouts", {}).values()
+        )
+        plans: list[LXRelayoutPlan] = []
+        for group in fired:
+            source = by_name[group.parent]
+            copy = by_name[relayout_copy_name(group.parent, group.group)]
+            assert source.chosen_division == group.source_division, (
+                f"relayout group {group.parent}/g{group.group} chose source "
+                f"division {group.source_division} but {source.chosen_division} "
+                "was committed"
+            )
+            assert source.address is not None, (
+                f"relayout source {group.parent} has no LX address"
+            )
+            assert copy.address == group.destination_address, (
+                f"relayout group {group.parent}/g{group.group}: consumers read the "
+                f"copy at {group.destination_address} but it was placed at "
+                f"{copy.address}"
+            )
+            for member in group.members:
+                consumer = by_name[member.candidate.consumer]
+                assert consumer.chosen_division == member.candidate.consumer_division, (
+                    f"relayout pair ({group.source_division}, "
+                    f"{member.candidate.consumer_division}) disagrees with committed "
+                    f"division {consumer.chosen_division} on {group.parent} -> "
+                    f"{consumer.name}"
+                )
+            plans.append(group.plan(source.address))
+        return plans
+
+    def _joint_post_solve(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[Any],
+        accepted_lx_relayouts: Sequence[LXRelayoutPlan],
+    ) -> None:
+        # Apply before commit. ``commit_iteration_space_ownership`` builds the
+        # ownership off ``iteration_space_from_op``, whose symbols come from the
+        # write dep's ranges -- which ``_divide_ranges`` invalidates. Committing
+        # afterwards derives both the split map and the core mapping against the
+        # already-divided op instead of migrating a stale object, and
+        # ``coarse_tile`` reads no ownership of its own, so the one
+        # ``_distribute_work`` left is simply overwritten.
+        tiled = self._apply_chosen_tilings(graph, allocation)
+        self._check_priced_footprints(graph, allocation, tiled)
+        # The divisions must be committed such that any buffer clones can correctly
+        # pull the selected core division from the dependent buffers when the graph
+        # is updated with clones in ``_push_allocation``.
+        commit_divisions(graph, allocation, self._live_splits)
+        # After the commit, and before the views below are derived from it: a
+        # copy-out the apply mints is not in ``allocation``, so nothing above gave
+        # it a division and it would be judged against its tiled op's as a mismatch.
+        self._commit_copy_out_divisions(graph, allocation, tiled)
+        commit_lx_views(
+            graph,
+            allocation,
+            accepted_lx_relayouts,
+            drained_readers=_drained_collectives(self._validated_drain_plans),
+        )
+        log_solver_decisions(graph, allocation)
+
+    def _joint_materialize_selection(
+        self,
+        graph: GraphLowering,
+        solver: MemoryPlanSolver,
+        allocation: Sequence[Any],
+    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
+        """Apply the coarse tilings the joint solve selected, then re-plan.
+
+        The first solve chooses core divisions *and* tilings jointly, pricing the
+        tiled candidates through their predicted (``wsr.tile_prediction``) views.
+        If it picks a non-empty tiling for any op, ``CoarseTilingPass`` applies
+        exactly those choices (mutating the IR the same way a pre-stickification
+        hint would), and the allocation is redone over the materialized graph so
+        new boundary buffers get placed and the applied ops get their final
+        divisions. The second pass enumerates no further tilings
+        (``_suppress_tiling``), so it terminates, and it mirrors the hint path
+        (allocate an already-tiled graph).
+
+        Ordering is solve-before-apply: a ``SolveError`` from the first solve
+        propagates over the *unmutated* graph, so ``scratchpad_planning``'s greedy
+        fallback never runs on a half-tiled graph (a second-solve ``SolveError``
+        falls back over the fully-tiled graph, which is a valid outcome).
+
+        Both the second solver and its allocation are returned: the caller reads
+        spill reasons off the solver that produced the allocation it commits, so
+        returning one without the other would report the first solve's reasons
+        against the second solve's plan.
+
+        Only for an engine that asks for it (``replans_after_tiling()``): for any
+        other, the first placement stands and the pair is returned unchanged.
+        """
+        assert isinstance(solver, CoreDivisionLayoutSolver)
+        if not solver.replans_after_tiling():
+            return solver, allocation
+        choices = self._chosen_tilings(graph, allocation)
+        if logger.isEnabledFor(logging.DEBUG):
+            for name, spec in choices.items():
+                logger.debug("chosen_tiling: %s -> %s", name, spec.label)
+        if not choices:
+            return solver, allocation
+
+        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+
+        op_count = len(graph.operations)
+        CoarseTilingPass(choices).apply_pass(graph)
+        assert len(graph.operations) >= op_count, (
+            "coarse tiling apply must not drop operations"
+        )
+        # Re-plan over the materialized tiling. Pre-passes are empty for this
+        # allocator; suppress further tiling so the second solve only places.
+        self._suppress_tiling = True
+        try:
+            buffers = self._prepare_buffers(graph)
+            solver = self._build_solver(buffers)
+            allocation = self._solve(solver, graph)
+        finally:
+            self._suppress_tiling = False
+        return solver, allocation
+
+    def _chosen_tilings(
+        self, graph: GraphLowering, allocation: Sequence[Any]
+    ) -> dict[str, TileSpec]:
+        """The non-empty tiling the solve chose for each op, keyed by operation
+        name (the key ``CoarseTilingPass``/``derive_tiling_groups`` consume)."""
+        op_by_name = {op.name: op for op in graph.operations}
+        choices: dict[str, TileSpec] = {}
+        for buf in allocation:
+            op = op_by_name.get(buf.name)
+            if op is None or buf.chosen_division is None:
+                continue
+            cd = buf.core_divisions[buf.chosen_division]
+            if not cd.tiling.is_untiled:
+                choices[op.get_operation_name()] = cd.tiling
+        return choices
+
+    def _apply_chosen_tilings(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+    ) -> dict[str, TileSpec]:
+        """Apply the solver's chosen coarse tilings, returning them by buffer name.
+
+        The only consumer a chosen ``TileSpec`` has. Without it the search prices
+        the *per-tile* footprint and the packer lays LX out by it while the graph
+        writes the full extent, so the reserved interval is a fraction of the
+        real one.
+
+        **The anneal's placement stands.** Applying the tiling is what makes its
+        addresses true rather than stale, so there is no second placement round:
+        re-running a placement engine here would decouple the layout from the
+        divisions and tilings it was jointly chosen with, which is the coupling
+        this allocator exists for. The companion buffers the apply mints (a
+        full-extent ``full_buf`` per op whose output escapes its tiling group)
+        were not in the joint state, so they get no LX address and stay in HBM
+        -- which is what the solver's ``_companion_bytes`` prices them as.
+
+        **A refusal raises.** The search is supposed to propose only tilings
+        ``coarse_tile`` accepts -- ``OpSplitSpace.admits`` is meant to be
+        complete with respect to it -- so a refusal is a defect in that model
+        rather than a graph to route around, and dropping the tiling here would
+        also invalidate the addresses already spaced for it.
+        """
+        if not self._solver_chooses_tilings:
+            return {}
+        op_by_name = {op.name: op for op in graph.operations}
+        # By buffer name; ``choices`` by operation name, as ``CoarseTilingPass``
+        # takes them.
+        tiled: dict[str, TileSpec] = {}
+        choices: dict[str, TileSpec] = {}
+        for buffer in allocation:
+            if buffer.chosen_division is None:
+                continue
+            tiling = buffer.core_divisions[buffer.chosen_division].tiling
+            if tiling.is_untiled:
+                continue
+            tiled[buffer.name] = tiling
+            choices[op_by_name[buffer.name].get_operation_name()] = tiling
+        if not choices:
+            return {}
+        # Local import: ``coarse_tiling`` imports ``ScratchpadOptimizationPass``
+        # from this module, so a top-level import would be circular.
+        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+
+        # A tiling comes only from a generated division, which only an
+        # enumerated ``ComputedBuffer`` has (``_build_cd_bound_buffers``).
+        frames = {
+            name: capture_iteration_frame(cast(ComputedBuffer, op_by_name[name]))
+            for name in tiled
+        }
+        chosen = ", ".join(
+            f"{name}={spec.label}" for name, spec in sorted(choices.items())
+        )
+        try:
+            CoarseTilingPass(choices).apply_pass(graph)
+        except Unsupported as exc:
+            exc.add_note(f"auto_coarse_tiling chose: {chosen}")
+            raise
+        self._remap_tiled_symbols(graph, frames)
+        # See ``JOINT_TILING_AND_DIVISION_ATTR``. Looked up afresh: the apply
+        # replaces an op it redirects to a companion's full buffer
+        # (``replace_computed_buffer_body``), so a pre-apply object is stale.
+        op_by_name = {op.name: op for op in graph.operations}
+        for name in tiled:
+            setattr(op_by_name[name], JOINT_TILING_AND_DIVISION_ATTR, True)
+        logger.info("applied a coarse tiling to %d op(s): %s", len(choices), chosen)
+        return tiled
+
+    def _remap_tiled_symbols(
+        self, graph: GraphLowering, frames: dict[str, IterationFrame]
+    ) -> None:
+        """Record how the apply renumbered each tiled op's iteration symbols, and
+        move the op's span floors through it.
+
+        The solve keyed its splits by the pre-apply symbols. A tile that shrinks
+        a dim to extent 1 drops that dim's symbol and renumbers every later one,
+        so a pre-apply key read against the live op names the next axis. The
+        floors ``span_reduction_pass`` committed are keyed the same way and are
+        read against the live op by ``meets_span_floors``.
+        """
+        live = {op.name: op for op in graph.operations}
+        self._tiling_symbol_remaps = {}
+        for name, frame in frames.items():
+            # ``replace_computed_buffer_body`` keeps it a ``ComputedBuffer``.
+            op = cast(ComputedBuffer, live[name])
+            self._tiling_symbol_remaps[name] = iteration_symbol_remap(op, frame)
+            floors = getattr(op, "_work_division_span_min_splits", None)
+            if floors:
+                op._work_division_span_min_splits = self._live_splits(name, floors)
+
+    def _live_splits(
+        self, name: str, splits: dict[sympy.Symbol, int]
+    ) -> dict[sympy.Symbol, int]:
+        """``splits``, keyed by op ``name``'s pre-apply symbols, re-keyed to its
+        live ones. Identity for an op the apply did not tile."""
+        remap = self._tiling_symbol_remaps.get(name)
+        if remap is None:
+            return dict(splits)
+        lost = sorted(
+            str(sym)
+            for sym, factor in splits.items()
+            if sym not in remap and factor > 1
+        )
+        if lost:
+            raise Unsupported(
+                f"{name}: the coarse tiling left no axis for the split on "
+                f"{', '.join(lost)}; it would commit as 1"
+            )
+        return {remap[sym]: factor for sym, factor in splits.items() if sym in remap}
+
+    def _commit_copy_out_divisions(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: Iterable[str],
+    ) -> None:
+        """Give each copy-out the apply minted its tiled op's core division.
+
+        ``_insert_copy_op`` (wsr/coarse_tile.py) builds the copy-out over the
+        tiled op's own ``data.ranges`` and reads the per-tile buffer, so it
+        keeps no division of its own -- one core -- while the tiled op commits
+        whatever the solve chose. ``get_ncores_for_buffers`` then reports the
+        mismatch and withholds the tiled buffer's view, and a resident one
+        raises in :meth:`_post_solve`.
+
+        The copy's iteration symbols are the tiled op's output symbols in order
+        (``iteration_space_from_op`` lists reductions after), so the splits map
+        positionally and only a reduction split is dropped.
+        """
+        by_name = {b.name: b for b in allocation}
+        ops = {getattr(op, "name", None): op for op in graph.operations}
+        for source in tiled:
+            # Named as ``_insert_copy_op`` names it.
+            copy = ops.get(graph.qualify_name(f"coarse_tile_copy_{source}"))
+            buffer = by_name[source]
+            if copy is None:
+                # Expected when the op's output stays inside its tiling group.
+                logger.debug("%s: no copy-out to give its core division", source)
+                continue
+            if buffer.chosen_division is None:
+                continue
+            splits = self._live_splits(
+                source, buffer.core_divisions[buffer.chosen_division].splits
+            )
+            symbols = list(iteration_space_from_op(copy))
+            source_symbols = list(iteration_space_from_op(graph.get_buffer(source)))
+            mapped = {
+                symbols[position]: factor
+                for position, symbol in enumerate(source_symbols)
+                if position < len(symbols) and (factor := splits.get(symbol, 1)) > 1
+            }
+            commit_iteration_space_ownership(copy, mapped)
+
+    def _check_priced_footprints(
+        self,
+        graph: GraphLowering,
+        allocation: Sequence[CoreDivisionBuffer],
+        tiled: Mapping[str, TileSpec],
+    ) -> None:
+        """Every tiled buffer's applied per-core footprint fits the one it was
+        placed at, or this raises.
+
+        The search divides the buffer's *total* size by
+        ``output_partition * output_tile_count``; the apply divides the op's
+        ranges per dim and rebuilds the device layout through
+        ``_resize_device_layout``. Those agree only if resizing divides the
+        device byte size exactly -- plausible, since ``build_tiling_space`` never
+        tiles the stick dim, but per-dim device padding could re-round. An
+        applied footprint *larger* than the priced one would overlap whatever
+        was packed above this buffer's LX interval; a smaller one only leaves
+        part of the interval unused, so it is logged rather than refused.
+        """
+        for buffer in allocation:
+            tiling = tiled.get(buffer.name)
+            if tiling is None:
+                continue
+            layout = graph.get_buffer(buffer.name).layout
+            device_layout = getattr(layout, "device_layout", None)
+            if device_layout is None:
+                raise Unsupported(
+                    f"{buffer.name}: tiled as {tiling.label} but carries no device "
+                    "layout to check the applied footprint against"
+                )
+            # ``_apply_chosen_tilings`` skips a buffer with no chosen division,
+            # so anything in ``tiled`` has one.
+            assert buffer.chosen_division is not None
+            partition = buffer.core_divisions[buffer.chosen_division].output_partition
+            applied = ceil_div(get_device_size_in_bytes(device_layout), partition)
+            priced = buffer.per_core_size(buffer.chosen_division)
+            if applied < priced:
+                logger.debug(
+                    "%s: applied per-core footprint %d bytes under tiling %s is "
+                    "below the %d it was placed at",
+                    buffer.name,
+                    applied,
+                    tiling.label,
+                    priced,
+                )
+            elif applied > priced:
+                raise Unsupported(
+                    f"{buffer.name}: placed at a per-core footprint of {priced} "
+                    f"bytes under tiling {tiling.label} ({buffer.size} bytes over "
+                    f"{partition} cores x {tiling.output_tile_count} tiles), but "
+                    f"the applied graph gives {applied}; its LX address is spaced "
+                    "for a footprint the graph does not have"
+                )
+
+    @property
+    def _solver_generates_divisions(self) -> bool:
+        """Whether the solver this allocator feeds generates divisions at all
+        (``generates_divisions()``).
+
+        The others read ``core_divisions`` and ``cd_parent_matches`` exactly as
+        before and would never look at a space. Building one is not free -- a
+        ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
+        engine that would ignore the answer does not pay for it.
+        """
+        assert self.layout_planning is not None
+        return self.layout_planning.generates_divisions()
+
+    @property
+    def _solver_chooses_tilings(self) -> bool:
+        """Whether the solver this allocator feeds picks coarse tilings that
+        this allocator applies: off the split space of a solver that generates
+        its divisions. CP-SAT takes its tilings off the menu instead
+        (``tilings_from_menu()``) and applies them through
+        ``_materialize_selection``.
+        """
+        assert self.layout_planning is not None
+        return (
+            config.auto_coarse_tiling
+            and self.layout_planning.chooses_tilings()
+            and self.layout_planning.generates_divisions()
+        )
+
 
 def _lx_planning_size() -> int:
     """Return the frontend LX reservation, matching Deeptools exactly.
@@ -2809,711 +3524,6 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
-class CoOptimizingAllocator(ScratchpadAllocator):
-    def __init__(
-        self,
-        layout_planning: type[CoreDivisionLayoutSolver],
-        size: int,
-        pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
-        post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
-        prune: bool = False,
-    ):
-        """Joint core-division + LX-placement allocator.
-
-        Args:
-            layout_planning: Class of a core-division-aware solver -- the
-                OR-Tools ``CpSatLayoutSolver`` (ILP), ``SaCoOptimizingSolver``,
-                or ``ExhaustiveSearchSolver.wrapping`` a placement-only solver
-                (DFS). This allocator drives the *joint* entry point, so it
-                needs the ``CoreDivisionLayoutSolver`` interface rather than a
-                plain ``MemoryPlanSolver``. The ortools-missing fallback to
-                greedy placement lives in :func:`select_allocator`, which
-                never constructs this allocator without a valid factory.
-            pre_optimization_passes: Graph passes applied before layout planning.
-            post_optimization_passes: Graph passes applied after layout planning.
-            prune: Enable heuristic pruning of the core-division search space.
-        """
-        super().__init__(
-            layout_planning=layout_planning,
-            size=size,
-            pre_optimization_passes=pre_optimization_passes,
-            post_optimization_passes=post_optimization_passes,
-        )
-        # Narrow the base's ``type[MemoryPlanSolver]`` annotation: the joint
-        # entry point requires the core-division interface.
-        self.layout_planning: Optional[type[CoreDivisionLayoutSolver]] = layout_planning
-        self.prune = prune
-        # Per op ``_apply_chosen_tilings`` tiled, its pre-apply iteration
-        # symbols to its live ones; read through :meth:`_live_splits`.
-        self._tiling_symbol_remaps: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
-        self._decides_lx_relayouts = layout_planning.decides_lx_relayouts()
-        self._tilings_from_menu = layout_planning.tilings_from_menu()
-        if config.lx_planner_relayout and not self._decides_lx_relayouts:
-            logger.debug(
-                "%s does not decide LX relayouts; continuing without relayout",
-                layout_planning.__name__,
-            )
-        # Candidate generation belongs to the solve's table encoding; this
-        # allocator dispatches the solve and applies the result.
-        from torch_spyre._inductor.scratchpad.encoding_strategy import (
-            EnumerationFactory,
-        )
-
-        self.candidates = EnumerationFactory().candidates(self)
-
-    def _prepare_buffers(
-        self,
-        graph: GraphLowering,
-        *,
-        lx_relayout_plans: list[LXRelayoutPlan] | None = None,
-    ) -> Sequence[Any]:
-        return self.candidates._prepare_buffers(
-            graph, lx_relayout_plans=lx_relayout_plans
-        )
-
-    def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
-        from torch_spyre._inductor.scratchpad.graph_solvers import solve_buffers
-
-        assert isinstance(solver, CoreDivisionLayoutSolver)
-        bufmap = {buf.name: buf for buf in solver.buffers}
-        # Built once here, not per op inside the loop below: every op's residency
-        # lookup is against this same whole-graph map, and rebuilding it per op
-        # turns an O(buffers) cost into O(ops * buffers) on the full graph.
-        default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
-        pricing_ops = self.candidates._pricing_operations(graph, solver.buffers)
-        pricing_by_name = {op.get_name(): op for op in pricing_ops}
-
-        # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
-        # features to the ops in each estimated bundle. ``mem_usage_by_buf`` keys
-        # on ``op.name`` over ``graph.operations``, so every feature here belongs
-        # to an op the grouping will see -- a feature whose buffer is absent from
-        # ``graph.operations`` would silently drop out of the objective.
-        mem_usage = mem_usage_by_buf(graph)
-        feature_names = [
-            output_name
-            for output_name in mem_usage
-            if isinstance(graph.get_buffer(output_name), ComputedBuffer)
-            and output_name in bufmap
-            and output_name in pricing_by_name
-        ]
-
-        from torch_spyre._inductor.cost_model import predict_bundles
-
-        # Logged, not asserted: dropping a buffer from the objective changes what
-        # the solver optimizes without failing anything, so it has to be visible,
-        # but it is not worth killing a plan over. Empty today.
-        unscored = set(feature_names) - {
-            getattr(op, "name", None) for op in graph.operations
-        }
-        if unscored:
-            logger.debug(
-                "cost objective omits %d buffer(s) absent from graph.operations: %s",
-                len(unscored),
-                sorted(unscored),
-            )
-
-        # Scored one estimated bundle at a time, not as a single whole-graph
-        # kernel: bundle membership decides input dedup, the arity derate and the
-        # underfill derate, so a graph that fuses into several kernels is
-        # mispriced when scored flat.
-        # TypeError is in the set because a cost-model branch over an undecided
-        # `is_lx`/`output_split` raises "cannot determine truth value of Relational"
-        # rather than anything the model raises itself (issue #4233); every tiling
-        # surface that did so now skips a symbolic tile height in `cost_model`, so this
-        # only has to keep a FUTURE symbolic-hostile branch from killing a compile.
-        # Losing the expression costs the objective, not correctness -- but it costs it
-        # in BOTH engines now that #4164 has the annealer consume cost_expr: CP-SAT falls
-        # back to its lexicographic solve and `_build_score_fn` returns None, dropping
-        # the annealer to the memory-only objective. Nothing downstream reports that, so
-        # log it here -- with the traceback, since the message alone ("cannot determine
-        # truth value of Relational") names no op, bundle or term -- and honour
-        # `_cpsat_warn_on_cost_expr` as `buffer_graph._minimize_cost_expr` does.
-        # Without that escape hatch a TypeError from ordinary drift, say a signature
-        # change or a None in a term, is a silent objective loss no test can fail on.
-        if (
-            config.auto_coarse_tiling
-            and solver.chooses_tilings()
-            and solver.linear_cost_only()
-        ):
-            # The cost model is flat in both axes the tiling search moves along:
-            # it has no term for tile size and none for cut count, so every
-            # candidate tiling scores identically and the choice falls to
-            # whichever optimum the multi-worker portfolio reaches first (the
-            # same graph drew 1, 2, 3 or 4 cuts run to run at one identical
-            # objective value). Worse, it is not merely uninformative there --
-            # #3810 makes it raise on symbolic args once an op is output-tiled,
-            # so the re-plan silently loses the runtime term anyway, and it
-            # prices residency the scheduler later revokes. Hand the solver no
-            # cost expression at all and let its lexicographic ladder rank
-            # residency, cuts, parallelism and division shape instead. Off this
-            # path the expression is unchanged and still the objective.
-            logger.debug(
-                "cost objective skipped: auto_coarse_tiling makes tile size and "
-                "cut count decision axes the cost model cannot score"
-            )
-            result = solve_buffers(solver, None, joint=True)
-            assert not any(buffer.lx_relayout_plans for buffer in result), (
-                "CoOptimizingAllocator does not support LX relayout"
-            )
-            return result
-
-        bundle_terms: list = []
-        # Feature extraction runs inside the same fallback: a candidate tiling
-        # can raise Unsupported (an axis with no resolvable loop variable) or
-        # ValueError (candidates on an already coarse-tiled op), and either
-        # costs the objective, not the compile.
-        try:
-            op_features = {
-                output_name: self._extract_op_features(
-                    graph,
-                    output_name,
-                    bufmap,
-                    default_is_lx,
-                    op=pricing_by_name[output_name],
-                )
-                for output_name in feature_names
-            }
-            bundle_terms = predict_bundles(
-                pricing_ops, op_features, params=_COST_PARAMS
-            )
-            cost_expr = sympy.sympify(sum(term for _, term in bundle_terms))
-        except (ValueError, RuntimeError, TypeError) as e:
-            logger.warning(
-                "cost objective unavailable (%s: %s); the solver falls back to its "
-                "own objective",
-                type(e).__name__,
-                e,
-                exc_info=True,
-            )
-            if not config._cpsat_warn_on_cost_expr:
-                raise
-            # Both the terms and the objective are the failed build's output, so
-            # neither is dumpable. ``cost_expr = None`` already skips the dump;
-            # clearing the terms too keeps that a local invariant rather than
-            # something a reader has to chase to the dump call below.
-            bundle_terms = []
-            cost_expr = None
-
-        # One price term per relayout copy (a source and one destination view,
-        # however many consumers share it): the fitted shuffle cost of the
-        # source's chosen division, charged while the copy is resident. One
-        # RelayoutCharge node per copy, over symbols every engine binds (is_lx,
-        # division), so the objective stays self-describing and the rewrite
-        # passes never expand it. Skipped when the bundle scoring failed: the
-        # solver then runs its fallback objective, under which every copy is
-        # pinned out.
-        if cost_expr is not None:
-            for copy in sorted(
-                (b for b in solver.buffers if isinstance(b, RelayoutCopyBuffer)),
-                key=lambda b: b.name,
-            ):
-                cost_expr = cost_expr + copy.cost_term()
-        result = solve_buffers(solver, cost_expr, joint=True)
-        if any(buffer.lx_relayout_plans for buffer in result):
-            raise AssertionError("CoOptimizingAllocator does not support LX relayout")
-        if config.dump_cost_expr_file and cost_expr is not None:
-            # The objective as solved: its terms, the chosen symbol values and
-            # the evaluated prices, for the summarize-sdsc skill.
-            from torch_spyre._inductor.dump_common import (
-                emit_json_line,
-                origin_op_name,
-            )
-
-            # No graph identity: the kernel name and directory hash are
-            # assigned at codegen, and `get_output_names()` is empty here. A
-            # reader pairs records to kernels by position -- they are appended
-            # in solve order -- so a counter would add only process-global state.
-            #
-            # Ops are named twice because the numeric cost dump names them
-            # twice: `op_names` matches its block heading and is what a human
-            # reads, `op_ids` matches its `output opN` line and is unique, so it
-            # is the key that joins the two dumps.
-            op_names, op_ids = {}, {}
-            for op in graph.operations or ():
-                # All three names or none: a half-written pair would leave the
-                # two maps disagreeing about which ops exist.
-                try:
-                    named = (op.get_name(), origin_op_name(op), op.get_operation_name())
-                except Exception:  # pragma: no cover - naming is best-effort
-                    continue
-                op_names[named[0]], op_ids[named[0]] = named[1], named[2]
-            context = {
-                "op_names": op_names,
-                "op_ids": op_ids,
-                "env": {
-                    # Per SOLVE, not per run: the head-major attention path
-                    # caps it for its own compile and leaves the rest at 32.
-                    "sencores": config.sencores,
-                    "lx_capacity": self.size,
-                    "solver": type(solver).__name__,
-                    "allocator": type(self).__name__,
-                },
-                "solve": dict(getattr(solver, "last_solve_stats", {}) or {}),
-            }
-            emit_json_line(
-                config.dump_cost_expr_file,
-                cost_expr_record(
-                    cost_expr,
-                    bundle_terms,
-                    result,
-                    _COST_PARAMS,
-                    solver.off_expression_ns(),
-                    solver.score_ns(),
-                    context=context,
-                ),
-            )
-        return result
-
-    def _extract_op_features(self, graph, output_name, buffers, is_lx, *, op=None):
-        """Build symbolic OpFeatures for one ComputedBuffer op (best-effort).
-
-        Same extraction as dump_cost_model.extract_op_features, but keyed off
-        each buffer's *symbolic* core-division vars (sym_core_divs) instead of
-        concrete values, so the resulting OpFeatures can be fed to
-        predict_ops() to build a cost expression over the solver's own
-        decision variables. The extractor reads each arg's symbolic residency
-        from ``is_lx`` (built once by the caller over all of ``buffers``, not
-        per op); ``buffers`` itself supplies this op's own candidate divisions.
-
-        Candidate coarse tilings enter the same way: each tiled axis's
-        symbolic count (``sym_tile_counts``) is keyed on the op's own loop
-        variable for that axis. With no tiled candidate there are none, and the
-        extractor reads the op's committed tiling (``loop_info``) as before.
-        """
-        from torch_spyre._inductor.dump_cost_model import extract_op_features
-        from torch_spyre._inductor.scratchpad.coarse_tiling import (
-            try_resolve_tile_axis_loop_vars,
-        )
-        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
-
-        op = graph.get_buffer(output_name) if op is None else op
-        buffer = buffers[output_name]
-        division = CoreDivision(splits=buffer.sym_core_divs)
-        ws = _work_slices(op, division)
-        sym_tiling: dict = {}
-        if config.auto_coarse_tiling:
-            for (host_dim, is_reduction), symbol in buffer.sym_tile_counts.items():
-                spec = TileSpec((TileAxis(host_dim, 1, is_reduction),))
-                loop_vars, reason = try_resolve_tile_axis_loop_vars(op, spec)
-                if loop_vars is None:
-                    raise Unsupported(reason)
-                (var,) = loop_vars
-                sym_tiling[var] = sym_tiling.get(var, 1) * symbol
-        return extract_op_features(
-            op,
-            ws,
-            is_lx=is_lx,
-            sym_tiling=sym_tiling or None,
-            candidate_work_slices=[
-                _work_slices(op, candidate) for candidate in buffer.core_divisions
-            ],
-        )
-
-    def _finalize_lx_relayout_allocation(
-        self,
-        allocation: Sequence[LifetimeBoundBuffer],
-        graph: GraphLowering,
-    ) -> list[LXRelayoutPlan]:
-        """Turn the solver's fired relayouts into materializable plans.
-
-        The solver already guaranteed everything the greedy path checks after
-        the fact: the copy's residency IS the decision, the served consumers'
-        division pairs are pinned by the literals that require the copy
-        resident, and the 2D no-overlap kept source and copy disjoint. The
-        fired ``ChosenRelayout`` records carry the views the enumeration
-        priced, so nothing is re-derived here: the fired edges regroup by
-        (source, destination view), the committed divisions and the copy's
-        address are checked against them, and ``materialize_lx_relayouts``
-        gets one plan per fired group.
-        """
-        by_name = {b.name: b for b in allocation}
-        fired = FiredRelayoutGroup.from_chosen(
-            chosen
-            for consumer in allocation
-            for chosen in getattr(consumer, "chosen_relayouts", {}).values()
-        )
-        plans: list[LXRelayoutPlan] = []
-        for group in fired:
-            source = by_name[group.parent]
-            copy = by_name[relayout_copy_name(group.parent, group.group)]
-            assert source.chosen_division == group.source_division, (
-                f"relayout group {group.parent}/g{group.group} chose source "
-                f"division {group.source_division} but {source.chosen_division} "
-                "was committed"
-            )
-            assert source.address is not None, (
-                f"relayout source {group.parent} has no LX address"
-            )
-            assert copy.address == group.destination_address, (
-                f"relayout group {group.parent}/g{group.group}: consumers read the "
-                f"copy at {group.destination_address} but it was placed at "
-                f"{copy.address}"
-            )
-            for member in group.members:
-                consumer = by_name[member.candidate.consumer]
-                assert consumer.chosen_division == member.candidate.consumer_division, (
-                    f"relayout pair ({group.source_division}, "
-                    f"{member.candidate.consumer_division}) disagrees with committed "
-                    f"division {consumer.chosen_division} on {group.parent} -> "
-                    f"{consumer.name}"
-                )
-            plans.append(group.plan(source.address))
-        return plans
-
-    def _post_solve(
-        self,
-        graph: GraphLowering,
-        allocation: Sequence[Any],
-        accepted_lx_relayouts: Sequence[LXRelayoutPlan],
-    ) -> None:
-        # Apply before commit. ``commit_iteration_space_ownership`` builds the
-        # ownership off ``iteration_space_from_op``, whose symbols come from the
-        # write dep's ranges -- which ``_divide_ranges`` invalidates. Committing
-        # afterwards derives both the split map and the core mapping against the
-        # already-divided op instead of migrating a stale object, and
-        # ``coarse_tile`` reads no ownership of its own, so the one
-        # ``_distribute_work`` left is simply overwritten.
-        tiled = self._apply_chosen_tilings(graph, allocation)
-        self._check_priced_footprints(graph, allocation, tiled)
-        # The divisions must be committed such that any buffer clones can correctly
-        # pull the selected core division from the dependent buffers when the graph
-        # is updated with clones in ``_push_allocation``.
-        commit_divisions(graph, allocation, self._live_splits)
-        # After the commit, and before the views below are derived from it: a
-        # copy-out the apply mints is not in ``allocation``, so nothing above gave
-        # it a division and it would be judged against its tiled op's as a mismatch.
-        self._commit_copy_out_divisions(graph, allocation, tiled)
-        commit_lx_views(
-            graph,
-            allocation,
-            accepted_lx_relayouts,
-            drained_readers=_drained_collectives(self._validated_drain_plans),
-        )
-        log_solver_decisions(graph, allocation)
-
-    def _materialize_selection(
-        self,
-        graph: GraphLowering,
-        solver: MemoryPlanSolver,
-        allocation: Sequence[Any],
-    ) -> tuple[MemoryPlanSolver, Sequence[Any]]:
-        """Apply the coarse tilings the joint solve selected, then re-plan.
-
-        The first solve chooses core divisions *and* tilings jointly, pricing the
-        tiled candidates through their predicted (``wsr.tile_prediction``) views.
-        If it picks a non-empty tiling for any op, ``CoarseTilingPass`` applies
-        exactly those choices (mutating the IR the same way a pre-stickification
-        hint would), and the allocation is redone over the materialized graph so
-        new boundary buffers get placed and the applied ops get their final
-        divisions. The second pass enumerates no further tilings
-        (``_suppress_tiling``), so it terminates, and it mirrors the hint path
-        (allocate an already-tiled graph).
-
-        Ordering is solve-before-apply: a ``SolveError`` from the first solve
-        propagates over the *unmutated* graph, so ``scratchpad_planning``'s greedy
-        fallback never runs on a half-tiled graph (a second-solve ``SolveError``
-        falls back over the fully-tiled graph, which is a valid outcome).
-
-        Both the second solver and its allocation are returned: the caller reads
-        spill reasons off the solver that produced the allocation it commits, so
-        returning one without the other would report the first solve's reasons
-        against the second solve's plan.
-
-        Only for an engine that asks for it (``replans_after_tiling()``): for any
-        other, the first placement stands and the pair is returned unchanged.
-        """
-        assert isinstance(solver, CoreDivisionLayoutSolver)
-        if not solver.replans_after_tiling():
-            return solver, allocation
-        choices = self._chosen_tilings(graph, allocation)
-        if logger.isEnabledFor(logging.DEBUG):
-            for name, spec in choices.items():
-                logger.debug("chosen_tiling: %s -> %s", name, spec.label)
-        if not choices:
-            return solver, allocation
-
-        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
-
-        op_count = len(graph.operations)
-        CoarseTilingPass(choices).apply_pass(graph)
-        assert len(graph.operations) >= op_count, (
-            "coarse tiling apply must not drop operations"
-        )
-        # Re-plan over the materialized tiling. Pre-passes are empty for this
-        # allocator; suppress further tiling so the second solve only places.
-        self._suppress_tiling = True
-        try:
-            buffers = self._prepare_buffers(graph)
-            solver = self._build_solver(buffers)
-            allocation = self._solve(solver, graph)
-        finally:
-            self._suppress_tiling = False
-        return solver, allocation
-
-    def _chosen_tilings(
-        self, graph: GraphLowering, allocation: Sequence[Any]
-    ) -> dict[str, TileSpec]:
-        """The non-empty tiling the solve chose for each op, keyed by operation
-        name (the key ``CoarseTilingPass``/``derive_tiling_groups`` consume)."""
-        op_by_name = {op.name: op for op in graph.operations}
-        choices: dict[str, TileSpec] = {}
-        for buf in allocation:
-            op = op_by_name.get(buf.name)
-            if op is None or buf.chosen_division is None:
-                continue
-            cd = buf.core_divisions[buf.chosen_division]
-            if not cd.tiling.is_untiled:
-                choices[op.get_operation_name()] = cd.tiling
-        return choices
-
-    def _get_spill_reasons(self, allocation: Sequence[LifetimeBoundBuffer]) -> dict:
-        # Surface the solver's per-buffer spill causes so the LX-pinning debug
-        # log reports why each buffer landed in HBM, on par with the other
-        # allocators.
-        return {
-            b.name: b.spill_reason for b in allocation if b.spill_reason is not None
-        }
-
-    def _apply_chosen_tilings(
-        self,
-        graph: GraphLowering,
-        allocation: Sequence[CoreDivisionBuffer],
-    ) -> dict[str, TileSpec]:
-        """Apply the solver's chosen coarse tilings, returning them by buffer name.
-
-        The only consumer a chosen ``TileSpec`` has. Without it the search prices
-        the *per-tile* footprint and the packer lays LX out by it while the graph
-        writes the full extent, so the reserved interval is a fraction of the
-        real one.
-
-        **The anneal's placement stands.** Applying the tiling is what makes its
-        addresses true rather than stale, so there is no second placement round:
-        re-running a placement engine here would decouple the layout from the
-        divisions and tilings it was jointly chosen with, which is the coupling
-        this allocator exists for. The companion buffers the apply mints (a
-        full-extent ``full_buf`` per op whose output escapes its tiling group)
-        were not in the joint state, so they get no LX address and stay in HBM
-        -- which is what the solver's ``_companion_bytes`` prices them as.
-
-        **A refusal raises.** The search is supposed to propose only tilings
-        ``coarse_tile`` accepts -- ``OpSplitSpace.admits`` is meant to be
-        complete with respect to it -- so a refusal is a defect in that model
-        rather than a graph to route around, and dropping the tiling here would
-        also invalidate the addresses already spaced for it.
-        """
-        if not self._solver_chooses_tilings:
-            return {}
-        op_by_name = {op.name: op for op in graph.operations}
-        # By buffer name; ``choices`` by operation name, as ``CoarseTilingPass``
-        # takes them.
-        tiled: dict[str, TileSpec] = {}
-        choices: dict[str, TileSpec] = {}
-        for buffer in allocation:
-            if buffer.chosen_division is None:
-                continue
-            tiling = buffer.core_divisions[buffer.chosen_division].tiling
-            if tiling.is_untiled:
-                continue
-            tiled[buffer.name] = tiling
-            choices[op_by_name[buffer.name].get_operation_name()] = tiling
-        if not choices:
-            return {}
-        # Local import: ``coarse_tiling`` imports ``ScratchpadOptimizationPass``
-        # from this module, so a top-level import would be circular.
-        from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
-
-        # A tiling comes only from a generated division, which only an
-        # enumerated ``ComputedBuffer`` has (``_build_cd_bound_buffers``).
-        frames = {
-            name: capture_iteration_frame(cast(ComputedBuffer, op_by_name[name]))
-            for name in tiled
-        }
-        chosen = ", ".join(
-            f"{name}={spec.label}" for name, spec in sorted(choices.items())
-        )
-        try:
-            CoarseTilingPass(choices).apply_pass(graph)
-        except Unsupported as exc:
-            exc.add_note(f"auto_coarse_tiling chose: {chosen}")
-            raise
-        self._remap_tiled_symbols(graph, frames)
-        # See ``JOINT_TILING_AND_DIVISION_ATTR``. Looked up afresh: the apply
-        # replaces an op it redirects to a companion's full buffer
-        # (``replace_computed_buffer_body``), so a pre-apply object is stale.
-        op_by_name = {op.name: op for op in graph.operations}
-        for name in tiled:
-            setattr(op_by_name[name], JOINT_TILING_AND_DIVISION_ATTR, True)
-        logger.info("applied a coarse tiling to %d op(s): %s", len(choices), chosen)
-        return tiled
-
-    def _remap_tiled_symbols(
-        self, graph: GraphLowering, frames: dict[str, IterationFrame]
-    ) -> None:
-        """Record how the apply renumbered each tiled op's iteration symbols, and
-        move the op's span floors through it.
-
-        The solve keyed its splits by the pre-apply symbols. A tile that shrinks
-        a dim to extent 1 drops that dim's symbol and renumbers every later one,
-        so a pre-apply key read against the live op names the next axis. The
-        floors ``span_reduction_pass`` committed are keyed the same way and are
-        read against the live op by ``meets_span_floors``.
-        """
-        live = {op.name: op for op in graph.operations}
-        self._tiling_symbol_remaps = {}
-        for name, frame in frames.items():
-            # ``replace_computed_buffer_body`` keeps it a ``ComputedBuffer``.
-            op = cast(ComputedBuffer, live[name])
-            self._tiling_symbol_remaps[name] = iteration_symbol_remap(op, frame)
-            floors = getattr(op, "_work_division_span_min_splits", None)
-            if floors:
-                op._work_division_span_min_splits = self._live_splits(name, floors)
-
-    def _live_splits(
-        self, name: str, splits: dict[sympy.Symbol, int]
-    ) -> dict[sympy.Symbol, int]:
-        """``splits``, keyed by op ``name``'s pre-apply symbols, re-keyed to its
-        live ones. Identity for an op the apply did not tile."""
-        remap = self._tiling_symbol_remaps.get(name)
-        if remap is None:
-            return dict(splits)
-        lost = sorted(
-            str(sym)
-            for sym, factor in splits.items()
-            if sym not in remap and factor > 1
-        )
-        if lost:
-            raise Unsupported(
-                f"{name}: the coarse tiling left no axis for the split on "
-                f"{', '.join(lost)}; it would commit as 1"
-            )
-        return {remap[sym]: factor for sym, factor in splits.items() if sym in remap}
-
-    def _commit_copy_out_divisions(
-        self,
-        graph: GraphLowering,
-        allocation: Sequence[CoreDivisionBuffer],
-        tiled: Iterable[str],
-    ) -> None:
-        """Give each copy-out the apply minted its tiled op's core division.
-
-        ``_insert_copy_op`` (wsr/coarse_tile.py) builds the copy-out over the
-        tiled op's own ``data.ranges`` and reads the per-tile buffer, so it
-        keeps no division of its own -- one core -- while the tiled op commits
-        whatever the solve chose. ``get_ncores_for_buffers`` then reports the
-        mismatch and withholds the tiled buffer's view, and a resident one
-        raises in :meth:`_post_solve`.
-
-        The copy's iteration symbols are the tiled op's output symbols in order
-        (``iteration_space_from_op`` lists reductions after), so the splits map
-        positionally and only a reduction split is dropped.
-        """
-        by_name = {b.name: b for b in allocation}
-        ops = {getattr(op, "name", None): op for op in graph.operations}
-        for source in tiled:
-            # Named as ``_insert_copy_op`` names it.
-            copy = ops.get(graph.qualify_name(f"coarse_tile_copy_{source}"))
-            buffer = by_name[source]
-            if copy is None:
-                # Expected when the op's output stays inside its tiling group.
-                logger.debug("%s: no copy-out to give its core division", source)
-                continue
-            if buffer.chosen_division is None:
-                continue
-            splits = self._live_splits(
-                source, buffer.core_divisions[buffer.chosen_division].splits
-            )
-            symbols = list(iteration_space_from_op(copy))
-            source_symbols = list(iteration_space_from_op(graph.get_buffer(source)))
-            mapped = {
-                symbols[position]: factor
-                for position, symbol in enumerate(source_symbols)
-                if position < len(symbols) and (factor := splits.get(symbol, 1)) > 1
-            }
-            commit_iteration_space_ownership(copy, mapped)
-
-    def _check_priced_footprints(
-        self,
-        graph: GraphLowering,
-        allocation: Sequence[CoreDivisionBuffer],
-        tiled: Mapping[str, TileSpec],
-    ) -> None:
-        """Every tiled buffer's applied per-core footprint fits the one it was
-        placed at, or this raises.
-
-        The search divides the buffer's *total* size by
-        ``output_partition * output_tile_count``; the apply divides the op's
-        ranges per dim and rebuilds the device layout through
-        ``_resize_device_layout``. Those agree only if resizing divides the
-        device byte size exactly -- plausible, since ``build_tiling_space`` never
-        tiles the stick dim, but per-dim device padding could re-round. An
-        applied footprint *larger* than the priced one would overlap whatever
-        was packed above this buffer's LX interval; a smaller one only leaves
-        part of the interval unused, so it is logged rather than refused.
-        """
-        for buffer in allocation:
-            tiling = tiled.get(buffer.name)
-            if tiling is None:
-                continue
-            layout = graph.get_buffer(buffer.name).layout
-            device_layout = getattr(layout, "device_layout", None)
-            if device_layout is None:
-                raise Unsupported(
-                    f"{buffer.name}: tiled as {tiling.label} but carries no device "
-                    "layout to check the applied footprint against"
-                )
-            # ``_apply_chosen_tilings`` skips a buffer with no chosen division,
-            # so anything in ``tiled`` has one.
-            assert buffer.chosen_division is not None
-            partition = buffer.core_divisions[buffer.chosen_division].output_partition
-            applied = ceil_div(get_device_size_in_bytes(device_layout), partition)
-            priced = buffer.per_core_size(buffer.chosen_division)
-            if applied < priced:
-                logger.debug(
-                    "%s: applied per-core footprint %d bytes under tiling %s is "
-                    "below the %d it was placed at",
-                    buffer.name,
-                    applied,
-                    tiling.label,
-                    priced,
-                )
-            elif applied > priced:
-                raise Unsupported(
-                    f"{buffer.name}: placed at a per-core footprint of {priced} "
-                    f"bytes under tiling {tiling.label} ({buffer.size} bytes over "
-                    f"{partition} cores x {tiling.output_tile_count} tiles), but "
-                    f"the applied graph gives {applied}; its LX address is spaced "
-                    "for a footprint the graph does not have"
-                )
-
-    @property
-    def _solver_generates_divisions(self) -> bool:
-        """Whether the solver this allocator feeds generates divisions at all
-        (``generates_divisions()``).
-
-        The others read ``core_divisions`` and ``cd_parent_matches`` exactly as
-        before and would never look at a space. Building one is not free -- a
-        ``WorkDivisionContext`` and a factor domain per axis, per buffer -- so an
-        engine that would ignore the answer does not pay for it.
-        """
-        assert self.layout_planning is not None
-        return self.layout_planning.generates_divisions()
-
-    @property
-    def _solver_chooses_tilings(self) -> bool:
-        """Whether the solver this allocator feeds picks coarse tilings that
-        this allocator applies: off the split space of a solver that generates
-        its divisions. CP-SAT takes its tilings off the menu instead
-        (``tilings_from_menu()``) and applies them through
-        ``_materialize_selection``.
-        """
-        assert self.layout_planning is not None
-        return (
-            config.auto_coarse_tiling
-            and self.layout_planning.chooses_tilings()
-            and self.layout_planning.generates_divisions()
-        )
-
-
 def _cpsat_solver_class() -> type[MemoryPlanSolver]:
     """``CpSatLayoutSolver``, or ``GreedyLayoutSolver`` when ortools is
     unavailable.
@@ -3554,9 +3564,9 @@ def select_allocator() -> ScratchpadAllocator:
     config:
 
     * Without ``co_optimizing_lx_planning``, returns a :class:`ScratchpadAllocator`
-      instance that solves for LX placement only.
-    * With ``co_optimizing_lx_planning``, returns a :class:`CoOptimizingAllocator`
-      instance. ``"simulated_annealing"`` is served by
+      that solves for LX placement only (the committed division mode).
+    * With ``co_optimizing_lx_planning``, returns one in the open division
+      mode, which chooses core divisions jointly with placement. ``"simulated_annealing"`` is served by
       :class:`SaCoOptimizingSolver`, the joint work-division + LX engine.
       Otherwise a core-division-capable factory (currently only ``"cpsat"``, and
       only when ortools is available) is used directly; every other factory
@@ -3602,8 +3612,8 @@ def select_allocator() -> ScratchpadAllocator:
 
     if config.co_optimizing_lx_planning:
         if config.layout_solver == "simulated_annealing":
-            return CoOptimizingAllocator(
-                layout_planning=SaCoOptimizingSolver, size=size
+            return ScratchpadAllocator(
+                division_mode="open", layout_planning=SaCoOptimizingSolver, size=size
             )
         if not solver_cls.chooses_core_divisions():
             if not config.allow_exhaustive_search:
@@ -3620,7 +3630,8 @@ def select_allocator() -> ScratchpadAllocator:
                     "set co_optimizing_lx_planning=False (or "
                     "CO_OPTIMIZING_LX_PLANNING=0) to avoid it."
                 )
-            return CoOptimizingAllocator(
+            return ScratchpadAllocator(
+                division_mode="open",
                 layout_planning=ExhaustiveSearchSolver.wrapping(solver_cls),
                 size=size,
                 prune=True,
@@ -3628,7 +3639,8 @@ def select_allocator() -> ScratchpadAllocator:
             )
         # chooses_core_divisions() holds exactly for CoreDivisionLayoutSolver
         # subclasses (MemoryPlanSolver.__init_subclass__ checks it).
-        return CoOptimizingAllocator(
+        return ScratchpadAllocator(
+            division_mode="open",
             layout_planning=cast(type[CoreDivisionLayoutSolver], solver_cls),
             size=size,
             post_optimization_passes=post_optimization_passes,

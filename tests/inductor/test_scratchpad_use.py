@@ -137,18 +137,19 @@ def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
     solver.plan_layout_and_core_divisions.return_value = [
         SimpleNamespace(lx_relayout_plans=[object()])
     ]
-    allocator = allocator_module.CoOptimizingAllocator(
+    allocator = allocator_module.ScratchpadAllocator(
         # Never built: the test hands _solve the mock directly.
         layout_planning=allocator_module.ExhaustiveSearchSolver.wrapping(
             allocator_module.GreedyLayoutSolver
         ),
         size=0,
+        division_mode="open",
     )
     graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
     with (
         patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
         unittest.TestCase().assertRaisesRegex(
-            AssertionError, "CoOptimizingAllocator does not support LX relayout"
+            AssertionError, "the joint allocator does not support LX relayout"
         ),
     ):
         allocator._solve(solver, graph)
@@ -1557,7 +1558,6 @@ class TestSelectAllocator(unittest.TestCase):
 
     def test_dispatch_by_config(self):
         from torch_spyre._inductor.scratchpad.allocator import (
-            CoOptimizingAllocator,
             ExhaustiveSearchSolver,
             ScratchpadAllocator,
             select_allocator,
@@ -1617,7 +1617,7 @@ class TestSelectAllocator(unittest.TestCase):
                     allow_exhaustive_search=True,
                 ):
                     a = select_allocator()
-                    self.assertIsInstance(a, CoOptimizingAllocator)
+                    self.assertEqual(a.division_mode, "open")
                     solver = a.layout_planning([], a.size)
                     self.assertIsInstance(solver, ExhaustiveSearchSolver)
                     self.assertIs(solver._inner_factory, solver_cls)
@@ -1635,7 +1635,7 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             if _HAS_ORTOOLS:
                 a = select_allocator()
-                self.assertIsInstance(a, CoOptimizingAllocator)
+                self.assertEqual(a.division_mode, "open")
                 self.assertIs(a.layout_planning, CpSatLayoutSolver)
             else:
                 with self.assertRaises(ValueError):
@@ -1648,7 +1648,7 @@ class TestSelectAllocator(unittest.TestCase):
             _cpsat_warn_on_cost_expr=False,
         ):
             a = select_allocator()
-            self.assertIsInstance(a, CoOptimizingAllocator)
+            self.assertEqual(a.division_mode, "open")
             solver = a.layout_planning([], a.size)
             if _HAS_ORTOOLS:
                 self.assertIs(a.layout_planning, CpSatLayoutSolver)
@@ -1684,7 +1684,7 @@ class TestSelectAllocator(unittest.TestCase):
             layout_solver="simulated_annealing", co_optimizing_lx_planning=True
         ):
             a = select_allocator()
-            self.assertIsInstance(a, CoOptimizingAllocator)
+            self.assertEqual(a.division_mode, "open")
             self.assertEqual(a.layout_planning, SaCoOptimizingSolver)
 
         # Without co-optimization the same config value selects the layout-only
@@ -2321,7 +2321,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             # This test targets the base placement allocator's
             # ``_build_bound_buffers``; with co-optimization now the default,
             # pin the joint path off so ``select_allocator`` does not route to
-            # ``CoOptimizingAllocator`` (whose builder is ``_build_cd_bound_buffers``).
+            # the joint ``ScratchpadAllocator`` (whose builder is ``_build_cd_bound_buffers``).
             with ts_inductor_config.patch(
                 lx_planning=True, co_optimizing_lx_planning=False
             ):
@@ -2512,7 +2512,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
                 # Base placement path targeted (see the input-clone test above);
                 # pin the joint path off so the default co-optimization flip does
-                # not route to ``CoOptimizingAllocator``.
+                # not route to the joint ``ScratchpadAllocator``.
                 with ts_inductor_config.patch(
                     lx_planning=True, co_optimizing_lx_planning=False
                 ):
@@ -2590,7 +2590,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
                 # Base placement path targeted (see the input-clone test above);
                 # pin the joint path off so the default co-optimization flip does
-                # not route to ``CoOptimizingAllocator``.
+                # not route to the joint ``ScratchpadAllocator``.
                 with ts_inductor_config.patch(
                     lx_planning=True, co_optimizing_lx_planning=False
                 ):

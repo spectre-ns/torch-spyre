@@ -782,7 +782,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
     consumer reads the copy only under a division pair its candidates list, and
     a resident copy must serve at least one consumer (``CpSatLayoutSolver``
     carries the CP-SAT encoding; the annealer does not decide relayouts yet and
-    is never handed a copy, see ``CoOptimizingAllocator``).
+    is never handed a copy, see the joint ``ScratchpadAllocator``).
 
     ``size`` is the destination's per-core span (the candidates'
     ``destination_footprint_bytes``, the bound the committed path reserves for
@@ -1040,7 +1040,7 @@ class MemoryPlanSolver(ABC):
     def replans_after_tiling(cls) -> bool:
         """Needs a second, placement-only solve over the graph once the tilings
         it chose are applied, rather than its own placement standing
-        (``CoOptimizingAllocator._materialize_selection``)."""
+        (``ScratchpadAllocator._materialize_selection``)."""
 
     @classmethod
     @abstractmethod

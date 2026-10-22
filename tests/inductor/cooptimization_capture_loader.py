@@ -14,7 +14,7 @@
 
 """Rehydrate captured co-optimizer dumps into **real** substrate objects.
 
-The fixture JSON is produced by running the real ``CoOptimizingAllocator`` over
+The fixture JSON is produced by running the real the joint ``ScratchpadAllocator`` over
 softmax/mlp/swiglu/sdpa/... and serializing the buffers handed to the solver
 (candidate menus + ``cd_parent_matches`` + placement/cost fields) plus the
 solver's chosen division + address per buffer.

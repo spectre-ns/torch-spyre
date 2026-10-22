@@ -9672,7 +9672,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
 
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
         from torch_spyre._inductor.scratchpad import utils as utils_module
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
         from torch_spyre._inductor.scratchpad.plan_solver import (
             CoreDivision,
             _check_in_place_relationships,
@@ -9712,7 +9712,9 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             CpSatLayoutSolver,
         )
 
-        allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=4096)
+        allocator = ScratchpadAllocator(
+            CpSatLayoutSolver, size=4096, division_mode="open"
+        )
         allocator._validated_drain_plans = {
             "carry": SimpleNamespace(storage_name="carry", collective=None)
         }

@@ -561,7 +561,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
         commit_iteration_space_ownership,
         iteration_space_from_op,
     )
-    from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
     graph, stage, consumer = staged_transport_graph
@@ -570,7 +570,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     commit_iteration_space_ownership(consumer, committed)
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
-    allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
+    allocator = ScratchpadAllocator(CpSatLayoutSolver, size=2**20, division_mode="open")
     ordinary, _ = allocator.candidates._enumerate_core_divisions(
         consumer, config.sencores
     )
@@ -674,7 +674,9 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         monkeypatch.setattr(
             tcm, "has_resolved_work_div_hint", lambda op: op is consumer
         )
-    allocator = am.CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
+    allocator = am.ScratchpadAllocator(
+        CpSatLayoutSolver, size=2**20, division_mode="open"
+    )
     if failure in ("source_clone", "relayout"):
         from torch_spyre._inductor.scratchpad.plan_solver import (
             CoreDivision,

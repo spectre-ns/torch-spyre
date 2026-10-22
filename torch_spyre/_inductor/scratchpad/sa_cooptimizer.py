@@ -60,6 +60,7 @@ from torch_spyre._inductor.work_division import (
     OpSplitSpace,
     ResidencyEdge,
 )
+from torch_spyre._inductor.scratchpad.buffer_graph import spill_cost
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
@@ -771,7 +772,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Not supported: this engine is joint-only. :class:`MemoryPlanSolver`
         declares it abstract, but placement-only annealing belongs to the
-        standalone layout-only annealer, and ``CoOptimizingAllocator`` only ever
+        standalone layout-only annealer, and the joint ``ScratchpadAllocator`` only ever
         calls :meth:`plan_layout_and_core_divisions`."""
         raise NotImplementedError(
             "SaCoOptimizingSolver is a joint core-division + placement engine; "
@@ -1138,7 +1139,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Cache the loop-invariant inputs to :meth:`_score`. A move changes only
         the *per-core* footprint the packer sees, never a buffer's total size, so
         neither the spill costs nor the bandwidth constant can move."""
-        self._spill_costs = [self._spill_cost(b) for b in self._bufs]
+        # Differential HBM traffic a spill adds over residency, in bytes: the
+        # formula the CP-SAT engine charges (buffer_graph.spill_cost).
+        self._spill_costs = [spill_cost(b, size=max(0, b.size)) for b in self._bufs]
         self._hbm_bytes_per_us = utils.hbm_bytes_per_us()
 
     # -- division-dependent derivations --------------------------------------
@@ -1159,7 +1162,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         term, and be paid for afterwards in the traffic residency frees.
 
         Only the per-tile scratch is sized: an escaping op's companion never
-        enters LX (``CoOptimizingAllocator._apply_chosen_tilings``).
+        enters LX (``ScratchpadAllocator._apply_chosen_tilings``).
 
         Clamped non-negative so the packer never sees a negative size from the
         ``mem_usage`` ``-1`` sentinel; what stops an unsized buffer from looking
@@ -1287,25 +1290,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         )
 
     # -- scoring (lower is better) -------------------------------------------
-
-    @staticmethod
-    def _spill_cost(buffer: CoreDivisionBuffer) -> int:
-        """Differential HBM traffic a spill adds over residency, in bytes.
-
-        Duplicates :func:`buffer_graph.spill_cost` so the two engines score
-        the same quantity; sharing the one formula is a follow-up.
-
-        The reads residency would have served from LX, plus the producer's write,
-        which residency turns into a free LX write -- a graph input has no producer
-        write to save and a graph output's write-out is unavoidable either way, so
-        both cancel, exactly ``boundary != Intermediate``. The
-        ``first_use_is_read`` discount drops an input's first read, the clone-in
-        that pinning cannot avoid; a computed buffer's first use is the producing
-        write, which ``read_count`` already excludes.
-        """
-        is_intermediate = buffer.boundary == BufferType.Intermediate
-        reads_served = buffer.read_count - (1 if buffer.first_use_is_read else 0)
-        return (reads_served + (1 if is_intermediate else 0)) * max(0, buffer.size)
 
     def _companion_bytes(self, addresses: Sequence[Optional[int]]) -> int:
         """HBM bytes the apply's companion buffers move that the rest of the
