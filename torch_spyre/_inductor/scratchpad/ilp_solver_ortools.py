@@ -115,6 +115,22 @@ __all__ = ["CpSatLayoutSolver", "_gate_divisions"]
 
 logger = logging.getLogger(__name__)
 
+
+def _backend():
+    """The backend the graph posts to. Prototype knob: ``SPYRE_LX_BACKEND`` =
+    ``cpsat`` (default), ``mip:<SCIP|HIGHS|CBC>`` or ``bruteforce``."""
+    import os
+
+    from torch_spyre._inductor.scratchpad.backend import BruteForce, CpSat, Mip
+
+    choice = os.environ.get("SPYRE_LX_BACKEND", "cpsat")
+    if choice.startswith("mip"):
+        return Mip(choice.partition(":")[2] or "SCIP")
+    if choice == "bruteforce":
+        return BruteForce()
+    return CpSat()
+
+
 # Drop cause for a buffer the solver chose to spill, as opposed to one barred
 # up front (its residency reason).
 _SOLVER_CHOSE_SPILL = SOLVER_CHOSE_SPILL
@@ -247,7 +263,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             buffers, self.alignment, self._capacity_units, settings, forced_reasons
         )
         strategy = TableStrategy.from_buffers(buffers, forced_reasons)
-        graph.solve(cp_model.CpModel(), cost_expr, strategy)
+        graph.solve(_backend(), cost_expr, strategy)
 
         # Write the decisions back onto the caller's buffers, in bytes.
         order = {name: i for i, name in enumerate(graph.nodes)}

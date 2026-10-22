@@ -73,7 +73,7 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
         model.Add(enforce_lit == 0)
         return
     # A table, instead of a Boolean and two implications per compatible pair.
-    model.add_allowed_assignments([src_div, dst_div], compatible).only_enforce_if(
+    model.AddAllowedAssignments([src_div, dst_div], compatible).OnlyEnforceIf(
         enforce_lit
     )
 
@@ -129,9 +129,9 @@ class NodeVars:
             true, false = self._consts
             return true if i == self.fixed_index else false
         if i not in self._is:
-            lit = self.model.new_bool_var(f"div_{self.name}_is_{i}")
-            self.model.add(self.division == i).only_enforce_if(lit)
-            self.model.add(self.division != i).only_enforce_if(lit.Not())
+            lit = self.model.BoolVar(f"div_{self.name}_is_{i}")
+            self.model.Add(self.division == i).OnlyEnforceIf(lit)
+            self.model.Add(self.division != i).OnlyEnforceIf(lit.Not())
             self._is[i] = lit
         return self._is[i]
 
@@ -441,18 +441,16 @@ class TableStrategy(EncodingStrategy):
         v = self._base_vars(node, model)
         for e in node.inputs:
             if e.in_place:
-                v.merges[e.src.name] = model.new_bool_var(
-                    f"merge_{e.src.name}_{node.name}"
-                )
+                v.merges[e.src.name] = model.BoolVar(f"merge_{e.src.name}_{node.name}")
         self.vars[node] = v
         if self.chooses_split(node):
             self._split_vars(node, v, model)
         # A caller-pinned decision fixes its var; a pinned work split is
         # already a Fixed enumeration.
         if node.resident is not None:
-            model.add(v.in_buffer == int(node.resident))
+            model.Add(v.in_buffer == int(node.resident))
         if node.offset is not None:
-            model.add(v.offset == node.offset)
+            model.Add(v.offset == node.offset)
 
     def encode_layout(self, layout: RelayoutLayout, model: Model) -> None:
         v = self._base_vars(layout, model)
@@ -462,8 +460,8 @@ class TableStrategy(EncodingStrategy):
     def _base_vars(self, item: Item, model: Model) -> NodeVars:
         return NodeVars(
             model=model,
-            in_buffer=model.new_bool_var(f"in_buffer_{item.name}"),
-            offset=model.new_int_var(0, max(0, self._capacity - 1), f"off_{item.name}"),
+            in_buffer=model.BoolVar(f"in_buffer_{item.name}"),
+            offset=model.IntVar(0, max(0, self._capacity - 1), f"off_{item.name}"),
             eff_size=item.size,
             name=item.name,
         )
@@ -496,7 +494,7 @@ class TableStrategy(EncodingStrategy):
             # Nothing to choose: constants instead of element lookups on a
             # fixed index, which keeps presolve linear in the copy count.
             v.fixed_index = fixed
-            v.division = m.new_constant(fixed)
+            v.division = m.Constant(fixed)
             v.eff_size = v.per_core[fixed]
             v.core_cost = core_cost[fixed]
             v.cores = cores_used[fixed]
@@ -505,29 +503,29 @@ class TableStrategy(EncodingStrategy):
             v.splits_raw = {key: [val] for key, val in v.splits.items()}
             v.tile_counts = {key: only.tiling.count_for(key) for key in sym_tile_counts}
             v.tile_counts_raw = {key: [val] for key, val in v.tile_counts.items()}
-            v._consts = (m.new_constant(1), m.new_constant(0))
+            v._consts = (m.Constant(1), m.Constant(0))
             return
         name = item.name
-        v.division = m.new_int_var(0, len(menu) - 1, f"div_{name}")
-        v.eff_size = m.new_int_var(0, max(v.per_core), f"eff_size_{name}")
-        v.core_cost = m.new_int_var(0, max(core_cost), f"core_cost_{name}")
-        v.cores = m.new_int_var(min(cores_used), max(cores_used), f"occ_{name}")
+        v.division = m.IntVar(0, len(menu) - 1, f"div_{name}")
+        v.eff_size = m.IntVar(0, max(v.per_core), f"eff_size_{name}")
+        v.core_cost = m.IntVar(0, max(core_cost), f"core_cost_{name}")
+        v.cores = m.IntVar(min(cores_used), max(cores_used), f"occ_{name}")
         for key, symbol in sym_core_divs.items():
             assert isinstance(symbol, sympy.Symbol)
             raw = [cd.splits.get(key, 1) for cd in menu]
-            var = m.new_int_var(1, config.sencores, symbol.name)
-            m.add_element(v.division, raw, var)
+            var = m.IntVar(1, config.sencores, symbol.name)
+            m.AddElement(v.division, raw, var)
             v.splits[key] = var
             v.splits_raw[key] = raw
         for key, symbol in sym_tile_counts.items():
             raw = [cd.tiling.count_for(key) for cd in menu]
-            var = m.new_int_var(min(raw), max(raw), symbol.name)
-            m.add_element(v.division, raw, var)
+            var = m.IntVar(min(raw), max(raw), symbol.name)
+            m.AddElement(v.division, raw, var)
             v.tile_counts[key] = var
             v.tile_counts_raw[key] = raw
-        m.add_element(v.division, v.per_core, v.eff_size)
-        m.add_element(v.division, cores_used, v.cores)
-        m.add_element(v.division, core_cost, v.core_cost)
+        m.AddElement(v.division, v.per_core, v.eff_size)
+        m.AddElement(v.division, cores_used, v.cores)
+        m.AddElement(v.division, core_cost, v.core_cost)
 
     # ---- 2. merges ----
 
@@ -538,11 +536,11 @@ class TableStrategy(EncodingStrategy):
         alike."""
         src, dst = self.vars[edge.src], self.vars[edge.dst]
         lit = dst.merges[edge.src.name]
-        model.add(src.offset == dst.offset).OnlyEnforceIf(lit)
-        model.add_implication(lit, src.in_buffer)
-        model.add_implication(lit, dst.in_buffer)
+        model.Add(src.offset == dst.offset).OnlyEnforceIf(lit)
+        model.AddImplication(lit, src.in_buffer)
+        model.AddImplication(lit, dst.in_buffer)
         if self.chooses_split(edge.dst):
-            model.add(dst.eff_size == src.eff_size).OnlyEnforceIf(lit)
+            model.Add(dst.eff_size == src.eff_size).OnlyEnforceIf(lit)
             _gate_divisions(model, self._pairs(edge), src.division, dst.division, lit)
         self._incoming.setdefault(edge.dst, []).append(lit)
 
@@ -556,7 +554,7 @@ class TableStrategy(EncodingStrategy):
                 self.vars[e.dst].merges[node.name] for e in node.outputs if e.in_place
             ]
         if len(lits) > 1:
-            model.add_at_most_one(lits)
+            model.AddAtMostOne(lits)
 
     def _pairs(self, edge: DependencyEdge) -> list[tuple[int, int]]:
         return self.matches.get((edge.src.name, edge.dst.name), [])
@@ -565,7 +563,7 @@ class TableStrategy(EncodingStrategy):
 
     def encode_capacity(self, item: Item, model: Model) -> None:
         v = self.vars[item]
-        model.add(v.offset + v.eff_size <= self._capacity).OnlyEnforceIf(v.in_buffer)
+        model.Add(v.offset + v.eff_size <= self._capacity).OnlyEnforceIf(v.in_buffer)
 
     def encode_no_overlap(self, graph: SpyreOptimizationGraph, model: Model) -> None:
         """Every item's optional rectangle ``[start, end) x [offset, offset +
@@ -578,39 +576,39 @@ class TableStrategy(EncodingStrategy):
             v = self.vars[item]
             ins = self._incoming.get(item, [])
             if ins:
-                start = model.new_int_var(
+                start = model.IntVar(
                     item.start_time, item.end_time, f"start_{item.name}"
                 )
-                model.add(start == item.start_time + sum(ins))
+                model.Add(start == item.start_time + sum(ins))
                 x_start: Any = start
                 x_size: Any = item.end_time - start
             else:
                 x_start = item.start_time
                 x_size = item.end_time - item.start_time
             x_intervals.append(
-                model.new_optional_interval_var(
+                model.NewOptionalIntervalVar(
                     x_start, x_size, item.end_time, v.in_buffer, f"x_{item.name}"
                 )
             )
             # An interval end must be affine, so the top of a division-dependent
             # footprint gets its own var; its range covers buffers larger
             # than LX itself.
-            y_end = model.new_int_var(
+            y_end = model.IntVar(
                 0, max(0, self._capacity - 1) + item.size, f"top_{item.name}"
             )
-            model.add(y_end == v.offset + v.eff_size)
+            model.Add(y_end == v.offset + v.eff_size)
             y_intervals.append(
-                model.new_optional_interval_var(
+                model.NewOptionalIntervalVar(
                     v.offset, v.eff_size, y_end, v.in_buffer, f"y_{item.name}"
                 )
             )
-        model.add_no_overlap_2d(x_intervals, y_intervals)
+        model.AddNoOverlap2D(x_intervals, y_intervals)
 
     # ---- 4. op constraints ----
 
     def encode_op_constraints(self, item: Item, model: Model) -> None:
         if item.residency_reason is not None:
-            model.add(self.vars[item].in_buffer == 0)
+            model.Add(self.vars[item].in_buffer == 0)
 
     # ---- 5. reads ----
 
@@ -633,7 +631,7 @@ class TableStrategy(EncodingStrategy):
                 by_layout.setdefault(layout, []).append(c)
         served: dict[RelayoutLayout, Var] = {}
         for layout, cands in sorted(by_layout.items(), key=lambda i: i[0].group):
-            lit = model.new_bool_var(
+            lit = model.BoolVar(
                 f"served_{edge.src.name}__{edge.dst.name}__g{layout.group}"
             )
             _gate_divisions(
@@ -643,7 +641,7 @@ class TableStrategy(EncodingStrategy):
                 dst.division,
                 lit,
             )
-            model.add_implication(lit, self.vars[layout].in_buffer)
+            model.AddImplication(lit, self.vars[layout].in_buffer)
             served[layout] = lit
             self._serves.setdefault(layout, []).append(lit)
         pairs = self._pairs(edge)
@@ -651,9 +649,9 @@ class TableStrategy(EncodingStrategy):
             _gate_divisions(model, pairs, src.division, dst.division, src.in_buffer)
             return
         self.served.setdefault(edge, []).extend(served.items())
-        match = model.new_bool_var(f"match_{edge.src.name}__{edge.dst.name}")
+        match = model.BoolVar(f"match_{edge.src.name}__{edge.dst.name}")
         _gate_divisions(model, pairs, src.division, dst.division, match)
-        model.add_bool_or([match, *served.values()]).only_enforce_if(src.in_buffer)
+        model.AddBoolOr([match, *served.values()]).OnlyEnforceIf(src.in_buffer)
 
     # ---- 6. relayouts ----
 
@@ -664,17 +662,17 @@ class TableStrategy(EncodingStrategy):
         v = self.vars[layout]
         source = layout.producer
         if source is None or not self.chooses_split(source):
-            model.add(v.in_buffer == 0)
+            model.Add(v.in_buffer == 0)
             return
         sv = self.vars[source]
-        model.add_implication(v.in_buffer, sv.in_buffer)
+        model.AddImplication(v.in_buffer, sv.in_buffer)
         priced = [sv.division_is(i) for i in self._priced[layout]]
-        model.add_bool_or(priced).only_enforce_if(v.in_buffer)
+        model.AddBoolOr(priced).OnlyEnforceIf(v.in_buffer)
         serves = self._serves.get(layout, [])
         if serves:
-            model.add_bool_or(serves).only_enforce_if(v.in_buffer)
+            model.AddBoolOr(serves).OnlyEnforceIf(v.in_buffer)
         else:
-            model.add(v.in_buffer == 0)
+            model.Add(v.in_buffer == 0)
 
     # ---- 7. coarse tiling ----
 
@@ -685,11 +683,11 @@ class TableStrategy(EncodingStrategy):
             return
         v = self.vars[item]
         ids = [self._nest_ids[cd.tiling.level_counts] for cd in self._candidates(item)]
-        var = model.new_int_var(0, max(self._nest_ids.values()), f"loop_id_{item.name}")
-        model.add_element(v.division, ids, var)
-        tiled = model.new_bool_var(f"tiled_{item.name}")
-        model.add(var != 0).only_enforce_if(tiled)
-        model.add(var == 0).only_enforce_if(tiled.negated())
+        var = model.IntVar(0, max(self._nest_ids.values()), f"loop_id_{item.name}")
+        model.AddElement(v.division, ids, var)
+        tiled = model.BoolVar(f"tiled_{item.name}")
+        model.Add(var != 0).OnlyEnforceIf(tiled)
+        model.Add(var == 0).OnlyEnforceIf(tiled.Not())
         self._loop_id[item] = var
         self._tiled[item] = tiled
 
@@ -740,21 +738,19 @@ class TableStrategy(EncodingStrategy):
             return
         prev = self._join_prev[node]
         if prev is None:
-            self._group[node] = model.new_constant(0)
+            self._group[node] = model.Constant(0)
             return
         a, b = prev.name, node.name
-        same = model.new_bool_var(f"samenest_{a}_{b}")
-        model.add(self._loop_id[prev] == self._loop_id[node]).only_enforce_if(same)
-        model.add(self._loop_id[prev] != self._loop_id[node]).only_enforce_if(
-            same.negated()
+        same = model.BoolVar(f"samenest_{a}_{b}")
+        model.Add(self._loop_id[prev] == self._loop_id[node]).OnlyEnforceIf(same)
+        model.Add(self._loop_id[prev] != self._loop_id[node]).OnlyEnforceIf(same.Not())
+        joined = model.BoolVar(f"joined_{a}_{b}")
+        model.AddBoolAnd([same, self._tiled[node]]).OnlyEnforceIf(joined)
+        model.AddBoolOr([same.Not(), self._tiled[node].Not()]).OnlyEnforceIf(
+            joined.Not()
         )
-        joined = model.new_bool_var(f"joined_{a}_{b}")
-        model.add_bool_and([same, self._tiled[node]]).only_enforce_if(joined)
-        model.add_bool_or(
-            [same.negated(), self._tiled[node].negated()]
-        ).only_enforce_if(joined.negated())
-        var = model.new_int_var(0, self._chain_len, f"tile_group_{b}")
-        model.add(var == self._group[prev] + 1 - joined)
+        var = model.IntVar(0, self._chain_len, f"tile_group_{b}")
+        model.Add(var == self._group[prev] + 1 - joined)
         self._group[node] = var
 
     def encode_cuts(
@@ -778,29 +774,25 @@ class TableStrategy(EncodingStrategy):
             if seg is None or segments.get(child) != seg:
                 unshareable = True
                 continue
-            d = model.new_bool_var(f"apart_{item.name}_{child.name}")
-            model.add(self._group[item] != self._group[child]).only_enforce_if(d)
-            model.add(self._group[item] == self._group[child]).only_enforce_if(
-                d.negated()
-            )
+            d = model.BoolVar(f"apart_{item.name}_{child.name}")
+            model.Add(self._group[item] != self._group[child]).OnlyEnforceIf(d)
+            model.Add(self._group[item] == self._group[child]).OnlyEnforceIf(d.Not())
             _gate_divisions(
                 model,
                 self._pairs(edge),
                 self.vars[item].division,
                 self.vars[child].division,
-                d.negated(),
+                d.Not(),
             )
             diffs.append(d)
-        cut = model.new_bool_var(f"cut_{item.name}")
+        cut = model.BoolVar(f"cut_{item.name}")
         if unshareable or not diffs:
-            model.add(cut == is_tiled)
+            model.Add(cut == is_tiled)
         else:
-            any_diff = model.new_bool_var(f"anydiff_{item.name}")
-            model.add_max_equality(any_diff, diffs)
-            model.add_bool_and([is_tiled, any_diff]).only_enforce_if(cut)
-            model.add_bool_or([is_tiled.negated(), any_diff.negated()]).only_enforce_if(
-                cut.negated()
-            )
+            any_diff = model.BoolVar(f"anydiff_{item.name}")
+            model.AddMaxEquality(any_diff, diffs)
+            model.AddBoolAnd([is_tiled, any_diff]).OnlyEnforceIf(cut)
+            model.AddBoolOr([is_tiled.Not(), any_diff.Not()]).OnlyEnforceIf(cut.Not())
         self.cut_terms.append(cut)
 
     def encode_tile_counts(self, item: Item, model: Model) -> None:
@@ -810,8 +802,8 @@ class TableStrategy(EncodingStrategy):
         counts = [cd.tiling.tile_count for cd in self._candidates(item)]
         if min(counts) == max(counts):
             return
-        var = model.new_int_var(min(counts), max(counts), f"tile_count_{item.name}")
-        model.add_element(self.vars[item].division, counts, var)
+        var = model.IntVar(min(counts), max(counts), f"tile_count_{item.name}")
+        model.AddElement(self.vars[item].division, counts, var)
         self.tile_terms.append(var)
 
     # ---- 8. clones ----

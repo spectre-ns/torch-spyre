@@ -56,7 +56,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 
 if TYPE_CHECKING:
-    from ortools.sat.python import cp_model
     from torch._inductor.ir import Operation
 
     from torch_spyre._inductor.scratchpad.encoding_strategy import EncodingStrategy
@@ -397,23 +396,29 @@ class SpyreOptimizationGraph:
 
     def solve(
         self,
-        model: cp_model.CpModel,
+        model: Any,
         cost_expr: Optional[sympy.Expr] = None,
         strategy: Optional[EncodingStrategy] = None,
     ) -> list[ResourceNode]:
         """Encode, run the objective ladder, and fill every open decision on
-        the nodes (and ``chosen`` on edges). Returns the op outputs in
-        execution order. Raises :class:`SolveError`, writing nothing."""
+        the nodes (and ``chosen`` on edges). ``model`` is the backend to post
+        to and solve with (a bare ``CpModel`` is wrapped in ``CpSat``).
+        Returns the op outputs in execution order. Raises
+        :class:`SolveError`, writing nothing."""
         from ortools.sat.python import cp_model
 
+        from torch_spyre._inductor.scratchpad.backend import CpSat
+
+        backend = CpSat(model) if isinstance(model, cp_model.CpModel) else model
         if strategy is None:
             from torch_spyre._inductor.scratchpad.encoding_strategy import (
                 EnumerationFactory,
             )
 
             strategy = EnumerationFactory().strategy()
-        self._finalize(model, strategy)
-        solver = cp_model.CpSolver()
+        self._finalize(backend, strategy)
+        solver = backend.solver
+        backend.record = self.settings.record
         settings = self.settings
         if settings.time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(settings.time_limit_seconds)
@@ -443,8 +448,8 @@ class SpyreOptimizationGraph:
         justify_offsets = settings.bottom_justify and all(
             n.offset is None for n in self.get_nodes()
         )
-        self._ladder(model, solver, strategy, cost_expr)
-        self._extract(solver, strategy, justify_offsets)
+        self._ladder(backend, strategy, cost_expr)
+        self._extract(backend, strategy, justify_offsets)
         node = self.first
         plan = []
         while node is not None:
@@ -452,7 +457,7 @@ class SpyreOptimizationGraph:
             node = node.next.after if node.next else None
         return plan
 
-    def _finalize(self, model: cp_model.CpModel, strategy: EncodingStrategy) -> None:
+    def _finalize(self, model: Any, strategy: EncodingStrategy) -> None:
         """Walk the graph in emission order, calling the strategy once per
         node, edge or relayout layout, and record which call posted what."""
         nodes = list(self.get_nodes())
@@ -498,12 +503,11 @@ class SpyreOptimizationGraph:
             if n.produced_at is None:
                 record(strategy.encode_clone, n)
         # Read by the equivalence harness, next to each stage's proto.
-        setattr(model, "_spyre_provenance", strategy.provenance)
+        setattr(model.model, "_spyre_provenance", strategy.provenance)
 
     def _ladder(
         self,
-        model: cp_model.CpModel,
-        solver: cp_model.CpSolver,
+        model: Any,
         strategy: EncodingStrategy,
         cost_expr: Optional[sympy.Expr],
     ) -> None:
@@ -512,7 +516,7 @@ class SpyreOptimizationGraph:
         stage ends without a plan."""
         from ortools.sat.python import cp_model
 
-        record = self.settings.record
+        solver = model
         items: list[ResourceNode | RelayoutLayout] = [
             *self.get_nodes(),
             *strategy.layouts,
@@ -526,7 +530,7 @@ class SpyreOptimizationGraph:
         tile_terms = strategy.tile_terms
 
         def solve_stage(stage: str) -> int:
-            result = record(solver, model)
+            result = model.Solve()
             if result not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(result)} without a plan "
@@ -538,7 +542,7 @@ class SpyreOptimizationGraph:
         core_terms = None
         occupancy: Optional[int] = None
         if cost_expr is not None:
-            status = self._minimize_cost_expr(model, solver, strategy, cost_expr)
+            status = self._minimize_cost_expr(model, strategy, cost_expr)
 
         if status is None:
             # One lexicographic ladder, in priority order: LX residency (HBM
@@ -550,7 +554,7 @@ class SpyreOptimizationGraph:
             # shuffle looks free, so no relayout may fire under it.
             with _ProvenanceRecorder(model, strategy).section("ladder:copy pin"):
                 for lay in strategy.layouts:
-                    model.add(strategy.vars[lay].in_buffer == 0)
+                    model.Add(strategy.vars[lay].in_buffer == 0)
 
             vars_ = strategy.vars
             hbm_terms = [
@@ -559,15 +563,15 @@ class SpyreOptimizationGraph:
             status = cp_model.INFEASIBLE
             terms = [strategy.objective_terms(item) for item in items]
             if hbm_terms:
-                model.minimize(sum(hbm_terms))
+                model.Minimize(sum(hbm_terms))
                 status = solve_stage("residency")
                 # Lock the traffic optimum (not just the count); the objective
                 # is a sum of ints, so the round is exact.
                 if cut_terms or any(cores is not None for cores, _ in terms):
-                    model.add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
+                    model.Add(sum(hbm_terms) <= round(solver.ObjectiveValue()))
 
             if cut_terms:
-                model.minimize(sum(cut_terms))
+                model.Minimize(sum(cut_terms))
                 status = solve_stage("cut tiebreak")
                 cuts = round(solver.ObjectiveValue())
                 logger.debug(
@@ -580,18 +584,18 @@ class SpyreOptimizationGraph:
             core_cost_terms = [cost for _, cost in terms if cost is not None]
             if core_terms:
                 if cut_terms:
-                    model.add(sum(cut_terms) <= cuts)
-                model.maximize(sum(core_terms))
+                    model.Add(sum(cut_terms) <= cuts)
+                model.Maximize(sum(core_terms))
                 status = solve_stage("parallelism")
                 occupancy = round(solver.ObjectiveValue())
-                model.add(sum(core_terms) >= occupancy)
-                model.minimize(sum(core_cost_terms))
+                model.Add(sum(core_terms) >= occupancy)
+                model.Minimize(sum(core_cost_terms))
                 status = solve_stage("division shape")
                 # Tilings that differ only in count tie on every stage above;
                 # holding the shape optimum, take the fewest tiles.
                 if tile_terms:
-                    model.add(sum(core_cost_terms) <= round(solver.ObjectiveValue()))
-                    model.minimize(sum(tile_terms))
+                    model.Add(sum(core_cost_terms) <= round(solver.ObjectiveValue()))
+                    model.Minimize(sum(tile_terms))
                     status = solve_stage("tile count")
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -629,8 +633,7 @@ class SpyreOptimizationGraph:
 
     def _minimize_cost_expr(
         self,
-        model: cp_model.CpModel,
-        solver: cp_model.CpSolver,
+        model: Any,
         strategy: EncodingStrategy,
         cost_expr: sympy.Expr,
     ) -> Optional[int]:
@@ -645,11 +648,14 @@ class SpyreOptimizationGraph:
         sym_map, buffer_map = strategy.cost_bindings()
         try:
             with _ProvenanceRecorder(model, strategy).section("ladder:cost_expr"):
-                cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
+                cp_cost = cost_expr_to_cpsat(
+                    model.model, sym_map, buffer_map, cost_expr
+                )
                 if not isinstance(cp_cost, (int, float)):
                     # A constant cost leaves any solution optimal.
-                    model.minimize(cp_cost)
-            status = self.settings.record(solver, model, objective=True)
+                    model.Minimize(cp_cost)
+            solver = model
+            status = model.Solve(objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
@@ -675,7 +681,7 @@ class SpyreOptimizationGraph:
 
     def _extract(
         self,
-        solver: cp_model.CpSolver,
+        solver: Any,
         strategy: EncodingStrategy,
         justify_offsets: bool,
     ) -> None:
@@ -779,8 +785,7 @@ class _ProvenanceRecorder:
         self.strategy = strategy
 
     def _counts(self) -> tuple[int, int]:
-        proto = self.model.proto
-        return len(proto.variables), len(proto.constraints)
+        return self.model.NumVariables(), self.model.NumConstraints()
 
     def __call__(self, method: Callable, element: Any, *args, **kwargs) -> None:
         with self.section(method.__name__, element):
