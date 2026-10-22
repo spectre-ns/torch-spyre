@@ -152,44 +152,43 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         self.size = size
 
         # Barred buffers keep address=None and stay out of the permutation
-        # entirely, so no annealing move can ever place one. The full buffer
-        # list (barred buffers included) is kept aside so plan_layout can
-        # still return it; every internal structure below (self.buffers, the
-        # initial permutation, self.plan) is built over placeable buffers only.
-        self._all_buffers = self.buffers
+        # entirely, so no annealing move can ever place one. ``buffers`` stays
+        # the full input set (barred buffers included), as every solver's does;
+        # every internal structure below (``_placeable``, the initial
+        # permutation, self.plan) is built over placeable buffers only.
         placeable, _ = self.partition()
-        self.buffers = list(placeable)
+        self._placeable = list(placeable)
         self._skip_solve = not placeable
         if self._skip_solve:
             return
 
         if isinstance(initial, list):
-            if sorted(initial) != list(range(len(self.buffers))):
+            if sorted(initial) != list(range(len(self._placeable))):
                 raise ValueError(
                     "given initial list is not a permutation of "
-                    f"range({len(self.buffers)})"
+                    f"range({len(self._placeable)})"
                 )
             self.initial = initial
         else:
             if initial == "first_fit":
                 initial = FirstFitLayoutSolver(
-                    copy.deepcopy(self.buffers), size, alignment
+                    copy.deepcopy(self._placeable), size, alignment
                 )
             elif initial == "best_fit":
                 initial = BestFitLayoutSolver(
-                    copy.deepcopy(self.buffers), size, alignment
+                    copy.deepcopy(self._placeable), size, alignment
                 )
             elif initial == "greedy":
                 initial = GreedyLayoutSolver(
-                    copy.deepcopy(self.buffers), size, alignment
+                    copy.deepcopy(self._placeable), size, alignment
                 )
 
             assert isinstance(initial, MemoryPlanSolver)
             convertor = SolverToPermutation(initial)
-            self.initial = convertor.permutation(self.buffers)
+            self.initial = convertor.permutation(self._placeable)
 
         self.plan = NativePermutationLayoutSolver(
-            self.buffers, self.initial, size, alignment
+            self._placeable, self.initial, size, alignment
         )
         self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
@@ -207,7 +206,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         else:
             self.schedule = schedule
         # Let the schedule derive any buffer-dependent parameters (e.g. t0).
-        self.schedule.set_buffers(self.buffers)
+        self.schedule.set_buffers(self._placeable)
 
         if random is not None:
             self.random = random
@@ -224,7 +223,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
             self.finalize()
         # The annealer mutates the buffer objects in place, so the caller's full
         # list (barred buffers included, still at address=None) is the result.
-        return list(self._all_buffers)
+        return list(self.buffers)
 
     def finalize(self) -> None:
         self.plan.finalize()
@@ -236,7 +235,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         its full use-weighted size, so no rotation or swap can improve it and
         the search can stop.
         """
-        return self.plan.count_allocated() == len(self.buffers)
+        return self.plan.count_allocated() == len(self._placeable)
 
     def solve(self) -> None:
         # If the initial layout already fits every buffer it is globally
@@ -250,7 +249,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         # whatever state annealing happened to end in.
         if self.plan.permutation != self.best_permutation:
             self.plan = NativePermutationLayoutSolver(
-                self.buffers, list(self.best_permutation), self.size, self.alignment
+                self._placeable, list(self.best_permutation), self.size, self.alignment
             )
 
     def anneal(self) -> None:
@@ -314,7 +313,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         # (address + size) of a buffer, or +inf when it is evicted. An evicted
         # buffer sorts as if it sits arbitrarily high, so it is treated as "above"
         # any placed buffer and never reordered below one. It reads the plan-local
-        # size rather than ``self.buffers[p].size``, so it stays correct once a
+        # size rather than ``self._placeable[p].size``, so it stays correct once a
         # co-optimizer drives ``resize``.
         top_or_inf = plan.top_or_inf
 
@@ -352,7 +351,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         rotation (if any) is applied to the live plan, so the live layout never has
         to sweep-and-restore."""
         plan = self.plan
-        n = len(self.buffers)
+        n = len(self._placeable)
         allocated = [plan.is_fully_allocated(plan.permutation[i]) for i in range(n)]
         n_allocated = sum(1 if b else 0 for b in allocated)
         # Choose each allocated buffer with weight n and each non-allocated buffer
