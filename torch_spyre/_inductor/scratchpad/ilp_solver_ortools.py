@@ -266,7 +266,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         graph = build_graph(
             buffers, self.alignment, self._capacity_units, settings, forced_reasons
         )
-        strategy = TableStrategy.from_buffers(buffers, forced_reasons)
+        strategy_cls: type[TableStrategy] = TableStrategy
+        if config.lx_division_encoding == "lazy":
+            from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+
+            assert config.lx_view_relation == "derived", (
+                "lx_division_encoding='lazy' needs lx_view_relation='derived'"
+            )
+            strategy_cls = LazyStrategy
+        strategy = strategy_cls.from_buffers(buffers, forced_reasons)
         graph.solve(_backend(), cost_expr, strategy)
 
         # Write the decisions back onto the caller's buffers, in bytes.

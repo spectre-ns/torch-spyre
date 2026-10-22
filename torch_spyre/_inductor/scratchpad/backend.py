@@ -70,6 +70,9 @@ class Backend(Protocol):
     def AddMaxEquality(
         self, target: Var, exprs: Sequence[LinearExpr]
     ) -> Constraint: ...
+    def AddMultiplicationEquality(
+        self, target: Var, factors: Sequence[LinearExpr]
+    ) -> Constraint: ...
     def NewOptionalIntervalVar(
         self,
         start: LinearExpr,
@@ -133,6 +136,9 @@ class CpSat:
 
     def AddMaxEquality(self, target, exprs):
         return self.model.add_max_equality(target, exprs)
+
+    def AddMultiplicationEquality(self, target, factors):
+        return self.model.add_multiplication_equality(target, factors)
 
     def NewOptionalIntervalVar(self, start, size, end, present, name):
         return self.model.new_optional_interval_var(start, size, end, present, name)

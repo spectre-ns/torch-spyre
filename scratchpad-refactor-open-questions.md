@@ -69,3 +69,42 @@ defect or big-M numerics.
 - Assumed: not worth chasing for the feasibility question (MIP is a second opinion
   on small models only).
 - Answer needed: do you want the MIP backend kept at all?
+
+## Q7. What the Lazy work split tabulates over
+
+`LX_DIVISION_ENCODING=lazy` (with `LX_VIEW_RELATION=derived`) gives a node no
+candidate index. Its split is one var per loop axis plus a tiling choice; legality is
+posted per tiling frame from its `WorkDivisionContext` (`lazy_division.py`, ported
+from the 2f spike). Every per-division quantity (footprint, core cost, tile counts,
+view ids, cost-expression terms) is a table over only the axes it varies with,
+tabulated over the space's *points*: each frame's factor domains within the core
+budget, a superset of the legal divisions that is cheap to list. No legality check
+and no menu are involved in those tables.
+
+- Assumed (recommended): tabulate over points for now. Views need per-point view
+  computation (`_view_for_div`), which is the cost 2c's closed-form views remove.
+- Answer needed: is per-(node, dep) view-id tables over points an acceptable
+  fallback, with 2c's digit form as the follow-up that removes the view computation?
+
+## Q8. The allocator still builds menus
+
+The Lazy strategy ignores the menu in the model, but the allocator still enumerates
+it: the carry and clone pair tables, residency gating and relayout pricing read it,
+and the solve writes its choice back as a menu index (`b.chosen_division`). So the
+planning-time saving of "menus gone" (the plan's ~78 s zoo-tiling column) does not
+show yet; the benchmark will show model size and solve time only.
+
+- Assumed (recommended): keep the menus until Phase 3 (3c/3g) moves those consumers
+  onto the graph; report allocator time separately.
+- Answer needed: should removing the menu from the allocator be part of this
+  exploration, or is the model-side result enough?
+
+## Q9. Which nodes stay Table under Lazy
+
+A node stays `Table` if its split is pinned or committed, it has no space (not
+enumerable), it is an end of an edge whose relation is still a pair table over menu
+indices (loop-carry update/read edges, input clones), or its space has more than
+4096 points. This is the plan's mixed enumeration (rule 5).
+
+- Assumed (recommended): as above; clones and carries move with 2c's clone encoding.
+- Answer needed: none unless you want a different cut-off.

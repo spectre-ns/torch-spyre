@@ -183,6 +183,11 @@ class memoize_method:
         return bound_cache
 
 
+def _owner_key(owner) -> object:
+    division = getattr(owner, "division", None)
+    return id(owner) if division is None else division.index
+
+
 class _SympyExprToCpSat(Printer):
     """Translates a sympy cost expression into an OR-Tools CP-SAT expression
     over an existing ``sympy symbol -> CP-SAT var`` mapping.
@@ -334,15 +339,25 @@ class _SympyExprToCpSat(Printer):
         coefficient = int(scale) if scale.denominator == 1 else float(scale)
         if Fraction(offset) != base or Fraction(coefficient) != scale:
             return None
-        key = owner.division.index, table
+        key = _owner_key(owner), table
         if key not in self._division_table_cache:
             var = self._model.new_int_var_from_domain(
                 cp_model.Domain.FromValues(table), f"division_cost_{self._count}"
             )
             self._count += 1
-            self._model.add_element(owner.division, table, var)
+            self._tie(owner, table, var)
             self._division_table_cache[key] = var
         return coefficient * self._division_table_cache[key] + offset
+
+    def _tie(self, owner, values, var) -> None:
+        """``var`` is ``values`` at ``owner``'s chosen candidate: the owner's
+        own tie when it has one (a strategy's node, menu-indexed or not),
+        else an element on its division index."""
+        tie = getattr(owner, "tie", None)
+        if tie is not None:
+            tie(values, var)
+        else:
+            self._model.add_element(owner.division, values, var)
 
     def convert(self, cost_expr: sympy.Expr) -> "cp_model.LinearExpr":
         """Return the CP-SAT expression equivalent to ``cost_expr`` under
@@ -795,7 +810,7 @@ class _SympyExprToCpSat(Printer):
             values = [int(round(_CORE_LOG_SCALE * math.log2(v))) for v in raw]
             domain = cp_model.Domain.FromValues(values)
             cp_var = self._model.new_int_var_from_domain(domain, expr.name)
-            self._model.add_element(b.division, values, cp_var)
+            self._tie(b, values, cp_var)
         else:
             scale = self._inv_scale(name)
             values = [scale // v for v in raw]
@@ -845,7 +860,7 @@ class _SympyExprToCpSat(Printer):
         name = is_lx.name if is_lx.is_Symbol else str(self._count)
         self._count += 1
         price = self._model.new_int_var(0, top, f"relayout_price_{name}")
-        self._model.add_element(wrapper.division, table, price)
+        self._tie(wrapper, table, price)
         charge = self._model.new_int_var(0, top, f"relayout_charge_{name}")
         self._model.add(charge == price).only_enforce_if(lit)
         self._model.add(charge == 0).only_enforce_if(lit.Not())
@@ -896,7 +911,7 @@ class _SympyExprToCpSat(Printer):
         name = f"{expr.func.__name__}_{buffer.sym_division.name}_{self._count}"
         self._count += 1
         var = self._model.new_int_var(min(table), max(table), name)
-        self._model.add_element(wrapper.division, table, var)
+        self._tie(wrapper, table, var)
         self._sym_map[key] = var
         return var
 

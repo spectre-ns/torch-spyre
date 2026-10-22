@@ -349,6 +349,23 @@ lx_view_relation: Literal["table", "derived"] = os.environ.get(  # type: ignore[
 # under ``lx_view_relation = "derived"``, which does not generate them yet.
 lx_solver_relayouts: bool = os.environ.get("LX_SOLVER_RELAYOUTS", "1") == "1"
 
+# How the CP-SAT layout solve encodes an open work split: "table" (an index
+# into the candidate menu) or "lazy" (one split var per axis and a tiling
+# choice, legality posted from each tiling frame's WorkDivisionContext, every
+# per-division quantity a table over the axes it depends on). "lazy" needs
+# lx_view_relation = "derived"; nodes on a pair-table edge stay "table".
+lx_division_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
+    "LX_DIVISION_ENCODING", "table"
+)
+
+# How a Lazy node's per-core views are related across an edge: "points" (a
+# view-id table over its points, one view computation per point) or "digits"
+# (per-device-dim factor and core-stride equalities over the split vars, where
+# the view has a digit form; else the view-id table).
+lx_lazy_views: Literal["points", "digits"] = os.environ.get(  # type: ignore[assignment]
+    "LX_LAZY_VIEWS", "points"
+)
+
 # How coarse-tiling nests are compared: "id" (an interned loop id per nest) or
 # "levels" (per-level tile-count vars, same_nest as their equality).
 lx_nest_encoding: Literal["id", "levels"] = os.environ.get(  # type: ignore[assignment]

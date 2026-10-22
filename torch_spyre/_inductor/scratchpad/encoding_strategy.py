@@ -65,6 +65,33 @@ AxisSetting = Literal["table", "lazy", "pruned"]
 RelayoutSetting = Literal["data", "pruned", "lazy"]
 
 
+def _owner_key(view) -> Optional[tuple]:
+    """A hashable form of ``view``'s owner map: equal exactly when
+    ``same_partition`` holds (``same_owner_maps``), or ``None`` when an owner
+    formula does not evaluate."""
+    from sympy.utilities.misc import as_int
+
+    from torch_spyre._inductor.core_mapping import _owner_at_core
+
+    cores = view.num_cores if view.num_cores is not None else view.split_product
+    if cores <= 0:
+        return None
+    slots = dict(view.core_to_slot)
+    try:
+        dims = tuple(
+            (
+                dim,
+                split,
+                tuple(as_int(_owner_at_core(slots[dim], c)) for c in range(cores)),
+            )
+            for dim, split in sorted(view.work_slice_dims)
+            if split > 1
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    return cores, dims
+
+
 def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
     """Enforce, when ``enforce_lit`` is true, that ``(src_div, dst_div)`` is
     one of the ``compatible`` (i, j) pairs. With no compatible pairs the
@@ -122,6 +149,17 @@ class NodeVars:
     fixed_index: Optional[int] = None  # the index, when nothing is left to choose
     _is: dict[int, Var] = field(default_factory=dict)
     _consts: Optional[tuple[Var, Var]] = None
+    # A Lazy node's per-axis encoding (no index); ties go through it.
+    lazy: Optional[Any] = None
+
+    def tie(self, values: Sequence[int], var: Var) -> None:
+        """``var`` is ``values[i]`` at the chosen candidate ``i``: an element on
+        the index, or for a Lazy node a table over the axes ``values`` vary
+        with."""
+        if self.lazy is not None:
+            self.lazy.tie(values, var)
+        else:
+            self.model.AddElement(self.division, values, var)
 
     def division_is(self, i: int) -> Var:
         """Table only: the literal ``division == i``, made on first use."""
@@ -371,6 +409,7 @@ class TableStrategy(EncodingStrategy):
         self.solved = {}
         self._capacity = graph.capacity
         self._reps: dict[tuple[str, str], list] = {}
+        self._rep_keys: dict[tuple[str, str], dict] = {}
         self._src_ids: dict = {}
         self._dst_ids: dict = {}
         import os
@@ -536,18 +575,18 @@ class TableStrategy(EncodingStrategy):
             assert isinstance(symbol, sympy.Symbol)
             raw = [cd.splits.get(key, 1) for cd in menu]
             var = m.IntVar(1, config.sencores, symbol.name)
-            m.AddElement(v.division, raw, var)
+            v.tie(raw, var)
             v.splits[key] = var
             v.splits_raw[key] = raw
         for key, symbol in sym_tile_counts.items():
             raw = [cd.tiling.count_for(key) for cd in menu]
             var = m.IntVar(min(raw), max(raw), symbol.name)
-            m.AddElement(v.division, raw, var)
+            v.tie(raw, var)
             v.tile_counts[key] = var
             v.tile_counts_raw[key] = raw
-        m.AddElement(v.division, v.per_core, v.eff_size)
-        m.AddElement(v.division, cores_used, v.cores)
-        m.AddElement(v.division, core_cost, v.core_cost)
+        v.tie(v.per_core, v.eff_size)
+        v.tie(cores_used, v.cores)
+        v.tie(core_cost, v.core_cost)
 
     # ---- 2. merges ----
 
@@ -605,10 +644,18 @@ class TableStrategy(EncodingStrategy):
         if view is None:
             return -1
         reps = self._reps.setdefault((buffer, kind), [])
+        keyed = self._rep_keys.setdefault((buffer, kind), {})
+        key = _owner_key(view)
+        if key is not None and key in keyed:
+            return keyed[key]
         for i, rep in enumerate(reps):
             if rep.same_partition(view):
+                if key is not None:
+                    keyed[key] = i
                 return i
         reps.append(view)
+        if key is not None:
+            keyed[key] = len(reps) - 1
         return len(reps) - 1
 
     def _id_var(self, item: Item, ids: list[int], name: str, model: Model):
@@ -618,7 +665,7 @@ class TableStrategy(EncodingStrategy):
         if min(ids) == max(ids):
             return ids[0]
         var = model.IntVar(min(ids), max(ids), name)
-        model.AddElement(v.division, ids, var)
+        v.tie(ids, var)
         return var
 
     def _source_ids(self, node: ResourceNode, re, model: Model):
@@ -835,7 +882,7 @@ class TableStrategy(EncodingStrategy):
                     for cd in cands
                 ]
                 lk = model.IntVar(min(vals), max(vals), f"L{k}_{item.name}")
-                model.AddElement(v.division, vals, lk)
+                v.tie(vals, lk)
                 levels.append(lk)
             tiled = model.BoolVar(f"tiled_{item.name}")
             model.Add(levels[0] != 0).OnlyEnforceIf(tiled)
@@ -844,7 +891,7 @@ class TableStrategy(EncodingStrategy):
         else:
             ids = [self._nest_ids[cd.tiling.level_counts] for cd in cands]
             var = model.IntVar(0, max(self._nest_ids.values()), f"loop_id_{item.name}")
-            model.AddElement(v.division, ids, var)
+            v.tie(ids, var)
             tiled = model.BoolVar(f"tiled_{item.name}")
             model.Add(var != 0).OnlyEnforceIf(tiled)
             model.Add(var == 0).OnlyEnforceIf(tiled.Not())
@@ -970,7 +1017,7 @@ class TableStrategy(EncodingStrategy):
         if min(counts) == max(counts):
             return
         var = model.IntVar(min(counts), max(counts), f"tile_count_{item.name}")
-        model.AddElement(self.vars[item].division, counts, var)
+        self.vars[item].tie(counts, var)
         self.tile_terms.append(var)
 
     # ---- 8. clones ----

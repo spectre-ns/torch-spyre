@@ -128,6 +128,8 @@ class TableCandidates:
     def __init__(self, allocator: CoOptimizingAllocator) -> None:
         self.allocator = allocator
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
+        # Per enumerated op, its divisions as a space (lx_division_encoding).
+        self.lazy_spaces: dict[str, Any] = {}
 
     def _prepare_buffers(
         self,
@@ -376,6 +378,7 @@ class TableCandidates:
             return _legal_fixed_division(op, fixed, str(exc)), False
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
+        options: list = []
         # Each tiling option gets its own division enumeration: the legal split
         # set is tiling-relative -- a tiled dim has fewer/other divisors and a
         # smaller per-core span. The untiled option reuses the already-enumerated
@@ -412,6 +415,15 @@ class TableCandidates:
                         exc,
                     )
                     continue
+            if config.lx_division_encoding == "lazy":
+                from torch_spyre._inductor.scratchpad.lazy_division import LazyOption
+                from torch_spyre._inductor.work_division import (
+                    work_division_context_for_op,
+                )
+
+                context = work_division_context_for_op(op, max_cores, tiling)
+                if context is not None and tiled_candidates:
+                    options.append(LazyOption(tiling, tile_splits, context))
             for candidate in tiled_candidates:
                 division = _core_division(op, candidate, tiling, tile_splits)
                 key = (
@@ -428,6 +440,10 @@ class TableCandidates:
                     seen.add(key)
                     cds.append(division)
         if cds:
+            if options:
+                from torch_spyre._inductor.scratchpad.lazy_division import LazySpace
+
+                self.lazy_spaces[op.get_name()] = LazySpace(op, options, max_cores)
             return cds, True
         return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
 
@@ -960,6 +976,8 @@ class TableCandidates:
                 buffer.division_space = self._division_space(
                     op, readers_by_name.get(output_name, ())
                 )
+            if output_name in division_map.enumerated:
+                buffer.lazy_space = self.lazy_spaces.get(output_name)
             if self.allocator._solver_chooses_tilings and isinstance(
                 op, ComputedBuffer
             ):

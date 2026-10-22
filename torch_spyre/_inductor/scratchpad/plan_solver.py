@@ -15,7 +15,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
 import itertools
 import math
@@ -365,6 +365,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # ``core_divisions`` without materializing it. ``None`` where the allocator
     # built none (see ``allocator._DivisionMap``).
     division_space: Optional["OpSplitSpace"] = None
+    # The same op's divisions as per-axis choices under each tiling option, for
+    # a strategy that posts them instead of indexing the menu (experimental).
+    lazy_space: Optional[Any] = None
     # Index of this buffer's producing operation in ``graph.operations``, which
     # is what a coarse-tiling *run* is measured over: a group has to occupy one
     # contiguous stretch of that list, and buffer order is not operation order
