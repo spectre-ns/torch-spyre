@@ -368,6 +368,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # The same op's divisions as per-axis choices under each tiling option, for
     # a strategy that posts them instead of indexing the menu (experimental).
     lazy_space: Optional[Any] = None
+    # core_divisions is lazy_space's points, not the legal divisions: only a
+    # strategy that posts legality may choose from it.
+    menu_is_points: bool = False
     # Index of this buffer's producing operation in ``graph.operations``, which
     # is what a coarse-tiling *run* is measured over: a group has to occupy one
     # contiguous stretch of that list, and buffer order is not operation order

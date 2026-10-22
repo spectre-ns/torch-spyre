@@ -154,6 +154,8 @@ def post_division(
         product = model.IntVar(1, space.max_cores, f"cores_{name}_{a}")
         model.AddMultiplicationEquality(product, [cores, splits[a]])
         cores = product
+    if not isinstance(cores, int):
+        model.Add(cores <= space.max_cores)
     for i, o in enumerate(space.options):
         _post_option(model, o.context, splits, domain, lits[i], f"{name}_{i}")
     return option, splits, lits, cores

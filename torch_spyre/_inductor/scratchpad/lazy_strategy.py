@@ -189,6 +189,22 @@ def _digits(prep, domain: dict) -> Optional[_Digits]:
     )
 
 
+def _why_illegal(space: LazySpace, k: int, splits: tuple) -> list[str]:
+    """Which ``is_legal`` checks a point fails (agreement-check diagnostics)."""
+    ctx = space.options[k].context
+    s = dict(zip(space.axes, splits))
+    s = {a: v for a, v in s.items() if a in ctx.axes}
+    checks = (
+        "_factors_in_domain",
+        "_within_core_budget",
+        "_one_reduction_split_at_most",
+        "_spans_within_cap",
+        "_in_split_domains",
+        "meets_span_floors",
+    )
+    return [c for c in checks if not getattr(ctx, c)(s)]
+
+
 def _not(lit):
     return 1 - lit if isinstance(lit, int) else lit.Not()
 
@@ -260,6 +276,7 @@ class LazyStrategy(TableStrategy):
         self._lazy: dict[Item, LazySpace] = {}
         self._grid: dict[Item, tuple[CoreDivision, ...]] = {}
         self._digit_cache: dict = {}
+        self.point_menus: set[str] = set()
 
     @classmethod
     def from_buffers(cls, buffers, reasons=None, **settings) -> LazyStrategy:
@@ -270,10 +287,16 @@ class LazyStrategy(TableStrategy):
             for b in buffers
             if getattr(b, "lazy_space", None) is not None
         }
+        strategy.point_menus = {
+            b.name for b in buffers if getattr(b, "menu_is_points", False)
+        }
         return strategy
 
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
-        tabled = {name for edge in self.matches for name in edge}
+        # An empty table forbids the relation whatever the indices are.
+        tabled = {
+            name for edge, pairs in self.matches.items() if pairs for name in edge
+        }
         tabled |= {name for edge in self.relayout_candidates for name in edge}
         self._lazy, self._grid = {}, {}
         for node in graph.get_nodes():
@@ -291,6 +314,17 @@ class LazyStrategy(TableStrategy):
         logger.debug(
             "lazy work splits: %d of %d nodes", len(self._lazy), len(graph.nodes)
         )
+        # A point menu holds illegal divisions: only a Lazy node may choose
+        # from it (the allocator gave those nodes no pair table).
+        stray = [
+            n.name
+            for n in graph.get_nodes()
+            if n.name in self.point_menus
+            and n not in self._lazy
+            and n.work_split is None
+            and not n.committed
+        ]
+        assert not stray, f"point menus on non-Lazy nodes: {stray}"
         super().prepare(graph)
         check = os.environ.get("LX_LAZY_CHECK")
         if check:
@@ -301,7 +335,14 @@ class LazyStrategy(TableStrategy):
         with open(path, "a") as f:
             for node, space in self._lazy.items():
                 got = legal_points(space)
-                want = menu_points(space, self.menus[node.name])
+                menu = self.menus[node.name]
+                if node.name in self.point_menus:
+                    menu = tuple(
+                        space.division(k, s)
+                        for k, s in space.points()
+                        if space.options[k].context.is_legal(s)
+                    )
+                want = menu_points(space, menu)
                 f.write(
                     json.dumps(
                         {
@@ -314,6 +355,10 @@ class LazyStrategy(TableStrategy):
                             "axes": [str(a) for a in space.axes],
                             "options": [str(o.tiling.label) for o in space.options],
                             "missing_sample": sorted(want - got)[:6],
+                            "extra_why": [
+                                (k, splits, _why_illegal(space, k, splits))
+                                for k, splits in sorted(got - want)[:4]
+                            ],
                             "got_sample": sorted(got)[:6],
                         }
                     )

@@ -26,9 +26,11 @@ drain plans) and the commit path that applies the solved divisions.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any, Optional
+
 import sympy
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -122,6 +124,15 @@ if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
 
 
+def _has_legal_division(context) -> bool:
+    """Whether ``context`` admits any division (stops at the first)."""
+    axes = context.axes
+    return any(
+        context.is_legal(dict(zip(axes, combo)))
+        for combo in itertools.product(*(context.factor_domain(v) for v in axes))
+    )
+
+
 class TableCandidates:
     """The candidate derivations of one :class:`CoOptimizingAllocator`."""
 
@@ -130,6 +141,8 @@ class TableCandidates:
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         # Per enumerated op, its divisions as a space (lx_division_encoding).
         self.lazy_spaces: dict[str, Any] = {}
+        # Ops whose menu is their space's points, not the legal divisions.
+        self.point_menus: set[str] = set()
 
     def _prepare_buffers(
         self,
@@ -155,6 +168,9 @@ class TableCandidates:
             and is_restickify_op(op, graph)
             and divisions[op.name] != [_fixed_core_division(op)]
         }
+        if pending:
+            for name in list(self.point_menus):
+                self._materialize(divisions, name)
         while True:
             buffers = self._build_cd_bound_buffers(graph, in_place, division_map)
             if not pending:
@@ -372,6 +388,10 @@ class TableCandidates:
             op.data, (Pointwise, Reduction)
         ):
             return fixed, False
+        if config.lx_division_encoding == "lazy" and config.lx_lazy_menus:
+            points = self._point_menu(op, max_cores)
+            if points is not None:
+                return points, True
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
@@ -446,6 +466,66 @@ class TableCandidates:
                 self.lazy_spaces[op.get_name()] = LazySpace(op, options, max_cores)
             return cds, True
         return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
+
+    def _point_menu(
+        self, op: ComputedBuffer, max_cores: int
+    ) -> Optional[list[CoreDivision]]:
+        """The op's space, and its points as its menu, without enumerating the
+        legal divisions (``lx_lazy_menus``): the Lazy strategy posts legality
+        instead. ``None`` sends the op to the ordinary enumeration."""
+        from torch_spyre._inductor.scratchpad.coarse_tiling import (
+            try_resolve_tile_axis_loop_vars,
+        )
+        from torch_spyre._inductor.scratchpad.lazy_division import (
+            LazyOption,
+            LazySpace,
+        )
+        from torch_spyre._inductor.scratchpad.lazy_strategy import MAX_POINTS
+        from torch_spyre._inductor.work_division import work_division_context_for_op
+
+        try:
+            untiled = work_division_context_for_op(op, max_cores)
+        except Unsupported:
+            return None
+        options = []
+        for tiling in self._tiling_candidates(op, max_cores):
+            tile_splits: tuple[tuple[sympy.Symbol, int], ...] = ()
+            context = untiled
+            if not tiling.is_untiled:
+                loop_vars, _ = try_resolve_tile_axis_loop_vars(op, tiling)
+                if loop_vars is None:
+                    continue
+                tile_splits = tuple(
+                    (sym, axis.count) for sym, axis in zip(loop_vars, tiling.axes)
+                )
+                try:
+                    context = work_division_context_for_op(op, max_cores, tiling)
+                except Unsupported:
+                    continue
+            # Only an option with some legal division: the menu has no other.
+            if context is not None and _has_legal_division(context):
+                options.append(LazyOption(tiling, tile_splits, context))
+        if not options:
+            return None
+        space = LazySpace(op, options, max_cores)
+        if len(space.points()) > MAX_POINTS:
+            return None
+        self.lazy_spaces[op.get_name()] = space
+        self.point_menus.add(op.get_name())
+        return [space.division(k, s) for k, s in space.points()]
+
+    def _materialize(self, divisions: dict, name: str) -> None:
+        """Replace a point menu by the legal menu, for a reader that indexes
+        it (a pair table, read-copy pricing). Same order as the enumeration."""
+        if name not in self.point_menus:
+            return
+        space = self.lazy_spaces[name]
+        divisions[name] = [
+            space.division(k, s)
+            for k, s in space.points()
+            if space.options[k].context.is_legal(s)
+        ]
+        self.point_menus.discard(name)
 
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
@@ -698,6 +778,19 @@ class TableCandidates:
                 continue
             if residency_by_buf.get(record.storage_name) is None:
                 carry_update_edges[record.update_name] = edge
+        # Carry edges keep pair tables over menu indices.
+        for update_name, edge in carry_update_edges.items():
+            self._materialize(divisions, update_name)
+            self._materialize(divisions, edge.buf_name)
+        if carry_update_edges:
+            for reader in graph.operations:
+                edges = self._loop_carry_read_edges(
+                    reader, carry_update_edges, prep_cache
+                )
+                if edges:
+                    self._materialize(divisions, reader.get_name())
+                    for storage in edges:
+                        self._materialize(divisions, storage)
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         # Consumer op name -> input clones for which it is the last reader, and so
@@ -709,6 +802,8 @@ class TableCandidates:
             buffer_users = get_buffer_users(graph)
             for input_name in self._eligible_clone_inputs(graph, lifetimes):
                 consumers = [op for op in buffer_users.get(input_name, [])]
+                for consumer in consumers:
+                    self._materialize(divisions, consumer.get_name())
                 divs, matches = self._clone_divisions_and_matches(
                     input_name, consumers, divisions, prep_cache
                 )
@@ -978,6 +1073,7 @@ class TableCandidates:
                 )
             if output_name in division_map.enumerated:
                 buffer.lazy_space = self.lazy_spaces.get(output_name)
+                buffer.menu_is_points = output_name in self.point_menus
             if self.allocator._solver_chooses_tilings and isinstance(
                 op, ComputedBuffer
             ):

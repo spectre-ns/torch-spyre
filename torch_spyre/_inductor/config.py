@@ -358,6 +358,11 @@ lx_division_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore
     "LX_DIVISION_ENCODING", "table"
 )
 
+# With lx_division_encoding = "lazy": hand a Lazy-eligible op's space points to
+# the solver as its menu instead of enumerating its legal divisions. Ops whose
+# menu a pair table or read-copy pricing indexes still get the legal menu.
+lx_lazy_menus: bool = os.environ.get("LX_LAZY_MENUS", "0") == "1"
+
 # How a Lazy node's per-core views are related across an edge: "points" (a
 # view-id table over its points, one view computation per point) or "digits"
 # (per-device-dim factor and core-stride equalities over the split vars, where
