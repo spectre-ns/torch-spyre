@@ -18,6 +18,7 @@ builder that makes them from the allocator's buffers. Device-free."""
 from __future__ import annotations
 
 import sys
+from collections import Counter
 from dataclasses import fields
 from pathlib import Path
 
@@ -184,6 +185,28 @@ def test_build_graph_puts_in_place_inputs_first():
     assert all(e.reads for e in c.inputs)
 
 
+def test_a_parent_read_twice_is_one_edge_gated_twice():
+    """An op may read one buffer twice; each read is a relation, as before."""
+    from ortools.sat.python import cp_model
+
+    def read_rows(parents):
+        menu = [CoreDivision(), CoreDivision(splits={1: 2})]
+        buffers = [
+            _cd("a", [0, 1], menu=menu),
+            _cd("b", [1, 2], parents, menu=menu, cd_parent_matches={"a": [(0, 0)]}),
+        ]
+        graph = _graph_of(buffers)
+        strategy = TableStrategy.from_buffers(buffers)
+        graph.solve(cp_model.CpModel(), None, strategy)
+        (edge,) = graph.nodes["b"].inputs
+        rows = [p for p in strategy.provenance if p.source == "encode_read"]
+        return edge.reads, sum(len(p.constraints) for p in rows)
+
+    once, twice = read_rows(["a"]), read_rows(["a", "a"])
+    assert once[0] == 1 and twice[0] == 2
+    assert twice[1] == 2 * once[1] > 0
+
+
 def test_build_graph_keeps_an_unread_in_place_parent():
     """The merge still needs the edge; the read gate and cuts must not see it."""
     buffers = [_cd("a", [0, 2]), _cd("c", [1, 3], in_place_parents=["a"])]
@@ -206,8 +229,9 @@ def test_build_graph_matches_the_allocator_buffers(case, buffers):
         reads = [p for p in getattr(b, "parents", ()) if p in names]
         assert [e.src.name for e in node.inputs if e.reads] == [
             *(p for p in b.in_place_parents if p in reads),
-            *(p for p in reads if p not in b.in_place_parents),
+            *(p for p in dict.fromkeys(reads) if p not in b.in_place_parents),
         ]
+        assert {e.src.name: e.reads for e in node.inputs if e.reads} == Counter(reads)
         assert {e.src.name for e in node.inputs} == {*reads, *b.in_place_parents}
         for e in node.inputs:
             assert e in e.src.outputs

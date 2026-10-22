@@ -183,7 +183,7 @@ class EncodingStrategy:
     # per-solve state
     layouts: tuple[RelayoutLayout, ...] = ()
     vars: dict[Item, NodeVars] = field(default_factory=dict)
-    served: dict[DependencyEdge, dict[RelayoutLayout, Var]] = field(
+    served: dict[DependencyEdge, list[tuple[RelayoutLayout, Var]]] = field(
         default_factory=dict
     )
     provenance: list[Provenance] = field(default_factory=list)
@@ -615,11 +615,14 @@ class TableStrategy(EncodingStrategy):
     def encode_read(self, edge: DependencyEdge, model: Model) -> None:
         """A resident producer's division must slice it as the consumer's
         does, or the consumer reads it through a resident relayout copy
-        ("match or served"). Gated only when both ends choose a work split."""
-        if not (
-            edge.reads and self.chooses_split(edge.src) and self.chooses_split(edge.dst)
-        ):
+        ("match or served"). Gated only when both ends choose a work split,
+        and once per read the consumer lists."""
+        if not (self.chooses_split(edge.src) and self.chooses_split(edge.dst)):
             return
+        for _ in range(edge.reads):
+            self._encode_one_read(edge, model)
+
+    def _encode_one_read(self, edge: DependencyEdge, model: Model) -> None:
         src, dst = self.vars[edge.src], self.vars[edge.dst]
         by_layout: dict[RelayoutLayout, list] = {}
         for c in self.relayout_candidates.get((edge.src.name, edge.dst.name), ()):
@@ -645,7 +648,7 @@ class TableStrategy(EncodingStrategy):
         if not served:
             _gate_divisions(model, pairs, src.division, dst.division, src.in_buffer)
             return
-        self.served[edge] = served
+        self.served.setdefault(edge, []).extend(served.items())
         match = model.new_bool_var(f"match_{edge.src.name}__{edge.dst.name}")
         _gate_divisions(model, pairs, src.division, dst.division, match)
         model.add_bool_or([match, *served.values()]).only_enforce_if(src.in_buffer)
@@ -767,9 +770,8 @@ class TableStrategy(EncodingStrategy):
         unshareable = getattr(item, "boundary", None) == BufferType.Output
         seg = segments.get(item) if isinstance(item, ResourceNode) else None
         outputs = item.outputs if isinstance(item, ResourceNode) else []
-        for edge in outputs:
-            child = edge.dst
-            if not (edge.reads and self.chooses_split(child)):
+        for edge, child in ((e, e.dst) for e in outputs for _ in range(e.reads)):
+            if not self.chooses_split(child):
                 continue
             if seg is None or segments.get(child) != seg:
                 unshareable = True

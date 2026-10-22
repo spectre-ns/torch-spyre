@@ -35,6 +35,7 @@ shape and tile count, each stage holding the previous optimum.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar, Literal, Optional, TYPE_CHECKING
@@ -95,14 +96,15 @@ WorkSplit.COMMITTED = WorkSplit(splits=(), tiling=None, committed=True)
 class DependencyEdge:
     """``dst``'s op reads ``src``; with ``in_place`` it may also take over
     ``src``'s storage at the tick they share. The one object sits in
-    ``src.outputs`` and ``dst.inputs``. ``reads`` is false for an in-place
-    edge whose read the allocator does not model (the parent is not among the
-    child's ``parents``): it gates the merge, not residency or cuts."""
+    ``src.outputs`` and ``dst.inputs``. ``reads`` counts the times the child
+    lists the parent among its ``parents`` (an op may read one buffer twice),
+    each one a read relation; it is 0 for an in-place edge whose read the
+    allocator does not model, which gates the merge, not residency or cuts."""
 
     src: ResourceNode
     dst: ResourceNode
     in_place: bool = False
-    reads: bool = True
+    reads: int = 1
     # Set by solve(): the relayout copy this read goes through; None = directly.
     chosen: Optional[RelayoutLayout] = None
 
@@ -173,7 +175,7 @@ class ResourceNode:
         return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
 
     def add_child(
-        self, child: ResourceNode, in_place: bool = False, reads: bool = True
+        self, child: ResourceNode, in_place: bool = False, reads: int = 1
     ) -> DependencyEdge:
         """The only way to add a dependency edge; refuses a second edge between
         the same pair."""
@@ -751,7 +753,7 @@ class SpyreOptimizationGraph:
             for edge in node.outputs:
                 fired = [
                     lay
-                    for lay, lit in strategy.served.get(edge, {}).items()
+                    for lay, lit in strategy.served.get(edge, ())
                     if solver.BooleanValue(lit)
                 ]
                 if not fired:
@@ -841,12 +843,11 @@ def build_graph(
     nodes = graph.nodes
     for b in real:
         child = nodes[b.name]
-        reads = list(getattr(b, "parents", ()))
-        assert len(set(reads)) == len(reads), f"{b.name} repeats a parent"
+        reads = Counter(getattr(b, "parents", ()))
         for parent in b.in_place_parents:
-            nodes[parent].add_child(child, in_place=True, reads=parent in reads)
-        for parent in reads:
+            nodes[parent].add_child(child, in_place=True, reads=reads[parent])
+        for parent, count in reads.items():
             if parent in nodes and parent not in b.in_place_parents:
-                nodes[parent].add_child(child)
+                nodes[parent].add_child(child, reads=count)
     graph.link_execution_order()
     return graph
