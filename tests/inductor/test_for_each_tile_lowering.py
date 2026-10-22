@@ -2307,7 +2307,7 @@ class TestDrainMaterialization(unittest.TestCase):
 
         # The validator reads op read/writes, which need an active graph
         # handler (op.get_read_writes -> V.graph.sizevars), exactly as in the
-        # production call site inside _prepare_buffers.
+        # production call site inside TableCandidates.prepare_graph.
         with V.set_graph_handler(graph):
             return allocator_module.validated_drain_plans(
                 graph, division_is_fixed=False

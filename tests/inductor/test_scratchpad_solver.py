@@ -31,10 +31,12 @@ from unittest import TestCase, mock
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
     ScratchpadAllocator,
+    SolvedPlan,
     _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.scratchpad.buffer_graph import SOLVER_CHOSE_SPILL
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -214,14 +216,16 @@ class TestExhaustiveSearchResidency(TestCase):
 
 
 class TestAllocatorSpillReasons(TestCase):
-    """The allocator reports spill reasons from the solved buffers alone."""
+    """The allocator reports spill reasons from the solved plan alone."""
 
     def _solve(self, *extra):
         barred = LifetimeBoundBuffer(
             "barred", 64, [0, 1], residency_reason="op not allowed"
         )
         first = LifetimeBoundBuffer("first", 128, [0, 2])
-        return GreedyLayoutSolver([barred, first, *extra], 128, 1).plan_layout()
+        return SolvedPlan.of_buffers(
+            GreedyLayoutSolver([barred, first, *extra], 128, 1).plan_layout()
+        )
 
     def test_placement_allocator(self):
         # "late" is live while "first" fills the scratchpad.
@@ -231,7 +235,8 @@ class TestAllocatorSpillReasons(TestCase):
         )
         self.assertEqual(set(reasons), {"barred", "late"})
         self.assertEqual(reasons["barred"], "op not allowed")
-        self.assertIn("no room on scratchpad", reasons["late"])
+        # Greedy gives a capacity spill no reason of its own.
+        self.assertEqual(reasons["late"], SOLVER_CHOSE_SPILL)
 
     def test_joint_allocator_reports_as_placement_does(self):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))

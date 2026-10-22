@@ -49,7 +49,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (  # noqa: E402
     LifetimeBoundBuffer,
     RelayoutCopyBuffer,
 )
-from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
+from torch_spyre._inductor.scratchpad.table_candidates import relayout_copies_of
 
 _SETTINGS = SolveSettings(time_limit_seconds=None, bottom_justify=True, record=None)
 
@@ -215,7 +215,7 @@ def test_build_graph_keeps_an_unread_in_place_parent():
 
 @pytest.mark.parametrize("case,buffers", _corpus(), ids=lambda v: v)
 def test_build_graph_matches_the_allocator_buffers(case, buffers):
-    buffers = [*buffers, *TableCandidates._relayout_copy_buffers(buffers)]
+    buffers = [*buffers, *relayout_copies_of(buffers)]
     graph = build_graph(buffers, 128, 1 << 14, _SETTINGS)
     names = {b.name for b in buffers}
     for b in buffers:

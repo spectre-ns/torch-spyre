@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
-from unittest.mock import create_autospec, patch
+from unittest.mock import patch
 import torch
 
 from torch._inductor import config as t_inductor_config
@@ -123,22 +123,21 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
     assert calls == [graph]
 
 
-def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
-    """Unsupported paired plans remain fail-closed under ``python -O``."""
+def test_cooptimizing_allocator_never_materializes_committed_relayout_plans():
+    """Unsupported paired plans remain fail-closed under ``python -O``: the
+    joint allocator materializes only the relayouts its solve fired, never a
+    committed plan a node carries."""
 
     import torch_spyre._inductor.scratchpad.allocator as allocator_module
 
-    from torch_spyre._inductor.scratchpad.graph_solvers import BufferSolver
+    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
-    solver = create_autospec(allocator_module.CoreDivisionLayoutSolver, instance=True)
-    solver.buffers = []
-    solver.alignment, solver.limit = 128, 0
-    solver.graph_solver.return_value = BufferSolver(solver)
-    solver.plan_layout_and_core_divisions.return_value = [
-        SimpleNamespace(lx_relayout_plans=[object()])
-    ]
+    source = LifetimeBoundBuffer("source", 128, [0, 1])
+    source.address = 0
+    source.lx_relayout_plans = [object()]
+    plan = allocator_module.SolvedPlan.of_buffers([source])
+    assert plan.graph.nodes["source"].lx_relayout_plans == source.lx_relayout_plans
     allocator = allocator_module.ScratchpadAllocator(
-        # Never built: the test hands _solve the mock directly.
         layout_planning=allocator_module.ExhaustiveSearchSolver.wrapping(
             allocator_module.GreedyLayoutSolver
         ),
@@ -146,14 +145,7 @@ def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
         division_mode="open",
     )
     graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
-    with (
-        patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
-        unittest.TestCase().assertRaisesRegex(
-            AssertionError, "the joint allocator does not support LX relayout"
-        ),
-    ):
-        allocator._solve(solver, graph)
-    solver.plan_layout_and_core_divisions.assert_called_once()
+    assert allocator._finalize_lx_relayout_allocation(plan, graph) == []
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -2218,9 +2210,47 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
 class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
     """In-place reuse of boundary-clone buffers in the greedy build path (#3212).
 
-    These are assertion-style tests (they inspect the buffers the allocator builds
+    These are assertion-style tests (they inspect the graph the allocator builds
     and the final LX addresses), so they live in a plain non-parameterized class
     rather than the model-sweep ``TestCloneAtGraphBoundaries``."""
+
+    @staticmethod
+    def _in_place_parents(solve_graph) -> dict[str, set[str]]:
+        """Each node's in-place parents in a solve graph."""
+        return {
+            n.name: {e.src.name for e in n.inputs if e.in_place}
+            for n in solve_graph.get_nodes()
+        }
+
+    @contextmanager
+    def _capture_placement_graphs(self):
+        """The placement allocator's solve graphs, as it builds them."""
+        from torch_spyre._inductor.scratchpad import graph_builder
+
+        captured: list = []
+        orig = graph_builder.placement_graph
+
+        def spy(*a, **k):
+            solve_graph = orig(*a, **k)
+            captured.append(solve_graph)
+            return solve_graph
+
+        with patch.object(graph_builder, "placement_graph", spy):
+            yield captured
+
+    @contextmanager
+    def _capture_joint_graphs(self):
+        """The joint allocator's ``(solve graph, tables)`` pairs."""
+        captured: list = []
+        orig = TableCandidates._build_graph
+
+        def spy(inner_self, *a, **k):
+            result = orig(inner_self, *a, **k)
+            captured.append(result)
+            return result
+
+        with patch.object(TableCandidates, "_build_graph", spy):
+            yield captured
 
     @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
     def test_division_invariant_edges_respect_per_input_pointwise(self):
@@ -2293,47 +2323,41 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         The clone (buffer named after the graph input) is pinned to LX and dies at
         its last read; when that last reader is pointwise and writes a same-shape
         buffer that is itself read again (a realized candidate),
-        ``_build_bound_buffers`` marks the clone as that consumer's in-place parent.
-        We capture the buffers the allocator builds and assert the reverse-parent
-        edge is present. Values must be unchanged.
+        ``graph_builder.placement_graph`` marks the clone as that consumer's
+        in-place parent. We capture the graph the allocator builds and assert the
+        reverse-parent edge is present. Values must be unchanged.
 
         ``x * 2 + x * 3`` gives x two direct pointwise readers; the second (``x*3``)
         is x's last read and its output feeds the final add, so that output is a
         candidate that names the input clone as parent. (A shape like
         ``torch.abs(x) + x`` would instead have x's last reader be the graph output
         itself -- single-use, never a candidate -- so no edge, correctly.)"""
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
         def fn(x):
             return x * 2.0 + x * 3.0
 
-        captured: list[list] = []
-        orig = ScratchpadAllocator._build_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
-
-        with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
-            # This test targets the base placement allocator's
-            # ``_build_bound_buffers``; with co-optimization now the default,
-            # pin the joint path off so ``select_allocator`` does not route to
-            # the joint ``ScratchpadAllocator`` (whose builder is ``_build_cd_bound_buffers``).
+        with self._capture_placement_graphs() as captured:
+            # This test targets the placement allocator's graph builder; with
+            # co-optimization now the default, pin the joint path off so
+            # ``select_allocator`` does not route to the joint allocator (whose
+            # builder is ``TableCandidates._build_graph``).
             with ts_inductor_config.patch(
                 lx_planning=True, co_optimizing_lx_planning=False
             ):
                 compiled = torch.compile(fn, fullgraph=True)
                 result = compiled(x).to("cpu")
 
-        self.assertTrue(captured, "allocator._build_bound_buffers was not called")
+        self.assertTrue(captured, "graph_builder.placement_graph was not called")
         edge_found = False
-        for bufs in captured:
-            # Input clones are exactly the buffers whose first access is a read.
-            input_clone_names = {b.name for b in bufs if b.first_use_is_read}
-            if any(set(b.in_place_parents) & input_clone_names for b in bufs):
+        for solve_graph in captured:
+            # Input clones are exactly the nodes whose first access is a read.
+            input_clone_names = {
+                n.name for n in solve_graph.get_nodes() if n.first_use_is_read
+            }
+            parents = self._in_place_parents(solve_graph).values()
+            if any(p & input_clone_names for p in parents):
                 edge_found = True
                 break
         self.assertTrue(
@@ -2358,15 +2382,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         def fn(x):
             return x * 2.0 + x * 3.0
 
-        captured: list[list] = []
-        orig = TableCandidates._build_cd_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
-
-        with patch.object(TableCandidates, "_build_cd_bound_buffers", spy):
+        with self._capture_joint_graphs() as captured:
             with ts_inductor_config.patch(
                 lx_planning=True,
                 layout_solver="cpsat",
@@ -2375,14 +2391,18 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             ):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
-        self.assertTrue(captured, "_build_cd_bound_buffers was not called")
+        self.assertTrue(captured, "TableCandidates._build_graph was not called")
         edge_found = False
-        for bufs in captured:
-            input_clones = {b.name for b in bufs if b.boundary == BufferType.Input}
-            for b in bufs:
-                merged = set(b.in_place_parents) & input_clones
+        for solve_graph, tables in captured:
+            input_clones = {
+                n.name
+                for n in solve_graph.get_nodes()
+                if n.boundary == BufferType.Input
+            }
+            for child, parents in self._in_place_parents(solve_graph).items():
+                merged = parents & input_clones
                 # The CP-SAT merge also needs the division-match gate populated.
-                if merged and any(p in b.cd_parent_matches for p in merged):
+                if any((p, child) in tables.matches for p in merged):
                     edge_found = True
                     break
         self.assertTrue(
@@ -2473,14 +2493,13 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         metadata (unlike the input side).
 
         An LX-pinned buffer that is (or is cloned into) a graph output is a normal
-        op-backed ComputedBuffer, so ``_determine_in_place`` already gives it in-place
+        op-backed ComputedBuffer, so ``graph_builder._in_place`` already gives it in-place
         parents (as a child of its producer's input) and lets consumers name it as a
         parent. Here ``y`` is a graph output also read internally; its pointwise
         consumer ``p`` (whose result is itself read, so it is a realized candidate)
         reuses ``y``'s slot -- i.e. the output-feeding buffer is an in-place parent.
         This is a regression guard: if output in-place ever breaks, it fails here."""
         from torch_spyre._inductor.pass_utils import op_short_name
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2491,13 +2510,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return y, q
 
         output_feeders: set[str] = set()
-        captured: list[list] = []
-        orig = ScratchpadAllocator._build_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
 
         def collect_feeders(graph: GraphLowering) -> None:
             by_name = {op.name: op for op in graph.operations}
@@ -2509,7 +2521,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
-            with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
+            with self._capture_placement_graphs() as captured:
                 # Base placement path targeted (see the input-clone test above);
                 # pin the joint path off so the default co-optimization flip does
                 # not route to the joint ``ScratchpadAllocator``.
@@ -2520,14 +2532,14 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     ry, rq = compiled(x)
                     ry, rq = ry.to("cpu"), rq.to("cpu")
 
-        self.assertTrue(captured, "allocator._build_bound_buffers was not called")
+        self.assertTrue(captured, "graph_builder.placement_graph was not called")
         merged = False
-        for bufs in captured:
-            for b in bufs:
+        for solve_graph in captured:
+            for parents in self._in_place_parents(solve_graph).values():
                 # An output-feeding buffer is used as an in-place *parent*: some
-                # consumer names it in its in_place_parents (matches the docstring;
-                # the sibling aliasing test uses the same tighter check).
-                if set(b.in_place_parents) & output_feeders:
+                # consumer names it among its in-place parents (matches the
+                # docstring; the sibling aliasing test uses the same tighter check).
+                if parents & output_feeders:
                     merged = True
                     break
         self.assertTrue(
@@ -2557,7 +2569,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         reuse edge is actually offered (the hazard is exercised, not vacuous) and
         that both returned values are correct."""
         from torch_spyre._inductor.pass_utils import op_short_name
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2570,13 +2581,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return y, u
 
         output_feeders: set[str] = set()
-        captured: list[list] = []
-        orig = ScratchpadAllocator._build_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
 
         def collect_feeders(graph: GraphLowering) -> None:
             by_name = {op.name: op for op in graph.operations}
@@ -2587,7 +2591,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
-            with patch.object(ScratchpadAllocator, "_build_bound_buffers", spy):
+            with self._capture_placement_graphs() as captured:
                 # Base placement path targeted (see the input-clone test above);
                 # pin the joint path off so the default co-optimization flip does
                 # not route to the joint ``ScratchpadAllocator``.
@@ -2601,7 +2605,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         # The hazard is real only if a returned (output-feeding) buffer is actually
         # named as an in-place parent by some consumer.
         reused = any(
-            set(b.in_place_parents) & output_feeders for bufs in captured for b in bufs
+            parents & output_feeders
+            for solve_graph in captured
+            for parents in self._in_place_parents(solve_graph).values()
         )
         self.assertTrue(
             reused,
@@ -2635,13 +2641,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return y, u
 
         output_feeders: set[str] = set()
-        captured: list[list] = []
-        orig = TableCandidates._build_cd_bound_buffers
-
-        def spy(self, *a, **k):
-            bufs = orig(self, *a, **k)
-            captured.append(list(bufs))
-            return bufs
 
         def collect_feeders(graph: GraphLowering) -> None:
             by_name = {op.name: op for op in graph.operations}
@@ -2652,7 +2651,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
-            with patch.object(TableCandidates, "_build_cd_bound_buffers", spy):
+            with self._capture_joint_graphs() as captured:
                 with ts_inductor_config.patch(
                     lx_planning=True,
                     layout_solver="cpsat",
@@ -2664,7 +2663,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     ry, ru = ry.to("cpu"), ru.to("cpu")
 
         reused = any(
-            set(b.in_place_parents) & output_feeders for bufs in captured for b in bufs
+            parents & output_feeders
+            for solve_graph, _ in captured
+            for parents in self._in_place_parents(solve_graph).values()
         )
         self.assertTrue(
             reused,
@@ -2846,22 +2847,23 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
     contexts and preps; what only a real compile can check is that the two
     answers agree on *live* ops, which is what a generated division rests on."""
 
-    def _captured_buffers(self, fn, x):
-        """The buffer list the co-optimizing allocator built, plus the result.
+    def _captured_graphs(self, fn, x):
+        """The solve graph and tables the co-optimizing allocator built, plus
+        the result.
 
         The assertions run inside the spy: the split space and the residency
         edges hold live Inductor IR, which needs the virtualized compile context
         that ``torch.compile`` tears down on exit."""
 
         checked: set[str] = set()
-        orig = TableCandidates._build_cd_bound_buffers
+        orig = TableCandidates._build_graph
 
         def spy(inner_self, *args, **kwargs):
-            buffers = orig(inner_self, *args, **kwargs)
-            self._check_buffers(buffers, checked)
-            return buffers
+            solve_graph, tables = orig(inner_self, *args, **kwargs)
+            self._check_graph(solve_graph, tables, checked)
+            return solve_graph, tables
 
-        with patch.object(TableCandidates, "_build_cd_bound_buffers", spy):
+        with patch.object(TableCandidates, "_build_graph", spy):
             with ts_inductor_config.patch(
                 lx_planning=True,
                 layout_solver="simulated_annealing",
@@ -2872,41 +2874,41 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
         return checked, result
 
-    def _check_buffers(self, buffers, checked):
-        """Every claim the engine makes about a live buffer, per buffer."""
-        by_name = {b.name: b for b in buffers}
-        for buf in buffers:
-            space = buf.division_space
+    def _check_graph(self, solve_graph, tables, checked):
+        """Every claim the engine makes about a live node, per node."""
+        nodes = solve_graph.nodes
+        # The pair table is a projection of the edges, so the two agree on
+        # every row.
+        self.assertEqual(set(tables.residency) - set(tables.matches), set())
+        for node in solve_graph.get_nodes():
+            space = node.space
+            menu = tables.menus.get(node.name, ())
             if space is not None:
                 # The menu is exactly what the space admits, which is what makes
                 # a generated division one the enumeration would have carried.
-                for division in buf.core_divisions:
+                for division in menu:
                     self.assertTrue(
                         space.admits(space.splits(division)),
-                        f"{buf.name}: menu entry {division.label} not admitted",
+                        f"{node.name}: menu entry {division.label} not admitted",
                     )
-                menu = {division.label for division in buf.core_divisions}
-                for neighbour in space.neighbours(buf.core_divisions[0]):
-                    self.assertIn(neighbour.label, menu, buf.name)
+                labels = {division.label for division in menu}
+                for neighbour in space.neighbours(menu[0]):
+                    self.assertIn(neighbour.label, labels, node.name)
                 checked.add("space")
-            # The pair table is a projection of the edges, so the two agree on
-            # every row -- and where both ends generate, so does the inverse
-            # that replaces the row.
-            self.assertEqual(
-                set(buf.residency_edges) - set(buf.cd_parent_matches),
-                set(),
-                buf.name,
-            )
-            for parent, edge in buf.residency_edges.items():
-                pairs = buf.cd_parent_matches[parent]
-                parent_divisions = by_name[parent].core_divisions
+            # Where both ends generate, so does the inverse that replaces the
+            # pair table's row.
+            for (parent, child), edge in tables.residency.items():
+                if child != node.name:
+                    continue
+                pairs = tables.matches[(parent, node.name)]
+                parent_divisions = tables.menus.get(parent, ())
                 self.assertEqual(
-                    edge.match_pairs(parent_divisions, buf.core_divisions),
+                    edge.match_pairs(parent_divisions, menu),
                     pairs,
-                    f"{buf.name} <- {parent}",
+                    f"{node.name} <- {parent}",
                 )
                 checked.add("edge")
-                parent_space = by_name[parent].division_space
+                parent_space = nodes[parent].space
                 if parent_space is None or space is None:
                     continue
                 for i, parent_division in enumerate(parent_divisions):
@@ -2915,11 +2917,11 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
                     if constructed is None:
                         self.assertFalse(
                             compatible,
-                            f"{buf.name} <- {parent}: no inverse for candidate "
+                            f"{node.name} <- {parent}: no inverse for candidate "
                             f"{i}, but the table pairs it with {compatible}",
                         )
                         continue
-                    labels = [buf.core_divisions[j].label for j in compatible]
+                    labels = [menu[j].label for j in compatible]
                     # Identity, not only membership: the two relations may pick
                     # different compatible entries (see ``_ViewRelation``), but
                     # a change to which one a flood propagates should be
@@ -2927,7 +2929,7 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
                     self.assertEqual(
                         constructed.label,
                         labels[0] if labels else None,
-                        f"{buf.name} <- {parent}: inverse of candidate {i}",
+                        f"{node.name} <- {parent}: inverse of candidate {i}",
                     )
                     checked.add("inverse")
 
@@ -2940,10 +2942,10 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
             b = a * 2.0
             return torch.nn.functional.softmax(b, dim=-1)
 
-        kinds, result = self._captured_buffers(fn, x)
+        kinds, result = self._captured_graphs(fn, x)
         # Non-vacuity: all three claims have to have been made on something.
-        self.assertIn("space", kinds, "no buffer got a split space")
-        self.assertIn("edge", kinds, "no buffer got a residency edge")
+        self.assertIn("space", kinds, "no node got a split space")
+        self.assertIn("edge", kinds, "no node got a residency edge")
         self.assertIn("inverse", kinds, "no edge exercised the view inverse")
         self.assertTrue(
             torch.allclose(

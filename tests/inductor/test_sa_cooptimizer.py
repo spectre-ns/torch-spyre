@@ -1140,10 +1140,9 @@ class ReorderSweepTest(TestCase):
 class ForeignParentTest(TestCase):
     """``parents`` naming buffers the solver does not own.
 
-    ``_build_cd_bound_buffers`` assigns ``parents = info["op_inputs"]`` without
-    intersecting the solver's buffer set, so graph inputs, constants and extern
-    outputs land there on a real compile. This used to assert, which made the
-    joint path unusable on 10 of the 11 corpus graphs.
+    A buffer-form graph (a capture replay) can list graph inputs, constants and
+    extern outputs among ``parents``. This used to assert, which made the joint
+    path unusable on 10 of the 11 corpus graphs.
     """
 
     def test_unowned_parent_is_skipped_not_asserted(self):

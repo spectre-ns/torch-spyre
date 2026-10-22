@@ -99,7 +99,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
     EnumerationFactory,
-    TableStrategy,
     _gate_divisions,
 )
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
@@ -109,7 +108,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     RelayoutCopyBuffer,
     _check_in_place_relationships,
-    build_relayout_copy,
+    ceil_div,
 )
 from torch_spyre._inductor import config
 
@@ -248,6 +247,36 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         return CpSat
 
+    def solve_graph(self, graph, strategy, cost_expr=None) -> None:
+        """Encode ``graph`` through ``strategy``, run the objective ladder and
+        fill every open decision. A node the allocator did not bar is barred
+        here when even its smallest per-core footprint exceeds LX, as
+        :meth:`MemoryPlanSolver.excluded` bars a buffer."""
+        for node in graph.get_nodes():
+            if node.residency_reason is not None:
+                continue
+            menu = strategy.menus.get(node.name, ())
+            footprint = min(
+                (
+                    ceil_div(
+                        node.nbytes, cd.output_partition * cd.tiling.output_tile_count
+                    )
+                    for cd in menu
+                ),
+                default=node.nbytes,
+            )
+            if footprint > self.limit:
+                node.residency_reason = (
+                    f"min footprint {footprint} B > LX capacity {self.limit} B"
+                )
+        graph.settings = SolveSettings(
+            time_limit_seconds=self._time_limit_seconds,
+            bottom_justify=self._bottom_justify,
+            record=self._solve_and_record,
+            note_stats=self._note_stats,
+        )
+        graph.solve(_backend(), cost_expr, strategy)
+
     def _plan_layout_generic(
         self,
         log_lx_usage: bool = False,
@@ -268,17 +297,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # available for slicing matching and in-place chains), pinned
         # non-resident.
         forced_reasons = dict(self.record_exclusions())
-        settings = SolveSettings(
-            time_limit_seconds=self._time_limit_seconds,
-            bottom_justify=self._bottom_justify,
-            record=self._solve_and_record,
-            note_stats=self._note_stats,
-        )
         graph = build_graph(
-            buffers, self.alignment, self._capacity_units, settings, forced_reasons
+            buffers,
+            self.alignment,
+            self._capacity_units,
+            SolveSettings(None, self._bottom_justify, self._solve_and_record),
+            forced_reasons,
         )
         strategy = EnumerationFactory.from_config().strategy(buffers, forced_reasons)
-        graph.solve(_backend(), cost_expr, strategy)
+        self.solve_graph(graph, strategy, cost_expr)
 
         # Write the decisions back onto the caller's buffers, in bytes.
         order = {name: i for i, name in enumerate(graph.nodes)}
@@ -304,32 +331,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             b.chosen_relayouts = {
                 parent: c.scaled(self.alignment) for parent, c in chosen.items()
             }
-        return [*buffers, *self._lazy_copies(graph, strategy, buffers)]
-
-    def _lazy_copies(
-        self, graph, strategy: TableStrategy, buffers: Sequence[LifetimeBoundBuffer]
-    ) -> list[RelayoutCopyBuffer]:
-        """A copy buffer per resident lazy relayout (2d), built from the
-        candidates that fired through it as the table encoding builds one per
-        group, and placed where the solve put it."""
-        by_name = {b.name: b for b in buffers}
-        ticks = {b.name: b.start_time for b in buffers}
-        fired: dict = {}
-        for node in graph.get_nodes():
-            for edge in node.outputs:
-                t = edge.transform
-                if t is not None and t.name not in by_name:
-                    fired.setdefault(t, []).append(strategy.fired[edge])
-        copies = []
-        for t, candidates in fired.items():
-            assert t.producer is not None and t.offset is not None
-            source = by_name[t.producer.name]
-            assert isinstance(source, CoreDivisionBuffer)
-            copy = build_relayout_copy(source, candidates[0].group, candidates, ticks)
-            copy.address = t.offset * self.alignment
-            copy.chosen_division = 0
-            copies.append(copy)
-        return copies
+        return list(buffers)
 
     def _note_stats(self, stats: dict) -> None:
         self.last_solve_stats = stats

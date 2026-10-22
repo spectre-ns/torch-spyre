@@ -441,7 +441,7 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
     )
     def test_cpu_pointwise_chain_compiles_co_optimizing(self):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
-        `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
+        `TableCandidates._build_graph` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
         self._run_and_check(self)
 

@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import sympy
 
@@ -139,14 +139,57 @@ class PlacementSolver:
         return graph.execution_plan()
 
 
-class BufferSolver:
-    """A joint solver that reads the allocator's buffers (the annealing
-    co-optimizer, exhaustive search) as a graph solver: it solves its own
-    buffers and fills the graph's nodes from the choices it wrote back."""
+def buffers_of(graph: SpyreOptimizationGraph, tables: Any) -> list[CoreDivisionBuffer]:
+    """The buffer form of the graph's nodes and the table strategy's
+    candidates: what a solver that still reads buffers (the annealing
+    co-optimizer) is handed. Each node's reads keep their count, and its
+    lifetime its overrides."""
+    out = []
+    for node in graph.get_nodes():
+        uses = list(node.uses)
+        keys = [(e.src.name, node.name) for e in node.inputs]
+        b = CoreDivisionBuffer(
+            name=node.name,
+            size=node.nbytes,
+            uses=uses,
+            first_use_is_read=node.first_use_is_read,
+            in_place_parents=[e.src.name for e in node.inputs if e.in_place],
+            core_divisions=list(tables.menus.get(node.name, ())),
+            parents=[e.src.name for e in node.inputs for _ in range(e.reads)],
+            cd_parent_matches={
+                k[0]: tables.matches[k] for k in keys if k in tables.matches
+            },
+            cd_parent_relayouts={
+                k[0]: tables.relayouts[k] for k in keys if k in tables.relayouts
+            },
+            residency_edges={
+                k[0]: tables.residency[k] for k in keys if k in tables.residency
+            },
+            residency_reason=node.residency_reason,
+            lifetime_start_override=node.start_time
+            if node.start_time < uses[0]
+            else None,
+            lifetime_end_override=(
+                node.end_time if node.end_time > uses[-1] + 1 else None
+            ),
+            op_position=tables.positions.get(node.name),
+            boundary=node.boundary,
+        )
+        b.division_space = node.space
+        b.tile_reads = dict(tables.tile_reads.get(node.name, {}))
+        out.append(b)
+    return out
 
-    def __init__(self, solver: CoreDivisionLayoutSolver) -> None:
-        self.solver = solver
-        self.result: Sequence[Any] = ()
+
+class BufferSolver:
+    """A joint solver that reads buffers (the annealing co-optimizer) as a
+    graph solver: it solves the buffer form of the graph's nodes and the
+    strategy's candidates, and fills the nodes from what it chose."""
+
+    def __init__(self, inner: type[CoreDivisionLayoutSolver], capacity: int) -> None:
+        self.inner = inner
+        self.capacity = capacity  # bytes
+        self.last: list[LifetimeBoundBuffer] = []
 
     def accepts(self, strategy: Any) -> bool:
         return strategy.division == "table" and strategy.relayout == "data"
@@ -157,17 +200,26 @@ class BufferSolver:
         strategy: Any,
         cost_expr: Optional[sympy.Expr],
     ) -> list[ResourceNode]:
-        self.result = self.solver.plan_layout_and_core_divisions(cost_expr)
-        by_name = {b.name: b for b in self.solver.buffers}
+        solver = self.inner(
+            buffers_of(graph, strategy.tables), self.capacity, graph.alignment
+        )
+        solver.plan_layout_and_core_divisions(cost_expr)
+        self.last = list(solver.buffers)
+        by_name = {b.name: b for b in self.last}
+        # A solver that generates divisions appends the ones it chose that the
+        # menu lacked (a generated tiling); the chosen index is into that menu.
+        for b in self.last:
+            menu = tuple(b.core_divisions)
+            if len(menu) > len(strategy.tables.menus.get(b.name, ())):
+                strategy.tables.menus[b.name] = menu
+                strategy.menus[b.name] = menu
         for node in graph.get_nodes():
             b = by_name[node.name]
             _write_back(node, b.address, b.spill_reason, graph.alignment)
-            if node.work_split is None and isinstance(b, CoreDivisionBuffer):
-                node.work_split = (
-                    WorkSplit.of(b.core_divisions[b.chosen_division])
-                    if b.core_divisions and b.chosen_division is not None
-                    else WorkSplit.COMMITTED
-                )
+            if node.work_split is None and b.core_divisions:
+                assert b.chosen_division is not None
+                node.work_split = WorkSplit.of(b.core_divisions[b.chosen_division])
+                strategy.solved[node] = b.chosen_division
         return graph.execution_plan()
 
 
@@ -318,14 +370,13 @@ def solve_buffers(
         EnumerationFactory,
     )
 
-    graph.set_solver(spec)
     strategy = EnumerationFactory().strategy(solver.buffers)
+    graph.set_solver(spec)
     graph.solve(cost_expr=cost_expr, strategy=strategy)
-    if isinstance(spec, BufferSolver):
-        return list(spec.result)
     by_name = {b.name: b for b in solver.buffers}
     # The inner solver's own reasons: none for a buffer that did not fit.
-    reasons = {v.name: v.spill_reason for v in spec.last}
+    last = spec.last
+    reasons = {v.name: v.spill_reason for v in last}
     for node in graph.get_nodes():
         items: list[ResourceNode | Transform] = [node, *node.pinned_transforms]
         for item in items:

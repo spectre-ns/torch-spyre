@@ -323,6 +323,63 @@ class EncodingStrategy:
         return []
 
 
+@dataclass
+class CandidateTables:
+    """The table strategy's candidates for one solve, generated from the IR
+    (``TableCandidates``): per node its candidate menu (and, for a ``Lazy``
+    split, its space), per edge its pair table, relayout candidates and the
+    relations a derived encoding uses, and the candidate relayout copies.
+    Keyed by node name, or by ``(parent, child)``; ``parents`` lists each
+    child's parents (reads and in-place) in the solve, in order."""
+
+    menus: dict[str, tuple[CoreDivision, ...]] = field(default_factory=dict)
+    parents: dict[str, list[str]] = field(default_factory=dict)
+    matches: dict[tuple[str, str], list[tuple[int, int]]] = field(default_factory=dict)
+    relayouts: dict[tuple[str, str], list] = field(default_factory=dict)
+    residency: dict[tuple[str, str], Any] = field(default_factory=dict)
+    clone_reads: dict[tuple[str, str], Any] = field(default_factory=dict)
+    relayout_edges: dict[tuple[str, str], Any] = field(default_factory=dict)
+    copies: list[RelayoutCopyBuffer] = field(default_factory=list)
+    lazy_spaces: dict[str, Any] = field(default_factory=dict)
+    point_menus: set[str] = field(default_factory=set)
+    tile_reads: dict[str, dict] = field(default_factory=dict)
+    positions: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def of_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> CandidateTables:
+        """The candidates the buffer form carries (tests, capture replay)."""
+        names = {b.name for b in buffers}
+        tables = cls(copies=[b for b in buffers if isinstance(b, RelayoutCopyBuffer)])
+        for b in buffers:
+            if isinstance(b, RelayoutCopyBuffer) or not isinstance(
+                b, CoreDivisionBuffer
+            ):
+                continue
+            if b.core_divisions:
+                tables.menus[b.name] = tuple(b.core_divisions)
+            parents = [
+                p
+                for p in dict.fromkeys([*b.parents, *b.in_place_parents])
+                if p in names
+            ]
+            tables.parents[b.name] = parents
+            # Captured buffers may predate the newer fields.
+            for p in parents:
+                key = (p, b.name)
+                if p in b.cd_parent_matches:
+                    tables.matches[key] = b.cd_parent_matches[p]
+                if p in b.cd_parent_relayouts:
+                    tables.relayouts[key] = b.cd_parent_relayouts[p]
+                if p in b.residency_edges:
+                    tables.residency[key] = b.residency_edges[p]
+            if getattr(b, "tile_reads", None):
+                tables.tile_reads[b.name] = b.tile_reads
+            position = getattr(b, "op_position", None)
+            if position is not None:
+                tables.positions[b.name] = position
+        return tables
+
+
 class TableStrategy(EncodingStrategy):
     """The default strategy: every open work split is a ``Table`` over its
     candidate menu, a pinned one ``Fixed``, and the view, relayout and nest
@@ -345,6 +402,8 @@ class TableStrategy(EncodingStrategy):
         **settings,
     ) -> None:
         super().__init__(**settings)
+        # Everything the candidates were generated as (``from_tables``).
+        self.tables: Optional[CandidateTables] = None
         # Edges whose relation is derived from their ResidencyEdge (equality of
         # per-node view ids, tile-view ids and core counts) instead of a table,
         # and input-clone edges derived from the consumer's CloneRead.
@@ -363,57 +422,44 @@ class TableStrategy(EncodingStrategy):
         self.solved: dict[Item, int] = {}
 
     @classmethod
-    def from_buffers(
+    def from_tables(
         cls,
-        buffers: Sequence[LifetimeBoundBuffer],
+        tables: CandidateTables,
         reasons: Mapping[str, str] | None = None,
         relation: str = "table",
         **settings,
     ) -> TableStrategy:
-        """The allocator's final candidates, read once from its buffers: the
-        menus, the view tables per edge, the relayout candidates on groups
-        with a copy in this solve, and the copies in copy order."""
+        """The strategy over ``tables``: per edge a pair table, or under the
+        derived relation the clone or residency relation where there is one;
+        the relayout candidates on groups with a copy in this solve; the
+        copies in copy order."""
         reasons = reasons or {}
-        names = {b.name for b in buffers}
-        copies = [b for b in buffers if isinstance(b, RelayoutCopyBuffer)]
-        groups = {c.group_key for c in copies}
+        groups = {c.group_key for c in tables.copies}
         derived = relation == "derived"
-        menus, matches, relayouts, residency, clone_reads = {}, {}, {}, {}, {}
-        relayout_edges = {}
-        for b in buffers:
-            if isinstance(b, RelayoutCopyBuffer) or not isinstance(
-                b, CoreDivisionBuffer
-            ):
-                continue
-            if b.core_divisions:
-                menus[b.name] = b.core_divisions
-            for parent in dict.fromkeys([*b.parents, *b.in_place_parents]):
-                if parent not in names:
-                    continue
-                # Captured buffers may predate these fields.
-                edge = getattr(b, "relayout_edges", {}).get(parent)
-                if edge is not None:
-                    relayout_edges[(parent, b.name)] = edge
-                clone = getattr(b, "clone_reads", {}).get(parent)
+        matches, relayouts, residency, clone_reads = {}, {}, {}, {}
+        for child, parents in tables.parents.items():
+            for parent in parents:
+                key = (parent, child)
+                clone = tables.clone_reads.get(key)
                 if derived and clone is not None:
-                    clone_reads[(parent, b.name)] = clone
-                elif (
-                    derived
-                    and parent not in b.cd_parent_matches
-                    and parent in b.residency_edges
-                ):
-                    residency[(parent, b.name)] = b.residency_edges[parent]
+                    clone_reads[key] = clone
+                elif derived and key not in tables.matches and key in tables.residency:
+                    residency[key] = tables.residency[key]
                 else:
-                    matches[(parent, b.name)] = b.cd_parent_matches.get(parent, [])
+                    matches[key] = tables.matches.get(key, [])
                 cands = [
-                    c
-                    for c in b.cd_parent_relayouts.get(parent, ())
-                    if c.group_key in groups
+                    c for c in tables.relayouts.get(key, ()) if c.group_key in groups
                 ]
                 if cands:
-                    relayouts[(parent, b.name)] = cands
-        return cls(
-            menus=menus,
+                    relayouts[key] = cands
+        relayout_edges = {
+            key: edge
+            for key, edge in tables.relayout_edges.items()
+            if key[0] in tables.parents.get(key[1], ())
+        }
+        copies = tables.copies
+        strategy = cls(
+            menus=tables.menus,
             matches=matches,
             relayout_candidates=relayouts,
             copies=copies,
@@ -422,6 +468,22 @@ class TableStrategy(EncodingStrategy):
             clone_reads=clone_reads,
             relayout_edges=relayout_edges,
             **settings,
+        )
+        strategy.tables = tables
+        return strategy
+
+    @classmethod
+    def from_buffers(
+        cls,
+        buffers: Sequence[LifetimeBoundBuffer],
+        reasons: Mapping[str, str] | None = None,
+        relation: str = "table",
+        **settings,
+    ) -> TableStrategy:
+        """The strategy over candidates given as buffers (tests, capture
+        replay): see :meth:`CandidateTables.of_buffers`."""
+        return cls.from_tables(
+            CandidateTables.of_buffers(buffers), reasons, relation, **settings
         )
 
     # ---- whole-graph hooks ----
@@ -1257,15 +1319,23 @@ class EnumerationFactory:
         buffers: Sequence[LifetimeBoundBuffer] = (),
         reasons: Mapping[str, str] | None = None,
     ) -> TableStrategy:
-        """The strategy for these settings over ``buffers``' candidates: a
-        ``Lazy`` work split wherever a node can take one, else tables."""
+        """The strategy over candidates given as buffers (tests, replay)."""
+        return self.strategy_from_tables(CandidateTables.of_buffers(buffers), reasons)
+
+    def strategy_from_tables(
+        self,
+        tables: CandidateTables,
+        reasons: Mapping[str, str] | None = None,
+    ) -> TableStrategy:
+        """The strategy for these settings over ``tables``: a ``Lazy`` work
+        split wherever a node can take one, else tables."""
         cls: type[TableStrategy] = TableStrategy
         if self.division == "lazy":
             from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
             cls = LazyStrategy
-        return cls.from_buffers(
-            buffers,
+        return cls.from_tables(
+            tables,
             reasons,
             relation=self.relation,
             division=self.division,

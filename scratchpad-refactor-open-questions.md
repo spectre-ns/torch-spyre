@@ -27,7 +27,7 @@ it CP-SAT time (Q12). The report has the full tables and an implementation guide
 | 3d placement solvers read placement views (`PlacementSolver`); greedy drops its isinstance | done |
 | 3e exhaustive search as `DecomposedPlacement`; annealer charges `spill_cost` | done; annealer adjacency stays `op_position` (Q14) |
 | 3f tests moved with the API | done for 3a-3g |
-| 3g one allocator (`division_mode`), `CoOptimizingAllocator` deleted, every solve through `graph.solve` | done; same-plans check in progress; the buffer construction stays (Q15) |
+| 3g one allocator (`division_mode`), `CoOptimizingAllocator` deleted; the allocator builds no buffers: graph from the IR, `solve_graph`, commit from the solved graph | done; same-plans 80/80 before this step, rerun in progress (Q15) |
 | Final cleanup: delete redundant code (superseded encodings/arms, the merged allocator subclass, dead helpers) | requested 2026-10-22; last step |
 
 ## Q1. Stage 9: extraction or generation from the op?
@@ -204,34 +204,20 @@ alone, so deriving positions from the chain makes them collide.
   `buffer_graph.spill_cost`.
 - Answer needed: rewrite those fixtures (distinct ticks) and drop `op_position`?
 
-## Q15. How far "delete the allocator's buffer construction" goes
+## Q15. How far "delete the allocator's buffer construction" goes (answered)
 
-3g says the allocator's buffer construction is deleted and the graph is built from the
-IR, with the buffer form of `add_node` kept for tests and replay. Today every
-consumer still reads `CoreDivisionBuffer`s: the CP-SAT strategy (`from_buffers`),
-the annealer (about 2000 lines), and the post-solve commit path (`commit_divisions`,
-`commit_lx_views`, `_apply_chosen_tilings`, `_push_allocation`). The IR graph agrees
-with the buffer graph (3c), so the switch is possible. But it rewrites the annealer
-and the commit path onto nodes, and the plan's own 3e makes the annealer rewrite a
-precondition.
+Answer (2026-10-22): "The allocator shouldn't build buffers; we should be able to pass
+IR buffers in the graph and solve; the allocator should just coordinate solving and
+committing of results."
 
-Why it is not one more step: `_build_cd_bound_buffers` derives the solve's incoming
-data (lifetimes and overrides, drain plans, residency reasons, in-place pairs,
-clones, carries) in the same pass as the candidates (menus, match tables,
-relayouts). The commit path needs each buffer's chosen `CoreDivision` (reduction
-symbols, tile splits), which a `WorkSplit` does not carry and only the menu has.
-Splitting that pass is the Stage 9 "generate from the op" work, and the plan
-already lists it as open.
+Done:
+- The placement-mode graph is built from the IR: `graph_builder.placement_graph`.
+- The open mode's candidate generator builds the graph plus the strategy's
+  `CandidateTables`: `TableCandidates.prepare_graph`.
+- Every solver takes the graph through `MemoryPlanSolver.solve_graph`.
+- The commit path reads the solved graph (`SolvedPlan`).
 
-- Assumed (recommended): stop 3g at one allocator class with every solve going
-  through `graph.solve`. The buffers stay the allocator's own structures, which the
-  plan's Interfaces section allows ("writes the decisions it finds on the nodes back
-  to its own structures"). The IR graph (3c) is checked against them. The split is
-  written up in the feasibility report as the next stage, in this order:
-  1. `WorkSplit` carries the chosen `CoreDivision`.
-  2. The commit path reads nodes.
-  3. Incoming data moves into `add_node(op)`.
-  4. Candidates come from the strategy.
-  5. The annealer runs over nodes and the strategy's tables.
-  6. The buffer construction is deleted.
-- Answer needed: should that split be done on this branch before you re-implement?
+`_generate_buffers`, `_build_bound_buffers`, `_append_lx_relayout_destinations`,
+`_build_cd_bound_buffers` and `_relayout_copy_buffers` are deleted. Buffers remain only
+as the solvers' buffer form (unit tests and capture replay) and as the annealing
+co-optimizer's internals, built from the graph and tables (`graph_solvers.buffers_of`).

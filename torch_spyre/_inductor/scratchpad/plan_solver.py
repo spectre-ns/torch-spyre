@@ -361,24 +361,10 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # constructs the division on the other end of an edge by inverting the view.
     # Empty where the allocator has not built them (they need the live ops).
     residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
-    # How this buffer reads each input clone, per candidate (``CloneRead``):
-    # set instead of the clone's ``cd_parent_matches`` entry when the
-    # strategy derives that relation.
-    clone_reads: dict[str, Any] = field(default_factory=dict)
-    # Per producer this buffer may read through a relayout copy, the edge's
-    # gates and price (``RelayoutEdge``), for a strategy that encodes
-    # relayouts over view ids instead of ``cd_parent_relayouts``.
-    relayout_edges: dict[str, Any] = field(default_factory=dict)
     # This buffer's producing op's legal divisions as a space to move in --
     # ``core_divisions`` without materializing it. ``None`` where the allocator
     # built none (see ``allocator._DivisionMap``).
     division_space: Optional["OpSplitSpace"] = None
-    # The same op's divisions as per-axis choices under each tiling option, for
-    # a strategy that posts them instead of indexing the menu (experimental).
-    lazy_space: Optional[Any] = None
-    # core_divisions is lazy_space's points, not the legal divisions: only a
-    # strategy that posts legality may choose from it.
-    menu_is_points: bool = False
     # Index of this buffer's producing operation in ``graph.operations``, which
     # is what a coarse-tiling *run* is measured over: a group has to occupy one
     # contiguous stretch of that list, and buffer order is not operation order
@@ -437,53 +423,58 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
 
     @property
     def sym_core_divs(self) -> dict[sympy.Symbol, sympy.Symbol]:
-        """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
-        stride coefficient seen across this buffer's candidate divisions, so the
-        cost model can carry an undecided split as an unknown rather than a
-        concrete value."""
-        core_divs = self.core_divisions
-
-        def unique(args):
-            d = dict.fromkeys(args)
-            return list(d)
-
-        keys = unique(itertools.chain.from_iterable(cd.splits for cd in core_divs))
-
-        return {
-            key: sympy.Symbol(f"split_{self.name}_{key}", integer=True, positive=True)
-            for key in keys
-        }
+        """See :func:`sym_core_divs_for`."""
+        return sym_core_divs_for(self.name, self.core_divisions)
 
     @property
     def sym_tile_counts(self) -> dict[tuple[int, bool], sympy.Symbol]:
-        """Symbolic stand-in for a chosen ``tiling``, the coarse-tiling sibling
-        of :attr:`sym_core_divs`: one symbol per tiled axis (a
-        ``(host_dim, is_reduction)`` pair) seen across this buffer's candidate
-        divisions, bound to that candidate's count on the axis, 1 where it
-        leaves the axis untiled. Keyed on the axis rather than the nesting level, so the
-        symbols do not depend on how a candidate orders its levels -- the cost
-        of a nest (a product of per-level trip counts) does not either. Empty
-        while no candidate is tiled.
+        """See :func:`sym_tile_counts_for`."""
+        return sym_tile_counts_for(self.name, self.core_divisions, self.division_space)
 
-        The SA co-optimizer generates its tilings from :attr:`division_space`
-        instead of listing them as candidates, so every output dim that space
-        may tile is declared too."""
-        keys = dict.fromkeys(
-            (axis.host_dim, axis.is_reduction)
-            for cd in self.core_divisions
-            for axis in cd.tiling.axes
+
+def sym_core_divs_for(
+    name: str, divisions: Sequence[CoreDivision]
+) -> dict[sympy.Symbol, sympy.Symbol]:
+    """Symbolic stand-in for a chosen ``op_it_space_splits``: one symbol per
+    stride coefficient seen across buffer ``name``'s candidate divisions, so
+    the cost model can carry an undecided split as an unknown rather than a
+    concrete value."""
+    keys = dict.fromkeys(itertools.chain.from_iterable(cd.splits for cd in divisions))
+    return {
+        key: sympy.Symbol(f"split_{name}_{key}", integer=True, positive=True)
+        for key in keys
+    }
+
+
+def sym_tile_counts_for(
+    name: str, divisions: Sequence[CoreDivision], space: Optional["OpSplitSpace"]
+) -> dict[tuple[int, bool], sympy.Symbol]:
+    """Symbolic stand-in for a chosen ``tiling``, the coarse-tiling sibling
+    of :func:`sym_core_divs_for`: one symbol per tiled axis (a ``(host_dim,
+    is_reduction)`` pair) seen across the candidate divisions, bound to that
+    candidate's count on the axis, 1 where it leaves the axis untiled. Keyed on
+    the axis rather than the nesting level, so the symbols do not depend on how
+    a candidate orders its levels -- the cost of a nest (a product of per-level
+    trip counts) does not either. Empty while no candidate is tiled.
+
+    The SA co-optimizer generates its tilings from the op's split ``space``
+    instead of listing them as candidates, so every output dim that space may
+    tile is declared too."""
+    keys = dict.fromkeys(
+        (axis.host_dim, axis.is_reduction)
+        for cd in divisions
+        for axis in cd.tiling.axes
+    )
+    if space is not None and space.tiling is not None:
+        keys.update(dict.fromkeys((dim, False) for dim in space.tiling.output_dims))
+    return {
+        (dim, is_red): sympy.Symbol(
+            f"tile_{name}_{'r' if is_red else 'o'}{dim}",
+            integer=True,
+            positive=True,
         )
-        space = self.division_space
-        if space is not None and space.tiling is not None:
-            keys.update(dict.fromkeys((dim, False) for dim in space.tiling.output_dims))
-        return {
-            (dim, is_red): sympy.Symbol(
-                f"tile_{self.name}_{'r' if is_red else 'o'}{dim}",
-                integer=True,
-                positive=True,
-            )
-            for (dim, is_red) in keys
-        }
+        for (dim, is_red) in keys
+    }
 
 
 def division_symbol(buffer_name: str) -> sympy.Symbol:
@@ -863,7 +854,7 @@ class RelayoutCopyBuffer(CoreDivisionBuffer):
 
 
 def build_relayout_copy(
-    parent: CoreDivisionBuffer,
+    parent: str,
     group: int,
     candidates: Sequence["RelayoutCandidate"],
     consumer_ticks: dict[str, int],
@@ -878,7 +869,7 @@ def build_relayout_copy(
             key=lambda c: (c.consumer, c.source_division, c.consumer_division),
         )
     )
-    assert ordered, f"relayout group {parent.name}/g{group} has no candidates"
+    assert ordered, f"relayout group {parent}/g{group} has no candidates"
     # The copy is the destination: its geometry is the destination view's span on
     # the destination's cores. Candidates on one destination view may come from
     # source divisions on DIFFERENT core counts (a producer's menu spans 1..32
@@ -886,24 +877,24 @@ def build_relayout_copy(
     # priced by its own source division, so only the destination count must agree.
     cores = {c.destination_num_cores for c in ordered}
     assert len(cores) == 1, (
-        f"relayout group {parent.name}/g{group} mixes destination core counts "
+        f"relayout group {parent}/g{group} mixes destination core counts "
         f"{sorted(cores)}"
     )
-    assert all(c.parent == parent.name and c.group == group for c in ordered)
+    assert all(c.parent == parent and c.group == group for c in ordered)
     # One destination view per group, hence one span; the candidates were
     # measured against the same layout, so a disagreement is an enumeration
     # error, not something to take the max of.
     spans = {c.destination_footprint_bytes for c in ordered}
     assert len(spans) == 1, (
-        f"relayout group {parent.name}/g{group} mixes destination spans {sorted(spans)}"
+        f"relayout group {parent}/g{group} mixes destination spans {sorted(spans)}"
     )
     num_cores = cores.pop()
     return RelayoutCopyBuffer(
-        name=relayout_copy_name(parent.name, group),
+        name=relayout_copy_name(parent, group),
         size=spans.pop() * num_cores,
         uses=sorted({consumer_ticks[c.consumer] for c in ordered}),
         core_divisions=[CoreDivision(splits={"relayout_copy": num_cores})],
-        relayout_parent=parent.name,
+        relayout_parent=parent,
         group=group,
         candidates=ordered,
     )
@@ -1129,6 +1120,18 @@ class MemoryPlanSolver(ABC):
 
         return PlacementSolver(type(self), self.limit)
 
+    def solve_graph(self, graph: Any, strategy: Any, cost_expr: Any = None) -> None:
+        """Fill every open decision of ``graph`` (built from the IR, with
+        ``strategy``'s candidates): the one entry point the allocator solves
+        through. A backend posts the graph through the strategy; a graph
+        solver solves it itself."""
+        spec = self.graph_solver()
+        assert not isinstance(spec, type), (
+            f"{type(self).__name__} posts a model: it overrides solve_graph"
+        )
+        graph.set_solver(spec)
+        graph.solve(cost_expr=cost_expr, strategy=strategy)
+
     def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
         if buffer.residency_reason is not None:
@@ -1203,7 +1206,7 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
         the graph's nodes from its choices."""
         from torch_spyre._inductor.scratchpad.graph_solvers import BufferSolver
 
-        return BufferSolver(self)
+        return BufferSolver(type(self), self.limit)
 
     def off_expression_ns(self) -> dict[str, float]:
         """The terms this engine's objective adds outside ``cost_expr`` for the

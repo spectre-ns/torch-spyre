@@ -49,6 +49,7 @@ from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
     ScratchpadAllocator,
+    SolvedPlan,
     _spec_within_read_distance,
     select_allocator,
 )
@@ -901,7 +902,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         out-of-step group is ``CoarseTilingPass`` itself.
         """
 
-        def chosen(alloc, graph, allocation):
+        def chosen(alloc, graph, plan):
             return {
                 op.get_operation_name(): _D0_BY_4
                 for op in graph.operations
@@ -942,7 +943,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         x = torch.randn(64, 64, 128, dtype=torch.float16)
         y = torch.randn(64, 64, 128, dtype=torch.float16)
 
-        def chosen(alloc, graph, allocation):
+        def chosen(alloc, graph, plan):
             return {
                 op.get_operation_name(): _D1_BY_4
                 for op in graph.operations
@@ -980,7 +981,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
         y = torch.randn(1, 64, 2048, dtype=torch.float16)
         unit_tile = TileSpec((TileAxis(host_dim=1, count=64),))
 
-        def chosen(alloc, graph, allocation):
+        def chosen(alloc, graph, plan):
             return {
                 op.get_operation_name(): unit_tile
                 for op in graph.operations
@@ -1080,7 +1081,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
 class ReplanAfterTilingGateTests(unittest.TestCase):
     """``_materialize_selection`` applies chosen tilings and solves again only
     for an engine whose ``replans_after_tiling()`` is true; any other engine's
-    first placement stands, whatever tilings its allocation carries."""
+    first plan stands, whatever tilings it carries."""
 
     _CHOICES = {"buf0": _D0_BY_4}
 
@@ -1089,8 +1090,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
             co_optimizing_lx_planning=True, layout_solver=layout_solver
         ):
             alloc = select_allocator()
-            solver = alloc._build_solver([])
-            allocation = [MagicMock()]
+            plan = SolvedPlan.of_buffers([], alloc._build_solver())
             graph = SimpleNamespace(operations=[])
             with contextlib.ExitStack() as stack:
                 chosen = stack.enter_context(
@@ -1110,31 +1110,22 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
                     stack.enter_context(
                         patch.object(ScratchpadAllocator, name, return_value=value)
                     )
-                result = alloc._materialize_selection(graph, solver, allocation)
-            return solver, allocation, result, chosen, apply
+                result = alloc._materialize_selection(graph, plan)
+            return plan, result, chosen, apply
 
     def test_annealer_placement_stands(self):
-        solver, allocation, result, chosen, apply = self._materialize(
-            "simulated_annealing"
-        )
-        self.assertFalse(solver.replans_after_tiling())
-        self.assertIs(result[0], solver)
-        self.assertIs(result[1], allocation)
+        plan, result, chosen, apply = self._materialize("simulated_annealing")
+        self.assertFalse(plan.solver.replans_after_tiling())
+        self.assertIs(result, plan)
         chosen.assert_not_called()
         apply.assert_not_called()
 
     @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
     def test_cpsat_applies_and_solves_again(self):
-        second_solver, second_allocation = MagicMock(), [MagicMock()]
-        _, _, result, _, apply = self._materialize(
-            "cpsat",
-            _prepare_buffers=[],
-            _build_solver=second_solver,
-            _solve=second_allocation,
-        )
+        second_plan = MagicMock()
+        _, result, _, apply = self._materialize("cpsat", _solve=second_plan)
         apply.assert_called_once_with(self._CHOICES)
-        self.assertIs(result[0], second_solver)
-        self.assertIs(result[1], second_allocation)
+        self.assertIs(result, second_plan)
 
 
 class _HeldDivisions(sa._GeneratedDivisions):

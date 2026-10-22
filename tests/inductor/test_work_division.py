@@ -2604,9 +2604,10 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         return graph, ops
 
     def _plan_solve_push(self, graph, divisions, mem_usage, residency):
-        """Run the real drain validator, buffer build, CP-SAT solve and push.
+        """Run the real drain validator, graph build, CP-SAT solve and push.
 
-        Returns ``(plans, built, solved, editor_cls)``, with buffers by name.
+        Returns ``(plans, solved, editor_cls)``; ``solved`` is the
+        :class:`SolvedPlan` the push read.
         """
         allocator = ScratchpadAllocator(
             CpSatLayoutSolver, size=4096, division_mode="open"
@@ -2651,16 +2652,18 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 graph, division_is_fixed=False
             )
             allocator._validated_drain_plans = plans
-            built = allocator.candidates._build_cd_bound_buffers(
+            solve_graph, tables = allocator.candidates._build_graph(
                 graph, {}, allocator_module._DivisionMap(divisions, set())
             )
-            solver = allocator.layout_planning(built, allocator.size)
-            solved = {b.name: b for b in solver.plan_layout()}
+            solver = allocator._build_solver()
+            strategy = allocator.factory.strategy_from_tables(tables)
+            solved = allocator_module.SolvedPlan(solve_graph, strategy, solver, tables)
+            solver.solve_graph(solve_graph, strategy)
             # commit_divisions would record the committed ownership here.
             for op in graph.operations:
                 op.iteration_space_ownership = object()
-            allocator._push_allocation(graph, list(solved.values()), [])
-        return plans, {b.name: b for b in built}, solved, editor_cls
+            allocator._push_allocation(graph, solved, [])
+        return plans, solved, editor_cls
 
     def test_carry_read_gate_decides_whether_the_post_loop_drain_is_emitted(self):
         """A drained carry under the carry-read gate: resident only if readers agree.
@@ -2712,18 +2715,19 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 "consumer": reader_divs,
                 "tail": self.parent_divs[:1],
             }
-            plans, built, solved, editor_cls = self._plan_solve_push(
+            plans, solved, editor_cls = self._plan_solve_push(
                 graph, divisions, mem_usage, residency
             )
             self.assertEqual(set(plans), {"plain"})
             self.assertIs(plans["plain"].anchor_op, self.consumer_op)
             self.assertIsNone(plans["plain"].collective)
-            return plans["plain"], built, solved, editor_cls
+            return plans["plain"], solved, editor_cls
 
         with self.subTest("reader splits like the storage"):
-            plan, built, solved, editor_cls = run(self.consumer_divs[:2])
-            storage = solved["plain"]
-            self.assertIsNotNone(storage.address)
+            plan, solved, editor_cls = run(self.consumer_divs[:2])
+            nodes = solved.graph.nodes
+            storage = nodes["plain"]
+            self.assertIsNotNone(solved.address(storage))
             editor = editor_cls.return_value
             editor.push_allocation_with_clone.assert_called_once_with(
                 storage_op,
@@ -2737,23 +2741,27 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor.change_graph_output.assert_called_once_with(storage_op, drain)
             # Why: the reader's edge on the storage admits the identical
             # slicings, and the solver committed one of them.
-            matches = built["consumer"].cd_parent_matches.get("plain")
+            matches = solved.tables.matches.get(("plain", "consumer"))
             self.assertEqual(matches, [(0, 0), (1, 1)])
             self.assertIn(
-                (storage.chosen_division, solved["consumer"].chosen_division), matches
+                (
+                    solved.division_index(storage),
+                    solved.division_index(nodes["consumer"]),
+                ),
+                matches,
             )
             # The drain plan keeps the storage live to the graph exit (4 ops),
             # past the loop's end (3) that the counted-loop rule alone gives.
-            self.assertEqual(built["plain"].end_time, len(ops))
+            self.assertEqual(storage.end_time, len(ops))
 
         with self.subTest("reader splits the storage differently"):
-            plan, built, solved, editor_cls = run([self.consumer_divs[3]])
-            self.assertIsNone(solved["plain"].address)
+            plan, solved, editor_cls = run([self.consumer_divs[3]])
+            self.assertIsNone(solved.address(solved.graph.nodes["plain"]))
             editor = editor_cls.return_value
             editor.push_allocation_with_clone.assert_not_called()
             editor.change_graph_output.assert_not_called()
             # Why: the reader's edge on the storage exists but admits no pair.
-            self.assertEqual(built["consumer"].cd_parent_matches.get("plain"), [])
+            self.assertEqual(solved.tables.matches.get(("plain", "consumer")), [])
 
     def test_post_loop_all_reduce_reads_a_drain_of_the_resident_carry(self):
         """A carry whose only post-loop use is an all_reduce stays in LX.
@@ -2816,14 +2824,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 return self._plan_solve_push(graph, divisions, mem_usage, residency)
 
         with self.subTest("the collective is drained"):
-            plans, built, solved, editor_cls = run(with_plan=True)
+            plans, solved, editor_cls = run(with_plan=True)
             self.assertEqual(set(plans), {"plain"})
             plan = plans["plain"]
             self.assertIs(plan.collective, all_reduce)
-            self.assertIsNotNone(solved["plain"].address)
-            self.assertNotIn("plain", built["all_reduce"].parents)
+            storage = solved.graph.nodes["plain"]
+            self.assertIsNotNone(solved.address(storage))
+            self.assertNotIn("plain", solved.tables.parents["all_reduce"])
             # Live to the all_reduce (index 3), not to the graph exit (5).
-            self.assertEqual(built["plain"].end_time, ops.index(all_reduce) + 1)
+            self.assertEqual(storage.end_time, ops.index(all_reduce) + 1)
             editor = editor_cls.return_value
             editor.push_allocation_with_clone.assert_called_once_with(
                 storage_op,
@@ -2840,10 +2849,10 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor.change_graph_output.assert_not_called()
 
         with self.subTest("without a plan the all_reduce edge keeps it in HBM"):
-            _plans, built, solved, editor_cls = run(with_plan=False)
-            self.assertIsNone(solved["plain"].address)
-            self.assertIn("plain", built["all_reduce"].parents)
-            self.assertNotIn("plain", built["all_reduce"].cd_parent_matches)
+            _plans, solved, editor_cls = run(with_plan=False)
+            self.assertIsNone(solved.address(solved.graph.nodes["plain"]))
+            self.assertIn("plain", solved.tables.parents["all_reduce"])
+            self.assertNotIn(("plain", "all_reduce"), solved.tables.matches)
             editor_cls.return_value.replace_collective_operand.assert_not_called()
 
     @staticmethod
@@ -3126,15 +3135,17 @@ class TestJointAllocator(unittest.TestCase):
         self.assertEqual(is_legal.call_args_list[1].args[1], unsafe)
 
         op.iteration_space_ownership = MagicMock()
-        allocation = [
-            CoreDivisionBuffer(
-                name=op.name,
-                size=128,
-                uses=[0],
-                core_divisions=[CoreDivision(splits={batch: 4})],
-                chosen_division=0,
-            )
-        ]
+        plan = allocator_module.SolvedPlan.of_buffers(
+            [
+                CoreDivisionBuffer(
+                    name=op.name,
+                    size=128,
+                    uses=[0],
+                    core_divisions=[CoreDivision(splits={batch: 4})],
+                    chosen_division=0,
+                )
+            ]
+        )
         with (
             patch(
                 "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
@@ -3142,7 +3153,7 @@ class TestJointAllocator(unittest.TestCase):
             ),
             self.assertRaisesRegex(Unsupported, "chosen split violates hard domain"),
         ):
-            allocator_module.commit_divisions(graph, allocation)
+            allocator_module.commit_divisions(graph, plan)
 
     def test_no_enumerable_candidates_keeps_legal_fixed_division(self):
         op = MagicMock(spec=ComputedBuffer)
@@ -3252,6 +3263,7 @@ class TestJointAllocator(unittest.TestCase):
                 layout=SimpleNamespace(device_layout=object())
             )
         )
+        plan = allocator_module.SolvedPlan.of_buffers([buf])
         allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
         # Priced at 1024 bytes over 1 core x 4 tiles = 256; a smaller applied
         # footprint fits the interval.
@@ -3259,7 +3271,7 @@ class TestJointAllocator(unittest.TestCase):
             with patch.object(
                 allocator_module, "get_device_size_in_bytes", return_value=applied
             ):
-                allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
+                allocator._check_priced_footprints(graph, plan, {"buf0": spec})
         # The graph kept the full extent: the address is spaced for a quarter of
         # what will be written there.
         with (
@@ -3268,7 +3280,7 @@ class TestJointAllocator(unittest.TestCase):
             ),
             self.assertRaises(Unsupported) as caught,
         ):
-            allocator._check_priced_footprints(graph, [buf], {"buf0": spec})
+            allocator._check_priced_footprints(graph, plan, {"buf0": spec})
         self.assertIn("buf0", str(caught.exception))
 
 
@@ -3350,22 +3362,24 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                     before[p]: f for p, f in floors_by_position.items()
                 }
             graph = MagicMock(operations=[op])
-            allocation = [
-                CoreDivisionBuffer(
-                    name=op.name,
-                    size=2 * math.prod(sizes),
-                    uses=[0],
-                    core_divisions=[
-                        CoreDivision(
-                            splits={
-                                before[p]: f for p, f in splits_by_position.items()
-                            },
-                            tiling=tiling,
-                        )
-                    ],
-                    chosen_division=0,
-                )
-            ]
+            plan = allocator_module.SolvedPlan.of_buffers(
+                [
+                    CoreDivisionBuffer(
+                        name=op.name,
+                        size=2 * math.prod(sizes),
+                        uses=[0],
+                        core_divisions=[
+                            CoreDivision(
+                                splits={
+                                    before[p]: f for p, f in splits_by_position.items()
+                                },
+                                tiling=tiling,
+                            )
+                        ],
+                        chosen_division=0,
+                    )
+                ]
+            )
             allocator = ScratchpadAllocator(
                 _UNBUILT_SOLVER, size=1, division_mode="open"
             )
@@ -3379,11 +3393,11 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                     allocator_module, "commit_iteration_space_ownership"
                 ) as commit,
             ):
-                allocator._apply_chosen_tilings(graph, allocation)
+                allocator._apply_chosen_tilings(graph, plan)
                 yield SimpleNamespace(
                     allocator=allocator,
                     graph=graph,
-                    allocation=allocation,
+                    plan=plan,
                     op=op,
                     commit=commit,
                 )
@@ -3397,7 +3411,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
 
     def _committed(self, applied):
         allocator_module.commit_divisions(
-            applied.graph, applied.allocation, applied.allocator._live_splits
+            applied.graph, applied.plan, applied.allocator._live_splits
         )
         (committed,) = [c.args[1] for c in applied.commit.call_args_list]
         return self._by_extent(applied.op, committed)
@@ -3481,7 +3495,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
             applied.graph.qualify_name.side_effect = lambda name: name
             applied.graph.get_buffer.return_value = applied.op
             applied.allocator._commit_copy_out_divisions(
-                applied.graph, applied.allocation, {"tiled"}
+                applied.graph, applied.plan, {"tiled"}
             )
             (committed,) = [c.args[1] for c in applied.commit.call_args_list]
             self.assertEqual(self._by_extent(copy, committed), {64: 16, 256: 2})

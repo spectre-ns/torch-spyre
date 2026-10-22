@@ -577,14 +577,11 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     assert len(ordinary) > 1
     # No hand-built menu: go through the same candidate, clone and relayout
     # construction as the real joint solve.
-    buffers = allocator._prepare_buffers(graph)
-    actual = next(buf for buf in buffers if buf.name == consumer.name)
-    assert actual.core_divisions == ordinary
-    solver = CpSatLayoutSolver(buffers, allocator.size)
-    result = allocator._solve(solver, graph)
-    selected = next(buf for buf in result if buf.name == consumer.name)
-    chosen = selected.core_divisions[selected.chosen_division]
-    direct = allocator.candidates._pricing_operations(graph, buffers)[0]
+    solve_graph, tables = allocator._build_graph(graph)
+    assert list(tables.menus[consumer.name]) == ordinary
+    result = allocator._solve(graph)
+    chosen = result.division(result.graph.nodes[consumer.name])
+    direct = allocator.candidates._pricing_operations(graph, solve_graph, tables)[0]
     costs = [
         cm._transport_dma_excess_ns(
             [dcm.extract_op_features(direct, splits)], cm.CostParams()
@@ -679,38 +676,46 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
     )
     if failure in ("source_clone", "relayout"):
         from torch_spyre._inductor.scratchpad.plan_solver import (
+            BufferType,
             CoreDivision,
-            CoreDivisionBuffer,
             RelayoutCopyBuffer,
         )
 
-        build = allocator.candidates._build_cd_bound_buffers
+        build = allocator.candidates._build_graph
 
         def with_allocation_choice(*args):
-            buffers = build(*args)
+            solve_graph, tables = build(*args)
             # Inject only the allocation-dependent choice, not divisions or
             # the proof. Preparation must use the same context as pricing.
             if failure == "source_clone":
-                extra = CoreDivisionBuffer(
-                    "input", 128, [0, 1], core_divisions=[CoreDivision()]
+                assert "input" not in solve_graph.nodes
+                solve_graph.add_ir_node(
+                    "input",
+                    nbytes=128,
+                    uses=[0, 1],
+                    first_use_is_read=True,
+                    boundary=BufferType.Input,
+                    open_split=True,
                 )
+                tables.menus["input"] = (CoreDivision(),)
             else:
-                extra = RelayoutCopyBuffer(
-                    "shuffle",
-                    128,
-                    [0, 1],
-                    core_divisions=[CoreDivision()],
-                    relayout_parent=stage.name,
+                tables.copies.append(
+                    RelayoutCopyBuffer(
+                        "shuffle",
+                        128,
+                        [0, 1],
+                        core_divisions=[CoreDivision()],
+                        relayout_parent=stage.name,
+                    )
                 )
-            return [*buffers, extra]
+            return solve_graph, tables
 
         monkeypatch.setattr(
-            allocator.candidates, "_build_cd_bound_buffers", with_allocation_choice
+            allocator.candidates, "_build_graph", with_allocation_choice
         )
     if failure == "core_budget":
         with pytest.raises(AssertionError, match="fixed direct-read division over"):
-            allocator._prepare_buffers(graph)
+            allocator._build_graph(graph)
         return
-    buffers = allocator._prepare_buffers(graph)
-    actual = next(buf for buf in buffers if buf.name == consumer.name)
-    assert actual.core_divisions == [am._fixed_core_division(consumer)]
+    _, tables = allocator._build_graph(graph)
+    assert list(tables.menus[consumer.name]) == [am._fixed_core_division(consumer)]

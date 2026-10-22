@@ -360,64 +360,147 @@ class SpyreOptimizationGraph:
     first: Optional[ResourceNode] = None
     solver: Any = None  # a Backend class or a GraphSolver; None: CpSat
 
+    def add_ir_node(
+        self,
+        name: str,
+        *,
+        nbytes: int,
+        uses: Sequence[int],
+        first_use_is_read: bool = False,
+        boundary: Optional[BufferType] = None,
+        residency_reason: Optional[str] = None,
+        start_override: Optional[int] = None,
+        end_override: Optional[int] = None,
+        op: Optional[Operation] = None,
+        space: Optional[OpSplitSpace] = None,
+        sym_core_divs: Mapping[SplitKey, sympy.Symbol] = {},
+        sym_tile_counts: Mapping[TileKey, sympy.Symbol] = {},
+        lx_view: Any = None,
+        lx_relayout_plans: Sequence = (),
+        open_split: bool = False,
+    ) -> ResourceNode:
+        """A node for IR buffer ``name``: an op output, or a graph input read
+        (``first_use_is_read``). Its lifetime is its ``uses`` widened by the
+        overrides; ``nbytes`` is its LX footprint in bytes (the total, divided
+        per candidate, when its work split is open). A work split is open only
+        when the caller has candidates for it (``open_split``); else it was
+        committed upstream."""
+        assert name not in self.nodes, f"{name} added twice"
+        uses = list(uses)
+        start = min(uses[0], start_override) if start_override is not None else uses[0]
+        end = uses[-1] + 1
+        if end_override is not None:
+            end = max(end, end_override)
+        node = ResourceNode(
+            name=name,
+            size=ceil_div(nbytes, self.alignment),
+            start_time=start,
+            end_time=end,
+            read_count=max(0, len(uses) - (0 if first_use_is_read else 1)),
+            first_use_is_read=first_use_is_read,
+            boundary=(
+                boundary
+                if boundary is not None
+                else BufferType.Input
+                if first_use_is_read
+                else BufferType.Intermediate
+            ),
+            sym_core_divs=sym_core_divs,
+            sym_tile_counts=sym_tile_counts,
+            produced_at=uses[0] if uses and not first_use_is_read else None,
+            op=op,
+            space=space,
+            residency_reason=residency_reason,
+            uses=tuple(uses),
+            nbytes=nbytes,
+            lx_view=lx_view,
+            lx_relayout_plans=list(lx_relayout_plans),
+            work_split=None if open_split else WorkSplit.COMMITTED,
+        )
+        self.nodes[name] = node
+        return node
+
+    def add_reads(
+        self,
+        child: ResourceNode,
+        parents: Sequence[str],
+        in_place_parents: Sequence[str] = (),
+    ) -> None:
+        """The child's dependency edges: one per parent it reads (counted:
+        an op may list a parent twice), ``in_place`` for one whose storage it
+        may take over. In-place inputs come first, in their order, since the
+        merge literals are made in it; a parent that is not a node is not in
+        the solve."""
+        reads = Counter(parents)
+        for parent in in_place_parents:
+            self.nodes[parent].add_child(child, in_place=True, reads=reads[parent])
+        for parent, count in reads.items():
+            if parent in self.nodes and parent not in in_place_parents:
+                self.nodes[parent].add_child(child, reads=count)
+
     def add_node(
         self, source: LifetimeBoundBuffer, residency_reason: Optional[str] = None
     ) -> ResourceNode:
-        """A node holding ``source``'s incoming data, in alignment units. A
-        buffer with no candidate divisions is committed upstream."""
-        assert source.name not in self.nodes, f"{source.name} added twice"
+        """The buffer form of :meth:`add_ir_node`, for tests and capture
+        replay: a node holding ``source``'s incoming data. A buffer with no
+        candidate divisions is committed upstream."""
         assert not isinstance(source, RelayoutCopyBuffer), (
             "a relayout copy is a transform, not a node"
         )
         b = source
         divided = b if isinstance(b, CoreDivisionBuffer) and b.core_divisions else None
-        node = ResourceNode(
-            name=b.name,
-            size=ceil_div(b.size, self.alignment),
-            start_time=b.start_time,
-            end_time=b.end_time,
-            read_count=b.read_count,
+        return self.add_ir_node(
+            b.name,
+            nbytes=b.size,
+            uses=b.uses,
             first_use_is_read=b.first_use_is_read,
-            boundary=(
-                b.boundary
-                if isinstance(b, CoreDivisionBuffer)
-                else BufferType.Input
-                if b.first_use_is_read
-                else BufferType.Intermediate
-            ),
+            boundary=b.boundary if isinstance(b, CoreDivisionBuffer) else None,
+            residency_reason=residency_reason,
+            start_override=b.lifetime_start_override,
+            end_override=b.lifetime_end_override,
+            space=divided.division_space if divided else None,
             sym_core_divs=divided.sym_core_divs if divided else {},
             sym_tile_counts=divided.sym_tile_counts if divided else {},
-            produced_at=b.uses[0] if b.uses and not b.first_use_is_read else None,
-            space=divided.division_space if divided else None,
-            residency_reason=residency_reason,
-            uses=tuple(b.uses),
-            nbytes=b.size,
             lx_view=b.lx_view,
-            lx_relayout_plans=list(b.lx_relayout_plans),
-            work_split=None if divided else WorkSplit.COMMITTED,
+            lx_relayout_plans=b.lx_relayout_plans,
+            open_split=divided is not None,
         )
-        self.nodes[b.name] = node
-        return node
 
-    def pin_transform(self, source: ResourceNode, dest: LifetimeBoundBuffer) -> None:
-        """A committed relayout destination of ``source``: a transform with
-        a fixed view, placed all-or-nothing with it."""
-        source.pinned_transforms.append(
-            Transform(
-                producer=source,
-                name=dest.name,
-                group=len(source.pinned_transforms),
-                size=ceil_div(dest.size, self.alignment),
-                read_count=dest.read_count,
-                division=CoreDivision(),
-                start_time=dest.start_time,
-                end_time=dest.end_time,
-                residency_reason=dest.residency_reason,
-                uses=tuple(dest.uses),
-                nbytes=dest.size,
-                lx_view=dest.lx_view,
-            )
+    def pin_transform(
+        self,
+        source: ResourceNode,
+        name: str,
+        *,
+        nbytes: int,
+        uses: Sequence[int],
+        start_override: Optional[int] = None,
+        end_override: Optional[int] = None,
+        lx_view: Any = None,
+        residency_reason: Optional[str] = None,
+    ) -> Transform:
+        """A committed relayout destination of ``source``: a transform with a
+        fixed view, placed all-or-nothing with it."""
+        uses = list(uses)
+        start = min(uses[0], start_override) if start_override is not None else uses[0]
+        end = uses[-1] + 1
+        if end_override is not None:
+            end = max(end, end_override)
+        transform = Transform(
+            producer=source,
+            name=name,
+            group=len(source.pinned_transforms),
+            size=ceil_div(nbytes, self.alignment),
+            read_count=max(0, len(uses) - 1),
+            division=CoreDivision(),
+            start_time=start,
+            end_time=end,
+            residency_reason=residency_reason,
+            uses=tuple(uses),
+            nbytes=nbytes,
+            lx_view=lx_view,
         )
+        source.pinned_transforms.append(transform)
+        return transform
 
     def get_nodes(self) -> Iterator[ResourceNode]:
         return iter(self.nodes.values())
@@ -927,14 +1010,17 @@ def build_graph(
     nodes = graph.nodes
     for b in real:
         for dest in b.paired_with:
-            graph.pin_transform(nodes[b.name], dest)
+            graph.pin_transform(
+                nodes[b.name],
+                dest.name,
+                nbytes=dest.size,
+                uses=dest.uses,
+                start_override=dest.lifetime_start_override,
+                end_override=dest.lifetime_end_override,
+                lx_view=dest.lx_view,
+                residency_reason=dest.residency_reason,
+            )
     for b in real:
-        child = nodes[b.name]
-        reads = Counter(getattr(b, "parents", ()))
-        for parent in b.in_place_parents:
-            nodes[parent].add_child(child, in_place=True, reads=reads[parent])
-        for parent, count in reads.items():
-            if parent in nodes and parent not in b.in_place_parents:
-                nodes[parent].add_child(child, reads=count)
+        graph.add_reads(nodes[b.name], getattr(b, "parents", ()), b.in_place_parents)
     graph.link_execution_order()
     return graph

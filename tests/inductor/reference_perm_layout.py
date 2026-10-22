@@ -384,7 +384,7 @@ class ReferencePermutationBasedLayoutSolver:
                     # Single-tick handoff: a valid in-place pair overlaps at
                     # exactly one tick, the child's first. Both in-place
                     # candidate generators upstream enforce it
-                    # (``allocator._determine_in_place`` and
+                    # (``graph_builder._in_place`` and
                     # ``_determine_in_place_division_invariant``), and
                     # ``_check_in_place_relationships`` re-checks it. The
                     # native packer relies on it and rejects a violation here,

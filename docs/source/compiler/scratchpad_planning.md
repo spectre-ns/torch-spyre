@@ -257,11 +257,11 @@ Scratchpad planning has three layers with separate concerns:
 :width: 480px
 :align: center
 
-`ScratchpadAllocator` runs pre-passes (clone insertion), gathers
-`LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
-chosen LX addresses onto buffer layouts. In its open division mode
-(`division_mode="open"`) the same allocator also chooses each op's core
-division, jointly with placement.
+`ScratchpadAllocator` runs pre-passes (clone insertion), builds the solve's
+graph from the IR (one node per IR buffer), hands it to a pluggable solver,
+then commits the solved graph: the chosen LX addresses onto buffer layouts.
+In its open division mode (`division_mode="open"`) the same allocator also
+chooses each op's core division, jointly with placement.
 :::
 
 The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
@@ -272,10 +272,10 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `plan_solver.py` | `MemoryPlanSolver` ABC (declarative exclusion via `partition`/`excluded`), `LifetimeBoundBuffer` |
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
-| `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT): builds the solve graph from the allocator's buffers and writes its decisions back |
+| `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT): `solve_graph` posts the graph through the strategy to the CP-SAT backend; its buffer form solves a buffer list |
+| `graph_builder.py` | The placement-only graph built from the IR (`placement_graph`) |
 | `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat`, `Decomposed`, `Mip`, `BruteForce`, `Annealing`, and the `GraphSolver` protocol |
-| `graph_solvers.py` | Graph solvers: `PlacementSolver` (placement views), `DecomposedPlacement` (the exhaustive search), `BufferSolver`; `solve_buffers`, the one way the allocator solves |
-| `ir_graph.py` | The solve graph built straight from the IR, and its agreement check against the buffer graph |
+| `graph_solvers.py` | Graph solvers: `PlacementSolver` (placement views), `DecomposedPlacement` (the exhaustive search), `BufferSolver` (the annealing co-optimizer over the buffer form of the graph) |
 | `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
 | `lazy_relayout.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
 | `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
@@ -301,17 +301,23 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    `_eligible_clone_inputs` walks graph inputs and inserts a `clone` for any
    HBM input that is read more than once *and* fits on LX. The clone output
    becomes a fresh LX-eligible buffer.
-2. **Buffer analysis.** `_generate_buffers` produces one
-   `LifetimeBoundBuffer` per buffer, *including* the ones that may not
-   reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`
-   (in `allocator.py`) decides eligibility and the verdict rides along as
+2. **The solve's graph.** `graph_builder.placement_graph` (placement only)
+   or `TableCandidates.prepare_graph` (the open division mode) builds one
+   `ResourceNode` per IR buffer, *including* the ones that may not reside,
+   with its lifetime, footprint and in-place edges; the open mode also
+   builds the table strategy's candidates (`CandidateTables`). Nothing is
+   filtered out; `ScratchpadAllocator._residency_reasons` (in `allocator.py`)
+   decides eligibility and the verdict rides along as the node's
    `residency_reason` (see
    [Declarative exclusion](#declarative-exclusion) below).
-3. **Layout planning.** The solver partitions off every barred buffer
-   (`MemoryPlanSolver.partition`), then assigns an `address` to each of the
-   rest it can fit; whatever is left gets `address=None` and stays on HBM.
-4. **Push allocation.** Successful placements are written to
-   `layout.allocation["lx"] = addr` on each buffer's `FixedTiledLayout`.
+3. **Layout planning.** `MemoryPlanSolver.solve_graph` fills every node's
+   decisions: a placement-only solver packs the nodes' placement views
+   (`graph_solvers.PlacementSolver`), CP-SAT encodes the graph through the
+   strategy, and a node left out of LX stays on HBM with its
+   `spill_reason`.
+4. **Push allocation.** The solved graph (`SolvedPlan`) is committed:
+   successful placements are written to `layout.allocation["lx"] = addr` on
+   each buffer's `FixedTiledLayout`.
 5. **Post-passes.** Reserved for solver-driven graph mutations such as op
    re-ordering. Output-boundary cloning already runs as part of push
    allocation: `_push_allocation` calls
@@ -323,7 +329,7 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
 
 Eligibility is decided in exactly one place, `ScratchpadAllocator._residency_reasons`
 in `allocator.py`, and carried
-to the solver as a single field, `LifetimeBoundBuffer.residency_reason`:
+to the solver as a single field, the node's `residency_reason`:
 `None` means the buffer may be pinned, any string is the reason it may not.
 
 **No buffer is ever dropped.** A barred buffer is still handed to the
@@ -709,8 +715,8 @@ boundaries.
 Three suites cover the planner:
 
 - `tests/inductor/test_scratchpad_solver.py`: solver-level unit tests.
-  Buffers are constructed directly as `LifetimeBoundBuffer` lists and
-  fed to each solver.
+  Buffers are constructed directly as `LifetimeBoundBuffer` lists (the
+  solvers' buffer form) and fed to each solver.
 - `tests/inductor/test_scratchpad_use.py`: end-to-end op-level checks
   that LX is actually used for representative graphs.
 - `tests/inductor/test_scratchpad_patterns.py`: the `@expectedFailure`

@@ -103,6 +103,34 @@ class _Recorder:
             }
         )
 
+    def finish_graph(self, graph, strategy, error: Optional[str]) -> None:
+        """``finish`` for a solve of a graph built from the IR: the same
+        decisions, read off the solved nodes and candidate copies."""
+        unit = graph.alignment
+        decisions = {}
+        items = [*graph.get_nodes(), *strategy.transforms]
+        for item in items:
+            chosen = {}
+            for edge in getattr(item, "inputs", ()):
+                t = edge.transform
+                if t is not None and t.offset is not None:
+                    c = strategy.fired[edge]
+                    chosen[edge.src.name] = [
+                        c.group,
+                        c.source_division,
+                        c.consumer_division,
+                        t.offset * unit,
+                    ]
+            decisions[item.name] = {
+                "address": None if item.offset is None else item.offset * unit,
+                "spill_reason": item.spill_reason,
+                "chosen_division": (
+                    0 if item in strategy.transforms else strategy.solved.get(item)
+                ),
+                "chosen_relayouts": dict(sorted(chosen.items())),
+            }
+        self._write(decisions, error)
+
     def finish(self, buffers, error: Optional[str]) -> None:
         decisions = {}
         for b in buffers:
@@ -121,6 +149,9 @@ class _Recorder:
                     for parent, c in sorted(chosen.items())
                 },
             }
+        self._write(decisions, error)
+
+    def _write(self, decisions: dict, error: Optional[str]) -> None:
         record = {
             "case": self.case,
             "stages": self.stages,
@@ -171,8 +202,23 @@ def install(out: str | Path) -> _Recorder:
         rec.finish(self.buffers, None)
         return result
 
+    orig_solve_graph = cls.solve_graph
+
+    def solve_graph(self, graph, strategy, cost_expr=None):
+        rec = _RECORDER
+        if rec is None or rec.stages is not None:
+            return orig_solve_graph(self, graph, strategy, cost_expr)
+        rec.stages = []
+        try:
+            orig_solve_graph(self, graph, strategy, cost_expr)
+        except Exception as exc:
+            rec.finish_graph(graph, strategy, f"{type(exc).__name__}: {exc}")
+            raise
+        rec.finish_graph(graph, strategy, None)
+
     cls._solve_and_record = _solve_and_record
     cls._plan_layout_generic = _plan_layout_generic
+    cls.solve_graph = solve_graph
     cls._cpsat_equiv_installed = True
     return _RECORDER
 

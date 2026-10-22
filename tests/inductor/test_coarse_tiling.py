@@ -9629,6 +9629,22 @@ class _SentinelOp:
         return f"_SentinelOp({self.name!r})"
 
 
+def _solved_plan(*placements):
+    """A ``SolvedPlan`` of one-tick buffers given as ``(name, address,
+    lx_view)``; ``address=None`` leaves the buffer in HBM."""
+    from torch_spyre._inductor.scratchpad.allocator import SolvedPlan
+    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+
+    return SolvedPlan.of_buffers(
+        [
+            LifetimeBoundBuffer(
+                name=name, size=128, uses=[0], address=address, lx_view=lx_view
+            )
+            for name, address, lx_view in placements
+        ]
+    )
+
+
 class TestDrainPlanPushAndLifetime(unittest.TestCase):
     """Post-loop drain plan: lifetime extension and the push branch.
 
@@ -9673,6 +9689,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
         from torch_spyre._inductor.scratchpad import utils as utils_module
         from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+        from torch_spyre._inductor.scratchpad.graph_solvers import buffers_of
         from torch_spyre._inductor.scratchpad.plan_solver import (
             CoreDivision,
             _check_in_place_relationships,
@@ -9767,16 +9784,20 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 graph
             )
             self.assertEqual(in_place["reader"], ["carry"])
-            built = allocator.candidates._build_cd_bound_buffers(
+            solve_graph, tables = allocator.candidates._build_graph(
                 graph, in_place, allocator_module._DivisionMap(divisions, set())
             )
 
         # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
-        _check_in_place_relationships(built)
-        buffers = {b.name: b for b in built}
-        self.assertEqual(buffers["carry"].end_time, len(ops))
-        self.assertEqual(buffers["reader"].in_place_parents, [])
-        self.assertEqual(buffers["tail"].in_place_parents, ["reader"])
+        _check_in_place_relationships(buffers_of(solve_graph, tables))
+        nodes = solve_graph.nodes
+        self.assertEqual(nodes["carry"].end_time, len(ops))
+
+        def in_place_parents(name):
+            return [e.src.name for e in nodes[name].inputs if e.in_place]
+
+        self.assertEqual(in_place_parents("reader"), [])
+        self.assertEqual(in_place_parents("tail"), ["reader"])
 
     def test_missing_drain_anchor_raises_instead_of_falling_back(self):
         """After LX is committed there is no late decline."""
@@ -9794,7 +9815,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         )
         graph = SimpleNamespace(operations=[], graph=object())
         with self.assertRaisesRegex(AssertionError, "no longer in graph.operations"):
-            _assert_drain_plan_committed(graph, None, {}, {}, plan)
+            _assert_drain_plan_committed(graph, None, None, {}, plan)
 
     def _isolation_plan(self):
         from torch_spyre._inductor.scratchpad.allocator import DrainPlan
@@ -9821,7 +9842,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         graph.get_output_names.return_value = ["buf2"]
         graph.graph_input_names = []
         graph.get_buffer.return_value = storage_op
-        buffer = SimpleNamespace(name="buf2", address=address, lx_view=object())
+        buffer = ("buf2", address, object())
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
@@ -9841,7 +9862,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         ):
             editor = graph_editor_cls.return_value
             editor.push_allocation_with_clone.return_value = clone
-            allocator._push_allocation(graph, [buffer], [])
+            allocator._push_allocation(graph, _solved_plan(buffer), [])
         return SimpleNamespace(
             editor=editor,
             clone=clone,
@@ -9924,13 +9945,9 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             "buf2": storage_op,
             "outA": other_op,
         }.get
-        buffer = SimpleNamespace(name="buf2", address=0x4000, lx_view=object())
         # Ordinary output clone first, then the drain: the drain's anchor is
         # the same object, whatever the ordinary push did to the list.
-        buffers = [
-            SimpleNamespace(name="outA", address=0x2000, lx_view=object()),
-            buffer,
-        ]
+        solved = _solved_plan(("outA", 0x2000, object()), ("buf2", 0x4000, object()))
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
@@ -9948,7 +9965,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         ):
             editor = graph_editor_cls.return_value
             editor.push_allocation_with_clone.return_value = clone
-            allocator._push_allocation(graph, buffers, [])
+            allocator._push_allocation(graph, solved, [])
         calls = editor.push_allocation_with_clone.call_args_list
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].args, (other_op, [other_consumer]))
@@ -10280,7 +10297,6 @@ class TestHoistedInputClone(unittest.TestCase):
         source = _SentinelOp("x")
         graph.get_buffer.return_value = source
         lx_view = object()
-        buffer = SimpleNamespace(name="x", address=0x4000, lx_view=lx_view)
         clone = SimpleNamespace(
             loop_info=object(),
             _loop_carry_record=object(),
@@ -10295,7 +10311,7 @@ class TestHoistedInputClone(unittest.TestCase):
         ):
             editor = graph_editor_cls.return_value
             editor.push_allocation_with_clone.return_value = clone
-            allocator._push_allocation(graph, [buffer], [])
+            allocator._push_allocation(graph, _solved_plan(("x", 0x4000, lx_view)), [])
         return SimpleNamespace(
             editor=editor,
             clone=clone,

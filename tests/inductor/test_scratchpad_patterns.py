@@ -23,10 +23,7 @@ import os
 
 import torch
 
-from torch_spyre._inductor.scratchpad.allocator import (
-    LifetimeBoundBuffer,
-    _lx_planning_size,
-)
+from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
     FirstFitLayoutSolver,
@@ -35,6 +32,7 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    LifetimeBoundBuffer,
     MemoryPlanSolver,
     LifetimeBoundBuffer as Buffer,
 )

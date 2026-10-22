@@ -36,7 +36,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.work_division import OpSplitSpace
 from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
-from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
+from torch_spyre._inductor.scratchpad.table_candidates import relayout_copies_of
 
 _CORE = sympy.Symbol("core_id")
 
@@ -117,7 +117,7 @@ def test_solved_bindings_bind_the_chosen_tiling_per_axis():
 
 def test_record_evaluates_every_term_under_the_solved_plan():
     p, c = _buffers()
-    (copy,) = TableCandidates._relayout_copy_buffers([p, c])
+    (copy,) = relayout_copies_of([p, c])
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = 16, 0
     copy.address = 32
@@ -282,7 +282,7 @@ def test_record_carries_the_divisions_the_choice_was_made_over():
     p, c = _buffers()
     # The gate admits only P's axis-1 split as a per-core match for C.
     c.cd_parent_matches = {"P": [(0, 0)]}
-    (copy,) = TableCandidates._relayout_copy_buffers([p, c])
+    (copy,) = relayout_copies_of([p, c])
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = 16, 0
     copy.address = 32
@@ -313,7 +313,7 @@ def test_a_parent_the_gate_refused_outright_is_still_listed():
     """
     p, c = _buffers()
     c.cd_parent_matches = {}  # the gate built no edge for P at all
-    (copy,) = TableCandidates._relayout_copy_buffers([p, c])
+    (copy,) = relayout_copies_of([p, c])
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = 16, 0
     copy.address = 32

@@ -279,19 +279,13 @@ class LazyStrategy(TableStrategy):
         self.point_menus: set[str] = set()
 
     @classmethod
-    def from_buffers(
-        cls, buffers, reasons=None, relation: str = "table", **settings
+    def from_tables(
+        cls, tables, reasons=None, relation: str = "table", **settings
     ) -> LazyStrategy:
-        strategy = super().from_buffers(buffers, reasons, relation, **settings)
+        strategy = super().from_tables(tables, reasons, relation, **settings)
         assert isinstance(strategy, LazyStrategy)
-        strategy.spaces = {
-            b.name: b.lazy_space
-            for b in buffers
-            if getattr(b, "lazy_space", None) is not None
-        }
-        strategy.point_menus = {
-            b.name for b in buffers if getattr(b, "menu_is_points", False)
-        }
+        strategy.spaces = dict(tables.lazy_spaces)
+        strategy.point_menus = set(tables.point_menus)
         return strategy
 
     def prepare(self, graph: SpyreOptimizationGraph) -> None:

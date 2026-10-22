@@ -75,12 +75,12 @@ from torch_spyre._inductor.op_spec import (
 from torch_spyre._inductor.pass_utils import PerCoreView
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+import torch_spyre._inductor.scratchpad.graph_builder as graph_builder_module
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.core_mapping import remap_work_division
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 
@@ -728,18 +728,16 @@ def test_allocator_reuses_only_unmodified_plans(plans, prepass):
     with (
         config.patch({"lx_planner_relayout": True, "ktir_emitter": False}),
         mock_patch.object(
-            allocator_module, "collect_lx_relayout_plans", return_value=[]
+            graph_builder_module, "collect_lx_relayout_plans", return_value=[]
         ) as collect,
-        mock_patch.object(allocator, "_generate_buffers", return_value=[]) as generate,
-        mock_patch.object(allocator, "_append_lx_relayout_destinations"),
+        mock_patch.object(graph_builder_module, "_entries", return_value={}) as entries,
+        mock_patch.object(graph_builder_module, "_relayout_destinations"),
         mock_patch.object(allocator, "_build_solver", side_effect=StopIteration),
         pytest.raises(StopIteration),
     ):
         allocator.plan_allocation(graph, lx_relayout_plans=plans)
     assert collect.call_count == int(prepass)
-    assert generate.call_args.kwargs["lx_relayout_plans"] is (
-        collect.return_value if prepass else plans
-    )
+    assert entries.call_args.args[2] is (collect.return_value if prepass else plans)
 
 
 def test_plan_reuse_keeps_materialization_guard_and_retry_recollects():
@@ -748,13 +746,13 @@ def test_plan_reuse_keeps_materialization_guard_and_retry_recollects():
     with (
         config.patch({"lx_planner_relayout": True, "ktir_emitter": False}),
         mock_patch.object(
-            allocator_module,
+            graph_builder_module,
             "materialized_lx_relayouts",
             return_value={"copy": object()},
         ),
         pytest.raises(RuntimeError, match="unmaterialized graph"),
     ):
-        allocator._prepare_buffers(graph, lx_relayout_plans=[])
+        allocator._build_graph(graph, lx_relayout_plans=[])
     with (
         mock_patch.object(
             allocator, "plan_allocation", side_effect=allocator_module.SolveError
@@ -800,15 +798,17 @@ def test_fixed_plan_handoff_keeps_feature_gates(mode):
         config.patch(
             {"lx_planner_relayout": mode != "off", "ktir_emitter": mode == "ktir"}
         ),
-        mock_patch.object(allocator_module, "collect_lx_relayout_plans") as collect,
-        mock_patch.object(allocator, "_generate_buffers", return_value=[]) as generate,
-        mock_patch.object(allocator, "_append_lx_relayout_destinations"),
+        mock_patch.object(graph_builder_module, "collect_lx_relayout_plans") as collect,
+        mock_patch.object(graph_builder_module, "_entries", return_value={}) as entries,
+        mock_patch.object(
+            graph_builder_module, "_relayout_destinations"
+        ) as destinations,
     ):
-        allocator._prepare_buffers(graph, lx_relayout_plans=[_relayout_plan()])
+        allocator._build_graph(graph, lx_relayout_plans=[_relayout_plan()])
     collect.assert_not_called()
-    assert generate.call_args.kwargs == (
-        {} if mode == "unsupported_solver" else {"lx_relayout_plans": []}
-    )
+    assert list(entries.call_args.args[2]) == []
+    # A solver that cannot place relayout destinations gets none appended.
+    assert destinations.called == (mode != "unsupported_solver")
 
 
 def test_joint_allocation_does_not_consume_fixed_plan_handoff():
@@ -829,11 +829,11 @@ def test_joint_allocation_does_not_consume_fixed_plan_handoff():
             allocator.candidates, "_division_map", return_value=division_map
         ),
         mock_patch.object(
-            allocator.candidates, "_build_cd_bound_buffers", return_value=[]
+            allocator.candidates, "_build_graph", return_value=(None, None)
         ) as build,
-        mock_patch.object(allocator_module, "collect_lx_relayout_plans") as collect,
+        mock_patch.object(graph_builder_module, "collect_lx_relayout_plans") as collect,
     ):
-        allocator._prepare_buffers(graph, lx_relayout_plans=[_relayout_plan()])
+        allocator._build_graph(graph, lx_relayout_plans=[_relayout_plan()])
     collect.assert_not_called()
     build.assert_called_once_with(graph, {}, division_map)
 
@@ -1782,6 +1782,19 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     )
 
 
+def _solve_entries(allocator, graph, entries):
+    """Place ``entries`` (the builder's per-node data, relayout destinations
+    already pinned) through the allocator's real placement solve."""
+    with (
+        mock_patch.object(
+            graph_builder_module, "collect_lx_relayout_plans", return_value=[]
+        ),
+        mock_patch.object(graph_builder_module, "_entries", return_value=entries),
+        mock_patch.object(graph_builder_module, "_relayout_destinations"),
+    ):
+        return allocator._solve(graph)
+
+
 def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     alternate_view = PerCoreView(((1, 8),), ((1, _CORE_ID),))
     plans = [
@@ -1792,25 +1805,26 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     graph = _allocation_graph(
         "producer", "consumer_a", "consumer_b", "consumer_c", "ordinary_consumer"
     )
-    source = LifetimeBoundBuffer("source", 128, [0, 1, 2, 3])
-    source.lx_relayout_plans = list(plans)
-    ordinary = LifetimeBoundBuffer("ordinary", 128, [0, 4])
-    buffers = [source, ordinary]
-    allocator._append_lx_relayout_destinations(graph, buffers)
+    entries = {
+        "source": graph_builder_module._Entry(128, [0, 1, 2, 3], plans=list(plans)),
+        "ordinary": graph_builder_module._Entry(128, [0, 4]),
+    }
+    graph_builder_module._relayout_destinations(allocator, graph, entries)
 
-    assert source.uses == [1, 2, 6]
-    assert [buffer.uses for buffer in source.paired_with] == [[2, 3, 5], [6, 7]]
+    assert entries["source"].uses == [1, 2, 6]
+    assert [dest["uses"] for dest in entries["source"].pinned] == [[2, 3, 5], [6, 7]]
 
-    solver = allocator._build_solver(buffers)
     with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
-        allocation = allocator._solve(solver, graph)
-        allocator._finalize_lx_relayout_allocation(allocation, graph)
+        plan = _solve_entries(allocator, graph, entries)
+        allocator._finalize_lx_relayout_allocation(plan, graph)
 
-    by_name = {buffer.name: buffer for buffer in allocation}
-    assert by_name["ordinary"].address == 0
-    assert by_name["source"].address is None
-    assert all(by_name[plan.destination_name].address is None for plan in plans)
-    assert not by_name["source"].lx_relayout_plans
+    nodes = plan.graph.nodes
+    assert plan.address(nodes["ordinary"]) == 0
+    assert plan.address(nodes["source"]) is None
+    destinations = {t.name: t for t in nodes["source"].pinned_transforms}
+    assert set(destinations) == {p.destination_name for p in plans}
+    assert all(plan.address(t) is None for t in destinations.values())
+    assert not nodes["source"].lx_relayout_plans
     assert any(
         "rejected LX relayout group source=source" in record.message
         for record in caplog.records
@@ -1846,17 +1860,21 @@ def test_relayout_footprint_uses_device_storage_not_host_strides(host_strides):
     assert lx_relayout_module.partition_footprint(layout, destination) == 131072
 
 
-def _assert_live_buffers_do_not_share_addresses(graph, buffers, limit):
+def _assert_live_buffers_do_not_share_addresses(graph, entries, limit):
     allocator = ScratchpadAllocator(GreedyLayoutSolver, limit)
-    allocation = allocator._solve(allocator._build_solver(buffers), graph)
-    assert all(buffer.address is not None for buffer in allocation)
-    for index, left in enumerate(allocation):
-        for right in allocation[index + 1 :]:
-            if not left.overlaps_in_time(right):
+    plan = _solve_entries(allocator, graph, entries)
+    items = [item for node in plan.nodes for item in (node, *node.pinned_transforms)]
+    assert {item.name for item in items} >= set(entries)
+    assert all(plan.address(item) is not None for item in items)
+    for index, left in enumerate(items):
+        for right in items[index + 1 :]:
+            if not (
+                left.start_time < right.end_time and right.start_time < left.end_time
+            ):
                 continue
-            assert left.address + left.size <= right.address or (
-                right.address + right.size <= left.address
-            )
+            left_end = plan.address(left) + left.size * plan.graph.alignment
+            right_end = plan.address(right) + right.size * plan.graph.alignment
+            assert left_end <= plan.address(right) or right_end <= plan.address(left)
 
 
 def test_lx_relayout_copies_loop_lifetime_to_every_destination():
@@ -1869,34 +1887,35 @@ def test_lx_relayout_copies_loop_lifetime_to_every_destination():
         ),
     ]
     graph = _allocation_graph("producer", "consumer_a", "consumer_b", "consumer_c")
-    source = LifetimeBoundBuffer("source", 64, [0, 1, 2, 3], lifetime_end_override=6)
-    source.lx_relayout_plans = list(plans)
-    buffers = [source]
-    ScratchpadAllocator(GreedyLayoutSolver, 256)._append_lx_relayout_destinations(
-        graph, buffers
+    source = graph_builder_module._Entry(
+        64, [0, 1, 2, 3], end_override=6, plans=list(plans)
     )
+    entries = {"source": source}
+    allocator = ScratchpadAllocator(GreedyLayoutSolver, 256)
+    graph_builder_module._relayout_destinations(allocator, graph, entries)
 
-    assert source.lifetime_end_override is None
-    assert [buffer.lifetime_end_override for buffer in source.paired_with] == [12, 12]
-    tail = LifetimeBoundBuffer("tail", 64, [8, 11])
-    buffers.append(tail)
-    _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
+    assert source.end_override is None
+    assert [dest["end_override"] for dest in source.pinned] == [12, 12]
+    entries["tail"] = graph_builder_module._Entry(64, [8, 11])
+    _assert_live_buffers_do_not_share_addresses(graph, entries, 384)
 
 
 def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
     graph = _allocation_graph("producer", "relayout_consumer", "ordinary_consumer")
-    source = LifetimeBoundBuffer("source", 64, [0, 1, 2], lifetime_end_override=4)
-    source.lx_relayout_plans = [_relayout_plan("source", "relayout_consumer")]
-    buffers = [source]
-    ScratchpadAllocator(GreedyLayoutSolver, 192)._append_lx_relayout_destinations(
-        graph, buffers
+    source = graph_builder_module._Entry(
+        64,
+        [0, 1, 2],
+        end_override=4,
+        plans=[_relayout_plan("source", "relayout_consumer")],
     )
+    entries = {"source": source}
+    allocator = ScratchpadAllocator(GreedyLayoutSolver, 192)
+    graph_builder_module._relayout_destinations(allocator, graph, entries)
 
-    assert source.lifetime_end_override == 8
-    assert source.paired_with[0].lifetime_end_override == 8
-    tail = LifetimeBoundBuffer("tail", 64, [6, 7])
-    buffers.append(tail)
-    _assert_live_buffers_do_not_share_addresses(graph, buffers, 384)
+    assert source.end_override == 8
+    assert source.pinned[0]["end_override"] == 8
+    entries["tail"] = graph_builder_module._Entry(64, [6, 7])
+    _assert_live_buffers_do_not_share_addresses(graph, entries, 384)
 
 
 class _RelayoutNode:

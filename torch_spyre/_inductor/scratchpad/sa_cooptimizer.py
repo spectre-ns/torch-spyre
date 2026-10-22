@@ -909,8 +909,9 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         for c_idx, c in enumerate(bufs):
             for p_name in c.parents:
                 # A parent outside the solver's set is skipped, not asserted:
-                # ``_build_cd_bound_buffers`` assigns ``parents`` unfiltered, so
-                # graph inputs, constants and extern outputs appear here. The edge
+                # a buffer-form graph (capture replay) lists ``parents``
+                # unfiltered, so graph inputs, constants and extern outputs
+                # appear here. The edge
                 # only gates a child's division against reading the parent from
                 # LX, and a buffer the solver does not own is never LX-resident.
                 p_idx = self._name_to_idx.get(p_name)

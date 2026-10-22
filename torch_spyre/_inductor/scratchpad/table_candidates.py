@@ -56,9 +56,14 @@ from torch_spyre._inductor.work_division import (
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.scratchpad.buffer_graph import SpyreOptimizationGraph
+from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
+from torch_spyre._inductor.scratchpad.graph_builder import empty_graph
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    CoreDivisionBuffer,
+    LifetimeBoundBuffer,
+    sym_core_divs_for,
+    sym_tile_counts_for,
     TileSpec,
     BufferType,
     RelayoutCopyBuffer,
@@ -123,6 +128,33 @@ if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
     from torch_spyre._inductor.scratchpad.encoding_strategy import EnumerationFactory
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
+
+
+def relayout_copies_of(
+    buffers: Sequence[LifetimeBoundBuffer], capacity: int | None = None
+) -> list[RelayoutCopyBuffer]:
+    """The candidate relayout copies of a solve given in buffer form (tests,
+    capture replay): what :meth:`TableCandidates._relayout_copies` builds
+    for the same nodes and candidates."""
+    from torch_spyre._inductor.scratchpad.buffer_graph import build_graph
+
+    graph = build_graph(
+        [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)],
+        1,
+        1 << 62,
+        empty_graph(0, "open").settings,
+    )
+    return TableCandidates._relayout_copies(
+        graph, CandidateTables.of_buffers(buffers), capacity
+    )
+
+
+def residency_symbols(graph: SpyreOptimizationGraph, tables: CandidateTables) -> dict:
+    """Each node's and candidate copy's residency symbol (``is_lx_<name>``),
+    what the cost model prices an LX read or write by."""
+    out = {n.name: n.sym_is_lx for n in graph.get_nodes()}
+    out.update({c.name: c.sym_is_lx for c in tables.copies})
+    return out
 
 
 class RelayoutEdge:
@@ -393,12 +425,14 @@ class TableCandidates:
         # Ops whose menu is their space's points, not the legal divisions.
         self.point_menus: set[str] = set()
 
-    def _prepare_buffers(
+    def prepare_graph(
         self,
         graph: GraphLowering,
         *,
         lx_relayout_plans: list[LXRelayoutPlan] | None = None,
-    ) -> Sequence[Any]:
+    ) -> tuple[SpyreOptimizationGraph, CandidateTables]:
+        """The open-mode graph of ``graph`` and the table strategy's
+        candidates for it."""
         # Joint selection derives its own divisions; fixed-division plans do not apply.
         # Validate the post-loop drain plans exactly once, here, before the
         # solver runs: the residency gate, the lifetime extension and the push
@@ -421,22 +455,23 @@ class TableCandidates:
             for name in list(self.point_menus):
                 self._materialize(divisions, name)
         while True:
-            buffers = self._build_cd_bound_buffers(graph, in_place, division_map)
+            solve_graph, tables = self._build_graph(graph, in_place, division_map)
             if not pending:
-                return buffers
+                return solve_graph, tables
             pricing = {
-                op.get_name(): op for op in self._pricing_operations(graph, buffers)
+                op.get_name(): op
+                for op in self._pricing_operations(graph, solve_graph, tables)
             }
             rejected = [
                 name
                 for name, op in pending.items()
                 if pricing.get(name) is op
                 or not self._direct_read_candidates_priced(
-                    pricing.get(name), divisions[name], buffers
+                    pricing.get(name), divisions[name], solve_graph, tables
                 )
             ]
             if not rejected:
-                return buffers
+                return solve_graph, tables
             for name in rejected:
                 op = pending.pop(name)
                 fixed = _fixed_core_division(op)
@@ -454,14 +489,14 @@ class TableCandidates:
             # per deferred read, without changing the graph or the late proof.
 
     @staticmethod
-    def _direct_read_candidates_priced(op, divisions, buffers) -> bool:
+    def _direct_read_candidates_priced(op, divisions, graph, tables) -> bool:
         from torch_spyre._inductor.cost_model import transport_dma_cost_available
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 
-        if op is None or not any(buf.name == op.get_name() for buf in buffers):
+        if op is None or op.get_name() not in graph.nodes:
             return False
-        is_lx = {buf.name: buf.sym_is_lx for buf in buffers}
+        is_lx = residency_symbols(graph, tables)
         return all(
             transport_dma_cost_available(
                 extract_op_features(op, _work_slices(op, division), is_lx=is_lx),
@@ -471,19 +506,22 @@ class TableCandidates:
         )
 
     @staticmethod
-    def _pricing_operations(graph, buffers):
+    def _pricing_operations(graph, solve_graph, tables):
         from torch_spyre._inductor.read_copy_elision import (
             project_transport_read_copies,
         )
 
+        splits = {
+            n.name: [cd.splits for cd in tables.menus.get(n.name, ())]
+            for n in solve_graph.get_nodes()
+        }
+        splits.update(
+            {c.name: [cd.splits for cd in c.core_divisions] for c in tables.copies}
+        )
         return project_transport_read_copies(
             graph,
-            {buf.name: [cd.splits for cd in buf.core_divisions] for buf in buffers},
-            relayout_sources={
-                buf.relayout_parent
-                for buf in buffers
-                if isinstance(buf, RelayoutCopyBuffer)
-            },
+            splits,
+            relayout_sources={c.relayout_parent for c in tables.copies},
         )
 
     def _division_map(
@@ -947,25 +985,26 @@ class TableCandidates:
             drain_plans=drain_plans,
         )
 
-    def _build_cd_bound_buffers(
+    def _build_graph(
         self,
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
         division_map: "_DivisionMap",
-    ) -> list[CoreDivisionBuffer]:
-        """Build the ``CoreDivisionBuffer``s handed to the solver.
+    ) -> tuple[SpyreOptimizationGraph, CandidateTables]:
+        """The open-mode graph of ``graph`` and its candidates.
 
-        Every buffer carries its candidate divisions and is sized by its
-        *total* device footprint plus its producer edges (``parent_proj``); the
-        solver picks a division and divides by its ``output_partition``.
-        Counted-loop lifetimes still filter unsafe in-place handoffs before the
-        solver compares those total footprints.
+        Each node is an op output or an input clone of the IR, sized by its
+        *total* device footprint, with an edge to each producer it reads
+        (``parent_proj``); the solver picks a division and divides by its
+        ``output_partition``. Counted-loop lifetimes still filter unsafe
+        in-place handoffs before the solver compares those total footprints.
 
-        Each buffer also carries the same two relations *per candidate*, for a
-        solver that generates divisions rather than indexing the list: the
-        residency edge to each divided producer, and -- where
+        The tables hold each node's candidate divisions and each edge's pair
+        table and relayout candidates, and the same relations *per candidate*
+        for a solver that generates divisions rather than indexing the list:
+        the residency edge to each divided producer, and -- where
         :class:`_DivisionMap` allows one and the solver is one that generates
-        (see :attr:`_solver_generates_divisions`) -- its op's split space.
+        (see :attr:`_solver_generates_divisions`) -- the op's split space.
         """
         divisions = division_map.divisions
         # Per-plan interning of relayout destination views (see
@@ -1001,7 +1040,9 @@ class TableCandidates:
                         readers_by_name.setdefault(name, []).append(reader)
 
         prep_cache: dict = {}
-        buffers: list[CoreDivisionBuffer] = []
+        g = empty_graph(self.allocator.size, "open")
+        tables = CandidateTables()
+        node_reads: list[tuple[str, list[str], list[str]]] = []
         residency_by_buf = self._residency_by_buf(
             graph, mem_usage, lifetimes, drain_plans
         )
@@ -1078,24 +1119,20 @@ class TableCandidates:
                 ).append(input_name)
                 dev_layout = graph.get_buffer(input_name).layout.device_layout
                 size = get_device_size_in_bytes(dev_layout)
-                buffers.append(
-                    CoreDivisionBuffer(
-                        input_name,
-                        size,
-                        lifetimes[input_name],
-                        first_use_is_read=True,
-                        in_place_parents=[],
-                        core_divisions=divs,
-                        parents=[],
-                        cd_parent_matches={},
-                        residency_reason=None,
-                        lifetime_start_override=lifetime_start_overrides.get(
-                            input_name
-                        ),
-                        lifetime_end_override=lifetime_end_overrides.get(input_name),
-                        boundary=BufferType.Input,
-                    )
+                g.add_ir_node(
+                    input_name,
+                    nbytes=size,
+                    uses=lifetimes[input_name],
+                    first_use_is_read=True,
+                    boundary=BufferType.Input,
+                    start_override=lifetime_start_overrides.get(input_name),
+                    end_override=lifetime_end_overrides.get(input_name),
+                    sym_core_divs=sym_core_divs_for(input_name, divs),
+                    sym_tile_counts=sym_tile_counts_for(input_name, divs, None),
+                    open_split=True,
                 )
+                tables.menus[input_name] = tuple(divs)
+                tables.parents[input_name] = []
 
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
@@ -1312,48 +1349,74 @@ class TableCandidates:
                 ):
                     parents.append(clone_name)
 
-            buffer = CoreDivisionBuffer(
-                output_name,
-                size,
-                uses,
-                # An op output is a computed buffer: ``uses[0]`` is the
-                # producing write, as on the placement path above. (Only the
-                # input-clone loop above sets this True.)
-                first_use_is_read=False,
-                in_place_parents=parents,
-                core_divisions=buf_divisions,
-                parents=parent_proj,
-                cd_parent_matches=cd_parent_matches,
-                cd_parent_relayouts=cd_parent_relayouts,
-                residency_edges=residency_edges,
-                clone_reads=clone_reads,
-                relayout_edges=relayout_edges,
-                residency_reason=residency_reason,
-                lifetime_start_override=lifetime_start_overrides.get(output_name),
-                lifetime_end_override=lifetime_end_overrides.get(output_name),
-                op_position=position_by_name.get(output_name),
-                boundary=BufferType.Output
-                if output_name in graph_output_names
-                else BufferType.Intermediate,
-            )
+            division_space = None
             if (
                 op is not None
                 and output_name in division_map.enumerated
                 and self.allocator._solver_generates_divisions
             ):
-                buffer.division_space = self._division_space(
+                division_space = self._division_space(
                     op, readers_by_name.get(output_name, ())
                 )
+            g.add_ir_node(
+                output_name,
+                nbytes=size,
+                uses=uses,
+                # An op output is a computed buffer: ``uses[0]`` is the
+                # producing write. (Only the input-clone loop above reads first.)
+                first_use_is_read=False,
+                boundary=BufferType.Output
+                if output_name in graph_output_names
+                else BufferType.Intermediate,
+                residency_reason=residency_reason,
+                start_override=lifetime_start_overrides.get(output_name),
+                end_override=lifetime_end_overrides.get(output_name),
+                op=op,
+                space=division_space,
+                sym_core_divs=sym_core_divs_for(output_name, buf_divisions),
+                sym_tile_counts=sym_tile_counts_for(
+                    output_name, buf_divisions, division_space
+                ),
+                open_split=bool(buf_divisions),
+            )
+            if buf_divisions:
+                tables.menus[output_name] = tuple(buf_divisions)
+            node_reads.append((output_name, parent_proj, parents))
+            for parent, pairs in cd_parent_matches.items():
+                tables.matches[(parent, output_name)] = pairs
+            for parent, cands in cd_parent_relayouts.items():
+                tables.relayouts[(parent, output_name)] = cands
+            for parent, residency in residency_edges.items():
+                tables.residency[(parent, output_name)] = residency
+            for parent, clone in clone_reads.items():
+                tables.clone_reads[(parent, output_name)] = clone
+            for parent, relayout in relayout_edges.items():
+                tables.relayout_edges[(parent, output_name)] = relayout
+            position = position_by_name.get(output_name)
+            if position is not None:
+                tables.positions[output_name] = position
             if output_name in division_map.enumerated:
-                buffer.lazy_space = self.lazy_spaces.get(output_name)
-                buffer.menu_is_points = output_name in self.point_menus
+                space = self.lazy_spaces.get(output_name)
+                if space is not None:
+                    tables.lazy_spaces[output_name] = space
+                if output_name in self.point_menus:
+                    tables.point_menus.add(output_name)
             if self.allocator._solver_chooses_tilings and isinstance(
                 op, ComputedBuffer
             ):
-                buffer.tile_reads = self._tile_reads(graph, op, op_by_name)
-            buffers.append(buffer)
-        buffers.extend(self._relayout_copy_buffers(buffers, self.allocator.size))
-        return buffers
+                tile_reads = self._tile_reads(graph, op, op_by_name)
+                if tile_reads:
+                    tables.tile_reads[output_name] = tile_reads
+        for name, parent_proj, in_place_parents in node_reads:
+            g.add_reads(g.nodes[name], parent_proj, in_place_parents)
+            tables.parents[name] = [
+                p
+                for p in dict.fromkeys([*parent_proj, *in_place_parents])
+                if p in g.nodes
+            ]
+        g.link_execution_order()
+        tables.copies = self._relayout_copies(g, tables, self.allocator.size)
+        return g, tables
 
     @staticmethod
     def _tile_reads(
@@ -1462,14 +1525,15 @@ class TableCandidates:
         return edges
 
     @staticmethod
-    def _relayout_copy_buffers(
-        buffers: Sequence[CoreDivisionBuffer],
+    def _relayout_copies(
+        graph: SpyreOptimizationGraph,
+        tables: CandidateTables,
         capacity: int | None = None,
     ) -> list[RelayoutCopyBuffer]:
-        """One :class:`RelayoutCopyBuffer` per relayout group enumerated across
-        ``buffers``: the destination the solver places, live from the group's
-        first consumer to its last, carrying every priced candidate that lands
-        on it. A group whose source is not among the buffers has nothing to
+        """One candidate copy per relayout group enumerated across the
+        graph's edges: the destination the solver places, live from the
+        group's first consumer to its last, carrying every priced candidate
+        that lands on it. A group whose source is not a node has nothing to
         shuffle from and gets no copy; the solver then ignores its candidates.
 
         ``capacity`` is the planner's per-core LX budget. A group whose
@@ -1479,18 +1543,15 @@ class TableCandidates:
         group has none). On the 304-op decode attention graph these copies are a
         measurable share of a model whose presolve alone outlived the time limit.
         """
-        by_name = {b.name: b for b in buffers}
         groups: dict[tuple[str, int], list[RelayoutCandidate]] = {}
-        for consumer in buffers:
-            for candidates in consumer.cd_parent_relayouts.values():
-                for candidate in candidates:
-                    groups.setdefault(candidate.group_key, []).append(candidate)
-        ticks = {b.name: b.start_time for b in buffers}
+        for candidates in tables.relayouts.values():
+            for candidate in candidates:
+                groups.setdefault(candidate.group_key, []).append(candidate)
+        ticks = {n.name: n.start_time for n in graph.get_nodes()}
         copies: list[RelayoutCopyBuffer] = []
         oversized = 0
         for (parent, group), candidates in sorted(groups.items()):
-            source = by_name.get(parent)
-            if source is None:
+            if parent not in graph.nodes:
                 logger.debug(
                     "[lx solver relayout] %s/g%d: source is not in the solve; "
                     "no copy built",
@@ -1498,7 +1559,7 @@ class TableCandidates:
                     group,
                 )
                 continue
-            copy = build_relayout_copy(source, group, candidates, ticks)
+            copy = build_relayout_copy(parent, group, candidates, ticks)
             if capacity is not None and copy.per_core_footprint > capacity:
                 oversized += 1
                 continue
