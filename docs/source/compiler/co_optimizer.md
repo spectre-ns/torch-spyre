@@ -141,7 +141,7 @@ the wrapped solver runs once more to produce the final LX/HBM addresses.
 
 For example: a producer with 2 candidate divisions feeding a consumer with 2 of its own is a
 `2×2 = 4`-leaf DFS. Say only one of those four pairings avoids a `core_div_mismatch` between
-them, per `_cd_parent_matches()` (`allocator.py`) — the same relation the production solvers use
+them, per `_cd_parent_matches()` (`table_candidates.py`) — the same relation the production solvers use
 to decide which combinations even make a buffer LX-eligible via its `cd_parent_matches` field,
 not a check bolted on separately here. The three mismatched leaves each spill one buffer to HBM
 and score accordingly; the matching leaf scores zero (both pin). `ExhaustiveSearchSolver` tries

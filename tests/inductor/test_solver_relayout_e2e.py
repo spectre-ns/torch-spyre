@@ -38,6 +38,8 @@ import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad import allocator as alloc_mod
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
+import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_module
 
 
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
@@ -142,9 +144,7 @@ class _Observed:
         monkeypatch.setattr(sdsc_mod, "is_lx_relayout_identity", spy_identity_codegen)
         monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_identity_kernel)
         if force:
-            monkeypatch.setattr(
-                alloc_mod.CoOptimizingAllocator, "_cd_parent_matches", _no_matches
-            )
+            monkeypatch.setattr(TableCandidates, "_cd_parent_matches", _no_matches)
         torch._inductor.codecache.FxGraphCache.clear()
         torch._dynamo.reset()
 
@@ -651,7 +651,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tables = []
-    orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+    orig_tables = TableCandidates._cd_parent_relayouts
 
     def spy_tables(self, *args, **kwargs):
         out = orig_tables(self, *args, **kwargs)
@@ -659,9 +659,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
             tables.append(out)
         return out
 
-    monkeypatch.setattr(
-        alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
-    )
+    monkeypatch.setattr(TableCandidates, "_cd_parent_relayouts", spy_tables)
 
     recorded = []
     real_materialize = alloc_mod.materialize_lx_relayouts
@@ -751,7 +749,7 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
 
     def run_and_collect_candidates():
         tables = []
-        orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+        orig_tables = TableCandidates._cd_parent_relayouts
 
         def spy_tables(self, *args, **kwargs):
             out = orig_tables(self, *args, **kwargs)
@@ -760,9 +758,7 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
             return out
 
         with monkeypatch.context() as m:
-            m.setattr(
-                alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
-            )
+            m.setattr(TableCandidates, "_cd_parent_relayouts", spy_tables)
             torch._inductor.codecache.FxGraphCache.clear()
             torch._dynamo.reset()
             a = ha.to("spyre")
@@ -789,7 +785,7 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     )
 
     with monkeypatch.context() as m:
-        m.setattr(alloc_mod, "_coarse_tile_loop_trip_count", lambda op: 1)
+        m.setattr(table_candidates_module, "_coarse_tile_loop_trip_count", lambda op: 1)
         _, unscaled_candidates = run_and_collect_candidates()
     assert unscaled_candidates, "forcing trip count to 1 should not remove candidates"
     unscaled_by_key = {_key(c): c.cost_ns for c in unscaled_candidates}

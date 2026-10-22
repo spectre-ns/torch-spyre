@@ -43,6 +43,7 @@ from torch_spyre._inductor.pass_utils import op_read_writes
 from torch_spyre._inductor.patches import enable_spyre_context
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
+from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -2158,7 +2159,6 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
     def test_attention_before_padded_ffn_keeps_division_candidates(self):
         """The #4990 pad must not pin the upstream attention's divisions."""
         from torch_spyre._inductor.pass_utils import _is_matmul_op
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
         from torch_spyre._inductor.scratchpad.utils import _writes_at_constant_offset
 
         def fn(q, k, v, gate_up, down):
@@ -2175,7 +2175,7 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
         )
         expected = fn(*(t.cpu() for t in args))
         captured = []
-        original = CoOptimizingAllocator._division_map
+        original = TableCandidates._division_map
 
         def capture(allocator, graph, **kwargs):
             division_map = original(allocator, graph, **kwargs)
@@ -2198,7 +2198,7 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
             return division_map
 
         with (
-            patch.object(CoOptimizingAllocator, "_division_map", capture),
+            patch.object(TableCandidates, "_division_map", capture),
             ts_inductor_config.patch(
                 lx_planning=True,
                 co_optimizing_lx_planning=True,
@@ -2229,7 +2229,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         must never be offered as an in-place parent pre-solver. The assertion locks
         the shared gate into this path; index-specific eligibility is covered by
         PointwiseInPlaceInputsTest."""
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2244,7 +2243,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         violations: list[str] = []
         edge_count = [0]
         called = [False]
-        orig = CoOptimizingAllocator._determine_in_place_division_invariant
+        orig = TableCandidates._determine_in_place_division_invariant
 
         def spy(self, graph):
             result = orig(self, graph)
@@ -2254,7 +2253,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 op = op_by_name.get(buf_name)
                 if op is None:
                     continue
-                eligible = self._op_inputs_good_for_lx_inplace(op)
+                eligible = self.allocator._op_inputs_good_for_lx_inplace(op)
                 for parent in parents:
                     edge_count[0] += 1
                     if parent not in eligible:
@@ -2262,7 +2261,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return result
 
         with patch.object(
-            CoOptimizingAllocator,
+            TableCandidates,
             "_determine_in_place_division_invariant",
             spy,
         ):
@@ -2348,7 +2347,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         """The co-optimizing (joint CP-SAT) path also lets an input clone's last
         consumer name it as an in-place parent, with the merge gate populated
         (issue #3212). Mirrors the placement-path test above on the joint builder."""
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
         from torch_spyre._inductor.scratchpad.plan_solver import BufferType
 
         x = self.rand_device((64, 1024))
@@ -2357,14 +2355,14 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return x * 2.0 + x * 3.0
 
         captured: list[list] = []
-        orig = CoOptimizingAllocator._build_cd_bound_buffers
+        orig = TableCandidates._build_cd_bound_buffers
 
         def spy(self, *a, **k):
             bufs = orig(self, *a, **k)
             captured.append(list(bufs))
             return bufs
 
-        with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+        with patch.object(TableCandidates, "_build_cd_bound_buffers", spy):
             with ts_inductor_config.patch(
                 lx_planning=True,
                 layout_solver="cpsat",
@@ -2407,15 +2405,13 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         solver's eventual choice."""
         import inspect
 
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-
         x = self.rand_device((64, 1024))
 
         def fn(x):
             return x * 2.0 + x * 3.0
 
         captured: list[set] = []
-        orig = CoOptimizingAllocator._cd_parent_relayouts
+        orig = TableCandidates._cd_parent_relayouts
 
         def spy(self, *a, **k):
             bound = inspect.signature(orig).bind(self, *a, **k)
@@ -2430,7 +2426,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         # parent and satisfy the ordering assertion without any clone being
         # visible.
         clone_names: set[str] = set()
-        orig_cdm = CoOptimizingAllocator._clone_divisions_and_matches
+        orig_cdm = TableCandidates._clone_divisions_and_matches
 
         def spy_cdm(self, input_name, *a, **k):
             divs, matches = orig_cdm(self, input_name, *a, **k)
@@ -2439,10 +2435,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return divs, matches
 
         with (
-            patch.object(CoOptimizingAllocator, "_cd_parent_relayouts", spy),
-            patch.object(
-                CoOptimizingAllocator, "_clone_divisions_and_matches", spy_cdm
-            ),
+            patch.object(TableCandidates, "_cd_parent_relayouts", spy),
+            patch.object(TableCandidates, "_clone_divisions_and_matches", spy_cdm),
         ):
             with ts_inductor_config.patch(
                 lx_planning=True,
@@ -2625,7 +2619,6 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         (joint CP-SAT) path: a returned buffer whose LX slot is reused in place must
         still be handed back to the caller intact (#3212)."""
         from torch_spyre._inductor.pass_utils import op_short_name
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -2639,7 +2632,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         output_feeders: set[str] = set()
         captured: list[list] = []
-        orig = CoOptimizingAllocator._build_cd_bound_buffers
+        orig = TableCandidates._build_cd_bound_buffers
 
         def spy(self, *a, **k):
             bufs = orig(self, *a, **k)
@@ -2655,7 +2648,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
-            with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+            with patch.object(TableCandidates, "_build_cd_bound_buffers", spy):
                 with ts_inductor_config.patch(
                     lx_planning=True,
                     layout_solver="cpsat",
@@ -2855,17 +2848,16 @@ class TestGeneratedCoreDivisions(BaseTestScratchpadUsage):
         The assertions run inside the spy: the split space and the residency
         edges hold live Inductor IR, which needs the virtualized compile context
         that ``torch.compile`` tears down on exit."""
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         checked: set[str] = set()
-        orig = CoOptimizingAllocator._build_cd_bound_buffers
+        orig = TableCandidates._build_cd_bound_buffers
 
         def spy(inner_self, *args, **kwargs):
             buffers = orig(inner_self, *args, **kwargs)
             self._check_buffers(buffers, checked)
             return buffers
 
-        with patch.object(CoOptimizingAllocator, "_build_cd_bound_buffers", spy):
+        with patch.object(TableCandidates, "_build_cd_bound_buffers", spy):
             with ts_inductor_config.patch(
                 lx_planning=True,
                 layout_solver="simulated_annealing",

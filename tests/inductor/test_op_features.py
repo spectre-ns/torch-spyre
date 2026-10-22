@@ -46,6 +46,7 @@ from torch_spyre._inductor.cost_model import (
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "cooptimization_op_features.json")
 
@@ -98,6 +99,10 @@ class CandidateDivisionTest(TestCase):
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
             ),
+            patch(
+                "torch_spyre._inductor.scratchpad.table_candidates.op_read_writes",
+                return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
+            ),
         ):
             CoOptimizingAllocator._extract_op_features(
                 None, None, "out", buffers, {}, op=op
@@ -110,7 +115,7 @@ class CandidateDivisionTest(TestCase):
 
             # Shortlisting prices only candidate 0, but applicability must still
             # see candidate 1. Otherwise symbolic and concrete prices disagree.
-            CoOptimizingAllocator._relayout_consumer_costs(
+            TableCandidates._relayout_consumer_costs(
                 op, divisions, "weight", [SimpleNamespace(consumer_division=0)]
             )
             extract.assert_called_once()

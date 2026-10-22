@@ -817,11 +817,15 @@ def test_joint_allocation_does_not_consume_fixed_plan_handoff():
     division_map = allocator_module._DivisionMap({}, set())
     with (
         mock_patch.object(
-            allocator, "_determine_in_place_division_invariant", return_value={}
+            allocator.candidates,
+            "_determine_in_place_division_invariant",
+            return_value={},
         ),
-        mock_patch.object(allocator, "_division_map", return_value=division_map),
         mock_patch.object(
-            allocator, "_build_cd_bound_buffers", return_value=[]
+            allocator.candidates, "_division_map", return_value=division_map
+        ),
+        mock_patch.object(
+            allocator.candidates, "_build_cd_bound_buffers", return_value=[]
         ) as build,
         mock_patch.object(allocator_module, "collect_lx_relayout_plans") as collect,
     ):

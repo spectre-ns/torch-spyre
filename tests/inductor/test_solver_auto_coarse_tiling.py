@@ -54,6 +54,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
 )
 from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr import for_each_tile
+from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_scratchpad_use import _ParameterizedScratchpadMeta  # noqa: E402
@@ -683,7 +684,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         cfg = {**self._AUTO_CFG, **overrides}
         with ts_inductor_config.patch(cfg):
             alloc = select_allocator()
-            return alloc._tiling_candidates(op, cfg["sencores"])
+            return alloc.candidates._tiling_candidates(op, cfg["sencores"])
 
     def test_untiled_dropped_for_overspan_unhinted_op(self):
         op = _pointwise_op(_OVERFLOW_SHAPE)
@@ -732,7 +733,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
 
         self.assertIn(unit_tile, self._candidates(op))
         with patch.object(
-            CoOptimizingAllocator,
+            TableCandidates,
             "_readers_by_name",
             {op.get_name(): [reader]},
             create=True,
@@ -746,7 +747,7 @@ class DiscoveryReadDistanceTests(unittest.TestCase):
         op = _pointwise_op((1, 2, 16, 64))
         self.assertGreater(len(self._candidates(op)), 1)  # non-vacuity
         with patch.object(
-            CoOptimizingAllocator,
+            TableCandidates,
             "_prescribed_ops",
             frozenset({op.get_operation_name()}),
             create=True,
@@ -854,7 +855,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
                     return consumer_menu
 
                 stack.enter_context(
-                    patch.object(CoOptimizingAllocator, "_tiling_candidates", offered)
+                    patch.object(TableCandidates, "_tiling_candidates", offered)
                 )
             stack.enter_context(torch.no_grad())
             stack.enter_context(t_inductor_config.patch(force_disable_caches=True))

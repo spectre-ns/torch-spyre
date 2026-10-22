@@ -30,9 +30,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from cooptimization_capture_loader import load_captures  # noqa: E402
 from synthetic_cooptimization_graphs import synthetic_graphs  # noqa: E402
-from torch_spyre._inductor.scratchpad.allocator import (  # noqa: E402
-    CoOptimizingAllocator,
-)
 from torch_spyre._inductor.scratchpad.buffer_graph import (  # noqa: E402
     DependencyEdge,
     ExecutionEdge,
@@ -52,6 +49,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (  # noqa: E402
     LifetimeBoundBuffer,
     RelayoutCopyBuffer,
 )
+from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 _SETTINGS = SolveSettings(time_limit_seconds=None, bottom_justify=True, record=None)
 
@@ -217,7 +215,7 @@ def test_build_graph_keeps_an_unread_in_place_parent():
 
 @pytest.mark.parametrize("case,buffers", _corpus(), ids=lambda v: v)
 def test_build_graph_matches_the_allocator_buffers(case, buffers):
-    buffers = [*buffers, *CoOptimizingAllocator._relayout_copy_buffers(buffers)]
+    buffers = [*buffers, *TableCandidates._relayout_copy_buffers(buffers)]
     graph = build_graph(buffers, 128, 1 << 14, _SETTINGS)
     names = {b.name for b in buffers}
     for b in buffers:

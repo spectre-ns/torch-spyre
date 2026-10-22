@@ -571,7 +571,9 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
     allocator = CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
-    ordinary, _ = allocator._enumerate_core_divisions(consumer, config.sencores)
+    ordinary, _ = allocator.candidates._enumerate_core_divisions(
+        consumer, config.sencores
+    )
     assert len(ordinary) > 1
     # No hand-built menu: go through the same candidate, clone and relayout
     # construction as the real joint solve.
@@ -582,7 +584,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     result = allocator._solve(solver, graph)
     selected = next(buf for buf in result if buf.name == consumer.name)
     chosen = selected.core_divisions[selected.chosen_division]
-    direct = allocator._pricing_operations(graph, buffers)[0]
+    direct = allocator.candidates._pricing_operations(graph, buffers)[0]
     costs = [
         cm._transport_dma_excess_ns(
             [dcm.extract_op_features(direct, splits)], cm.CostParams()
@@ -621,27 +623,30 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         iteration_space_from_op,
     )
     from torch_spyre._inductor.scratchpad import allocator as am
+    from torch_spyre._inductor.scratchpad import table_candidates as tcm
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
     commit_iteration_space_ownership(consumer, {b: 8, x: 2, n: 1})
     if failure in ("disabled_pricing", "core_budget"):
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
-        )
+        for module in (am, tcm):
+            monkeypatch.setattr(
+                module,
+                "_COST_PARAMS",
+                replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
+            )
         if failure == "core_budget":
             monkeypatch.setattr(config, "sencores", 8)
     elif failure == "unsupported_core_count":
         rates = dict(am._COST_PARAMS.transport_dma_ns_per_request)
         del rates[2]
-        monkeypatch.setattr(
-            am,
-            "_COST_PARAMS",
-            replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
-        )
+        for module in (am, tcm):
+            monkeypatch.setattr(
+                module,
+                "_COST_PARAMS",
+                replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
+            )
     elif failure == "unknown_geometry":
         monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *args: (None, None))
     elif failure == "one_candidate":
@@ -666,7 +671,9 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         monkeypatch.setattr(config, "read_copy_elision", False)
     elif failure == "hint":
         monkeypatch.setattr(config, "ignore_work_division_hints", False)
-        monkeypatch.setattr(am, "has_resolved_work_div_hint", lambda op: op is consumer)
+        monkeypatch.setattr(
+            tcm, "has_resolved_work_div_hint", lambda op: op is consumer
+        )
     allocator = am.CoOptimizingAllocator(CpSatLayoutSolver, size=2**20)
     if failure in ("source_clone", "relayout"):
         from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -675,7 +682,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
             RelayoutCopyBuffer,
         )
 
-        build = allocator._build_cd_bound_buffers
+        build = allocator.candidates._build_cd_bound_buffers
 
         def with_allocation_choice(*args):
             buffers = build(*args)
@@ -696,7 +703,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
             return [*buffers, extra]
 
         monkeypatch.setattr(
-            allocator, "_build_cd_bound_buffers", with_allocation_choice
+            allocator.candidates, "_build_cd_bound_buffers", with_allocation_choice
         )
     if failure == "core_budget":
         with pytest.raises(AssertionError, match="fixed direct-read division over"):

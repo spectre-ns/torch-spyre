@@ -2105,9 +2105,9 @@ class ApplyGroupAgreementTest(TestCase):
         self.enterContext(patch_row_major_out_coords())
 
     def _solver(self, operations):
-        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
-
         from torch._inductor.virtualized import V
+
+        from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
         op_by_name = {op.get_name(): op for op in operations}
         bufs = []
@@ -2115,7 +2115,7 @@ class ApplyGroupAgreementTest(TestCase):
             buf = _run_buffer(
                 op.get_name(), at, _two_axis_space(tiling=_tiling_space())
             )
-            buf.tile_reads = CoOptimizingAllocator._tile_reads(V.graph, op, op_by_name)
+            buf.tile_reads = TableCandidates._tile_reads(V.graph, op, op_by_name)
             buf.parents = sorted(buf.tile_reads)
             bufs.append(buf)
         solver = _primed(bufs, 1 << 30)

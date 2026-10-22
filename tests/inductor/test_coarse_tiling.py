@@ -129,6 +129,7 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_index,
     compute_tile_stride,
 )
+import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_module
 from utils_inductor import ir_computed_buffer, ir_input_loader
 
 _FP16 = DataFormats.SEN169_FP16
@@ -9720,10 +9721,24 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             patch.object(utils_module, "op_read_writes", side_effect=read_writes),
             patch.object(allocator_module, "op_read_writes", side_effect=read_writes),
             patch.object(
+                table_candidates_module, "op_read_writes", side_effect=read_writes
+            ),
+            patch.object(
                 allocator_module, "clone_at_graph_boundaries", return_value=False
             ),
             patch.object(
+                table_candidates_module, "clone_at_graph_boundaries", return_value=False
+            ),
+            patch.object(
                 allocator_module,
+                "mem_usage_by_buf",
+                return_value={
+                    name: {"size": 128, "op_inputs": reads}
+                    for name, reads in inputs.items()
+                },
+            ),
+            patch.object(
+                table_candidates_module,
                 "mem_usage_by_buf",
                 return_value={
                     name: {"size": 128, "op_inputs": reads}
@@ -9736,15 +9751,21 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 side_effect=lambda op: inputs[op.name],
             ),
             patch.object(
-                allocator, "_residency_by_buf", return_value=dict.fromkeys(by_name)
+                allocator.candidates,
+                "_residency_by_buf",
+                return_value=dict.fromkeys(by_name),
             ),
-            patch.object(allocator, "_parent_residency_edges", return_value={}),
-            patch.object(allocator, "_cd_parent_matches", return_value={}),
-            patch.object(allocator, "_cd_parent_relayouts", return_value={}),
+            patch.object(
+                allocator.candidates, "_parent_residency_edges", return_value={}
+            ),
+            patch.object(allocator.candidates, "_cd_parent_matches", return_value={}),
+            patch.object(allocator.candidates, "_cd_parent_relayouts", return_value={}),
         ):
-            in_place = allocator._determine_in_place_division_invariant(graph)
+            in_place = allocator.candidates._determine_in_place_division_invariant(
+                graph
+            )
             self.assertEqual(in_place["reader"], ["carry"])
-            built = allocator._build_cd_bound_buffers(
+            built = allocator.candidates._build_cd_bound_buffers(
                 graph, in_place, allocator_module._DivisionMap(divisions, set())
             )
 

@@ -274,6 +274,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT): builds the solve graph from the allocator's buffers and writes its decisions back |
 | `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
 | `encoding_strategy.py` | `EncodingStrategy` / `TableStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
+| `table_candidates.py` | `TableCandidates`: the table encoding's candidates (division menus, view tables, priced relayouts and copies), built for `CoOptimizingAllocator`'s solvers |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |

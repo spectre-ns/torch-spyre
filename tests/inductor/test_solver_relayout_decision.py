@@ -45,7 +45,6 @@ pytest.importorskip("ortools")
 from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import buffer_graph
-from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
@@ -58,6 +57,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     RelayoutCopyBuffer,
     relayout_copy_name,
 )
+from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 _SPILL_NS = 20000.0  # what spilling P charges in the crafted objective
 _CORE = sympy.Symbol("core_id")
@@ -76,9 +76,7 @@ def test_relayout_shortlist_prices_the_consumer(monkeypatch, cap, costs, expecte
         _candidate("C", 0, 1000, group=1, j=1),
     ]
     divisions = [CoreDivision(splits={sympy.Symbol("d0"): 4})] * 2
-    kept = CoOptimizingAllocator._cap_relayout_groups(
-        "P", "C", candidates, divisions, costs
-    )
+    kept = TableCandidates._cap_relayout_groups("P", "C", candidates, divisions, costs)
     assert [c.group for c in kept] == expected
 
 
@@ -138,7 +136,7 @@ def _consumer(name, start, end, candidates, *, matches=()) -> CoreDivisionBuffer
 def _with_copies(*buffers) -> list[CoreDivisionBuffer]:
     """The buffer set the allocator hands the solver: the graph buffers plus
     one copy per relayout group, built by the allocator's own builder."""
-    return [*buffers, *CoOptimizingAllocator._relayout_copy_buffers(list(buffers))]
+    return [*buffers, *TableCandidates._relayout_copy_buffers(list(buffers))]
 
 
 def _objective(buffers, spill_ns=None) -> sympy.Expr:
@@ -345,7 +343,7 @@ def test_copy_buffer_is_the_destination_the_allocator_would_build():
     p = _producer([0, 3])
     c1 = _consumer("C1", 1, 2, [_candidate("C1", 0, 5000.0)])
     c2 = _consumer("C2", 2, 3, [_candidate("C2", 0, 5000.0)])
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c1, c2])
+    (copy,) = TableCandidates._relayout_copy_buffers([p, c1, c2])
     assert copy.name == relayout_copy_name("P", 0)
     assert copy.name.startswith("__spyre_lx_relayout__:"), (
         "must share the synthetic prefix so nothing tries to push or commit it"
@@ -368,7 +366,7 @@ def test_copy_is_sized_by_the_destination_span_not_the_source_share():
     p = _producer([0, 3])
     c1 = _consumer("C1", 1, 2, [_candidate("C1", 0, 5000.0, destination_span=48)])
     c2 = _consumer("C2", 2, 3, [_candidate("C2", 0, 5000.0, destination_span=48)])
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c1, c2])
+    (copy,) = TableCandidates._relayout_copy_buffers([p, c1, c2])
     assert copy.size == 48 * 4 and copy.min_footprint == 48, (
         "per-core footprint must be the destination span, not size / num_cores"
     )
@@ -376,7 +374,7 @@ def test_copy_is_sized_by_the_destination_span_not_the_source_share():
     # disagreement is an enumeration error, never averaged or maxed away.
     c3 = _consumer("C3", 2, 3, [_candidate("C3", 0, 5000.0, destination_span=32)])
     with pytest.raises(AssertionError, match="mixes destination spans"):
-        CoOptimizingAllocator._relayout_copy_buffers([p, c1, c3])
+        TableCandidates._relayout_copy_buffers([p, c1, c3])
 
 
 def test_a_broadcast_copy_lives_on_the_destination_cores():
@@ -390,7 +388,7 @@ def test_a_broadcast_copy_lives_on_the_destination_cores():
         2,
         [_candidate("C", 0, 5000.0, destination_span=48, destination_cores=8)],
     )
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
+    (copy,) = TableCandidates._relayout_copy_buffers([p, c])
     assert copy.num_cores == 8 and copy.size == 48 * 8 and copy.min_footprint == 48
     (group,) = FiredRelayoutGroup.from_chosen(
         [ChosenRelayout(_candidate("C", 0, 5000.0, destination_cores=8), 16)]
@@ -403,7 +401,7 @@ def test_a_broadcast_copy_lives_on_the_destination_cores():
     with pytest.raises(ValueError, match="no physical core count"):
         RelayoutCandidate("P", "C", 0, 0, 0, _view(0), _view(1, None), 1.0, 16, 16)
     with pytest.raises(AssertionError, match="mixes destination core counts"):
-        CoOptimizingAllocator._relayout_copy_buffers(
+        TableCandidates._relayout_copy_buffers(
             [p, c, _consumer("D", 1, 2, [_candidate("D", 0, 5000.0)])]
         )
 
@@ -434,7 +432,7 @@ def test_one_destination_may_be_fed_from_sources_on_different_core_counts():
             ),
         ],
     )
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
+    (copy,) = TableCandidates._relayout_copy_buffers([p, c])
     assert copy.num_cores == 8 and copy.size == 16 * 8
     assert copy.cost_by_source_division == {0: 5000.0, 1: 3000.0}
 
@@ -461,7 +459,7 @@ def test_price_term_charges_the_chosen_source_division_while_resident():
     it here independently of any engine."""
     p = _producer([0, 2], divisions=2)
     c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0), _candidate("C", 1, 3000.0)])
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c])
+    (copy,) = TableCandidates._relayout_copy_buffers([p, c])
     term = copy.cost_term()
     assert term.free_symbols == {copy.sym_is_lx, p.sym_division}
     f = sympy.lambdify([copy.sym_is_lx, p.sym_division], term, modules="math")
@@ -473,14 +471,14 @@ def test_price_disagreement_within_a_group_is_an_error():
     p = _producer([0, 2])
     c1 = _consumer("C1", 1, 2, [_candidate("C1", 0, 5000.0)])
     c2 = _consumer("C2", 1, 2, [_candidate("C2", 0, 7000.0)])
-    (copy,) = CoOptimizingAllocator._relayout_copy_buffers([p, c1, c2])
+    (copy,) = TableCandidates._relayout_copy_buffers([p, c1, c2])
     with pytest.raises(AssertionError, match="disagree on the price"):
         copy.cost_by_source_division
 
 
 def test_group_without_its_source_gets_no_copy():
     c = _consumer("C", 1, 2, [_candidate("C", 0, 5000.0)])
-    assert CoOptimizingAllocator._relayout_copy_buffers([c]) == []
+    assert TableCandidates._relayout_copy_buffers([c]) == []
 
 
 # ---------------------------------------------------------------------------
