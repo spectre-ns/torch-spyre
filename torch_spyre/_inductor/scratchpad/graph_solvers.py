@@ -26,6 +26,9 @@ co-optimizer, exhaustive search) and fills the nodes from what it chose.
 
 from __future__ import annotations
 
+import logging
+import math
+import time
 from typing import Any, Optional, Sequence
 
 import sympy
@@ -42,7 +45,10 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
+    ceil_div,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def placement_view(item: ResourceNode | Transform) -> LifetimeBoundBuffer:
@@ -165,6 +171,118 @@ class BufferSolver:
         return graph.execution_plan()
 
 
+class DecomposedPlacement:
+    """Enumerates the ``Table`` axes (each open node's candidate menu) and
+    solves every leaf's placement with an inner placement-only solver,
+    keeping the leaf with the least HBM traffic (the total bytes of the
+    nodes left out of LX): ``backend.Decomposed`` with a placement heuristic
+    inside, which is the exhaustive search. A leaf bars a producer whose
+    division no consumer's matches, and drops an in-place parent smaller per
+    core than its child."""
+
+    def __init__(self, inner: type[MemoryPlanSolver], capacity: int) -> None:
+        self.inner = inner
+        self.capacity = capacity  # bytes
+        self.last: list[LifetimeBoundBuffer] = []
+
+    def accepts(self, strategy: Any) -> bool:
+        return hasattr(strategy, "menus") and not getattr(strategy, "residency", {})
+
+    def solve(
+        self,
+        graph: SpyreOptimizationGraph,
+        strategy: Any,
+        cost_expr: Optional[sympy.Expr],
+    ) -> list[ResourceNode]:
+        nodes = list(graph.get_nodes())
+        menus = {n.name: strategy.menus.get(n.name, ()) for n in nodes}
+        if any(not cd.tiling.is_untiled for m in menus.values() for cd in m):
+            raise ValueError("Exhaustive search requires untiled candidates")
+        chosen = {n.name: 0 for n in nodes}
+        variable = [n for n in nodes if len(menus[n.name]) > 1]
+
+        def per_core(node: ResourceNode, i: int) -> int:
+            menu = menus[node.name]
+            if not menu:
+                return node.nbytes
+            cd = menu[i]
+            return ceil_div(
+                node.nbytes, cd.output_partition * cd.tiling.output_tile_count
+            )
+
+        def reason(node: ResourceNode) -> Optional[str]:
+            if node.residency_reason is not None:
+                return node.residency_reason
+            for edge in node.outputs:
+                if not edge.reads:
+                    continue
+                pairs = strategy._pairs(edge)
+                pair = (chosen[node.name], chosen[edge.dst.name])
+                if pair not in pairs:
+                    return "core div mismatch"
+            return None
+
+        def views() -> list[LifetimeBoundBuffer]:
+            out = []
+            for node in nodes:
+                view = placement_view(node)
+                size = per_core(node, chosen[node.name])
+                view.size = size
+                view.residency_reason = reason(node)
+                view.in_place_parents = [
+                    p
+                    for p in view.in_place_parents
+                    if size <= per_core(graph.nodes[p], chosen[p])
+                ]
+                out.append(view)
+            return out
+
+        best_total = math.inf
+        best = dict(chosen)
+
+        def score() -> int:
+            allocation = self.inner(views(), self.capacity).plan_layout()
+            pinned = {a.name for a in allocation if a.address is not None}
+            return sum(n.nbytes for n in nodes if n.name not in pinned)
+
+        def recurse(k: int) -> None:
+            nonlocal best_total, best
+            if k == len(variable):
+                hbm = score()
+                if hbm < best_total:
+                    best_total, best = hbm, dict(chosen)
+                return
+            node = variable[k]
+            prev = chosen[node.name]
+            for i in range(len(menus[node.name])):
+                chosen[node.name] = i
+                recurse(k + 1)
+            chosen[node.name] = prev
+
+        t = time.perf_counter()
+        recurse(0)
+        logger.info(
+            "co-opt search: %d paths in %.1fms; winner=%s",
+            math.prod(max(1, len(m)) for m in menus.values()),
+            (time.perf_counter() - t) * 1e3,
+            {
+                n.name: menus[n.name][best[n.name]].label
+                for n in variable
+                if best[n.name]
+            },
+        )
+        chosen.update(best)
+        self.last = self.inner(views(), self.capacity).plan_layout()
+        final = {v.name: v for v in self.last}
+        for node in nodes:
+            if node.work_split is None and menus[node.name]:
+                node.work_split = WorkSplit.of(menus[node.name][chosen[node.name]])
+            v = final[node.name]
+            _write_back(node, v.address, v.spill_reason, graph.alignment)
+        strategy.solved.update({n: chosen[n.name] for n in nodes if menus[n.name]})
+        return graph.execution_plan()
+
+
 def _unused(*args, **kwargs) -> int:
     raise AssertionError("a graph solver posts no model")
 
@@ -196,15 +314,22 @@ def solve_buffers(
         # The allocator's reasons; the capacity check is the solver's own.
         {b.name: b.residency_reason for b in solver.buffers if b.residency_reason},
     )
+    from torch_spyre._inductor.scratchpad.encoding_strategy import TableStrategy
+
     graph.set_solver(spec)
-    graph.solve(cost_expr=cost_expr)
+    strategy = TableStrategy.from_buffers(solver.buffers)
+    graph.solve(cost_expr=cost_expr, strategy=strategy)
     if isinstance(spec, BufferSolver):
         return list(spec.result)
     by_name = {b.name: b for b in solver.buffers}
+    # The inner solver's own reasons: none for a buffer that did not fit.
+    reasons = {v.name: v.spill_reason for v in spec.last}
     for node in graph.get_nodes():
         items: list[ResourceNode | Transform] = [node, *node.pinned_transforms]
         for item in items:
             b = by_name[item.name]
             b.address = None if item.offset is None else item.offset * graph.alignment
-            b.spill_reason = item.spill_reason if not item.resident else None
+            b.spill_reason = reasons.get(item.name)
+        if node in strategy.solved:
+            by_name[node.name].chosen_division = strategy.solved[node]
     return list(solver.buffers)

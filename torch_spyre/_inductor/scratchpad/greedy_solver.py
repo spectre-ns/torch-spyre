@@ -179,13 +179,9 @@ class GreedyLayoutSolver(MemoryPlanSolver):
                 item.address = None
             return
 
-    def _try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
-        if isinstance(bufs, LifetimeBoundBuffer):
-            bufs = [bufs]
-
-        for buf in bufs:
-            if buf in self.usage:
-                self.usage.remove(buf)
+    def _try_deallocate(self, buf: LifetimeBoundBuffer):
+        if buf in self.usage:
+            self.usage.remove(buf)
 
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Allocates addresses to :attr:`buffers`.
