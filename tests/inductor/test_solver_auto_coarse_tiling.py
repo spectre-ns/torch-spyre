@@ -848,7 +848,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             if consumer_menu is not None:
 
                 def offered(alloc, op, max_cores):
-                    if getattr(alloc, "_suppress_tiling", False):
+                    if getattr(alloc.allocator, "_suppress_tiling", False):
                         return [TileSpec()]
                     if _reads_graph_inputs_only(op):
                         return [_D0_BY_4]

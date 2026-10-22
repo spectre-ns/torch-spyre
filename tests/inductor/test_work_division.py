@@ -2388,7 +2388,11 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 {"side_effect": lambda op: op.get_name() == "matmul"},
             ),
         ]:
-            for module in (allocator_module, work_division_module):
+            for module in (
+                allocator_module,
+                table_candidates_module,
+                work_division_module,
+            ):
                 if hasattr(module, target):
                     stack.enter_context(patch.object(module, target, **kwargs))
         return stack
@@ -2803,11 +2807,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         }
 
         def run(with_plan):
-            real_plans = table_candidates_module.validated_drain_plans
+            real_plans = allocator_module.validated_drain_plans
             plans_fn = real_plans if with_plan else (lambda *a, **k: {})
-            with patch.object(
-                table_candidates_module, "validated_drain_plans", plans_fn
-            ):
+            with patch.object(allocator_module, "validated_drain_plans", plans_fn):
                 return self._plan_solve_push(graph, divisions, mem_usage, residency)
 
         with self.subTest("the collective is drained"):
@@ -2880,7 +2882,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.divisions["clone"] = [self.consumer_divs[2]]
         read = self.rw[clone].reads[0].rename({"src": "plain"})
         with self._patches():
-            edge = allocator_module.build_residency_edge(
+            edge = work_division_module.build_residency_edge(
                 "plain", producer, clone, [read], None, {}
             )
             self.assertIsNotNone(edge)
@@ -2918,7 +2920,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                             self._patches(),
                             patch.object(self.rw[producer], "writes", writes),
                         ):
-                            edge = allocator_module.build_residency_edge(
+                            edge = work_division_module.build_residency_edge(
                                 "plain", producer, self.consumer_op, reads, None, {}
                             )
                         if memory in reads and memory in writes:
@@ -2981,7 +2983,7 @@ class TestCloneDivisionMatching(unittest.TestCase):
             ]:
                 stack.enter_context(
                     patch(
-                        f"torch_spyre._inductor.scratchpad.allocator.{target}",
+                        f"torch_spyre._inductor.scratchpad.table_candidates.{target}",
                         **kwargs,
                     )
                 )

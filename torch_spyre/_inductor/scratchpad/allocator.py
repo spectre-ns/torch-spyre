@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable, cast, NamedTuple, Optional
+from typing import Any, Callable, cast, NamedTuple, Optional
 
 import sympy
 from torch._inductor.ir import (
@@ -159,8 +159,6 @@ _COST_PARAMS = CostParams(
     loop_reread_scale=0.0,
 )
 
-if TYPE_CHECKING:
-    pass
 
 logger = get_inductor_logger("scratchpad.allocator")
 
