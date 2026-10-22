@@ -5,6 +5,14 @@ is implemented end to end on `scratchpad-refactor-experimental` as an exploratio
 Each entry says what I assumed in the meantime, so work did not stop on it. Newest
 last. Feasibility results so far: `~/spyre-roadmap/plans/cpsat-graph-buffer-refactor-feasibility.md`.
 
+Status (2026-10-22): stopped at Phase 2 plus 3a (Q11). The zoo benchmark is done:
+every new mode (derived, Lazy with points, digits, point menus) reaches the same
+objective as today's tables on 64/64 solves, and the agreement checks pass (746/746
+derived edges, 1,011/1,011 Lazy edges, 582/582 Lazy spaces). Planning time over the
+zoo, against today's tables with relayouts off: tiling compiles 161 s -> 123 s
+(derived) and 113 s (Lazy + point menus); default compiles 47 s -> 57-70 s, all of
+it CP-SAT time (Q12). The report has the full tables and an implementation guide.
+
 ## Q1. Stage 9: extraction or generation from the op?
 
 Stage 9 is done as an extraction: the candidate derivations moved verbatim from
@@ -94,6 +102,11 @@ and the solve writes its choice back as a menu index (`b.chosen_division`). So t
 planning-time saving of "menus gone" (the plan's ~78 s zoo-tiling column) does not
 show yet; the benchmark will show model size and solve time only.
 
+Update: point menus (`LX_LAZY_MENUS=1`) skip the enumeration for nodes that will be
+Lazy, which takes the zoo-tiling allocator time from 99.6 s to 61.4 s (134.8 s with
+today's tables). The carry, clone and restickify-pricing consumers still get full
+menus.
+
 - Assumed (recommended): keep the menus until Phase 3 (3c/3g) moves those consumers
   onto the graph; report allocator time separately.
 - Answer needed: should removing the menu from the allocator be part of this
@@ -134,3 +147,19 @@ the graph from the IR beside the buffers and must agree with it, and 3g deletes
   work split, digit views, point menus) plus 3a, finish the benchmark, and write the
   implementation guide and results into the feasibility report.
 - Answer needed: do you want a 3c prototype (IR builder plus agreement check) too?
+
+## Q12. CP-SAT is slower on every new encoding
+
+Over the zoo's default compiles, CP-SAT time goes from 12.2 s (pair tables) to
+21.7 s (derived) and 26.9-31.8 s (Lazy). Default compiles have small menus, so the
+allocator has little to save and the total rises 21-48%. On tiling compiles the
+allocator saving outweighs it (-24% derived, -30% Lazy with point menus). Equality
+of id vars propagates worse than a pair table, and Lazy adds product chains and
+reified span terms.
+
+- Assumed (recommended): not investigated further here. The guide lists the
+  candidates (keep pair tables where both menus are small, solution hints from a
+  table solve, a table instead of the product chain for the core count) and says to
+  measure them before making either encoding the default.
+- Answer needed: is a per-compile choice (derived / Lazy only when coarse tiling is
+  on) acceptable, or must the new encoding be no slower everywhere?
