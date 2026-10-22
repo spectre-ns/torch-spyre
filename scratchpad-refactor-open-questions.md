@@ -19,10 +19,15 @@ it CP-SAT time (Q12). The report has the full tables and an implementation guide
 |---|---|
 | Phase 1 plan text: `Transform` / `TransformKind`, `encode_transform` / `encode_transform_use`, `encode_lifetime`, `NodeVars.start/end`, `edge.merged` / `edge.transform`, `chosen_transforms()` | done; same model (smoke 37/37, unit-test solves 99/99) |
 | 2c input clones as constraints (`encode_clone`, `CloneRead`) | done under `LX_VIEW_RELATION=derived`; clone consumers can be Lazy |
-| 2d relayouts as constraints (`LX_RELAYOUT_ENCODING=lazy`, `lazy_relayout.py`) | in progress |
-| 2e in-place as constraints | next |
-| 3a `set_solver`, graph solvers, `Decomposed` | to do |
-| 3b-3g | to do |
+| 2d relayouts as constraints (`LX_RELAYOUT_ENCODING=lazy`, `lazy_relayout.py`) | done; 8 models x 2 configs, no errors, objectives far below no-relayout (attn 31455 -> 21199, transformer 83385 -> 58349), residency within 1 buffer of the table relayouts |
+| 2e in-place as constraints | covered: an in-place edge between Lazy nodes is the derived view relation plus footprint equality, each footprint a table over the axes it varies with (Q13) |
+| 3a `set_solver`, `GraphSolver`, `MarkTableAxis`, `Decomposed` (CP-SAT leaves) | done |
+| 3b node absorbs `lx_view`, relayout plans, paired members (pinned transforms) | done |
+| 3c graph from the IR (`ir_graph.py`, `LX_IR_GRAPH_CHECK`) | done; agreement run in progress |
+| 3d placement solvers read placement views (`PlacementSolver`); greedy drops its isinstance | done |
+| 3e exhaustive search as `DecomposedPlacement`; annealer charges `spill_cost` | done; annealer adjacency stays `op_position` (Q14) |
+| 3f tests moved with the API | done for 3a-3g |
+| 3g one allocator (`division_mode`), `CoOptimizingAllocator` deleted, every solve through `graph.solve` | done; same-plans check in progress; the buffer construction stays (Q15) |
 | Final cleanup: delete redundant code (superseded encodings/arms, the merged allocator subclass, dead helpers) | requested 2026-10-22; last step |
 
 ## Q1. Stage 9: extraction or generation from the op?
@@ -175,3 +180,58 @@ reified span terms.
   measure them before making either encoding the default.
 - Answer needed: is a per-compile choice (derived / Lazy only when coarse tiling is
   on) acceptable, or must the new encoding be no slower everywhere?
+
+## Q13. 2e as a product equality
+
+The plan writes in-place footprint equality as `out_partition * out_tiles`, a
+product equality. Under the Lazy encoding a node's footprint is already a table over
+the axes it varies with (the output splits and the tiling option), and an in-place
+edge posts footprint equality plus the derived view relation, which is the same
+constraint.
+
+- Assumed (recommended): no separate product form; it would add a product chain
+  per node for the same feasible set.
+- Answer needed: none unless you want the literal product form.
+
+## Q14. The annealer's op adjacency
+
+The plan moves `SaCoOptimizingSolver`'s op adjacency onto execution edges. On real
+graphs `op_position` equals each op output's `produced_at`. But 21 annealer tests
+build synthetic buffers whose `uses` all start at tick 0 and rely on `op_position`
+alone, so deriving positions from the chain makes them collide.
+
+- Assumed (recommended): keep `op_position` for the annealer; its spill cost now is
+  `buffer_graph.spill_cost`.
+- Answer needed: rewrite those fixtures (distinct ticks) and drop `op_position`?
+
+## Q15. How far "delete the allocator's buffer construction" goes
+
+3g says the allocator's buffer construction is deleted and the graph is built from the
+IR, with the buffer form of `add_node` kept for tests and replay. Today every
+consumer still reads `CoreDivisionBuffer`s: the CP-SAT strategy (`from_buffers`),
+the annealer (about 2000 lines), and the post-solve commit path (`commit_divisions`,
+`commit_lx_views`, `_apply_chosen_tilings`, `_push_allocation`). The IR graph agrees
+with the buffer graph (3c), so the switch is possible. But it rewrites the annealer
+and the commit path onto nodes, and the plan's own 3e makes the annealer rewrite a
+precondition.
+
+Why it is not one more step: `_build_cd_bound_buffers` derives the solve's incoming
+data (lifetimes and overrides, drain plans, residency reasons, in-place pairs,
+clones, carries) in the same pass as the candidates (menus, match tables,
+relayouts). The commit path needs each buffer's chosen `CoreDivision` (reduction
+symbols, tile splits), which a `WorkSplit` does not carry and only the menu has.
+Splitting that pass is the Stage 9 "generate from the op" work, and the plan
+already lists it as open.
+
+- Assumed (recommended): stop 3g at one allocator class with every solve going
+  through `graph.solve`. The buffers stay the allocator's own structures, which the
+  plan's Interfaces section allows ("writes the decisions it finds on the nodes back
+  to its own structures"). The IR graph (3c) is checked against them. The split is
+  written up in the feasibility report as the next stage, in this order:
+  1. `WorkSplit` carries the chosen `CoreDivision`.
+  2. The commit path reads nodes.
+  3. Incoming data moves into `add_node(op)`.
+  4. Candidates come from the strategy.
+  5. The annealer runs over nodes and the strategy's tables.
+  6. The buffer construction is deleted.
+- Answer needed: should that split be done on this branch before you re-implement?

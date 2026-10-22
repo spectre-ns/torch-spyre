@@ -65,7 +65,10 @@ def build_graph_from_ir(
     ``"committed"`` mode every work split is committed upstream; in
     ``"open"`` an op with a split space in ``spaces`` is left open."""
     from torch_spyre._inductor.pass_utils import op_read_writes
-    from torch_spyre._inductor.scratchpad.utils import calculate_liveness
+    from torch_spyre._inductor.scratchpad.utils import (
+        calculate_liveness,
+        mem_usage_by_buf,
+    )
 
     graph = SpyreOptimizationGraph(
         alignment=alignment,
@@ -74,6 +77,8 @@ def build_graph_from_ir(
         division_mode=division_mode,
     )
     lifetimes = calculate_liveness(lowering)
+    # An op output's total footprint as the allocator sizes it.
+    mem_usage = mem_usage_by_buf(lowering)
     ops = {op.get_name(): op for op in lowering.operations}
     outputs = set(lowering.get_output_names())
     inputs = set(lowering.graph_input_names)
@@ -81,8 +86,12 @@ def build_graph_from_ir(
         uses = lifetimes.get(name) or []
         if not uses:
             continue
-        nbytes = _device_bytes(lowering, name)
         is_input = name in inputs
+        nbytes = (
+            mem_usage[name]["size"]
+            if name in mem_usage and not is_input
+            else _device_bytes(lowering, name)
+        )
         op = None if is_input else ops.get(name)
         space = spaces.get(name) if division_mode == "open" else None
         graph.nodes[name] = ResourceNode(

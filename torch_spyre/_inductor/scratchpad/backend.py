@@ -225,7 +225,7 @@ class Decomposed(CpSat):
         try:
             for leaf in itertools.product(*domains):
                 for p, v in zip(protos, leaf):
-                    p.domain[:] = [v, v]
+                    _set_domain(p, [v, v])
                 status = super().Solve(objective)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     continue
@@ -242,11 +242,16 @@ class Decomposed(CpSat):
                 return cp_model.INFEASIBLE
             # Load the best leaf's solution for Value().
             for p, v in zip(protos, best):
-                p.domain[:] = [v, v]
+                _set_domain(p, [v, v])
             return super().Solve(objective)
         finally:
             for p, d in zip(protos, saved):
-                p.domain[:] = d
+                _set_domain(p, d)
+
+
+def _set_domain(var_proto, domain: list[int]) -> None:
+    var_proto.domain.clear()
+    var_proto.domain.extend(domain)
 
 
 class GraphSolver(Protocol):
