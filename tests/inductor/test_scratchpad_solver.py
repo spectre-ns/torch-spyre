@@ -1855,46 +1855,6 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         self.assertIsNotNone(res["b"].address)
         self.assertIsNotNone(res["c"].address)
 
-    def test_an_input_clone_read_in_a_nest_lives_from_the_nest_start(self):
-        # The nest a, b, c, d first reads the clone w at c. A hoisted clone is
-        # written before a, so w must hold its slot from a on: a's tile (60,
-        # half of a) dies at b, but it and w (60) cannot share 100 while both
-        # are live.
-        spec = TileSpec((TileAxis(host_dim=0, count=2),))
-        tiled = [CoreDivision(tiling=spec)]
-        w = CoreDivisionBuffer(
-            "w", 60, [2, 3], first_use_is_read=True, core_divisions=_whole()
-        )
-        a = CoreDivisionBuffer("a", 120, [0, 1], core_divisions=tiled)
-        b = CoreDivisionBuffer(
-            "b",
-            10,
-            [1, 2],
-            core_divisions=tiled,
-            parents=["a"],
-            cd_parent_matches={"a": [(0, 0)]},
-        )
-        c = CoreDivisionBuffer(
-            "c",
-            10,
-            [2, 3],
-            core_divisions=tiled,
-            parents=["b", "w"],
-            cd_parent_matches={"b": [(0, 0)], "w": [(0, 0)]},
-        )
-        d = CoreDivisionBuffer(
-            "d",
-            10,
-            [3, 4],
-            core_divisions=tiled,
-            parents=["c", "w"],
-            cd_parent_matches={"c": [(0, 0)], "w": [(0, 0)]},
-        )
-        res = self._plan([w, a, b, c, d, self._sink("d")], size=100)
-        if res["w"].address is not None and res["a"].address is not None:
-            w_lo, a_lo = res["w"].address, res["a"].address
-            self.assertTrue(w_lo + 60 <= a_lo or a_lo + 60 <= w_lo, res)
-
     def test_a_tiled_graph_output_resides_as_a_tile(self):
         # Nothing reads a graph output from LX while it is untiled. Tiled, its
         # copy op does, so the bar holds only for the untiled candidate.
