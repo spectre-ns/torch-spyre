@@ -842,7 +842,7 @@ class _SympyExprToCpSat(Printer):
         boolean product per (copy, priced division) had the table been written
         as a sum of deltas. Divisions past the table read 0; a source that is
         not a division-choosing buffer of this solve prices at 0, as it can
-        never fire (``TableStrategy.encode_relayout``)."""
+        never fire (``TableStrategy.encode_transform_use``)."""
         is_lx, division, *prices = expr.args
         table = [int(p) for p in prices]
         lit = self._print(is_lx)

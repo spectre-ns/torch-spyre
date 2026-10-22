@@ -124,6 +124,251 @@ if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
 
 
+class RelayoutEdge:
+    """One (producer, consumer) edge whose read may go through a relayout
+    copy: the division-independent edge context, and the per-pair gates and
+    price of a (source view, destination view) pair. Every per-pair gate is a
+    function of the two per-core views and their core counts, so a strategy
+    can tabulate it over view ids instead of division pairs (2d)."""
+
+    def __init__(
+        self,
+        parent: str,
+        parent_op: Operation,
+        consumer_op: Operation,
+        context: tuple,
+        pair_costs: dict[tuple, Optional[float]],
+        capacity: int,
+    ) -> None:
+        (
+            self.write_dep,
+            self.read_dep,
+            self.prod_coords,
+            self.cons_coords,
+            self.prod_space,
+            self.cons_space,
+        ) = context
+        self.parent = parent
+        self.parent_op = parent_op
+        self.consumer_op = consumer_op
+        self.device_dims = list(parent_op.layout.device_layout.device_size)
+        self.out_elems = math.prod(self.device_dims)
+        self.dtype_bytes = parent_op.get_dtype().itemsize
+        # solver_relayout_edge_context's same-tile-group exception admits a
+        # coarse-tiled parent/consumer pair: that candidate's copy runs once per
+        # loop trip, not once total, so its price must scale by the loop's own
+        # trip count or the solver sees an under-priced option that could
+        # out-rank a correctly-priced alternative whose real total cost is
+        # actually lower (cyang49's PR #5057 review).
+        self.loop_trip_count = _coarse_tile_loop_trip_count(parent_op)
+        # Graph-wide cache: the same (source view, destination view, cores,
+        # tensor geometry) recurs across structurally identical ops (the
+        # unrolled KV blocks of attention), and pricing it re-runs the movement
+        # gate's per-core owner comparison each time.
+        self._pair_costs = pair_costs
+        self.capacity = capacity
+        self._projected: dict[tuple, Optional[TensorWorkDivision]] = {}
+        self._spans: dict[PerCoreView, Optional[int]] = {}
+
+    def source_views(
+        self, divs: Sequence[CoreDivision], prep_cache: dict
+    ) -> list[Optional[PerCoreView]]:
+        """The producer's per-core view under each division; ``None`` where it
+        cannot host a relayout source. Same screens as a matched producer: the
+        source gets LX-pinned exactly like one, so the same coherence bars
+        apply (partial-reduction write, unrepresentable slicing)."""
+        return [
+            view if repr_ok and not partial and not _candidate_tiled(cd) else None
+            for cd, (view, partial, repr_ok) in zip(
+                divs,
+                TableCandidates._views_for_divs(
+                    self.parent_op, self.write_dep, self.parent, list(divs), prep_cache
+                ),
+            )
+        ]
+
+    def consumer_views(
+        self, divs: Sequence[CoreDivision], prep_cache: dict
+    ) -> list[Optional[PerCoreView]]:
+        """The consumer's read view of the producer under each division;
+        ``None`` where it cannot read through a copy."""
+        return [
+            view if repr_ok and not _candidate_tiled(cd) else None
+            for cd, (view, _partial, repr_ok) in zip(
+                divs,
+                TableCandidates._views_for_divs(
+                    self.consumer_op,
+                    self.read_dep,
+                    self.parent,
+                    list(divs),
+                    prep_cache,
+                ),
+            )
+        ]
+
+    def _projected_on(self, view, frame: str) -> Optional[TensorWorkDivision]:
+        """``view``'s ownership projected into loop symbols on the producer
+        (``"prod"``) or consumer frame (the committed path's
+        ``work_division_from_view`` gates), cached per view: several
+        candidates often induce the same view. The projected division is kept
+        (not just a bool) because the transition gate compares source and
+        destination divisions for equality."""
+        key = (view, frame)
+        if key not in self._projected:
+            coords, space = (
+                (self.prod_coords, self.prod_space)
+                if frame == "prod"
+                else (self.cons_coords, self.cons_space)
+            )
+            try:
+                self._projected[key] = work_division_from_view(
+                    view, self.device_dims, coords, space
+                )
+            except ValueError:
+                self._projected[key] = None
+        return self._projected[key]
+
+    def _span(self, view: PerCoreView) -> Optional[int]:
+        """The per-core LX span of a view (#3440's reservation for a relayout
+        member). Unavailable (non-standard arrangement, an unsplittable stick
+        axis) is a decline, as on the committed path: without a size the copy
+        cannot be placed, so the pair is never offered."""
+        if view not in self._spans:
+            try:
+                self._spans[view] = partition_footprint(self.parent_op.layout, view)
+            except (TypeError, ValueError) as exc:
+                logger.debug(
+                    "[lx solver relayout] %s: span unavailable for view %s: %s",
+                    self.parent,
+                    dict(view.work_slice_dims),
+                    exc,
+                )
+                self._spans[view] = None
+        return self._spans[view]
+
+    def price(
+        self, pv: PerCoreView, cv: PerCoreView, ncores: int, dst_cores: int
+    ) -> Optional[tuple[float, int, int]]:
+        """``(cost_ns, source span, destination span)`` of reading through a
+        copy from source view ``pv`` on ``ncores`` cores to destination view
+        ``cv`` on ``dst_cores``, or ``None`` when the pair cannot relayout.
+        The caller has already ruled out equal views (a match, not a
+        shuffle)."""
+        # The committed collector's consumer rules (#3440): the core domains,
+        # then the gather rule on the destination view; the geometric half is
+        # movement_supported's, inside the pair cost.
+        if core_domain_rejection(ncores, dst_cores):
+            return None
+        if grouped_gather_rejection(self.consumer_op, ncores, cv):
+            return None
+        if self._projected_on(pv, "prod") is None:
+            return None
+        # The relayout copy iterates the producer's shape, so the destination
+        # view must also project on the producer frame (materialize_lx_relayouts
+        # commits it there and raises).
+        if self._projected_on(cv, "prod") is None:
+            return None
+        src_division = self._projected_on(pv, "cons")
+        dst_division = self._projected_on(cv, "cons")
+        if src_division is None or dst_division is None:
+            return None
+        # Distinct per-core views that collapse to one logical work division
+        # would codegen as a plain identity copy with the cross-core movement
+        # silently omitted (#3926); the solver must never be offered such a pair.
+        if (
+            _unsupported_relayout_transition_reason(src_division, dst_division)
+            is not None
+        ):
+            return None
+        source_span, destination_span = self._span(pv), self._span(cv)
+        if (
+            source_span is None
+            or destination_span is None
+            or destination_span > self.capacity
+        ):
+            return None
+        key = (
+            pv,
+            cv,
+            ncores,
+            dst_cores,
+            tuple(self.device_dims),
+            self.out_elems,
+            self.dtype_bytes,
+        )
+        if key not in self._pair_costs:
+            self._pair_costs[key] = solver_relayout_pair_cost(
+                pv,
+                cv,
+                ncores,
+                self.device_dims,
+                self.out_elems,
+                self.dtype_bytes,
+                destination_num_cores=dst_cores,
+            )
+        cost = self._pair_costs[key]
+        if cost is None:
+            return None
+        # The cache is graph-wide and keyed on geometry alone (shared across
+        # parents), so the trip multiplier is applied to this pair's own cost,
+        # never written back into the cached value.
+        return cost * self.loop_trip_count, source_span, destination_span
+
+
+def _candidate_tiled(cd: CoreDivision) -> bool:
+    """A coarse-tiled candidate can never host a relayout, for the same
+    reasons a coarse-tiled op cannot in general (its buffer is per-tile
+    scratch)."""
+    tiling = getattr(cd, "tiling", None)
+    return tiling is not None and not getattr(tiling, "is_untiled", True)
+
+
+class CloneRead:
+    """How one consumer reads an input clone (2c). A clone has no write view
+    of its own: its view is the one its consumers read it with, so each
+    consumer division maps to the clone view its read has (an index into the
+    clone's menu), or to none (-2) when that read is unrepresentable or a
+    broadcast. The relation on the edge is then equality of the clone's index
+    and the consumer's."""
+
+    def __init__(
+        self,
+        consumer: Operation,
+        read_dep: MemoryDep,
+        input_name: str,
+        clone_views: list[PerCoreView],
+        prep_cache: dict,
+    ) -> None:
+        self.consumer = consumer
+        self.read_dep = read_dep
+        self.input_name = input_name
+        self.clone_views = clone_views
+        self.prep_cache = prep_cache
+
+    def clone_index(self, divs: Sequence[CoreDivision]) -> list[int]:
+        """Per consumer division, the clone view index its read has."""
+        views = TableCandidates._views_for_divs(
+            self.consumer, self.read_dep, self.input_name, list(divs), self.prep_cache
+        )
+        out = []
+        for view, _, repr_ok in views:
+            k = _clone_view_index(view, repr_ok, self.clone_views)
+            out.append(-2 if k is None else k)
+        return out
+
+
+def _clone_view_index(
+    view: PerCoreView, repr_ok: bool, clone_views: list[PerCoreView]
+) -> Optional[int]:
+    """The clone view a consumer's read ``view`` equals, or ``None`` when no
+    clone can serve the read: unrepresentable, a broadcast read (the division
+    runs on more cores than the view covers: it splits an axis the input
+    lacks), or a view no clone candidate has."""
+    if not repr_ok or math.prod(f for _, f in view.work_slice_dims) != view.num_cores:
+        return None
+    return next((i for i, c in enumerate(clone_views) if c.same_partition(view)), None)
+
+
 def _has_legal_division(context) -> bool:
     """Whether ``context`` admits any division (stops at the first)."""
     axes = context.axes
@@ -793,6 +1038,8 @@ class TableCandidates:
                         self._materialize(divisions, storage)
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        input_clone_reads: dict[str, dict[str, CloneRead]] = {}
+        derived = config.lx_view_relation == "derived"
         # Consumer op name -> input clones for which it is the last reader, and so
         # may reuse the clone's LX slot in place (reverse-parent, #3212). Stays
         # empty unless cloning is on, making the reverse-parent block in the output
@@ -802,9 +1049,11 @@ class TableCandidates:
             buffer_users = get_buffer_users(graph)
             for input_name in self._eligible_clone_inputs(graph, lifetimes):
                 consumers = [op for op in buffer_users.get(input_name, [])]
-                for consumer in consumers:
-                    self._materialize(divisions, consumer.get_name())
-                divs, matches = self._clone_divisions_and_matches(
+                if not derived:
+                    # A clone edge is a pair table over menu indices.
+                    for consumer in consumers:
+                        self._materialize(divisions, consumer.get_name())
+                divs, matches, reads = self._clone_divisions_and_matches(
                     input_name, consumers, divisions, prep_cache
                 )
                 # No division matched any consumer -> the clone has no valid core
@@ -814,6 +1063,7 @@ class TableCandidates:
                 if not divs:
                     continue
                 input_clone_matches[input_name] = matches
+                input_clone_reads[input_name] = reads
                 residency_by_buf[input_name] = None
                 # Only the op at the clone's last-use tick both reads the clone and
                 # writes its own output, so only it satisfies the single handoff
@@ -870,12 +1120,13 @@ class TableCandidates:
             residency_edges = self._parent_residency_edges(
                 op, parent_proj, op_by_name, prep_cache, residency_by_buf
             )
-            if config.lx_view_relation == "derived":
+            if derived:
                 # The strategy derives these edges' relation from their
-                # ResidencyEdge; only edges whose table is overridden below
-                # (loop carries, input clones) are materialized here.
+                # ResidencyEdge (an input clone's from its CloneRead); only
+                # loop-carry edges, whose table is overridden below, are
+                # materialized here.
                 carry_edge = carry_update_edges.get(output_name)
-                special = set(input_clone_matches) | set(
+                special = set(
                     self._loop_carry_read_edges(op, carry_update_edges, prep_cache)
                 )
                 if carry_edge is not None:
@@ -979,8 +1230,14 @@ class TableCandidates:
             # match_pairs is unaffected by this merge; the re-merge after
             # the call below stays for carry storages that only join
             # parent_proj between the two points.
+            clone_reads: dict[str, CloneRead] = {}
             for input_name in parent_proj:
-                if input_name in input_clone_matches:
+                if input_name not in input_clone_matches:
+                    continue
+                read = input_clone_reads[input_name].get(output_name)
+                if derived and read is not None:
+                    clone_reads[input_name] = read
+                else:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
                         output_name
                     ]
@@ -995,12 +1252,24 @@ class TableCandidates:
                 residency_by_buf,
                 cd_parent_matches,
             )
+            relayout_edges: dict[str, RelayoutEdge] = {}
+            if (
+                derived
+                and config.lx_relayout_encoding == "lazy"
+                and config.lx_solver_relayouts
+                and self.allocator._decides_lx_relayouts
+                and not config.ktir_emitter
+                and op is not None
+            ):
+                relayout_edges = self._relayout_edges(
+                    graph, op, relayout_parent_names, op_by_name, residency_by_buf
+                )
             for storage_name in carry_storage_names:
                 if storage_name not in parent_proj:
                     parent_proj.append(storage_name)
 
             for input_name in parent_proj:
-                if input_name in input_clone_matches:
+                if input_name in input_clone_matches and input_name not in clone_reads:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
                         output_name
                     ]
@@ -1055,6 +1324,8 @@ class TableCandidates:
                 cd_parent_matches=cd_parent_matches,
                 cd_parent_relayouts=cd_parent_relayouts,
                 residency_edges=residency_edges,
+                clone_reads=clone_reads,
+                relayout_edges=relayout_edges,
                 residency_reason=residency_reason,
                 lifetime_start_override=lifetime_start_overrides.get(output_name),
                 lifetime_end_override=lifetime_end_overrides.get(output_name),
@@ -1286,7 +1557,9 @@ class TableCandidates:
         consumers: list[Operation],
         divisions: dict[str, list[CoreDivision]],
         prep_cache: dict,
-    ) -> tuple[list[CoreDivision], dict[str, list[tuple[int, int]]]]:
+    ) -> tuple[
+        list[CoreDivision], dict[str, list[tuple[int, int]]], dict[str, CloneRead]
+    ]:
         """Determine the core divisions which are applicable to the clone
         node based on the read per core views of the clone's consumers.
 
@@ -1307,11 +1580,14 @@ class TableCandidates:
         where the mapping exists for each consumer. When solved the parent
         output per core view must match that of all consumers to be placed.
         This forces correctness at solve time rather than pre-pruning by
-        finding the intersection of core divisions.
+        finding the intersection of core divisions. The third result is each
+        consumer's :class:`CloneRead`, the same relation per division for a
+        strategy that does not use the pair tables.
         """
         clone_divs: list[CoreDivision] = []
         clone_views: list[PerCoreView] = []
         matches: dict[str, list[tuple[int, int]]] = {}
+        reads: dict[str, CloneRead] = {}
         for consumer in consumers:
             cname = consumer.get_name()
             consumer_divs = divisions[cname]
@@ -1328,26 +1604,23 @@ class TableCandidates:
             if read_dep is None or write is None:
                 matches[cname] = []
                 continue
+            reads[cname] = CloneRead(
+                consumer, read_dep, input_name, clone_views, prep_cache
+            )
             views = self._views_for_divs(
                 consumer, read_dep, input_name, consumer_divs, prep_cache
             )
             pairs: list[tuple[int, int]] = []
             for j, (view, _, repr_ok) in enumerate(views):
-                if not repr_ok:
-                    continue
                 # ``num_cores`` is the division's core count; the split product
                 # is what the view covers. They differ exactly on a broadcast
                 # read (see the docstring).
-                if math.prod(f for _, f in view.work_slice_dims) != view.num_cores:
+                if (
+                    not repr_ok
+                    or math.prod(f for _, f in view.work_slice_dims) != view.num_cores
+                ):
                     continue
-                k = next(
-                    (
-                        idx
-                        for idx, candidate in enumerate(clone_views)
-                        if candidate.same_partition(view)
-                    ),
-                    None,
-                )
+                k = _clone_view_index(view, repr_ok, clone_views)
                 if k is None:
                     cd = consumer_divs[j]
                     per_sym = cd.splits
@@ -1378,7 +1651,7 @@ class TableCandidates:
         # fabricating a whole-buffer fallback that no consumer matches: the caller
         # drops such a clone (it can never reside), keeping it out of the solver's
         # >=1-division invariant.
-        return clone_divs, matches
+        return clone_divs, matches, reads
 
     @staticmethod
     def _parent_residency_edges(
@@ -1582,104 +1855,12 @@ class TableCandidates:
         if consumer_op is None:
             return {}
         relayouts: dict[str, list[RelayoutCandidate]] = {}
-        for parent in parent_names:
-            if parent not in op_by_name:
-                continue
-            # The source must be residency-eligible: a relayout keeps it in LX.
-            if residency_by_buf.get(parent, "not in graph") is not None:
-                continue
-            parent_op = op_by_name[parent]
-            context = solver_relayout_edge_context(
-                graph, parent_op, consumer_op, parent, op_by_name
-            )
-            if context is None:
-                continue
-            write_dep, read_dep, prod_coords, cons_coords, prod_space, cons_space = (
-                context
-            )
+        for parent, edge in self._relayout_edges(
+            graph, consumer_op, parent_names, op_by_name, residency_by_buf
+        ).items():
             parent_divs = divisions[parent]
-            # Same per-candidate view screens as _cd_parent_matches: the source
-            # gets LX-pinned exactly like a matched producer, so the same
-            # coherence bars apply (partial-reduction write, unrepresentable
-            # slicing). Movement is checked on the complete per-core views.
-            prod_views: list[Optional[PerCoreView]] = [
-                view if repr_ok and not partial else None
-                for view, partial, repr_ok in self._views_for_divs(
-                    parent_op, write_dep, parent, parent_divs, prep_cache
-                )
-            ]
-            cons_views: list[Optional[PerCoreView]] = [
-                view if repr_ok else None
-                for view, _partial, repr_ok in self._views_for_divs(
-                    consumer_op, read_dep, parent, consumer_divs, prep_cache
-                )
-            ]
-            device_dims = list(parent_op.layout.device_layout.device_size)
-            out_elems = math.prod(device_dims)
-            dtype_bytes = parent_op.get_dtype().itemsize
-
-            # Ownership must project into loop symbols on both frames (the
-            # committed path's work_division_from_view gates), cached per view:
-            # several candidates often induce the same view. The projected
-            # division is kept (not just a bool) because the transition gate
-            # below compares source and destination divisions for equality.
-            projected: dict[tuple, Optional[TensorWorkDivision]] = {}
-
-            def _projected(view, coords, space, frame) -> Optional[TensorWorkDivision]:
-                key = (view, frame)
-                if key not in projected:
-                    try:
-                        projected[key] = work_division_from_view(
-                            view, device_dims, coords, space
-                        )
-                    except ValueError:
-                        projected[key] = None
-                return projected[key]
-
-            # A coarse-tiled CANDIDATE can never host a relayout, for the same
-            # reasons a coarse-tiled op cannot in general (a tiled candidate's
-            # buffer is per-tile scratch). The loop_info edge gate covers
-            # hint-materialized tiling decided before the solve; once the
-            # unified-tiling work (#3923) makes tiling a per-candidate solver
-            # choice, cd.tiling is the only marker. Written via getattr so it
-            # is inert until that lands.
-            def _candidate_tiled(cd) -> bool:
-                tiling = getattr(cd, "tiling", None)
-                return tiling is not None and not getattr(tiling, "is_untiled", True)
-
-            # solver_relayout_edge_context's same-tile-group exception admits a
-            # coarse-tiled parent/consumer pair: that candidate's copy runs
-            # once per loop trip, not once total, so its price must scale by
-            # the loop's own trip count or the solver sees an under-priced
-            # option that could out-rank a correctly-priced alternative whose
-            # real total cost is actually lower (cyang49's PR #5057 review).
-            loop_trip_count = _coarse_tile_loop_trip_count(parent_op)
-
-            # The per-core LX span of a view (#3440's reservation for a relayout
-            # member). Unavailable (non-standard arrangement, an unsplittable
-            # stick axis) is a decline, as on the committed path: without a
-            # size the copy cannot be placed, so the pair is never offered.
-            spans: dict[PerCoreView, Optional[int]] = {}
-
-            def _span(view: PerCoreView) -> Optional[int]:
-                if view not in spans:
-                    try:
-                        spans[view] = partition_footprint(parent_op.layout, view)
-                    except (TypeError, ValueError) as exc:
-                        logger.debug(
-                            "[lx solver relayout] %s: span unavailable for view %s: %s",
-                            parent,
-                            dict(view.work_slice_dims),
-                            exc,
-                        )
-                        spans[view] = None
-                return spans[view]
-
-            # Graph-wide cache: the same (source view, destination view, cores,
-            # tensor geometry) recurs across structurally identical ops (the
-            # unrolled KV blocks of attention), and pricing it re-runs the movement
-            # gate's per-core owner comparison each time.
-            pair_cost = self._relayout_pair_costs
+            prod_views = edge.source_views(parent_divs, prep_cache)
+            cons_views = edge.consumer_views(consumer_divs, prep_cache)
             candidates: list[RelayoutCandidate] = []
             # Destination views are interned per parent across every consumer
             # of this solve: two consumers whose candidates land on the same
@@ -1687,80 +1868,19 @@ class TableCandidates:
             # shuffle (interned by ownership, so spelling cannot split a group).
             view_groups = self._relayout_view_groups.setdefault(parent, {})
             for i, pv in enumerate(prod_views):
-                if pv is None or _candidate_tiled(parent_divs[i]):
+                if pv is None:
                     continue
                 for j, cv in enumerate(cons_views):
                     # Physical ownership, not structural equality: two slot
                     # spellings of one partition are a match, never a shuffle.
                     if cv is None or pv.same_partition(cv):
                         continue
-                    if _candidate_tiled(consumer_divs[j]):
-                        continue
-                    ncores = parent_divs[i].cores_used
-                    dst_cores = consumer_divs[j].cores_used
-                    # The committed collector's consumer rules (#3440): the core
-                    # domains, then the gather rule on the destination view; the
-                    # geometric half is movement_supported's, inside the pair cost.
-                    if core_domain_rejection(ncores, dst_cores):
-                        continue
-                    if grouped_gather_rejection(consumer_op, ncores, cv):
-                        continue
-                    if _projected(pv, prod_coords, prod_space, "prod") is None:
-                        continue
-                    # The relayout copy iterates the producer's shape, so the
-                    # destination view must also project on the producer frame
-                    # (materialize_lx_relayouts commits it there and raises).
-                    if _projected(cv, prod_coords, prod_space, "prod") is None:
-                        continue
-                    src_division = _projected(pv, cons_coords, cons_space, "cons")
-                    dst_division = _projected(cv, cons_coords, cons_space, "cons")
-                    if src_division is None or dst_division is None:
-                        continue
-                    # Distinct per-core views that collapse to one logical work
-                    # division would codegen as a plain identity copy with the
-                    # cross-core movement silently omitted (#3926); the solver
-                    # must never be offered such a pair.
-                    if (
-                        _unsupported_relayout_transition_reason(
-                            src_division, dst_division
-                        )
-                        is not None
-                    ):
-                        continue
-                    source_span, destination_span = _span(pv), _span(cv)
-                    if (
-                        source_span is None
-                        or destination_span is None
-                        or destination_span > self.allocator.size
-                    ):
-                        continue
-                    key = (
-                        pv,
-                        cv,
-                        ncores,
-                        dst_cores,
-                        tuple(device_dims),
-                        out_elems,
-                        dtype_bytes,
+                    priced = edge.price(
+                        pv, cv, parent_divs[i].cores_used, consumer_divs[j].cores_used
                     )
-                    if key not in pair_cost:
-                        pair_cost[key] = solver_relayout_pair_cost(
-                            pv,
-                            cv,
-                            ncores,
-                            device_dims,
-                            out_elems,
-                            dtype_bytes,
-                            destination_num_cores=dst_cores,
-                        )
-                    cost = pair_cost[key]
-                    if cost is None:
+                    if priced is None:
                         continue
-                    # pair_cost is a graph-wide cache keyed on geometry alone
-                    # (shared across parents), so the trip multiplier is
-                    # applied to this candidate's own cost, never written
-                    # back into the cached value.
-                    cost = cost * loop_trip_count
+                    cost, source_span, destination_span = priced
                     candidates.append(
                         RelayoutCandidate(
                             parent=parent,
@@ -1814,6 +1934,41 @@ class TableCandidates:
                     min(c.cost_ns for c in candidates),
                 )
         return relayouts
+
+    def _relayout_edges(
+        self,
+        graph: GraphLowering,
+        consumer_op: Operation,
+        parent_names: list[str],
+        op_by_name: dict[str, Operation],
+        residency_by_buf: dict[str, Optional[str]],
+    ) -> dict[str, RelayoutEdge]:
+        """The edges into ``consumer_op`` that may read through a relayout
+        copy: the division-independent edge gates (single non-indirect write,
+        activation source, pointwise-or-matmul consumer, ...), mirroring
+        ``collect_lx_relayout_plans``."""
+        edges: dict[str, RelayoutEdge] = {}
+        for parent in parent_names:
+            if parent not in op_by_name:
+                continue
+            # The source must be residency-eligible: a relayout keeps it in LX.
+            if residency_by_buf.get(parent, "not in graph") is not None:
+                continue
+            parent_op = op_by_name[parent]
+            context = solver_relayout_edge_context(
+                graph, parent_op, consumer_op, parent, op_by_name
+            )
+            if context is None:
+                continue
+            edges[parent] = RelayoutEdge(
+                parent,
+                parent_op,
+                consumer_op,
+                context,
+                self._relayout_pair_costs,
+                self.allocator.size,
+            )
+        return edges
 
     @staticmethod
     def _views_for_divs(op, dep, buf_name, divs: list[CoreDivision], prep_cache: dict):

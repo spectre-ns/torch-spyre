@@ -38,6 +38,7 @@ import logging
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Any, Callable, ClassVar, Literal, Optional, TYPE_CHECKING
 
 import sympy
@@ -104,8 +105,11 @@ class DependencyEdge:
     dst: ResourceNode
     in_place: bool = False
     reads: int = 1
-    # Set by solve(): the relayout copy this read goes through; None = directly.
-    chosen: Optional[RelayoutLayout] = None
+    # decisions, filled by solve(): an in-place edge whether the child took
+    # over the parent's storage; the transform this read goes through (None:
+    # it reads ``src`` directly)
+    merged: Optional[bool] = None
+    transform: Optional[Transform] = None
 
     def __repr__(self) -> str:
         kind = "in_place" if self.in_place else "read"
@@ -146,12 +150,20 @@ class ResourceNode:
     op: Optional[Operation] = None
     space: Optional[OpSplitSpace] = None  # None: committed upstream
     residency_reason: Optional[str] = None  # applied by encode_op_constraints
+    # The placement view: the access ticks, the size in bytes, and the
+    # committed per-core view and relayout plans (placement-only path).
+    uses: tuple[int, ...] = ()
+    nbytes: int = 0
+    lx_view: Any = None
+    lx_relayout_plans: list = field(default_factory=list)
+    # Transforms required before the solve (a committed relayout's
+    # destinations), placed all-or-nothing with the node.
+    pinned_transforms: list[Transform] = field(default_factory=list)
     # decisions
     work_split: Optional[WorkSplit] = None
     resident: Optional[bool] = None
     offset: Optional[int] = None  # alignment units
     spill_reason: Optional[str] = None
-    relayouts: list[ResidentLayout] = field(default_factory=list)
     # structure
     prev: Optional[ExecutionEdge] = None
     next: Optional[ExecutionEdge] = None
@@ -172,6 +184,12 @@ class ResourceNode:
     @property
     def sym_is_lx(self) -> sympy.Symbol:
         return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
+
+    def chosen_transforms(self) -> list[Transform]:
+        """The distinct transforms this output's reads go through, in copy
+        order: what realization inserts."""
+        chosen = {e.transform: None for e in self.outputs if e.transform is not None}
+        return sorted(chosen, key=lambda t: t.group)
 
     def add_child(
         self, child: ResourceNode, in_place: bool = False, reads: int = 1
@@ -218,12 +236,21 @@ def spill_cost(item: Any, size: Optional[int] = None) -> int:
     )
 
 
+class TransformKind(Enum):
+    RELAYOUT = auto()  # another per-core view, LX to LX
+    COPY_OUT = auto()  # a cut tile's full buffer, to HBM
+    TRANSPOSE = auto()  # future: another dim order
+    RESTICKIFY = auto()  # future: another stick dimension
+
+
 @dataclass(eq=False)
-class RelayoutLayout:
-    """A candidate relayout copy: the producer's output re-laid-out into
-    another per-core view, held in LX from the first read it serves to the
-    last. Candidates belong to the strategy; ``solve()`` puts the resident
-    ones on the producer's ``relayouts``."""
+class Transform:
+    """A converted copy of the producer's output that one or more edges read
+    instead of the producer: one per (producer, kind, target), shared by every
+    edge that needs that conversion and priced once. A relayout is held in LX
+    from the first read it serves to the last. Candidates belong to the
+    strategy; ``solve()`` fills the decisions of each one and points the
+    edges that read through it at it (``edge.transform``)."""
 
     producer: Optional[ResourceNode]  # None: source not in this solve
     name: str
@@ -233,26 +260,24 @@ class RelayoutLayout:
     division: CoreDivision
     start_time: int
     end_time: int
+    kind: TransformKind = TransformKind.RELAYOUT
     residency_reason: Optional[str] = None
+    # The placement view of a pinned transform: access ticks, size in bytes,
+    # its fixed per-core view.
+    uses: tuple[int, ...] = ()
+    nbytes: int = 0
+    lx_view: Any = None
     # decisions, filled by solve()
     resident: Optional[bool] = None
     offset: Optional[int] = None
     spill_reason: Optional[str] = None
 
     def __repr__(self) -> str:
-        return f"RelayoutLayout({self.name})"
+        return f"Transform({self.kind.name}, {self.name})"
 
     @property
     def sym_is_lx(self) -> sympy.Symbol:
         return sympy.Symbol(f"is_lx_{self.name}", integer=True, nonnegative=True)
-
-
-@dataclass(frozen=True)
-class ResidentLayout:
-    """A relayout copy ``solve()`` made resident, and its LX offset."""
-
-    layout: RelayoutLayout
-    offset: int  # alignment units
 
 
 @dataclass(frozen=True)
@@ -333,7 +358,7 @@ class SpyreOptimizationGraph:
     division_mode: Literal["open", "committed"] = "open"
     nodes: dict[str, ResourceNode] = field(default_factory=dict)
     first: Optional[ResourceNode] = None
-    solver: Any = None  # a Backend class or GraphSolver; None: CP-SAT direct
+    solver: Any = None  # a Backend class or a GraphSolver; None: CpSat
 
     def add_node(
         self, source: LifetimeBoundBuffer, residency_reason: Optional[str] = None
@@ -342,7 +367,7 @@ class SpyreOptimizationGraph:
         buffer with no candidate divisions is committed upstream."""
         assert source.name not in self.nodes, f"{source.name} added twice"
         assert not isinstance(source, RelayoutCopyBuffer), (
-            "a relayout copy is a layout, not a node"
+            "a relayout copy is a transform, not a node"
         )
         b = source
         divided = b if isinstance(b, CoreDivisionBuffer) and b.core_divisions else None
@@ -365,10 +390,34 @@ class SpyreOptimizationGraph:
             produced_at=b.uses[0] if b.uses and not b.first_use_is_read else None,
             space=divided.division_space if divided else None,
             residency_reason=residency_reason,
+            uses=tuple(b.uses),
+            nbytes=b.size,
+            lx_view=b.lx_view,
+            lx_relayout_plans=list(b.lx_relayout_plans),
             work_split=None if divided else WorkSplit.COMMITTED,
         )
         self.nodes[b.name] = node
         return node
+
+    def pin_transform(self, source: ResourceNode, dest: LifetimeBoundBuffer) -> None:
+        """A committed relayout destination of ``source``: a transform with
+        a fixed view, placed all-or-nothing with it."""
+        source.pinned_transforms.append(
+            Transform(
+                producer=source,
+                name=dest.name,
+                group=len(source.pinned_transforms),
+                size=ceil_div(dest.size, self.alignment),
+                read_count=dest.read_count,
+                division=CoreDivision(),
+                start_time=dest.start_time,
+                end_time=dest.end_time,
+                residency_reason=dest.residency_reason,
+                uses=tuple(dest.uses),
+                nbytes=dest.size,
+                lx_view=dest.lx_view,
+            )
+        )
 
     def get_nodes(self) -> Iterator[ResourceNode]:
         return iter(self.nodes.values())
@@ -390,32 +439,46 @@ class SpyreOptimizationGraph:
             before.add_successor(after)
 
     def set_solver(self, solver: Any) -> None:
+        """What ``solve`` runs on: a backend class (the posted model's solver)
+        or a graph solver, which solves the graph itself."""
         self.solver = solver
 
     # ---- the solve ----
 
     def solve(
         self,
-        model: Any,
+        model: Any = None,
         cost_expr: Optional[sympy.Expr] = None,
         strategy: Optional[EncodingStrategy] = None,
     ) -> list[ResourceNode]:
         """Encode, run the objective ladder, and fill every open decision on
-        the nodes (and ``chosen`` on edges). ``model`` is the backend to post
-        to and solve with (a bare ``CpModel`` is wrapped in ``CpSat``).
-        Returns the op outputs in execution order. Raises
-        :class:`SolveError`, writing nothing."""
-        from ortools.sat.python import cp_model
-
-        from torch_spyre._inductor.scratchpad.backend import CpSat
-
-        backend = CpSat(model) if isinstance(model, cp_model.CpModel) else model
+        the nodes, transforms and edges. ``model`` is the backend to post
+        to and solve with (a bare ``CpModel`` is wrapped in ``CpSat``; none:
+        an instance of :meth:`set_solver`'s backend class). A graph solver set
+        with :meth:`set_solver` solves the graph itself instead. Returns the
+        op outputs in execution order. Raises :class:`SolveError`, writing
+        nothing."""
         if strategy is None:
             from torch_spyre._inductor.scratchpad.encoding_strategy import (
                 EnumerationFactory,
             )
 
             strategy = EnumerationFactory().strategy()
+        if self.solver is not None and not isinstance(self.solver, type):
+            if not self.solver.accepts(strategy):
+                raise ValueError(
+                    f"{type(self.solver).__name__} cannot solve a "
+                    f"{type(strategy).__name__}"
+                )
+            return self.solver.solve(self, strategy, cost_expr)
+
+        from ortools.sat.python import cp_model
+
+        from torch_spyre._inductor.scratchpad.backend import CpSat
+
+        if model is None:
+            model = (self.solver or CpSat)()
+        backend = CpSat(model) if isinstance(model, cp_model.CpModel) else model
         self._finalize(backend, strategy)
         solver = backend.solver
         backend.record = self.settings.record
@@ -425,8 +488,8 @@ class SpyreOptimizationGraph:
         # Presolve runs on every model, priced or not; the copy-count threshold
         # is an opt-in escape hatch (off by default).
         free_copies = sum(
-            lay.producer is not None and strategy.chooses_split(lay.producer)
-            for lay in strategy.layouts
+            t.producer is not None and strategy.chooses_split(t.producer)
+            for t in strategy.transforms
         )
         max_copies = config.lx_solver_relayout_presolve_max_copies
         if max_copies > 0 and free_copies > max_copies:
@@ -450,6 +513,10 @@ class SpyreOptimizationGraph:
         )
         self._ladder(backend, strategy, cost_expr)
         self._extract(backend, strategy, justify_offsets)
+        return self.execution_plan()
+
+    def execution_plan(self) -> list[ResourceNode]:
+        """The op outputs along the execution chain."""
         node = self.first
         plan = []
         while node is not None:
@@ -459,17 +526,17 @@ class SpyreOptimizationGraph:
 
     def _finalize(self, model: Any, strategy: EncodingStrategy) -> None:
         """Walk the graph in emission order, calling the strategy once per
-        node, edge or relayout layout, and record which call posted what."""
+        node, edge or transform, and record which call posted what."""
         nodes = list(self.get_nodes())
         assert all(n.produced_at is None or n is self.first or n.prev for n in nodes)
         strategy.prepare(self)
-        layouts = strategy.layouts
+        transforms = strategy.transforms
         record = _ProvenanceRecorder(model, strategy)
 
         for n in nodes:  # 1. vars
             record(strategy.encode_node, n)
-        for lay in layouts:
-            record(strategy.encode_layout, lay)
+        for t in transforms:
+            record(strategy.encode_transform, t)
         merges = [e for n in nodes for e in n.inputs if e.in_place]
         for e in merges:  # 2. merges
             record(strategy.encode_merge, e)
@@ -477,31 +544,33 @@ class SpyreOptimizationGraph:
             record(strategy.limit_merges, n, incoming=True)
         for n in dict.fromkeys(e.src for e in merges):
             record(strategy.limit_merges, n, incoming=False)
-        for item in (*nodes, *layouts):  # 3. placement
+        for item in (*nodes, *transforms):  # 3. placement
             record(strategy.encode_capacity, item)
         record(strategy.encode_no_overlap, self)
-        for item in (*nodes, *layouts):  # 4. op constraints
+        for item in (*nodes, *transforms):  # 4. op constraints
             record(strategy.encode_op_constraints, item)
         for n in nodes:  # 5. reads
             for e in n.outputs:
                 record(strategy.encode_read, e)
-        for lay in layouts:  # 6. relayouts
-            record(strategy.encode_relayout, lay)
+        for t in transforms:  # 6. transforms
+            record(strategy.encode_transform_use, t)
         divided = [n for n in nodes if strategy.chooses_split(n)]
-        for item in (*divided, *layouts):  # 7. coarse tiling
+        for item in (*divided, *transforms):  # 7. coarse tiling
             record(strategy.encode_tiling_vars, item)
         segments = strategy.tiling_segments(self)
         if self.first is not None:
             record(strategy.encode_chain_head, self.first)
         for edge in self.execution_chain():
             record(strategy.encode_nest, edge)
-        for item in (*divided, *layouts):
+        for item in (*divided, *transforms):
             record(strategy.encode_cuts, item, segments)
         for n in nodes:
             record(strategy.encode_tile_counts, n)
         for n in nodes:  # 8. clones
             if n.produced_at is None:
                 record(strategy.encode_clone, n)
+        for item in (*nodes, *transforms):  # 9. lifetimes
+            record(strategy.encode_lifetime, item)
         # Read by the equivalence harness, next to each stage's proto.
         setattr(model.model, "_spyre_provenance", strategy.provenance)
 
@@ -517,9 +586,9 @@ class SpyreOptimizationGraph:
         from ortools.sat.python import cp_model
 
         solver = model
-        items: list[ResourceNode | RelayoutLayout] = [
+        items: list[ResourceNode | Transform] = [
             *self.get_nodes(),
-            *strategy.layouts,
+            *strategy.transforms,
         ]
         cut_terms = strategy.cut_terms
         if cut_terms:
@@ -553,8 +622,8 @@ class SpyreOptimizationGraph:
             # The traffic objective knows no relayout price, and an unpriced
             # shuffle looks free, so no relayout may fire under it.
             with _ProvenanceRecorder(model, strategy).section("ladder:copy pin"):
-                for lay in strategy.layouts:
-                    model.Add(strategy.vars[lay].in_buffer == 0)
+                for t in strategy.transforms:
+                    model.Add(strategy.vars[t].in_buffer == 0)
 
             vars_ = strategy.vars
             hbm_terms = [
@@ -651,6 +720,9 @@ class SpyreOptimizationGraph:
                 cp_cost = cost_expr_to_cpsat(
                     model.model, sym_map, buffer_map, cost_expr
                 )
+                extra = strategy.extra_cost_terms()
+                if extra:
+                    cp_cost = cp_cost + sum(extra)
                 if not isinstance(cp_cost, (int, float)):
                     # A constant cost leaves any solution optimal.
                     model.Minimize(cp_cost)
@@ -689,9 +761,9 @@ class SpyreOptimizationGraph:
         ``justify_offsets``, each in-place-merged placement unit slides down to the lowest
         free address; if that cannot keep every unit inside capacity the
         solver's own offsets are kept, since those are always legal."""
-        every: list[ResourceNode | RelayoutLayout] = [
+        every: list[ResourceNode | Transform] = [
             *self.get_nodes(),
-            *strategy.layouts,
+            *strategy.transforms,
         ]
         items = {item.name: item for item in every}
         vars_ = {name: strategy.vars[item] for name, item in items.items()}
@@ -752,14 +824,15 @@ class SpyreOptimizationGraph:
                 if name in spilled
                 else None
             )
-        for lay in strategy.layouts:
-            if lay.offset is not None and lay.producer is not None:
-                lay.producer.relayouts.append(ResidentLayout(lay, lay.offset))
         for node in self.get_nodes():
             for edge in node.outputs:
+                if edge.in_place:
+                    edge.merged = solver.BooleanValue(
+                        vars_[edge.dst.name].merges[node.name]
+                    )
                 fired = [
-                    lay
-                    for lay, lit in strategy.served.get(edge, ())
+                    t
+                    for t, lit in strategy.served.get(edge, ())
                     if solver.BooleanValue(lit)
                 ]
                 if not fired:
@@ -772,7 +845,7 @@ class SpyreOptimizationGraph:
                     f"{edge.dst.name} reads {node.name} from a spilled copy "
                     f"{fired[0].name}"
                 )
-                edge.chosen = fired[0]
+                edge.transform = fired[0]
                 strategy.record_fired(edge, solver)
 
 
@@ -833,7 +906,8 @@ def build_graph(
     reasons: Mapping[str, str] = {},
 ) -> SpyreOptimizationGraph:
     """The graph of ``buffers`` (relayout copies excluded; they are the
-    strategy's candidates), sized in ``alignment`` units. ``reasons`` is each
+    strategy's candidate transforms; a committed relayout's destinations
+    become transforms pinned on their source), sized in ``alignment`` units. ``reasons`` is each
     barred buffer's residency reason (``MemoryPlanSolver.excluded``).
 
     One edge per (producer, consumer) pair the consumer reads (``parents``),
@@ -842,10 +916,18 @@ def build_graph(
     graph = SpyreOptimizationGraph(
         alignment=alignment, capacity=capacity, settings=settings
     )
-    real = [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)]
+    pinned = {id(d) for b in buffers for d in b.paired_with}
+    real = [
+        b
+        for b in buffers
+        if not isinstance(b, RelayoutCopyBuffer) and id(b) not in pinned
+    ]
     for b in real:
         graph.add_node(b, reasons.get(b.name))
     nodes = graph.nodes
+    for b in real:
+        for dest in b.paired_with:
+            graph.pin_transform(nodes[b.name], dest)
     for b in real:
         child = nodes[b.name]
         reads = Counter(getattr(b, "parents", ()))

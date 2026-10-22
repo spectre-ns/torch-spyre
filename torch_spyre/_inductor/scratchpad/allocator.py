@@ -873,8 +873,11 @@ class ScratchpadAllocator:
         return buffers
 
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
-        """Assign LX addresses. Base: placement-only ``plan_layout``."""
-        return solver.plan_layout(log_lx_usage=True)
+        """Assign LX addresses. Base: the placement-only solve of the
+        solver's buffers."""
+        from torch_spyre._inductor.scratchpad.graph_solvers import solve_buffers
+
+        return solve_buffers(solver)
 
     def _materialize_selection(
         self,
@@ -2869,6 +2872,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
 
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
+        from torch_spyre._inductor.scratchpad.graph_solvers import solve_buffers
+
         assert isinstance(solver, CoreDivisionLayoutSolver)
         bufmap = {buf.name: buf for buf in solver.buffers}
         # Built once here, not per op inside the loop below: every op's residency
@@ -2946,7 +2951,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 "cost objective skipped: auto_coarse_tiling makes tile size and "
                 "cut count decision axes the cost model cannot score"
             )
-            result = solver.plan_layout_and_core_divisions(None)
+            result = solve_buffers(solver, None, joint=True)
             assert not any(buffer.lx_relayout_plans for buffer in result), (
                 "CoOptimizingAllocator does not support LX relayout"
             )
@@ -3003,7 +3008,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 key=lambda b: b.name,
             ):
                 cost_expr = cost_expr + copy.cost_term()
-        result = solver.plan_layout_and_core_divisions(cost_expr)
+        result = solve_buffers(solver, cost_expr, joint=True)
         if any(buffer.lx_relayout_plans for buffer in result):
             raise AssertionError("CoOptimizingAllocator does not support LX relayout")
         if config.dump_cost_expr_file and cost_expr is not None:

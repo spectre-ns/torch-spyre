@@ -2992,7 +2992,7 @@ class TestCloneDivisionMatching(unittest.TestCase):
             )
 
     def test_broadcast_read_reaches_neither_the_menu_nor_the_table(self):
-        divs, matches = self._menu()
+        divs, matches, _ = self._menu()
         self.assertEqual(
             [cd.splits for cd in divs], [{_isym("x"): split} for split in (4, 2)]
         )

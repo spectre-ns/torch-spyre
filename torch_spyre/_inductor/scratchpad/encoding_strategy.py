@@ -14,11 +14,11 @@
 
 """How a :class:`SpyreOptimizationGraph` becomes a CP model.
 
-An :class:`EncodingStrategy` encodes the graph one node, edge or relayout
-layout at a time, in the order ``SpyreOptimizationGraph._finalize`` walks
+An :class:`EncodingStrategy` encodes the graph one node, edge or transform
+at a time, in the order ``SpyreOptimizationGraph._finalize`` walks
 them. It owns everything about *how* decisions are searched: how each node's
 work split is enumerated (a pinned value, a table of candidates), the
-relations over each edge's two ends, the candidate relayout copies, and every
+relations over each edge's two ends, the candidate transforms, and every
 CP variable (:class:`NodeVars`). Nodes and edges stay pure data.
 
 :class:`TableStrategy` is the default: each open work split is a ``Table``
@@ -38,9 +38,9 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.buffer_graph import (
     DependencyEdge,
     ExecutionEdge,
-    RelayoutLayout,
     ResourceNode,
     SpyreOptimizationGraph,
+    Transform,
     WorkSplit,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 
 Var = Any  # a backend variable or literal
 Model = Any  # cp_model.CpModel until 3a, a Backend after
-Item = ResourceNode | RelayoutLayout
+Item = ResourceNode | Transform
 AxisSetting = Literal["table", "lazy", "pruned"]
 RelayoutSetting = Literal["data", "pruned", "lazy"]
 
@@ -126,7 +126,9 @@ class PrinterView:
 
 @dataclass(eq=False)
 class NodeVars:
-    """The variables of one node or relayout layout. ``division``, ``buffer``
+    """The variables of one node or transform. ``start`` / ``end`` are its
+    lifetime, the time side of its rectangle (constants while lifetimes are
+    the allocator's). ``division``, ``buffer``
     and the ``*_raw`` columns (the per-candidate values the cost lowering
     tabulates over) exist only for a ``Table``."""
 
@@ -134,6 +136,8 @@ class NodeVars:
     in_buffer: Var
     offset: Var
     eff_size: Var | int
+    start: Var | int = 0
+    end: Var | int = 0
     merges: dict[str, Var] = field(default_factory=dict)
     splits: dict[Any, Var | int] = field(default_factory=dict)
     tile_counts: dict[Any, Var | int] = field(default_factory=dict)
@@ -221,9 +225,9 @@ class EncodingStrategy:
     tiling: AxisSetting = "table"
     relayout: RelayoutSetting = "data"
     # per-solve state
-    layouts: tuple[RelayoutLayout, ...] = ()
+    transforms: tuple[Transform, ...] = ()
     vars: dict[Item, NodeVars] = field(default_factory=dict)
-    served: dict[DependencyEdge, list[tuple[RelayoutLayout, Var]]] = field(
+    served: dict[DependencyEdge, list[tuple[Transform, Var]]] = field(
         default_factory=dict
     )
     provenance: list[Provenance] = field(default_factory=list)
@@ -238,7 +242,7 @@ class EncodingStrategy:
         raise NotImplementedError
 
     def encode_no_overlap(self, graph: SpyreOptimizationGraph, model: Model) -> None:
-        """The 2-D no-overlap over every node's and layout's rectangle."""
+        """The 2-D no-overlap over every node's and transform's rectangle."""
         raise NotImplementedError
 
     def tiling_segments(self, graph: SpyreOptimizationGraph) -> dict[ResourceNode, int]:
@@ -250,7 +254,7 @@ class EncodingStrategy:
     def encode_node(self, node: ResourceNode, model: Model) -> None:
         raise NotImplementedError
 
-    def encode_layout(self, layout: RelayoutLayout, model: Model) -> None:
+    def encode_transform(self, transform: Transform, model: Model) -> None:
         raise NotImplementedError
 
     def encode_merge(self, edge: DependencyEdge, model: Model) -> None:
@@ -268,7 +272,7 @@ class EncodingStrategy:
     def encode_read(self, edge: DependencyEdge, model: Model) -> None:
         raise NotImplementedError
 
-    def encode_relayout(self, layout: RelayoutLayout, model: Model) -> None:
+    def encode_transform_use(self, transform: Transform, model: Model) -> None:
         raise NotImplementedError
 
     def encode_tiling_vars(self, item: Item, model: Model) -> None:
@@ -289,6 +293,9 @@ class EncodingStrategy:
         raise NotImplementedError
 
     def encode_clone(self, node: ResourceNode, model: Model) -> None:
+        raise NotImplementedError
+
+    def encode_lifetime(self, item: Item, model: Model) -> None:
         raise NotImplementedError
 
     # ---- objective inputs and extraction ----
@@ -312,6 +319,9 @@ class EncodingStrategy:
     def record_fired(self, edge: DependencyEdge, solver) -> None:
         raise NotImplementedError
 
+    def extra_cost_terms(self) -> list[Var]:
+        return []
+
 
 class TableStrategy(EncodingStrategy):
     """The default strategy: every open work split is a ``Table`` over its
@@ -330,12 +340,18 @@ class TableStrategy(EncodingStrategy):
         copies: Sequence[RelayoutCopyBuffer] = (),
         copy_reasons: Mapping[str, str] | None = None,
         residency: Mapping[tuple[str, str], Any] | None = None,
+        clone_reads: Mapping[tuple[str, str], Any] | None = None,
+        relayout_edges: Mapping[tuple[str, str], Any] | None = None,
         **settings,
     ) -> None:
         super().__init__(**settings)
         # Edges whose relation is derived from their ResidencyEdge (equality of
-        # per-node view ids, tile-view ids and core counts) instead of a table.
+        # per-node view ids, tile-view ids and core counts) instead of a table,
+        # and input-clone edges derived from the consumer's CloneRead.
         self.residency = dict(residency or {})
+        self.clone_reads = dict(clone_reads or {})
+        # Edges whose relayouts are constraints over view ids (lazy_relayout).
+        self.relayout_edges = dict(relayout_edges or {})
         self.menus = {k: tuple(v) for k, v in (menus or {}).items()}
         self.matches = {k: list(v) for k, v in (matches or {}).items()}
         self.relayout_candidates = {
@@ -361,7 +377,8 @@ class TableStrategy(EncodingStrategy):
         copies = [b for b in buffers if isinstance(b, RelayoutCopyBuffer)]
         groups = {c.group_key for c in copies}
         derived = config.lx_view_relation == "derived"
-        menus, matches, relayouts, residency = {}, {}, {}, {}
+        menus, matches, relayouts, residency, clone_reads = {}, {}, {}, {}, {}
+        relayout_edges = {}
         for b in buffers:
             if isinstance(b, RelayoutCopyBuffer) or not isinstance(
                 b, CoreDivisionBuffer
@@ -372,7 +389,14 @@ class TableStrategy(EncodingStrategy):
             for parent in dict.fromkeys([*b.parents, *b.in_place_parents]):
                 if parent not in names:
                     continue
-                if (
+                # Captured buffers may predate these fields.
+                edge = getattr(b, "relayout_edges", {}).get(parent)
+                if edge is not None:
+                    relayout_edges[(parent, b.name)] = edge
+                clone = getattr(b, "clone_reads", {}).get(parent)
+                if derived and clone is not None:
+                    clone_reads[(parent, b.name)] = clone
+                elif (
                     derived
                     and parent not in b.cd_parent_matches
                     and parent in b.residency_edges
@@ -394,6 +418,8 @@ class TableStrategy(EncodingStrategy):
             copies=copies,
             copy_reasons={c.name: reasons[c.name] for c in copies if c.name in reasons},
             residency=residency,
+            clone_reads=clone_reads,
+            relayout_edges=relayout_edges,
             **settings,
         )
 
@@ -408,6 +434,8 @@ class TableStrategy(EncodingStrategy):
         self.fired = {}
         self.solved = {}
         self._capacity = graph.capacity
+        self._alignment = graph.alignment
+        self._prep_cache: dict = {}
         self._reps: dict[tuple[str, str], list] = {}
         self._rep_keys: dict[tuple[str, str], dict] = {}
         self._src_ids: dict = {}
@@ -417,14 +445,14 @@ class TableStrategy(EncodingStrategy):
         self._check: Optional[list] = (
             [] if os.environ.get("LX_RELATION_CHECK") else None
         )
-        self._serves: dict[RelayoutLayout, list[Var]] = {}
-        self._candidates_of: dict[RelayoutLayout, tuple[RelayoutCandidate, ...]] = {}
-        self._priced: dict[RelayoutLayout, list[int]] = {}
+        self._serves: dict[Transform, list[Var]] = {}
+        self._candidates_of: dict[Transform, tuple[RelayoutCandidate, ...]] = {}
+        self._priced: dict[Transform, list[int]] = {}
         self._incoming: dict[Item, list[Var]] = {}
         self._enum: dict[Item, Any] = {}
-        layouts = []
+        transforms = []
         for copy in self.copies:
-            layout = RelayoutLayout(
+            transform = Transform(
                 producer=graph.nodes.get(copy.relayout_parent),
                 name=copy.name,
                 group=copy.group,
@@ -435,16 +463,22 @@ class TableStrategy(EncodingStrategy):
                 end_time=copy.end_time,
                 residency_reason=self.copy_reasons.get(copy.name),
             )
-            layouts.append(layout)
-            self._candidates_of[layout] = copy.candidates
-            self._priced[layout] = sorted(copy.cost_by_source_division)
-            self._enum[layout] = _Table((layout.division,))
-        self.layouts = tuple(layouts)
-        self._layout_by_group = {
-            (c.relayout_parent, c.group): lay for c, lay in zip(self.copies, layouts)
+            transforms.append(transform)
+            self._candidates_of[transform] = copy.candidates
+            self._priced[transform] = sorted(copy.cost_by_source_division)
+            self._enum[transform] = _Table((transform.division,))
+        self.transforms = tuple(transforms)
+        self._transform_by_group = {
+            (c.relayout_parent, c.group): t for c, t in zip(self.copies, transforms)
         }
         for node in graph.get_nodes():
             self._enum[node] = self._enumeration(node)
+        self._lazy_relayouts = None
+        if self.relayout_edges:
+            from torch_spyre._inductor.scratchpad.lazy_relayout import LazyRelayouts
+
+            self._lazy_relayouts = LazyRelayouts(self, self.relayout_edges)
+            self.transforms += tuple(self._lazy_relayouts.prepare(graph))
         # Coarse-tiling nests, interned over every item with a work split; the
         # untiled nest is 0, so loop_id != 0 means tiled.
         self._nest_ids: dict[tuple[int, ...], int] = {(): 0}
@@ -454,9 +488,9 @@ class TableStrategy(EncodingStrategy):
                     self._nest_ids.setdefault(
                         cd.tiling.level_counts, len(self._nest_ids)
                     )
-        for layout in self.layouts:
+        for transform in self.transforms[: len(self.copies)]:
             self._nest_ids.setdefault(
-                layout.division.tiling.level_counts, len(self._nest_ids)
+                transform.division.tiling.level_counts, len(self._nest_ids)
             )
         self._tiling_on = len(self._nest_ids) > 1
         self._loop_id: dict[Item, Var] = {}
@@ -483,7 +517,7 @@ class TableStrategy(EncodingStrategy):
         raise ValueError(f"{name}: work split {split} is not a candidate")
 
     def _candidates(self, item: Item) -> tuple[CoreDivision, ...]:
-        if isinstance(item, RelayoutLayout):
+        if isinstance(item, Transform):
             return (item.division,)
         return self.menus.get(item.name, ())
 
@@ -513,10 +547,21 @@ class TableStrategy(EncodingStrategy):
         if node.offset is not None:
             model.Add(v.offset == node.offset)
 
-    def encode_layout(self, layout: RelayoutLayout, model: Model) -> None:
-        v = self._base_vars(layout, model)
-        self.vars[layout] = v
-        self._split_vars(layout, v, model)
+    def encode_transform(self, transform: Transform, model: Model) -> None:
+        v = self._base_vars(transform, model)
+        self.vars[transform] = v
+        if self._is_lazy_copy(transform):
+            assert self._lazy_relayouts is not None
+            self._lazy_relayouts.encode_transform(transform, v, model)
+            return
+        self._split_vars(transform, v, model)
+
+    def _is_lazy_copy(self, item: Item) -> bool:
+        return (
+            self._lazy_relayouts is not None
+            and isinstance(item, Transform)
+            and item in self._lazy_relayouts.copies
+        )
 
     def _base_vars(self, item: Item, model: Model) -> NodeVars:
         return NodeVars(
@@ -524,11 +569,13 @@ class TableStrategy(EncodingStrategy):
             in_buffer=model.BoolVar(f"in_buffer_{item.name}"),
             offset=model.IntVar(0, max(0, self._capacity - 1), f"off_{item.name}"),
             eff_size=item.size,
+            start=item.start_time,
+            end=item.end_time,
             name=item.name,
         )
 
     def _syms(self, item: Item) -> tuple[Mapping, Mapping]:
-        if isinstance(item, RelayoutLayout):
+        if isinstance(item, Transform):
             return _sym_core_divs_of(item.name, (item.division,)), {}
         return item.sym_core_divs, item.sym_tile_counts
 
@@ -568,6 +615,7 @@ class TableStrategy(EncodingStrategy):
             return
         name = item.name
         v.division = m.IntVar(0, len(menu) - 1, f"div_{name}")
+        m.MarkTableAxis(v.division)
         v.eff_size = m.IntVar(0, max(v.per_core), f"eff_size_{name}")
         v.core_cost = m.IntVar(0, max(core_cost), f"core_cost_{name}")
         v.cores = m.IntVar(min(cores_used), max(cores_used), f"occ_{name}")
@@ -627,6 +675,12 @@ class TableStrategy(EncodingStrategy):
         key = (edge.src.name, edge.dst.name)
         re = self.residency.get(key)
         src, dst = self.vars[edge.src], self.vars[edge.dst]
+        clone = self.clone_reads.get(key)
+        if clone is not None:
+            model.Add(
+                src.division == self._clone_ids(edge, clone, model)
+            ).OnlyEnforceIf(lit)
+            return
         if re is None:
             _gate_divisions(model, self._pairs(edge), src.division, dst.division, lit)
             return
@@ -718,6 +772,19 @@ class TableStrategy(EncodingStrategy):
                 self._check_edge(edge, re)
         return self._dst_ids[edge][:2]
 
+    def _clone_ids(self, edge: DependencyEdge, clone, model: Model):
+        """The input-clone view the consumer reads under its division: an
+        index into the clone's menu, -2 where no clone view serves it."""
+        if edge not in self._dst_ids:
+            ids = clone.clone_index(self._candidates(edge.dst))
+            self._dst_ids[edge] = (
+                self._id_var(
+                    edge.dst, ids, f"cview_{edge.src.name}__{edge.dst.name}", model
+                ),
+                ids,
+            )
+        return self._dst_ids[edge][0]
+
     def _check_edge(self, edge: DependencyEdge, re) -> None:
         """Agreement test: the pairs the derived relation admits must be the
         pair table ``match_pairs`` would build."""
@@ -762,23 +829,21 @@ class TableStrategy(EncodingStrategy):
         parent, whose bytes above a smaller child are still read on that tick)
         by the one handoff tick, so the two abut and may share an offset."""
         x_intervals, y_intervals = [], []
-        items: list[Item] = [*graph.get_nodes(), *self.layouts]
+        items: list[Item] = [*graph.get_nodes(), *self.transforms]
         for item in items:
             v = self.vars[item]
             ins = self._incoming.get(item, [])
             if ins:
-                start = model.IntVar(
-                    item.start_time, item.end_time, f"start_{item.name}"
-                )
-                model.Add(start == item.start_time + sum(ins))
+                start = model.IntVar(v.start, v.end, f"start_{item.name}")
+                model.Add(start == v.start + sum(ins))
                 x_start: Any = start
-                x_size: Any = item.end_time - start
+                x_size: Any = v.end - start
             else:
-                x_start = item.start_time
-                x_size = item.end_time - item.start_time
+                x_start = v.start
+                x_size = v.end - v.start
             x_intervals.append(
                 model.NewOptionalIntervalVar(
-                    x_start, x_size, item.end_time, v.in_buffer, f"x_{item.name}"
+                    x_start, x_size, v.end, v.in_buffer, f"x_{item.name}"
                 )
             )
             # An interval end must be affine, so the top of a division-dependent
@@ -810,20 +875,25 @@ class TableStrategy(EncodingStrategy):
         and once per read the consumer lists."""
         if not (self.chooses_split(edge.src) and self.chooses_split(edge.dst)):
             return
+        if (edge.src.name, edge.dst.name) in self.clone_reads:
+            return  # encode_clone
+        if self._lazy_relayouts is not None and edge in self._lazy_relayouts.by_edge:
+            self._lazy_relayouts.encode_read(edge, model)
+            return
         for _ in range(edge.reads):
             self._encode_one_read(edge, model)
 
     def _encode_one_read(self, edge: DependencyEdge, model: Model) -> None:
         src, dst = self.vars[edge.src], self.vars[edge.dst]
-        by_layout: dict[RelayoutLayout, list] = {}
+        by_transform: dict[Transform, list] = {}
         for c in self.relayout_candidates.get((edge.src.name, edge.dst.name), ()):
-            layout = self._layout_by_group.get(c.group_key)
-            if layout is not None:
-                by_layout.setdefault(layout, []).append(c)
-        served: dict[RelayoutLayout, Var] = {}
-        for layout, cands in sorted(by_layout.items(), key=lambda i: i[0].group):
+            transform = self._transform_by_group.get(c.group_key)
+            if transform is not None:
+                by_transform.setdefault(transform, []).append(c)
+        served: dict[Transform, Var] = {}
+        for transform, cands in sorted(by_transform.items(), key=lambda i: i[0].group):
             lit = model.BoolVar(
-                f"served_{edge.src.name}__{edge.dst.name}__g{layout.group}"
+                f"served_{edge.src.name}__{edge.dst.name}__g{transform.group}"
             )
             _gate_divisions(
                 model,
@@ -832,9 +902,9 @@ class TableStrategy(EncodingStrategy):
                 dst.division,
                 lit,
             )
-            model.AddImplication(lit, self.vars[layout].in_buffer)
-            served[layout] = lit
-            self._serves.setdefault(layout, []).append(lit)
+            model.AddImplication(lit, self.vars[transform].in_buffer)
+            served[transform] = lit
+            self._serves.setdefault(transform, []).append(lit)
         if not served:
             self._relate(edge, src.in_buffer, model)
             return
@@ -843,22 +913,26 @@ class TableStrategy(EncodingStrategy):
         self._relate(edge, match, model)
         model.AddBoolOr([match, *served.values()]).OnlyEnforceIf(src.in_buffer)
 
-    # ---- 6. relayouts ----
+    # ---- 6. transforms ----
 
-    def encode_relayout(self, layout: RelayoutLayout, model: Model) -> None:
-        """A resident copy needs its producer resident under a division it
-        was priced for, and must serve some read. One whose producer is not
+    def encode_transform_use(self, transform: Transform, model: Model) -> None:
+        """A resident relayout needs its producer resident under a division
+        it was priced for, and must serve some read. One whose producer is not
         in the solve, or chooses no division, never fires."""
-        v = self.vars[layout]
-        source = layout.producer
+        if self._is_lazy_copy(transform):
+            assert self._lazy_relayouts is not None
+            self._lazy_relayouts.encode_use(transform, model)
+            return
+        v = self.vars[transform]
+        source = transform.producer
         if source is None or not self.chooses_split(source):
             model.Add(v.in_buffer == 0)
             return
         sv = self.vars[source]
         model.AddImplication(v.in_buffer, sv.in_buffer)
-        priced = [sv.division_is(i) for i in self._priced[layout]]
+        priced = [sv.division_is(i) for i in self._priced[transform]]
         model.AddBoolOr(priced).OnlyEnforceIf(v.in_buffer)
-        serves = self._serves.get(layout, [])
+        serves = self._serves.get(transform, [])
         if serves:
             model.AddBoolOr(serves).OnlyEnforceIf(v.in_buffer)
         else:
@@ -869,7 +943,7 @@ class TableStrategy(EncodingStrategy):
     def encode_tiling_vars(self, item: Item, model: Model) -> None:
         """The item's loop nest id (tied to its division like ``eff_size``)
         and whether it is tiled."""
-        if not self._tiling_on:
+        if not self._tiling_on or self._is_lazy_copy(item):
             return
         v = self.vars[item]
         cands = self._candidates(item)
@@ -1023,7 +1097,32 @@ class TableStrategy(EncodingStrategy):
     # ---- 8. clones ----
 
     def encode_clone(self, node: ResourceNode, model: Model) -> None:
-        """A graph input's relation to its consumers: ordinary edge tables."""
+        """A resident input clone is read alike by every consumer that
+        chooses a work split: each one's read view is the clone's (derived
+        clone edges; a table edge was posted as an ordinary read)."""
+        if not self.chooses_split(node):
+            return
+        in_buffer = self.vars[node].in_buffer
+        for edge in node.outputs:
+            if (node.name, edge.dst.name) not in self.clone_reads:
+                continue
+            if self.chooses_split(edge.dst):
+                for _ in range(edge.reads):
+                    self._relate(edge, in_buffer, model)
+
+    # ---- 9. lifetimes ----
+
+    def encode_lifetime(self, item: Item, model: Model) -> None:
+        """Lifetimes are the allocator's constants, except a lazy relayout
+        copy's, which lives until its last user."""
+        if self._is_lazy_copy(item):
+            assert self._lazy_relayouts is not None and isinstance(item, Transform)
+            self._lazy_relayouts.encode_lifetime(item, model)
+
+    def extra_cost_terms(self) -> list[Var]:
+        """Objective terms the strategy prices itself (lazy relayout
+        charges), in the cost expression's unit."""
+        return [] if self._lazy_relayouts is None else self._lazy_relayouts.charges
 
     # ---- objective inputs and extraction ----
 
@@ -1071,18 +1170,25 @@ class TableStrategy(EncodingStrategy):
         return WorkSplit.of(self._candidates(item)[i])
 
     def footprint(self, item: Item, solver) -> int:
+        if self._is_lazy_copy(item):
+            assert self._lazy_relayouts is not None and isinstance(item, Transform)
+            return self._lazy_relayouts.footprint(item, solver)
         v = self.vars[item]
         return item.size if v.division is None else v.per_core[solver.Value(v.division)]
 
     def record_fired(self, edge: DependencyEdge, solver) -> None:
         """The relayout candidate the read on ``edge`` fired through: the one
         on its copy for this consumer under the solved division pair."""
-        assert edge.chosen is not None
+        assert edge.transform is not None
+        if self._is_lazy_copy(edge.transform):
+            assert self._lazy_relayouts is not None
+            self.fired[edge] = self._lazy_relayouts.fired(edge, solver)
+            return
         i = solver.Value(self.vars[edge.src].division)
         j = solver.Value(self.vars[edge.dst].division)
         (self.fired[edge],) = [
             c
-            for c in self._candidates_of[edge.chosen]
+            for c in self._candidates_of[edge.transform]
             if c.consumer == edge.dst.name
             and c.source_division == i
             and c.consumer_division == j

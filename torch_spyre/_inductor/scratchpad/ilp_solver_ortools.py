@@ -58,7 +58,7 @@ own offsets are kept.
 **LX relayouts.** The allocator hands the solver one ``RelayoutCopyBuffer`` per
 relayout group (a source and one destination per-core view, however many
 consumers read it); the strategy holds each as a candidate
-:class:`RelayoutLayout`, live from the group's first consumer to its last. The
+:class:`Transform`, live from the group's first consumer to its last. The
 copy's residency IS the decision to shuffle, its rectangle sits in the same
 no-overlap as every node, and its price is an ordinary term of the cost
 expression (``RelayoutCopyBuffer.cost_term``). A resident copy needs its
@@ -72,7 +72,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import sympy
 
@@ -108,6 +108,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     RelayoutCopyBuffer,
     _check_in_place_relationships,
+    build_relayout_copy,
 )
 from torch_spyre._inductor import config
 
@@ -237,6 +238,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             list(self._plan_layout_generic(cost_expr=cost_expr)),
         )
 
+    def graph_solver(self) -> Any:
+        """The CP-SAT backend: the graph is encoded through a strategy and
+        solved by the objective ladder."""
+        from torch_spyre._inductor.scratchpad.backend import CpSat
+
+        return CpSat
+
     def _plan_layout_generic(
         self,
         log_lx_usage: bool = False,
@@ -274,14 +282,18 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "lx_division_encoding='lazy' needs lx_view_relation='derived'"
             )
             strategy_cls = LazyStrategy
+        assert (
+            config.lx_relayout_encoding == "table"
+            or config.lx_view_relation == "derived"
+        ), "lx_relayout_encoding='lazy' needs lx_view_relation='derived'"
         strategy = strategy_cls.from_buffers(buffers, forced_reasons)
         graph.solve(_backend(), cost_expr, strategy)
 
         # Write the decisions back onto the caller's buffers, in bytes.
         order = {name: i for i, name in enumerate(graph.nodes)}
-        layouts = {lay.name: lay for lay in strategy.layouts}
+        transforms = {t.name: t for t in strategy.transforms}
         for b in buffers:
-            item = graph.nodes.get(b.name) or layouts[b.name]
+            item = graph.nodes.get(b.name) or transforms[b.name]
             b.address = None if item.offset is None else item.offset * self.alignment
             b.spill_reason = item.spill_reason
             if isinstance(b, RelayoutCopyBuffer):
@@ -294,14 +306,39 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 b.chosen_division = strategy.solved[item]
             chosen = dict(b.chosen_relayouts)
             for edge in sorted(item.inputs, key=lambda e: order[e.src.name]):
-                if edge.chosen is not None and edge.chosen.offset is not None:
+                if edge.transform is not None and edge.transform.offset is not None:
                     chosen[edge.src.name] = ChosenRelayout(
-                        strategy.fired[edge], edge.chosen.offset
+                        strategy.fired[edge], edge.transform.offset
                     )
             b.chosen_relayouts = {
                 parent: c.scaled(self.alignment) for parent, c in chosen.items()
             }
-        return list(buffers)
+        return [*buffers, *self._lazy_copies(graph, strategy, buffers)]
+
+    def _lazy_copies(
+        self, graph, strategy: TableStrategy, buffers: Sequence[LifetimeBoundBuffer]
+    ) -> list[RelayoutCopyBuffer]:
+        """A copy buffer per resident lazy relayout (2d), built from the
+        candidates that fired through it as the table encoding builds one per
+        group, and placed where the solve put it."""
+        by_name = {b.name: b for b in buffers}
+        ticks = {b.name: b.start_time for b in buffers}
+        fired: dict = {}
+        for node in graph.get_nodes():
+            for edge in node.outputs:
+                t = edge.transform
+                if t is not None and t.name not in by_name:
+                    fired.setdefault(t, []).append(strategy.fired[edge])
+        copies = []
+        for t, candidates in fired.items():
+            assert t.producer is not None and t.offset is not None
+            source = by_name[t.producer.name]
+            assert isinstance(source, CoreDivisionBuffer)
+            copy = build_relayout_copy(source, candidates[0].group, candidates, ticks)
+            copy.address = t.offset * self.alignment
+            copy.chosen_division = 0
+            copies.append(copy)
+        return copies
 
     def _note_stats(self, stats: dict) -> None:
         self.last_solve_stats = stats

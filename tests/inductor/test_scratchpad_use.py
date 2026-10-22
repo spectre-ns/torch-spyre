@@ -128,8 +128,12 @@ def test_cooptimizing_allocator_rejects_relayout_results_without_asserts():
 
     import torch_spyre._inductor.scratchpad.allocator as allocator_module
 
+    from torch_spyre._inductor.scratchpad.graph_solvers import BufferSolver
+
     solver = create_autospec(allocator_module.CoreDivisionLayoutSolver, instance=True)
     solver.buffers = []
+    solver.alignment, solver.limit = 128, 0
+    solver.graph_solver.return_value = BufferSolver(solver)
     solver.plan_layout_and_core_divisions.return_value = [
         SimpleNamespace(lx_relayout_plans=[object()])
     ]
@@ -2429,10 +2433,10 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         orig_cdm = TableCandidates._clone_divisions_and_matches
 
         def spy_cdm(self, input_name, *a, **k):
-            divs, matches = orig_cdm(self, input_name, *a, **k)
+            divs, matches, reads = orig_cdm(self, input_name, *a, **k)
             if divs:
                 clone_names.add(input_name)
-            return divs, matches
+            return divs, matches, reads
 
         with (
             patch.object(TableCandidates, "_cd_parent_relayouts", spy),

@@ -13,6 +13,18 @@ zoo, against today's tables with relayouts off: tiling compiles 161 s -> 123 s
 (derived) and 113 s (Lazy + point menus); default compiles 47 s -> 57-70 s, all of
 it CP-SAT time (Q12). The report has the full tables and an implementation guide.
 
+## Progress: the whole plan (requested 2026-10-22, "implement the whole plan with green CI")
+
+| step | state |
+|---|---|
+| Phase 1 plan text: `Transform` / `TransformKind`, `encode_transform` / `encode_transform_use`, `encode_lifetime`, `NodeVars.start/end`, `edge.merged` / `edge.transform`, `chosen_transforms()` | done; same model (smoke 37/37, unit-test solves 99/99) |
+| 2c input clones as constraints (`encode_clone`, `CloneRead`) | done under `LX_VIEW_RELATION=derived`; clone consumers can be Lazy |
+| 2d relayouts as constraints (`LX_RELAYOUT_ENCODING=lazy`, `lazy_relayout.py`) | in progress |
+| 2e in-place as constraints | next |
+| 3a `set_solver`, graph solvers, `Decomposed` | to do |
+| 3b-3g | to do |
+| Final cleanup: delete redundant code (superseded encodings/arms, the merged allocator subclass, dead helpers) | requested 2026-10-22; last step |
+
 ## Q1. Stage 9: extraction or generation from the op?
 
 Stage 9 is done as an extraction: the candidate derivations moved verbatim from

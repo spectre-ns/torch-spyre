@@ -361,6 +361,14 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # constructs the division on the other end of an edge by inverting the view.
     # Empty where the allocator has not built them (they need the live ops).
     residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
+    # How this buffer reads each input clone, per candidate (``CloneRead``):
+    # set instead of the clone's ``cd_parent_matches`` entry when the
+    # strategy derives that relation.
+    clone_reads: dict[str, Any] = field(default_factory=dict)
+    # Per producer this buffer may read through a relayout copy, the edge's
+    # gates and price (``RelayoutEdge``), for a strategy that encodes
+    # relayouts over view ids instead of ``cd_parent_relayouts``.
+    relayout_edges: dict[str, Any] = field(default_factory=dict)
     # This buffer's producing op's legal divisions as a space to move in --
     # ``core_divisions`` without materializing it. ``None`` where the allocator
     # built none (see ``allocator._DivisionMap``).
@@ -1108,6 +1116,14 @@ class MemoryPlanSolver(ABC):
         self.limit = size
         self.alignment = alignment
 
+    def graph_solver(self) -> Any:
+        """What ``SpyreOptimizationGraph.solve`` runs for this solver: a
+        backend class (the posted model's solver) or a graph solver. A
+        placement-only solver packs the nodes' placement views."""
+        from torch_spyre._inductor.scratchpad.graph_solvers import PlacementSolver
+
+        return PlacementSolver(type(self), self.limit)
+
     def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
         if buffer.residency_reason is not None:
@@ -1176,6 +1192,13 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     @classmethod
     def chooses_core_divisions(cls) -> bool:
         return True
+
+    def graph_solver(self) -> Any:
+        """A joint solver that reads its own buffers solves them and fills
+        the graph's nodes from its choices."""
+        from torch_spyre._inductor.scratchpad.graph_solvers import BufferSolver
+
+        return BufferSolver(self)
 
     def off_expression_ns(self) -> dict[str, float]:
         """The terms this engine's objective adds outside ``cost_expr`` for the

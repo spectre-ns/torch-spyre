@@ -345,9 +345,19 @@ lx_view_relation: Literal["table", "derived"] = os.environ.get(  # type: ignore[
     "LX_VIEW_RELATION", "table"
 )
 
-# Whether the co-optimizing solve is offered relayout candidates at all; off
-# under ``lx_view_relation = "derived"``, which does not generate them yet.
+# Whether the co-optimizing solve is offered relayout candidates at all. Under
+# ``lx_view_relation = "derived"`` only ``lx_relayout_encoding = "lazy"``
+# offers them.
 lx_solver_relayouts: bool = os.environ.get("LX_SOLVER_RELAYOUTS", "1") == "1"
+
+# How the CP-SAT layout solve encodes relayouts: "table" (the allocator's
+# capped, priced copy groups over division pairs) or "lazy" (per edge, a
+# legality and price table over the two ends' view ids, copies shared by
+# reified view equality, each owner's lifetime a variable; no cap). "lazy"
+# needs lx_view_relation = "derived". Experimental.
+lx_relayout_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
+    "LX_RELAYOUT_ENCODING", "table"
+)
 
 # How the CP-SAT layout solve encodes an open work split: "table" (an index
 # into the candidate menu) or "lazy" (one split var per axis and a tiling

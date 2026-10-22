@@ -131,7 +131,7 @@ def test_add_child_shares_one_edge_object():
     assert isinstance(edge, DependencyEdge)
     assert a.outputs == [edge] and b.inputs == [edge]
     assert a.inputs == [] and b.outputs == []
-    assert edge.in_place and edge.chosen is None
+    assert edge.in_place and edge.transform is None
     with pytest.raises(AssertionError):
         a.add_child(b)
 
@@ -236,7 +236,7 @@ def test_build_graph_matches_the_allocator_buffers(case, buffers):
     strategy = TableStrategy.from_buffers(buffers)
     strategy.prepare(graph)
     copies = [b.name for b in buffers if isinstance(b, RelayoutCopyBuffer)]
-    assert [lay.name for lay in strategy.layouts] == copies
+    assert [t.name for t in strategy.transforms] == copies
 
 
 def _graph_of(buffers, capacity=16) -> SpyreOptimizationGraph:
