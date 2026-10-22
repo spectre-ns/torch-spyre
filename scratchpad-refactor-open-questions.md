@@ -108,3 +108,29 @@ indices (loop-carry update/read edges, input clones), or its space has more than
 
 - Assumed (recommended): as above; clones and carries move with 2c's clone encoding.
 - Answer needed: none unless you want a different cut-off.
+
+## Q10. Relayouts under Lazy (2d): worth building now?
+
+The derived relation and Lazy run without relayout candidates (Q4). Measured on the
+zoo (table with vs without relayouts, same code, separate processes): relayouts make
+20 more real buffers resident (610 vs 590, about 3%), plans are identical on 40 of
+64 solves, and planning takes about 70% longer (prepare 239.7 s vs 141.5 s, solve
+105.2 s vs 66.3 s in total).
+
+- Assumed (recommended): 2d is not built in this exploration; its closed form for
+  `movement_supported` is already verified offline (Phase 2.0), and the remaining
+  per-pair gates and the price are the work.
+- Answer needed: is a ~3% residency gain worth 2d before the rest, or should
+  relayouts become an opt-in refinement?
+
+## Q11. How far into Phase 3
+
+3a (backend protocol) is built. 3b-3g are restructurings of the allocator: 3c builds
+the graph from the IR beside the buffers and must agree with it, and 3g deletes
+`CoOptimizingAllocator`. Their feasibility was judged from the code and the 3c spike
+(762/762 `produced_at`), and the plan says Phase 3 needs its own plan.
+
+- Assumed (recommended): stop implementation at Phase 2 (L1 derived relation, Lazy
+  work split, digit views, point menus) plus 3a, finish the benchmark, and write the
+  implementation guide and results into the feasibility report.
+- Answer needed: do you want a 3c prototype (IR builder plus agreement check) too?
