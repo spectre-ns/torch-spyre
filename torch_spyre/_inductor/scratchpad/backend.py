@@ -440,6 +440,7 @@ class _Linearizer:
             _vals(list(self.p.variables[vb].domain))
         ):
             (va, sa), (vb, sb) = (vb, sb), (va, sa)
+            a, b = b, a
         z = self._onehot(va)
         lo, hi = self.bnd(b)
         ybexpr = self.lin(b)
@@ -937,3 +938,110 @@ class _BruteForceSearch:
                 self._dfs(a, order, i + 1)
             for u in assigned:
                 a[u] = None
+
+
+class _AnnealSearch(_BruteForceSearch):
+    """Simulated annealing over the recorded model, no linearization: every
+    constraint kind is evaluated natively (the same checks as the exhaustive
+    search), violations are penalized, and a move reassigns one variable that
+    no constraint defines; defined ones are recomputed."""
+
+    def anneal(
+        self, seed: int, budget_s: float, penalty: Optional[float] = None, start=None
+    ):
+        import random
+
+        rng = random.Random(seed)
+        free = [v for v in range(self.n) if v not in self.defs]
+        doms = [_domain_values(self.domains[v]) for v in range(self.n)]
+        # Definitions that cannot resolve (a row "defining" several of its own
+        # vars) leave those vars free: the search moves them.
+        probe = [None] * self.n
+        for v in free:
+            probe[v] = doms[v][0]
+        self._propagate(probe, [])
+        self._floating: set = {v for v in self.defs if probe[v] is None}
+        free += sorted(self._floating)
+        a = [None] * self.n
+        for v in free:
+            a[v] = doms[v][0]
+        if start is not None:  # the previous ladder stage's plan (a hint)
+            for v in free:
+                if v < len(start) and start[v] is not None:
+                    a[v] = start[v]
+        self._settle(a, doms)
+        scale = (
+            max(1.0, sum(abs(c) for c in self.objective[1])) if self.objective else 1.0
+        )
+        penalty = penalty or scale
+        cur_v = self._violations(a)
+        cur = self._obj(a) + penalty * cur_v
+        best = None
+        if cur_v == 0:
+            best = (self._obj(a), list(a))
+        t0 = time.perf_counter()
+        temp = scale
+        moves = 0
+        while time.perf_counter() - t0 < budget_s and free:
+            moves += 1
+            v = rng.choice(free)
+            old = a[v]
+            choices = doms[v]
+            if len(choices) < 2:
+                continue
+            a[v] = rng.choice(choices)
+            if a[v] == old:
+                continue
+            saved = list(a)
+            saved[v] = old
+            self._settle(a, doms)
+            new_v = self._violations(a)
+            new = self._obj(a) + penalty * new_v
+            if new <= cur or rng.random() < math.exp(-(new - cur) / max(temp, 1e-9)):
+                cur, cur_v = new, new_v
+                if cur_v == 0 and (best is None or self._obj(a) < best[0] - 1e-9):
+                    best = (self._obj(a), list(a))
+            else:
+                a[:] = saved
+            temp = max(temp * 0.9995, 1e-3)
+            if moves % 2000 == 0:
+                penalty *= 1.2
+                cur = self._obj(a) + penalty * cur_v
+        self.moves = moves
+        if best is not None:
+            self.best, self.best_a = best
+        return best is not None
+
+    def _settle(self, a, doms):
+        for v in self.defs:
+            if v not in self._floating:
+                a[v] = None
+        self._propagate(a, [])
+        for v in self.defs:  # a definition that does not resolve here
+            if a[v] is None:
+                a[v] = doms[v][0]
+
+    def _violations(self, a):
+        return sum(0 if self._check(a, ci) else 1 for ci in range(len(self.cons)))
+
+
+class Annealing(_SolvedRecording):
+    """Simulated annealing over the recorded model, scored natively."""
+
+    def __init__(self, seed: int = 0, budget_s: float = 10.0, model=None):
+        super().__init__(model)
+        self.seed = seed
+        self.budget_s = budget_s
+
+    def Solve(self, objective: bool = False) -> int:
+        search = _AnnealSearch(self._proto(), max_nodes=0)
+        t = time.perf_counter()
+        found = search.anneal(self.seed, self.budget_s, start=self._values)
+        self._wall = time.perf_counter() - t
+        if not found:
+            self._status = cp_model.UNKNOWN
+            return self._status
+        self._values = search.best_a
+        self._objective_value = search.objective_value()
+        self._status = cp_model.FEASIBLE
+        return self._status

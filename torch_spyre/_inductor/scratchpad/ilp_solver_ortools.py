@@ -128,6 +128,10 @@ def _backend():
         return Mip(choice.partition(":")[2] or "SCIP")
     if choice == "bruteforce":
         return BruteForce()
+    if choice.startswith("anneal"):
+        from torch_spyre._inductor.scratchpad.backend import Annealing
+
+        return Annealing(budget_s=float(choice.partition(":")[2] or 10))
     return CpSat()
 
 
