@@ -386,9 +386,9 @@ hardware.
 `cost_expr` once, then score each candidate by substituting its guess and evaluating. The two
 solvers differ in what "substitute and evaluate" compiles down to:
 
-- **CP-SAT (symbolic all the way through)**: `_minimize_cost_expr`
-  (`scratchpad/ilp_solver_ortools.py`) maps each sympy symbol straight onto a native OR-Tools
-  decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
+- **CP-SAT (symbolic all the way through)**: `SpyreOptimizationGraph._minimize_cost_expr`
+  (`scratchpad/buffer_graph.py`) maps each sympy symbol straight onto a native OR-Tools
+  decision variable (`sym_map[node.sym_is_lx.name] = vars.in_buffer`, and similarly for
   `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
   as the objective to minimize via `cost_expr_to_cpsat(...)`
   (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates `cost_expr` in Python; it

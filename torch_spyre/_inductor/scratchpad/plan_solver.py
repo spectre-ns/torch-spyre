@@ -149,7 +149,7 @@ class LifetimeBoundBuffer:
         This counts the buffer's reads, not the reads residency would save: an
         input's first read is the clone-in that pinning cannot avoid, so a cost
         model has to discount it separately (see
-        :meth:`_LifetimeBufferWithCpVars.spill_cost`).  The ``max`` only guards
+        :func:`buffer_graph.spill_cost`).  The ``max`` only guards
         the transient empty-``uses`` state described in :meth:`__post_init__`.
         """
         return max(0, len(self.uses) - (0 if self.first_use_is_read else 1))
@@ -392,7 +392,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     def min_footprint(self) -> int:
         """Smallest per-core footprint any candidate division allows. With no
         candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on).
+        (the placement-only case ``SpyreOptimizationGraph.add_node`` commits).
 
         A tiled candidate's own buffer is per-tile scratch, so its footprint
         shrinks by the output tile count as well as the core count -- this is
@@ -950,7 +950,7 @@ def _check_in_place_relationships(
                 check_in_place_parent_is_read(parent, child.name)
                 # With core_divisions ``size`` is the *total* footprint, so a static
                 # size check doesn't apply; the per-core match is enforced against the
-                # chosen division in ``CpSatLayoutSolver._add_inplace_relaxation``. Only
+                # chosen division in ``TableStrategy.encode_merge``. Only
                 # the division-fixed case (plain ``LifetimeBoundBuffer``, no
                 # ``core_divisions``) keeps the static check.
                 if not (

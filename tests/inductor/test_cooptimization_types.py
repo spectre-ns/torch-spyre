@@ -239,7 +239,7 @@ class CaptureAssumptionsTest(TestCase):
         ``read_count`` itself: ``read_count`` counts every read, and for a graph
         input the first one is the clone-in that pinning cannot avoid. Both
         engines discount it -- ``SACoOptimizer.spill_cost`` and
-        ``_LifetimeBufferWithCpVars.spill_cost`` -- so the equivalence this test
+        ``buffer_graph.spill_cost`` -- so the equivalence this test
         protects is against the discounted count.
         """
         for tag, g in _all_captures():
@@ -358,17 +358,13 @@ class SpillCostTest(TestCase):
 
     def test_matches_the_cpsat_engine_formula(self):
         """Duplicated formula, so pin it against the original it copies."""
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            _LifetimeBufferWithCpVars,
-        )
+        from torch_spyre._inductor.scratchpad.buffer_graph import spill_cost
 
         for boundary in BufferType:
             for uses in ([0, 1], [0, 1, 2, 3], [5]):
                 b = self._buf(2048, uses, boundary)
                 mine = SaCoOptimizingSolver._spill_cost(b)
-                theirs = _LifetimeBufferWithCpVars.spill_cost(
-                    type("_S", (), {"buffer": b})()
-                )
+                theirs = spill_cost(b)
                 self.assertEqual(mine, theirs, f"{boundary} uses={uses}")
 
 

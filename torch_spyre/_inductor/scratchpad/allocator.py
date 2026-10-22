@@ -678,7 +678,7 @@ def _assert_drain_plan_committed(
     the solve, in :func:`validated_drain_plans`, and the HBM fallback simply
     never gets here).  The ownership check recomputes the carry edge's
     admitted ``(storage, update)`` division pairs from the chosen divisions --
-    the same geometry ``constrain_residency`` gated on -- so a resident
+    the same geometry ``encode_read`` gated on -- so a resident
     storage whose update does not actually match its slicing can never emit a
     drain.
     """
@@ -1113,10 +1113,10 @@ class ScratchpadAllocator:
         if division_is_fixed:
             # On the joint path this same geometric check runs again per
             # candidate division pair, as part of the solver's own residency
-            # gate (``_cd_parent_matches`` / ``constrain_residency``): a
+            # gate (``_cd_parent_matches`` / ``encode_read``): a
             # restickify reader is an ordinary consumer edge there, and an
             # edge with no compatible pair already forces ``in_buffer`` false
-            # (see ``constrain_residency``'s docstring). Applying the barrier
+            # (see ``encode_read``'s docstring). Applying the barrier
             # here too would instead test the read against whatever division
             # the op happens to carry on ``iteration_space_ownership`` before
             # the solver has chosen anything -- stale, provisional, and
@@ -1334,7 +1334,7 @@ class ScratchpadAllocator:
         has one committed division per op and no other mechanism to catch a
         cross-core restickify read. The joint path skips it -- the solver's
         own per-candidate residency gate (``_cd_parent_matches`` /
-        ``constrain_residency``) subsumes it there, correctly, over every
+        ``encode_read``) subsumes it there, correctly, over every
         division the solver could actually choose (see the call sites for
         why testing it here, against whatever division the op happens to
         carry pre-solve, is not just redundant but wrong; issue #4655).
@@ -2693,7 +2693,7 @@ def commit_divisions(
 
     The solver optimizes a core division for all buffers, not just resident
     ones: a resident producer and its consumers are pinned by
-    ``_CoreDivisionBufferWithCpVars.constrain_residency`` to one shared
+    ``TableStrategy.encode_read`` to one shared
     slicing (so those commits are mutually consistent), while a spilled
     buffer is free of that gate -- its accesses round-trip through HBM,
     which re-slices on load -- so it takes its most parallel candidate.
@@ -3019,7 +3019,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # the annealer to the memory-only objective. Nothing downstream reports that, so
         # log it here -- with the traceback, since the message alone ("cannot determine
         # truth value of Relational") names no op, bundle or term -- and honour
-        # `_cpsat_warn_on_cost_expr` as `ilp_solver_ortools._minimize_cost_expr` does.
+        # `_cpsat_warn_on_cost_expr` as `buffer_graph._minimize_cost_expr` does.
         # Without that escape hatch a TypeError from ordinary drift, say a signature
         # change or a None in a term, is a silent objective loss no test can fail on.
         if (

@@ -1292,9 +1292,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     def _spill_cost(buffer: CoreDivisionBuffer) -> int:
         """Differential HBM traffic a spill adds over residency, in bytes.
 
-        Duplicates :meth:`_LifetimeBufferWithCpVars.spill_cost` in
-        ``ilp_solver_ortools.py`` so the two engines score the same quantity;
-        lifting the formula into ``plan_solver.py`` is a follow-up.
+        Duplicates :func:`buffer_graph.spill_cost` so the two engines score
+        the same quantity; sharing the one formula is a follow-up.
 
         The reads residency would have served from LX, plus the producer's write,
         which residency turns into a free LX write -- a graph input has no producer

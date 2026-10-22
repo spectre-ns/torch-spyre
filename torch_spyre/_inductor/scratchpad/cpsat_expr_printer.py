@@ -806,8 +806,8 @@ class _SympyExprToCpSat(Printer):
 
     def _print_KroneckerDelta(self, expr):
         """``KroneckerDelta(division_X, k)`` -> the reified literal
-        ``division == k`` of buffer X (``_CoreDivisionBufferWithCpVars.
-        division_is``), so a table term such as the relayout price lowers to a
+        ``division == k`` of buffer X (``NodeVars.division_is``), so a table
+        term such as the relayout price lowers to a
         product of literals. sympy canonicalises the argument order, so the
         symbol and the constant are found by type, not position."""
         symbols = [a for a in expr.args if isinstance(a, sympy.Symbol)]
@@ -827,7 +827,7 @@ class _SympyExprToCpSat(Printer):
         boolean product per (copy, priced division) had the table been written
         as a sum of deltas. Divisions past the table read 0; a source that is
         not a division-choosing buffer of this solve prices at 0, as it can
-        never fire (``_constrain_relayout_copies``)."""
+        never fire (``TableStrategy.encode_relayout``)."""
         is_lx, division, *prices = expr.args
         table = [int(p) for p in prices]
         lit = self._print(is_lx)

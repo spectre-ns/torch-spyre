@@ -44,7 +44,7 @@ pytest.importorskip("ortools")
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
-from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+from torch_spyre._inductor.scratchpad import buffer_graph
 from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -209,7 +209,7 @@ def test_relayout_solve_uses_available_parallel_search_workers(
 
     monkeypatch.setattr(config, "num_cpus", num_cpus)
     monkeypatch.setattr(
-        ilp_solver_ortools.torch,
+        buffer_graph.torch,
         "are_deterministic_algorithms_enabled",
         lambda: deterministic,
     )
@@ -546,7 +546,7 @@ def test_copy_never_resides_without_its_source():
 
 def test_gate_without_a_relayout_table_is_unchanged():
     # No match pairs and no relayout table: in_buffer is forced off exactly
-    # as before (regression guard for the constrain_residency rewrite). No
+    # as before (regression guard for the encode_read rewrite). No
     # copy exists, so no price term either.
     bufs = _with_copies(_producer([0, 1]), _consumer("C", 1, 2, []))
     assert not any(isinstance(b, RelayoutCopyBuffer) for b in bufs)

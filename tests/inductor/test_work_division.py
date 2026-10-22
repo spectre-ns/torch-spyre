@@ -335,7 +335,7 @@ class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
     happened to leave on the op, not any division the joint solver could
     actually pick. On the joint path (``division_is_fixed=False``) that
     committed division may disagree with a perfectly compatible candidate the
-    solver's own ``cd_parent_matches``/``constrain_residency`` gate would
+    solver's own ``cd_parent_matches``/``encode_read`` gate would
     later select, permanently barring a buffer the solver would otherwise
     place. The fixed-division (placement) path has no such downstream gate,
     so it must still apply the barrier up front.

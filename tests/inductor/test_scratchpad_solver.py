@@ -2512,7 +2512,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         self.assertEqual(result["parent"].address, result["child"].address)
 
     def test_core_division_buffer_without_divisions_is_placement_only(self):
-        # ``_wrap`` dispatches on *having candidate divisions*, not on the class:
+        # ``add_node`` commits on *having no candidate divisions*, not the class:
         # a CoreDivisionBuffer with an empty candidate list has nothing to
         # choose, so plan_layout treats it as placement-only instead of
         # tripping the joint path's enumeration assert.
