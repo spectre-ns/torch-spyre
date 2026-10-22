@@ -291,9 +291,13 @@ class TableStrategy(EncodingStrategy):
         | None = None,
         copies: Sequence[RelayoutCopyBuffer] = (),
         copy_reasons: Mapping[str, str] | None = None,
+        residency: Mapping[tuple[str, str], Any] | None = None,
         **settings,
     ) -> None:
         super().__init__(**settings)
+        # Edges whose relation is derived from their ResidencyEdge (equality of
+        # per-node view ids, tile-view ids and core counts) instead of a table.
+        self.residency = dict(residency or {})
         self.menus = {k: tuple(v) for k, v in (menus or {}).items()}
         self.matches = {k: list(v) for k, v in (matches or {}).items()}
         self.relayout_candidates = {
@@ -318,7 +322,8 @@ class TableStrategy(EncodingStrategy):
         names = {b.name for b in buffers}
         copies = [b for b in buffers if isinstance(b, RelayoutCopyBuffer)]
         groups = {c.group_key for c in copies}
-        menus, matches, relayouts = {}, {}, {}
+        derived = config.lx_view_relation == "derived"
+        menus, matches, relayouts, residency = {}, {}, {}, {}
         for b in buffers:
             if isinstance(b, RelayoutCopyBuffer) or not isinstance(
                 b, CoreDivisionBuffer
@@ -329,7 +334,14 @@ class TableStrategy(EncodingStrategy):
             for parent in dict.fromkeys([*b.parents, *b.in_place_parents]):
                 if parent not in names:
                     continue
-                matches[(parent, b.name)] = b.cd_parent_matches.get(parent, [])
+                if (
+                    derived
+                    and parent not in b.cd_parent_matches
+                    and parent in b.residency_edges
+                ):
+                    residency[(parent, b.name)] = b.residency_edges[parent]
+                else:
+                    matches[(parent, b.name)] = b.cd_parent_matches.get(parent, [])
                 cands = [
                     c
                     for c in b.cd_parent_relayouts.get(parent, ())
@@ -343,6 +355,7 @@ class TableStrategy(EncodingStrategy):
             relayout_candidates=relayouts,
             copies=copies,
             copy_reasons={c.name: reasons[c.name] for c in copies if c.name in reasons},
+            residency=residency,
             **settings,
         )
 
@@ -357,6 +370,14 @@ class TableStrategy(EncodingStrategy):
         self.fired = {}
         self.solved = {}
         self._capacity = graph.capacity
+        self._reps: dict[tuple[str, str], list] = {}
+        self._src_ids: dict = {}
+        self._dst_ids: dict = {}
+        import os
+
+        self._check: Optional[list] = (
+            [] if os.environ.get("LX_RELATION_CHECK") else None
+        )
         self._serves: dict[RelayoutLayout, list[Var]] = {}
         self._candidates_of: dict[RelayoutLayout, tuple[RelayoutCandidate, ...]] = {}
         self._priced: dict[RelayoutLayout, list[int]] = {}
@@ -400,6 +421,7 @@ class TableStrategy(EncodingStrategy):
             )
         self._tiling_on = len(self._nest_ids) > 1
         self._loop_id: dict[Item, Var] = {}
+        self._levels: dict[Item, list[Var]] = {}
         self._tiled: dict[Item, Var] = {}
         self._group: dict[Item, Var] = {}
         self._join_prev: dict[ResourceNode, Optional[ResourceNode]] = {}
@@ -541,7 +563,7 @@ class TableStrategy(EncodingStrategy):
         model.AddImplication(lit, dst.in_buffer)
         if self.chooses_split(edge.dst):
             model.Add(dst.eff_size == src.eff_size).OnlyEnforceIf(lit)
-            _gate_divisions(model, self._pairs(edge), src.division, dst.division, lit)
+            self._relate(edge, lit, model)
         self._incoming.setdefault(edge.dst, []).append(lit)
 
     def limit_merges(self, node: ResourceNode, model: Model, incoming: bool) -> None:
@@ -558,6 +580,128 @@ class TableStrategy(EncodingStrategy):
 
     def _pairs(self, edge: DependencyEdge) -> list[tuple[int, int]]:
         return self.matches.get((edge.src.name, edge.dst.name), [])
+
+    def _relate(self, edge: DependencyEdge, lit: Var, model: Model) -> None:
+        """When ``lit`` holds, the two ends' divisions slice the shared buffer
+        alike: a pair table, or for a derived edge equal view ids, tile-view
+        ids and core counts."""
+        key = (edge.src.name, edge.dst.name)
+        re = self.residency.get(key)
+        src, dst = self.vars[edge.src], self.vars[edge.dst]
+        if re is None:
+            _gate_divisions(model, self._pairs(edge), src.division, dst.division, lit)
+            return
+        sv, st = self._source_ids(edge.src, re, model)
+        dv, dt = self._consumer_ids(edge, re, model)
+        model.Add(sv == dv).OnlyEnforceIf(lit)
+        model.Add(st == dt).OnlyEnforceIf(lit)
+        model.Add(src.cores == dst.cores).OnlyEnforceIf(lit)
+
+    # ---- derived relation: per-node view ids ----
+
+    def _intern(self, buffer: str, kind: str, view) -> int:
+        """A small id per distinct view of ``buffer`` (``same_partition``
+        classes), shared by the producer and every consumer."""
+        if view is None:
+            return -1
+        reps = self._reps.setdefault((buffer, kind), [])
+        for i, rep in enumerate(reps):
+            if rep.same_partition(view):
+                return i
+        reps.append(view)
+        return len(reps) - 1
+
+    def _id_var(self, item: Item, ids: list[int], name: str, model: Model):
+        v = self.vars[item]
+        if v.fixed_index is not None:
+            return ids[v.fixed_index]
+        if min(ids) == max(ids):
+            return ids[0]
+        var = model.IntVar(min(ids), max(ids), name)
+        model.AddElement(v.division, ids, var)
+        return var
+
+    def _source_ids(self, node: ResourceNode, re, model: Model):
+        """The producer's write-view id and tile-view id, once per producer."""
+        if node not in self._src_ids:
+            from torch_spyre._inductor.work_division import _tile_view_for_div
+
+            menu = self._candidates(node)
+            core = [self._intern(node.name, "core", re.parent_view(cd)) for cd in menu]
+            tile = [
+                self._intern(
+                    node.name,
+                    "tile",
+                    _tile_view_for_div(
+                        re.parent_op, re.write_dep, re.buf_name, cd, re.prep_cache
+                    ),
+                )
+                for cd in menu
+            ]
+            self._src_ids[node] = (
+                self._id_var(node, core, f"wview_{node.name}", model),
+                self._id_var(node, tile, f"wtile_{node.name}", model),
+                core,
+                tile,
+            )
+        return self._src_ids[node][:2]
+
+    def _consumer_ids(self, edge: DependencyEdge, re, model: Model):
+        """The consumer's read-view id and tile-view id of the edge's buffer;
+        an unrepresentable read gets an id no write view has."""
+        if edge not in self._dst_ids:
+            menu = self._candidates(edge.dst)
+            core = [
+                self._intern(edge.src.name, "core", re.consumer_view(cd)) for cd in menu
+            ]
+            tile = [
+                self._intern(edge.src.name, "tile", re.consumer_tile_view(cd))
+                for cd in menu
+            ]
+            core = [-2 if i == -1 else i for i in core]
+            tile = [-2 if i == -1 else i for i in tile]
+            name = f"{edge.src.name}__{edge.dst.name}"
+            self._dst_ids[edge] = (
+                self._id_var(edge.dst, core, f"rview_{name}", model),
+                self._id_var(edge.dst, tile, f"rtile_{name}", model),
+                core,
+                tile,
+            )
+            if self._check is not None:
+                self._check_edge(edge, re)
+        return self._dst_ids[edge][:2]
+
+    def _check_edge(self, edge: DependencyEdge, re) -> None:
+        """Agreement test: the pairs the derived relation admits must be the
+        pair table ``match_pairs`` would build."""
+        src_menu, dst_menu = self._candidates(edge.src), self._candidates(edge.dst)
+        _, _, sc, stile = self._src_ids[edge.src]
+        _, _, dc, dtile = self._dst_ids[edge]
+        derived = {
+            (i, j)
+            for i in range(len(src_menu))
+            for j in range(len(dst_menu))
+            if sc[i] >= 0
+            and sc[i] == dc[j]
+            and stile[i] >= 0
+            and stile[i] == dtile[j]
+            and src_menu[i].cores_used == dst_menu[j].cores_used
+        }
+        table = set(re.match_pairs(list(src_menu), list(dst_menu)))
+        import json
+        import os
+
+        record = {
+            "edge": repr(edge),
+            "pairs": len(table),
+            "equal": derived == table,
+            "missing": len(table - derived),
+            "extra": len(derived - table),
+        }
+        assert self._check is not None
+        self._check.append(record)
+        with open(os.environ["LX_RELATION_CHECK"], "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     # ---- 3. placement ----
 
@@ -644,13 +788,12 @@ class TableStrategy(EncodingStrategy):
             model.AddImplication(lit, self.vars[layout].in_buffer)
             served[layout] = lit
             self._serves.setdefault(layout, []).append(lit)
-        pairs = self._pairs(edge)
         if not served:
-            _gate_divisions(model, pairs, src.division, dst.division, src.in_buffer)
+            self._relate(edge, src.in_buffer, model)
             return
         self.served.setdefault(edge, []).extend(served.items())
         match = model.BoolVar(f"match_{edge.src.name}__{edge.dst.name}")
-        _gate_divisions(model, pairs, src.division, dst.division, match)
+        self._relate(edge, match, model)
         model.AddBoolOr([match, *served.values()]).OnlyEnforceIf(src.in_buffer)
 
     # ---- 6. relayouts ----
@@ -682,13 +825,30 @@ class TableStrategy(EncodingStrategy):
         if not self._tiling_on:
             return
         v = self.vars[item]
-        ids = [self._nest_ids[cd.tiling.level_counts] for cd in self._candidates(item)]
-        var = model.IntVar(0, max(self._nest_ids.values()), f"loop_id_{item.name}")
-        model.AddElement(v.division, ids, var)
-        tiled = model.BoolVar(f"tiled_{item.name}")
-        model.Add(var != 0).OnlyEnforceIf(tiled)
-        model.Add(var == 0).OnlyEnforceIf(tiled.Not())
-        self._loop_id[item] = var
+        cands = self._candidates(item)
+        if config.lx_nest_encoding == "levels":
+            depth = max(len(k) for k in self._nest_ids)
+            levels = []
+            for k in range(depth):
+                vals = [
+                    cd.tiling.level_counts[k] if k < len(cd.tiling.level_counts) else 0
+                    for cd in cands
+                ]
+                lk = model.IntVar(min(vals), max(vals), f"L{k}_{item.name}")
+                model.AddElement(v.division, vals, lk)
+                levels.append(lk)
+            tiled = model.BoolVar(f"tiled_{item.name}")
+            model.Add(levels[0] != 0).OnlyEnforceIf(tiled)
+            model.Add(levels[0] == 0).OnlyEnforceIf(tiled.Not())
+            self._levels[item] = levels
+        else:
+            ids = [self._nest_ids[cd.tiling.level_counts] for cd in cands]
+            var = model.IntVar(0, max(self._nest_ids.values()), f"loop_id_{item.name}")
+            model.AddElement(v.division, ids, var)
+            tiled = model.BoolVar(f"tiled_{item.name}")
+            model.Add(var != 0).OnlyEnforceIf(tiled)
+            model.Add(var == 0).OnlyEnforceIf(tiled.Not())
+            self._loop_id[item] = var
         self._tiled[item] = tiled
 
     def tileable(self, node: ResourceNode) -> bool:
@@ -742,8 +902,21 @@ class TableStrategy(EncodingStrategy):
             return
         a, b = prev.name, node.name
         same = model.BoolVar(f"samenest_{a}_{b}")
-        model.Add(self._loop_id[prev] == self._loop_id[node]).OnlyEnforceIf(same)
-        model.Add(self._loop_id[prev] != self._loop_id[node]).OnlyEnforceIf(same.Not())
+        if self._levels:
+            # Same nest: every level's tile count equal (0 past a nest's depth).
+            eqs = []
+            for k, (la, lb) in enumerate(zip(self._levels[prev], self._levels[node])):
+                e = model.BoolVar(f"eq{k}_{a}_{b}")
+                model.Add(la == lb).OnlyEnforceIf(e)
+                model.Add(la != lb).OnlyEnforceIf(e.Not())
+                eqs.append(e)
+            model.AddBoolAnd(eqs).OnlyEnforceIf(same)
+            model.AddBoolOr([e.Not() for e in eqs]).OnlyEnforceIf(same.Not())
+        else:
+            model.Add(self._loop_id[prev] == self._loop_id[node]).OnlyEnforceIf(same)
+            model.Add(self._loop_id[prev] != self._loop_id[node]).OnlyEnforceIf(
+                same.Not()
+            )
         joined = model.BoolVar(f"joined_{a}_{b}")
         model.AddBoolAnd([same, self._tiled[node]]).OnlyEnforceIf(joined)
         model.AddBoolOr([same.Not(), self._tiled[node].Not()]).OnlyEnforceIf(
@@ -777,13 +950,7 @@ class TableStrategy(EncodingStrategy):
             d = model.BoolVar(f"apart_{item.name}_{child.name}")
             model.Add(self._group[item] != self._group[child]).OnlyEnforceIf(d)
             model.Add(self._group[item] == self._group[child]).OnlyEnforceIf(d.Not())
-            _gate_divisions(
-                model,
-                self._pairs(edge),
-                self.vars[item].division,
-                self.vars[child].division,
-                d.Not(),
-            )
+            self._relate(edge, d.Not(), model)
             diffs.append(d)
         cut = model.BoolVar(f"cut_{item.name}")
         if unshareable or not diffs:

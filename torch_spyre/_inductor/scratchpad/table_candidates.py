@@ -759,8 +759,21 @@ class TableCandidates:
             residency_edges = self._parent_residency_edges(
                 op, parent_proj, op_by_name, prep_cache, residency_by_buf
             )
+            if config.lx_view_relation == "derived":
+                # The strategy derives these edges' relation from their
+                # ResidencyEdge; only edges whose table is overridden below
+                # (loop carries, input clones) are materialized here.
+                carry_edge = carry_update_edges.get(output_name)
+                special = set(input_clone_matches) | set(
+                    self._loop_carry_read_edges(op, carry_update_edges, prep_cache)
+                )
+                if carry_edge is not None:
+                    special.add(carry_edge.buf_name)
+                tabled = {p: e for p, e in residency_edges.items() if p in special}
+            else:
+                tabled = residency_edges
             cd_parent_matches = self._cd_parent_matches(
-                residency_edges, buf_divisions, divisions
+                tabled, buf_divisions, divisions
             )
 
             # A for_each_tile update writes through a MutationLayout whose
@@ -1445,7 +1458,12 @@ class TableCandidates:
         divisions, so it won't drop the one group that would let this parent
         join them.
         """
-        if not self.allocator._decides_lx_relayouts or config.ktir_emitter:
+        if (
+            not self.allocator._decides_lx_relayouts
+            or config.ktir_emitter
+            or config.lx_view_relation == "derived"
+            or not config.lx_solver_relayouts
+        ):
             return {}
         if consumer_op is None:
             return {}

@@ -335,6 +335,26 @@ cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )
 
+# How the CP-SAT layout solve encodes the relations over each dependency edge
+# (``EnumerationFactory``). "table": a pair table over the two ends' candidate
+# indices, built by the allocator (today's model). "derived": equality of
+# per-node view ids, tile-view ids and core counts, derived by the strategy
+# from each edge's ResidencyEdge; the allocator builds no pair tables for those
+# edges, and relayout candidates are not generated. Experimental.
+lx_view_relation: Literal["table", "derived"] = os.environ.get(  # type: ignore[assignment]
+    "LX_VIEW_RELATION", "table"
+)
+
+# Whether the co-optimizing solve is offered relayout candidates at all; off
+# under ``lx_view_relation = "derived"``, which does not generate them yet.
+lx_solver_relayouts: bool = os.environ.get("LX_SOLVER_RELAYOUTS", "1") == "1"
+
+# How coarse-tiling nests are compared: "id" (an interned loop id per nest) or
+# "levels" (per-level tile-count vars, same_nest as their equality).
+lx_nest_encoding: Literal["id", "levels"] = os.environ.get(  # type: ignore[assignment]
+    "LX_NEST_ENCODING", "id"
+)
+
 
 def _positive_int_env(name: str) -> int | None:
     """``name`` as a positive integer, or None when it is unset or not one."""
