@@ -40,7 +40,10 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     Transform,
     WorkSplit,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
+from torch_spyre._inductor.scratchpad.encoding_strategy import (
+    CandidateTables,
+    TableStrategy,
+)
 from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 from torch_spyre._inductor.scratchpad.graph_editor import (
     GraphEditor,
@@ -413,6 +416,7 @@ class ScratchpadAllocator:
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         division_mode: Literal["open", "committed"] = "committed",
         prune: bool = False,
+        division_strategy: Literal["lazy", "enumerated"] = "lazy",
     ):
         """Configure the allocator with graph passes.
 
@@ -426,6 +430,10 @@ class ScratchpadAllocator:
                 committed upstream; ``"open"`` chooses each buffer's core
                 division (and coarse tiling) jointly with its placement.
             prune: Enable heuristic pruning of the core-division search space.
+            division_strategy: ``"lazy"`` encodes a work split as constraints
+                over its op's space where it can (``LazyStrategy``);
+                ``"enumerated"`` picks every split from its op's enumerated
+                legal divisions (``TableStrategy``).
         """
         from torch_spyre._inductor.scratchpad.table_candidates import (
             TableCandidates,
@@ -439,7 +447,12 @@ class ScratchpadAllocator:
         self._validated_drain_plans: dict[str, DrainPlan] = {}
         self.division_mode = division_mode
         self.prune = prune
-        self.candidates = TableCandidates(size, prune, committed=not self.joint)
+        self.division_strategy = division_strategy
+        lazy = division_strategy == "lazy"
+        self.strategy_class = LazyStrategy if lazy else TableStrategy
+        self.candidates = TableCandidates(
+            size, prune, committed=not self.joint, lazy=lazy
+        )
 
     @property
     def joint(self) -> bool:
@@ -489,7 +502,7 @@ class ScratchpadAllocator:
     def _solve(self, graph: GraphLowering) -> SolvedPlan:
         """Build the graph and solve it under the priced cost expression."""
         solve_graph, tables = self._build_graph(graph)
-        strategy = LazyStrategy.from_tables(tables)
+        strategy = self.strategy_class.from_tables(tables)
         cost_expr, bundle_terms = pricing.cost_expr(graph, solve_graph, tables)
         nodes = solve_graph.solve(cost_expr=cost_expr, strategy=strategy)
         plan = SolvedPlan(nodes, tables, solve_graph.alignment)
@@ -929,6 +942,7 @@ def select_allocator() -> ScratchpadAllocator:
     return ScratchpadAllocator(
         size=size,
         division_mode="open" if config.co_optimizing_lx_planning else "committed",
+        division_strategy=config.lx_division_strategy,
         post_optimization_passes=(
             [LxContextSwitchingPass()] if config.enable_lx_context_switching else []
         ),
@@ -974,6 +988,7 @@ def scratchpad_planning(
             ScratchpadAllocator(
                 size=size,
                 post_optimization_passes=allocator.post_optimization_passes,
+                division_strategy=allocator.division_strategy,
             ).plan_allocation(graph)
             return
         except SolveError as error:

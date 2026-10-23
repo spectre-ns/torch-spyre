@@ -390,17 +390,22 @@ class TableCandidates:
     """The candidate generation for solves over ``capacity``
     bytes of LX: the graph from the IR, each node's menu, the pair tables,
     relations and relayout candidates. ``committed``: every op keeps the
-    division work division committed, a menu of one."""
+    division work division committed, a menu of one. ``lazy``: an op that can
+    take a ``Lazy`` work split gets a space (``lazy_spaces``) and, where the
+    space stands in for it, its points as its menu."""
 
     def __init__(
         self,
         capacity: int,
         prune: bool = False,
         committed: bool = False,
+        lazy: bool = True,
     ) -> None:
         self.capacity = capacity  # bytes
         self.prune = prune
         self.committed = committed
+        # Offer ops a Lazy space; off, every op's menu is its legal divisions.
+        self.lazy = lazy
         # The post-loop drain plans validated for the last graph.
         self.drain_plans: dict[str, DrainPlan] = {}
         # Set for the re-plan after applied tilings: no further tilings.
@@ -656,7 +661,7 @@ class TableCandidates:
             op.data, (Pointwise, Reduction)
         ):
             return fixed, False
-        points = self._point_menu(op, max_cores)
+        points = self._point_menu(op, max_cores) if self.lazy else None
         if points is not None:
             return points, True
         try:
@@ -707,7 +712,11 @@ class TableCandidates:
                 work_division_context_for_op,
             )
 
-            context = work_division_context_for_op(op, max_cores, tiling)
+            context = (
+                work_division_context_for_op(op, max_cores, tiling)
+                if self.lazy
+                else None
+            )
             if context is not None and tiled_candidates:
                 options.append(LazyOption(tiling, tile_splits, context))
             for candidate in tiled_candidates:

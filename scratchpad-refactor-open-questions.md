@@ -288,3 +288,16 @@ buffers (`OpSplitSpace`, `build_op_split_space`, the generated-division relation
 (`_apply_chosen_tilings` and its checks, `JOINT_TILING_AND_DIVISION_ATTR`). CP-SAT applies
 its tilings in `_materialize_selection` and re-solves, so the committed plan never
 carries a tiling. The cost dump drops `off_expression_ns`, `score_ns` and `env.solver`.
+
+## Q20. A configurable division strategy (answered)
+
+Answer (2026-10-23): "I want the strategy to be configurable. We should use lazy the
+way we are now but we should be able to fall back to enumerating and picking from the
+set and encoding accordingly." Also: delete the `Decomposed` backend (nothing used it
+after the exhaustive search went).
+
+Done: `config.lx_division_strategy` (`LX_DIVISION_STRATEGY`), `"lazy"` (default) or
+`"enumerated"`. `select_allocator` passes it to `ScratchpadAllocator(division_strategy=)`,
+which picks `LazyStrategy` or `TableStrategy` and builds `TableCandidates(lazy=)`: off,
+no op gets a `Lazy` space or a point menu, so every menu is the op's legal divisions.
+The committed replan keeps the strategy.

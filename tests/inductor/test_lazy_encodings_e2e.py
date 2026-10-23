@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End to end: the default CP-SAT encodings (the derived view relation,
-``Lazy`` work split and relayouts as constraints) plan graphs that compile and
-compute the right numbers on device."""
+"""End to end: both work-split strategies -- ``lazy`` (the default: the derived
+view relation, ``Lazy`` work split and relayouts as constraints) and
+``enumerated`` (every split picked from its op's enumerated menu) -- plan graphs
+that compile and compute the right numbers on device."""
 
 import pytest
 
@@ -37,8 +38,9 @@ def _norm_chain(x, w):
     return torch.relu(y) + y.softmax(-1)
 
 
+@pytest.mark.parametrize("strategy", ["lazy", "enumerated"])
 @pytest.mark.parametrize("model", ["mlp", "norm_chain"])
-def test_default_encodings_compute_the_reference(model):
+def test_division_strategies_compute_the_reference(model, strategy):
     torch.manual_seed(0)
     if model == "mlp":
         fn = _mlp
@@ -59,6 +61,6 @@ def test_default_encodings_compute_the_reference(model):
         tolerance = {"rtol": 1e-2, "atol": 1e-2}
     expected = fn(*[a.float() for a in args]).half()
     torch._inductor.codecache.FxGraphCache.clear()
-    with config.patch(_BASE):
+    with config.patch({**_BASE, "lx_division_strategy": strategy}):
         got = torch.compile(fn, dynamic=False)(*[a.to("spyre") for a in args])
     torch.testing.assert_close(got.cpu(), expected, **tolerance)

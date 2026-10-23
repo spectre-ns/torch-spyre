@@ -119,7 +119,7 @@ returns the nodes with their decisions filled in, and `SolvedPlan` reads them.
 
 `SPYRE_LX_BACKEND` picks the backend that runs the model (`scratchpad/backend.py`): `cpsat` by
 default, or `mip:<SCIP|HIGHS|CBC>`, `bruteforce`, or `anneal[:<budget s>]`. `backend.py` keeps
-`Mip`, `BruteForce`, `Decomposed`, and `Annealing` as alternative backends for comparing
+`Mip`, `BruteForce` and `Annealing` as alternative backends for comparing
 solutions.
 
 ### Co-optimizer will honor `spyre_hint` for work divisions

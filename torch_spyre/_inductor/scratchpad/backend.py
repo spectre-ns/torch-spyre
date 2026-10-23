@@ -89,7 +89,6 @@ class Backend(Protocol):
         name: str,
     ) -> Any: ...
     def AddNoOverlap2D(self, x: Sequence[Any], y: Sequence[Any]) -> Constraint: ...
-    def MarkTableAxis(self, index: Var) -> None: ...
     def Minimize(self, expr: LinearExpr) -> None: ...
     def Maximize(self, expr: LinearExpr) -> None: ...
     def SetHint(self, vars: Sequence[Var], values: Sequence[int]) -> None: ...
@@ -167,10 +166,6 @@ class CpSat:
     def AddNoOverlap2D(self, x, y):
         return self.model.add_no_overlap_2d(x, y)
 
-    def MarkTableAxis(self, index):
-        """A ``Table`` axis's index var, which ``Decomposed`` enumerates; the
-        other backends search it like any var."""
-
     def Minimize(self, expr):
         self.model.minimize(expr)
 
@@ -215,74 +210,6 @@ class CpSat:
 
     def NumConstraints(self):
         return len(self.model.proto.constraints)
-
-
-class Decomposed(CpSat):
-    """Enumerates the ``Table`` axes the strategy marked (``MarkTableAxis``)
-    and solves the rest of the model at each leaf with CP-SAT, keeping the
-    best leaf: an exhaustive search over the menus of any posted model. The model is posted once; a leaf pins the marked index vars by
-    narrowing their domains, so nothing is rebuilt per leaf. It costs one
-    inner solve per leaf per ladder stage and is exact when every leaf ends
-    OPTIMAL or INFEASIBLE."""
-
-    def __init__(self, model=None, max_leaves: int = 4096) -> None:
-        super().__init__(model)
-        self.max_leaves = max_leaves
-        self.axes: list = []
-
-    def MarkTableAxis(self, index) -> None:
-        if not isinstance(index, int) and index.Index() not in {
-            a.Index() for a in self.axes
-        }:
-            self.axes.append(index)
-
-    def Solve(self, objective: bool = False) -> int:
-        import itertools
-
-        protos = [self.model.proto.variables[a.Index()] for a in self.axes]
-        saved = [list(p.domain) for p in protos]
-        domains = [_domain_values(d) for d in saved]
-        if math.prod(len(d) for d in domains) > self.max_leaves:
-            raise TooBig(
-                f"{math.prod(len(d) for d in domains)} leaves over "
-                f"{len(self.axes)} table axes exceed {self.max_leaves}"
-            )
-        maximize = self.model.proto.objective.scaling_factor < 0
-        has_objective = bool(self.model.proto.objective.vars) or bool(
-            self.model.proto.HasField("floating_point_objective")
-        )
-        best: Optional[tuple] = None
-        best_value = 0.0
-        try:
-            for leaf in itertools.product(*domains):
-                for p, v in zip(protos, leaf):
-                    _set_domain(p, [v, v])
-                status = super().Solve(objective)
-                if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    continue
-                value = self.solver.ObjectiveValue() if has_objective else 0.0
-                if (
-                    best is None
-                    or (maximize and value > best_value)
-                    or (not maximize and value < best_value)
-                ):
-                    best, best_value = leaf, value
-                if not has_objective:
-                    break
-            if best is None:
-                return cp_model.INFEASIBLE
-            # Load the best leaf's solution for Value().
-            for p, v in zip(protos, best):
-                _set_domain(p, [v, v])
-            return super().Solve(objective)
-        finally:
-            for p, d in zip(protos, saved):
-                _set_domain(p, d)
-
-
-def _set_domain(var_proto, domain: list[int]) -> None:
-    var_proto.domain.clear()
-    var_proto.domain.extend(domain)
 
 
 class _SolvedRecording(CpSat):

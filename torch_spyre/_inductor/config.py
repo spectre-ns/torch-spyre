@@ -14,6 +14,7 @@
 
 import os
 import sys
+from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
@@ -38,6 +39,13 @@ lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
+# How the solve encodes each op's work split: "lazy" posts the split's legality
+# as constraints over the op's space where it can (LazyStrategy); "enumerated"
+# enumerates every op's legal divisions and picks one from that menu
+# (TableStrategy), the fallback when a Lazy space misbehaves.
+lx_division_strategy: Literal["lazy", "enumerated"] = os.environ.get(
+    "LX_DIVISION_STRATEGY", "lazy"
+)  # type: ignore[assignment]
 hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (
     "1",
     "true",

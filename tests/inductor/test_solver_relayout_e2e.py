@@ -137,9 +137,13 @@ class _Observed:
         monkeypatch.setattr(sdsc_mod, "is_lx_relayout_identity", spy_identity_codegen)
         monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_identity_kernel)
         if force:
+            from torch_spyre._inductor.scratchpad.encoding_strategy import (
+                TableStrategy,
+            )
             from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-            monkeypatch.setattr(LazyStrategy, "_relate", _no_relation)
+            for strategy in (TableStrategy, LazyStrategy):
+                monkeypatch.setattr(strategy, "_relate", _no_relation)
         torch._inductor.codecache.FxGraphCache.clear()
         torch._dynamo.reset()
 

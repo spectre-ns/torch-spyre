@@ -1121,6 +1121,21 @@ class TestSelectAllocator(unittest.TestCase):
                 self.assertIs(type(a), ScratchpadAllocator)
                 self.assertEqual(a.division_mode, mode)
 
+    def test_division_strategy_picks_the_encoding(self):
+        from torch_spyre._inductor.scratchpad.allocator import select_allocator
+        from torch_spyre._inductor.scratchpad.encoding_strategy import TableStrategy
+        from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+
+        for strategy, cls, lazy in (
+            ("lazy", LazyStrategy, True),
+            ("enumerated", TableStrategy, False),
+        ):
+            with self.subTest(lx_division_strategy=strategy):
+                with ts_inductor_config.patch(lx_division_strategy=strategy):
+                    a = select_allocator()
+                self.assertIs(a.strategy_class, cls)
+                self.assertIs(a.candidates.lazy, lazy)
+
 
 class TestInplaceEdgeGate(unittest.TestCase):
     """Unit tests for ``residency_rules._inplace_edge_ok``, the sole predicate

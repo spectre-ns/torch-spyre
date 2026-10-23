@@ -588,7 +588,6 @@ class TableStrategy(EncodingStrategy):
             return
         name = item.name
         v.division = m.IntVar(0, len(menu) - 1, f"div_{name}")
-        m.MarkTableAxis(v.division)
         v.eff_size = m.IntVar(0, max(v.per_core), f"eff_size_{name}")
         v.core_cost = m.IntVar(0, max(core_cost), f"core_cost_{name}")
         v.cores = m.IntVar(min(cores_used), max(cores_used), f"occ_{name}")

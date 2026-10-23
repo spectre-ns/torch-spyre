@@ -276,7 +276,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `encoding_strategy.py` | `EncodingStrategy` / `TableStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
 | `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
 | `lazy_relayout.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
-| `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat` (default), `Decomposed`, `Mip`, `BruteForce`, `Annealing`; `from_env` picks one from `SPYRE_LX_BACKEND` |
+| `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat` (default), `Mip`, `BruteForce`, `Annealing`; `from_env` picks one from `SPYRE_LX_BACKEND` |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `pricing.py` | The priced objective (`cost_expr`) over each node's symbolic work split and residency, and its dump (`dump_cost_expr`) |
 | `plan_solver.py` | The buffer form: `LifetimeBoundBuffer`, `CoreDivisionBuffer`, `CoreDivision`, `TileSpec`, and `SolveError` |
@@ -430,6 +430,11 @@ its slot. In the open division mode it also chooses each op's core division
 (and, with `config.auto_coarse_tiling`, its coarse tiling) and which relayout
 copies fire; see [The co-optimizer](co_optimizer.md).
 `config.co_optimizing_lx_planning` picks the division mode.
+`config.lx_division_strategy` (`LX_DIVISION_STRATEGY`) picks how a work split
+is encoded: `"lazy"` (the default) posts its legality as constraints over the
+op's split space where the op has one (`LazyStrategy`); `"enumerated"`
+enumerates every op's legal divisions and picks one from that menu
+(`TableStrategy`), the fallback when a `Lazy` space misbehaves.
 
 `SPYRE_LX_BACKEND` swaps the backend the model is solved with (`mip:<SCIP|HIGHS|CBC>`,
 `bruteforce`, `anneal[:<budget s>]`); these are for comparing solutions, not
