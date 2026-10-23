@@ -99,7 +99,7 @@ class LXRelayoutPlan:
 class RelayoutCandidate:
     """One priced way for a divided producer to stay LX-resident for one consumer.
 
-    Built from a fired lazy relayout (``LazyRelayouts.fired``) and carried
+    Built from a fired relayout copy (``RelayoutCopies.fired``) and carried
     unchanged through the extraction and the commit path: extraction attaches the solved
     placement (:class:`ChosenRelayout`), and the commit path folds the fired
     members of one fired group into a :class:`LXRelayoutPlan`

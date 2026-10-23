@@ -275,7 +275,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
 | `encoding_strategy.py` | `EncodingStrategy` / `EnumeratedStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
 | `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
-| `lazy_relayout.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
+| `relayout_copies.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
 | `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat` (default), `Mip`, `BruteForce`, `Annealing`; `from_env` picks one from `SPYRE_LX_BACKEND` |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `pricing.py` | The priced objective (`cost_expr`) over each node's symbolic work split and residency, and its dump (`dump_cost_expr`) |

@@ -249,7 +249,7 @@ class EncodingStrategy:
         # and input-clone edges derived from the consumer's CloneRead.
         self.residency: dict[tuple[str, str], Any] = {}
         self.clone_reads: dict[tuple[str, str], Any] = {}
-        # Edges whose relayouts are constraints over view ids (lazy_relayout).
+        # Edges whose relayouts are constraints over view ids (relayout_copies).
         self.relayout_edges: dict[tuple[str, str], Any] = {}
         self.solved: dict[Item, int] = {}
 
@@ -339,12 +339,12 @@ class EncodingStrategy:
         self.transforms = ()
         for node in graph.get_nodes():
             self._enum[node] = self._enumeration(node)
-        self._lazy_relayouts = None
+        self._relayout_copies = None
         if self.relayout_edges:
-            from torch_spyre._inductor.scratchpad.lazy_relayout import LazyRelayouts
+            from torch_spyre._inductor.scratchpad.relayout_copies import RelayoutCopies
 
-            self._lazy_relayouts = LazyRelayouts(self, self.relayout_edges)
-            self.transforms += tuple(self._lazy_relayouts.prepare(graph))
+            self._relayout_copies = RelayoutCopies(self, self.relayout_edges)
+            self.transforms += tuple(self._relayout_copies.prepare(graph))
         # Coarse-tiling nests over every item with a work split: their depth
         # sets the level vars, and any nest besides the untiled one turns
         # tiling on.
@@ -418,8 +418,8 @@ class EncodingStrategy:
     @property
     def _relayouts(self) -> Any:
         """The lazy relayouts: every transform is one of their copies."""
-        assert self._lazy_relayouts is not None
-        return self._lazy_relayouts
+        assert self._relayout_copies is not None
+        return self._relayout_copies
 
     def _base_vars(self, item: Item, model: Model) -> NodeVars:
         return NodeVars(
@@ -734,15 +734,15 @@ class EncodingStrategy:
             return
         if (edge.src.name, edge.dst.name) in self.clone_reads:
             return  # encode_clone
-        if self._lazy_relayouts is not None and edge in self._lazy_relayouts.by_edge:
-            self._lazy_relayouts.encode_read(edge, model)
+        if self._relayout_copies is not None and edge in self._relayout_copies.by_edge:
+            self._relayout_copies.encode_read(edge, model)
             return
         for _ in range(edge.reads):
             self._relate(edge, self.vars[edge.src].in_buffer, model)
 
     def encode_transform_use(self, transform: Transform, model: Model) -> None:
         """A resident relayout copy needs its producer resident and serves
-        some read (``lazy_relayout``)."""
+        some read (``relayout_copies``)."""
         self._relayouts.encode_use(transform, model)
 
     def encode_tiling_vars(self, item: Item, model: Model) -> None:
@@ -911,7 +911,7 @@ class EncodingStrategy:
     def extra_cost_terms(self) -> list[Var]:
         """Objective terms the strategy prices itself (lazy relayout
         charges), in the cost expression's unit."""
-        return [] if self._lazy_relayouts is None else self._lazy_relayouts.charges
+        return [] if self._relayout_copies is None else self._relayout_copies.charges
 
     # ---- objective inputs and extraction ----
 

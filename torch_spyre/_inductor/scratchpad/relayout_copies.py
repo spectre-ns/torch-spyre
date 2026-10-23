@@ -68,9 +68,10 @@ class _Copy:
     users: list[tuple[_Copy, Var]] = field(default_factory=list)  # user, lit
 
 
-class LazyRelayouts:
-    """The relayout half of a strategy whose view relation is derived: built
-    by ``EncodingStrategy.prepare`` from each consumer's ``RelayoutEdge``s."""
+class RelayoutCopies:
+    """Every strategy's relayout copies, one optional copy per edge that may
+    read through one: built by ``EncodingStrategy.prepare`` from each
+    consumer's ``RelayoutEdge``s."""
 
     def __init__(self, strategy: EncodingStrategy, edges: dict) -> None:
         self.strategy = strategy
