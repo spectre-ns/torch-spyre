@@ -2296,6 +2296,57 @@ class SolveStatsTest(TestCase):
         self.assertFalse(graph.solve_stats["objective_used"])
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class UniquenessCheckTest(TestCase):
+    """The tie probe that follows a priced solve: a second plan at the optimum's
+    cost is reported with a warning, and the probe never replaces the plan.
+    """
+
+    _LOGGER = "torch_spyre._inductor.scratchpad.buffer_graph"
+
+    def setUp(self):
+        # The probe is off by default (SPYRE_ENABLE_UNIQUENESS_CHECK).
+        self.enterContext(config.patch({"enable_uniqueness_check": True}))
+
+    @staticmethod
+    def _buffers():
+        return [
+            CoreDivisionBuffer("b0", 128, [0, 2], core_divisions=[CoreDivision()]),
+            CoreDivisionBuffer("b1", 128, [1, 3], core_divisions=[CoreDivision()]),
+        ]
+
+    @staticmethod
+    def _spill_cost(buffers):
+        return sum(4000 * (1 - b.sym_is_lx) for b in buffers)
+
+    def test_an_unpriced_residency_is_reported_as_a_tie(self):
+        """Only ``b0`` is priced, so ``b1`` resident or spilled costs the same."""
+        buffers = self._buffers()
+        with self.assertLogs(self._LOGGER, level="WARNING") as logs:
+            _cpsat_plan(buffers, 1 << 20, cost_expr=self._spill_cost(buffers[:1]))
+        self.assertTrue(
+            any("cannot prove uniqueness" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_fully_priced_plan_is_not_reported(self):
+        """Every other plan spills a priced buffer, so the runner-up is dearer.
+
+        The probe solves for that runner-up, and a plan extracted from
+        it would spill a buffer here despite the probe returning OPTIMAL."""
+        buffers = self._buffers()
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = _cpsat_plan(buffers, 1 << 20, cost_expr=self._spill_cost(buffers))
+        self.assertTrue(all(plan.address(n) is not None for n in plan.nodes))
+
+    def test_a_plan_with_no_alternative_is_not_reported(self):
+        """Neither buffer fits, so the probe reports INFEASIBLE."""
+        buffers = self._buffers()
+        with self.assertNoLogs(self._LOGGER, level="WARNING"):
+            plan = _cpsat_plan(buffers, 64, cost_expr=self._spill_cost(buffers))
+        self.assertTrue(all(plan.address(n) is None for n in plan.nodes))
+
+
 class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.

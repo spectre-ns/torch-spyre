@@ -820,6 +820,7 @@ class SpyreOptimizationGraph:
         it cannot be lowered."""
         from ortools.sat.python import cp_model
 
+        from torch_spyre._inductor.scratchpad.backend import CpSat
         from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
             cost_expr_to_cpsat,
         )
@@ -845,6 +846,16 @@ class SpyreOptimizationGraph:
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
                     f"after {solver.WallTime():.2f}s"
                 )
+            if (
+                config.enable_uniqueness_check
+                and status == cp_model.OPTIMAL
+                and type(model) is CpSat
+                and not self._is_unique_solution(model, strategy)
+            ):
+                logger.warning(
+                    "[CP-SAT layout solver] CP-SAT cannot prove uniqueness of the "
+                    "optimal solution"
+                )
             return status, held
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
@@ -860,6 +871,33 @@ class SpyreOptimizationGraph:
                 "objective_used": False,
             }
             return None
+
+    @staticmethod
+    def _is_unique_solution(model: Any, strategy: EncodingStrategy) -> bool:
+        """Whether the optimum ``model`` holds is the only plan at its cost over
+        the strategy's decision variables. False when a different plan costs
+        the same, or when the probe ends without proving either way."""
+        from ortools.sat.python import cp_model
+
+        probe = model.model.clone()
+        differs = []
+        for var in strategy.decision_variables():
+            lit = probe.new_bool_var(f"differs_{var.name}")
+            probe.add(var != model.Value(var)).only_enforce_if(lit)
+            differs.append(lit)
+        probe.add_bool_or(differs)
+        solver = cp_model.CpSolver()
+        solver.parameters.copy_from(model.solver.parameters)
+        # Only a probe run to completion proves anything, so it has no time
+        # limit: OPTIMAL gives the runner-up's cost, INFEASIBLE means no other
+        # plan.
+        solver.parameters.max_time_in_seconds = float("inf")
+        status = solver.Solve(probe)
+        if status == cp_model.INFEASIBLE:
+            return True
+        if status != cp_model.OPTIMAL:
+            return False
+        return round(solver.ObjectiveValue()) > round(model.ObjectiveValue())
 
     def _extract(
         self,

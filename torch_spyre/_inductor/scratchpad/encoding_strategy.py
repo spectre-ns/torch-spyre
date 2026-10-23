@@ -916,6 +916,21 @@ class EncodingStrategy:
         if isinstance(item, Transform):
             self._relayouts.encode_lifetime(item, model)
 
+    def decision_variables(self) -> list[Var]:
+        """The vars that define the plan: residency, merges, served relayouts
+        and each work split (a menu index, or a Lazy node's option and
+        splits). Offsets are left out: no objective prices an address, so every
+        legal shift of a resident buffer would read as a tie."""
+        out: list = []
+        for v in self.vars.values():
+            out += [v.in_buffer, *v.merges.values()]
+            if v.lazy is not None:
+                out += v.lazy.columns
+            elif v.division is not None:
+                out.append(v.division)
+        out += [lit for reads in self.served.values() for _, lit in reads]
+        return [x for x in out if not isinstance(x, int)]
+
     def extra_cost_terms(self) -> list[Var]:
         """Objective terms the strategy prices itself (lazy relayout
         charges), in the cost expression's unit."""
