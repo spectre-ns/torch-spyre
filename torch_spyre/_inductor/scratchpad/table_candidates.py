@@ -14,11 +14,12 @@
 
 """Candidate generation for the table encoding of the LX layout solve.
 
-:class:`TableCandidates` derives what the ``TableStrategy`` enumerates: each
-op's candidate core divisions and coarse tilings (the menus), the view tables
-between a producer's and a consumer's candidates (``cd_parent_matches``,
-including the loop-carry intersection and input-clone overrides), the priced
-relayout candidates, capped per edge, and the relayout copies built from them.
+:class:`TableCandidates` derives what the strategies enumerate: each op's
+candidate core divisions and coarse tilings (the menus, or a Lazy split's
+space), the view tables between a producer's and a consumer's candidates
+(``cd_parent_matches``, including the loop-carry intersection and input-clone
+overrides), the derived relations, and the edges that may read through a
+relayout copy (``RelayoutEdge``).
 It builds the open-mode graph with them (``CandidateTables``), reading each op's
 residency rules from ``residency_rules``, its lifetimes and drain plans from
 ``drain_plans`` and its split options from ``division_menus``.
@@ -63,13 +64,10 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
 from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    LifetimeBoundBuffer,
     sym_core_divs_for,
     sym_tile_counts_for,
     TileSpec,
     BufferType,
-    RelayoutCopyBuffer,
-    build_relayout_copy,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     clone_at_graph_boundaries,
@@ -94,7 +92,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     core_domain_rejection,
     grouped_gather_rejection,
     partition_footprint,
-    RelayoutCandidate,
     solver_relayout_edge_context,
     solver_relayout_pair_cost,
     work_division_from_view,
@@ -108,7 +105,6 @@ from torch_spyre._inductor.scratchpad.division_menus import (
     _find_distinct_matmul_splits,
     _fixed_core_division,
     _fused_layout_group_ops,
-    _intern_view_group,
     _is_cpu_host_buffer,
     _is_indirect_access_op,
     _is_windowed_pool,
@@ -136,31 +132,10 @@ if TYPE_CHECKING:
 logger = get_inductor_logger("scratchpad.table_candidates")
 
 
-def relayout_copies_of(
-    buffers: Sequence[LifetimeBoundBuffer], capacity: int | None = None
-) -> list[RelayoutCopyBuffer]:
-    """The candidate relayout copies of a solve given in buffer form (tests,
-    capture replay): what :meth:`TableCandidates._relayout_copies` builds
-    for the same nodes and candidates."""
-    from torch_spyre._inductor.scratchpad.buffer_graph import build_graph
-
-    graph = build_graph(
-        [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)],
-        1,
-        1 << 62,
-        empty_graph(0).settings,
-    )
-    return TableCandidates._relayout_copies(
-        graph, CandidateTables.of_buffers(buffers), capacity
-    )
-
-
 def residency_symbols(graph: SpyreOptimizationGraph, tables: CandidateTables) -> dict:
-    """Each node's and candidate copy's residency symbol (``is_lx_<name>``),
+    """Each node's residency symbol (``is_lx_<name>``),
     what the cost model prices an LX read or write by."""
-    out = {n.name: n.sym_is_lx for n in graph.get_nodes()}
-    out.update({c.name: c.sym_is_lx for c in tables.copies})
-    return out
+    return {n.name: n.sym_is_lx for n in graph.get_nodes()}
 
 
 class RelayoutEdge:
@@ -439,7 +414,7 @@ class TableCandidates:
         # Set for the re-plan after applied tilings: no further tilings.
         self.suppress_tiling = False
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
-        # Per enumerated op, its divisions as a space (lx_division_encoding).
+        # Per enumerated op, its divisions as a space (a Lazy split's).
         self.lazy_spaces: dict[str, Any] = {}
         # Ops whose menu is their space's points, not the legal divisions.
         self.point_menus: set[str] = set()
@@ -528,13 +503,11 @@ class TableCandidates:
             n.name: [cd.splits for cd in tables.menus.get(n.name, ())]
             for n in solve_graph.get_nodes()
         }
-        splits.update(
-            {c.name: [cd.splits for cd in c.core_divisions] for c in tables.copies}
-        )
+        # A copy that may be relaid out keeps its read: the relayout reads it.
         return project_transport_read_copies(
             graph,
             splits,
-            relayout_sources={c.relayout_parent for c in tables.copies},
+            relayout_sources={parent for parent, _ in tables.relayout_edges},
         )
 
     def _division_map(
@@ -691,7 +664,7 @@ class TableCandidates:
             op.data, (Pointwise, Reduction)
         ):
             return fixed, False
-        if self.factory.division == "lazy":
+        if self.factory.constraints:
             points = self._point_menu(op, max_cores)
             if points is not None:
                 return points, True
@@ -738,7 +711,7 @@ class TableCandidates:
                         exc,
                     )
                     continue
-            if self.factory.division == "lazy":
+            if self.factory.constraints:
                 from torch_spyre._inductor.scratchpad.lazy_division import LazyOption
                 from torch_spyre._inductor.work_division import (
                     work_division_context_for_op,
@@ -1019,9 +992,6 @@ class TableCandidates:
         (``EnumerationFactory.generates_divisions``) -- the op's split space.
         """
         divisions = division_map.divisions
-        # Per-plan interning of relayout destination views (see
-        # _cd_parent_relayouts): group ids are only meaningful within one plan.
-        self._relayout_view_groups: dict[str, dict[PerCoreView, int]] = {}
         lifetimes = calculate_liveness(graph)
         lifetime_start_overrides, lifetime_end_overrides = (
             counted_loop_lifetime_overrides(graph)
@@ -1042,7 +1012,6 @@ class TableCandidates:
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
-        position_by_name = {op.name: index for index, op in enumerate(graph.operations)}
         graph_output_names = set(graph.get_output_names())
         readers_by_name: dict[str, list[ComputedBuffer]] = {}
         if self.factory.applies_tilings:
@@ -1096,7 +1065,7 @@ class TableCandidates:
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         input_clone_reads: dict[str, dict[str, CloneRead]] = {}
-        derived = self.factory.relation == "derived"
+        derived = self.factory.constraints
         # Consumer op name -> input clones for which it is the last reader, and so
         # may reuse the clone's LX slot in place (reverse-parent, #3212). Stays
         # empty unless cloning is on, making the reverse-parent block in the output
@@ -1271,18 +1240,6 @@ class TableCandidates:
             relayout_parent_names = [
                 parent for parent in parent_proj if parent not in carry_storage_names
             ]
-            # Merge clone-supplied free divisions BEFORE the call: the
-            # cap-and-rank step inside _cd_parent_relayouts pins the candidate
-            # group that would let a parent join a division another parent
-            # already occupies for free, and an input clone's reusable slot
-            # (#3212) is one such free division -- merged only after the call,
-            # a positive lx_solver_relayout_groups_per_edge cap could prune the
-            # one group matching it and silently drop a residency option
-            # (cyang49's PR #5057 review). The carry branch above has already
-            # run, so the intersection it applies to a carry storage's
-            # match_pairs is unaffected by this merge; the re-merge after
-            # the call below stays for carry storages that only join
-            # parent_proj between the two points.
             clone_reads: dict[str, CloneRead] = {}
             for input_name in parent_proj:
                 if input_name not in input_clone_matches:
@@ -1294,21 +1251,9 @@ class TableCandidates:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
                         output_name
                     ]
-            cd_parent_relayouts = self._cd_parent_relayouts(
-                graph,
-                op,
-                buf_divisions,
-                relayout_parent_names,
-                divisions,
-                op_by_name,
-                prep_cache,
-                residency_by_buf,
-                cd_parent_matches,
-            )
             relayout_edges: dict[str, RelayoutEdge] = {}
             if (
-                self.factory.relayout == "lazy"
-                and self.factory.offers_relayouts
+                self.factory.offers_relayouts
                 and not config.ktir_emitter
                 and op is not None
             ):
@@ -1396,17 +1341,12 @@ class TableCandidates:
             node_reads.append((output_name, parent_proj, parents))
             for parent, pairs in cd_parent_matches.items():
                 tables.matches[(parent, output_name)] = pairs
-            for parent, cands in cd_parent_relayouts.items():
-                tables.relayouts[(parent, output_name)] = cands
             for parent, residency in residency_edges.items():
                 tables.residency[(parent, output_name)] = residency
             for parent, clone in clone_reads.items():
                 tables.clone_reads[(parent, output_name)] = clone
             for parent, relayout in relayout_edges.items():
                 tables.relayout_edges[(parent, output_name)] = relayout
-            position = position_by_name.get(output_name)
-            if position is not None:
-                tables.positions[output_name] = position
             if output_name in division_map.enumerated:
                 space = self.lazy_spaces.get(output_name)
                 if space is not None:
@@ -1425,7 +1365,6 @@ class TableCandidates:
                 if p in g.nodes
             ]
         g.link_execution_order()
-        tables.copies = self._relayout_copies(g, tables, self.capacity)
         return g, tables
 
     @staticmethod
@@ -1533,55 +1472,6 @@ class TableCandidates:
                 prep_cache=prep_cache,
             )
         return edges
-
-    @staticmethod
-    def _relayout_copies(
-        graph: SpyreOptimizationGraph,
-        tables: CandidateTables,
-        capacity: int | None = None,
-    ) -> list[RelayoutCopyBuffer]:
-        """One candidate copy per relayout group enumerated across the
-        graph's edges: the destination the solver places, live from the
-        group's first consumer to its last, carrying every priced candidate
-        that lands on it. A group whose source is not a node has nothing to
-        shuffle from and gets no copy; the solver then ignores its candidates.
-
-        ``capacity`` is the planner's per-core LX budget. A group whose
-        destination span alone exceeds it can never be resident, so building a
-        copy for it only adds a buffer the solver must place and prove out; such
-        groups get no copy either (the residency gate ignores candidates whose
-        group has none). On the 304-op decode attention graph these copies are a
-        measurable share of a model whose presolve alone outlived the time limit.
-        """
-        groups: dict[tuple[str, int], list[RelayoutCandidate]] = {}
-        for candidates in tables.relayouts.values():
-            for candidate in candidates:
-                groups.setdefault(candidate.group_key, []).append(candidate)
-        ticks = {n.name: n.start_time for n in graph.get_nodes()}
-        copies: list[RelayoutCopyBuffer] = []
-        oversized = 0
-        for (parent, group), candidates in sorted(groups.items()):
-            if parent not in graph.nodes:
-                logger.debug(
-                    "[lx solver relayout] %s/g%d: source is not in the solve; "
-                    "no copy built",
-                    parent,
-                    group,
-                )
-                continue
-            copy = build_relayout_copy(parent, group, candidates, ticks)
-            if capacity is not None and copy.per_core_footprint > capacity:
-                oversized += 1
-                continue
-            copies.append(copy)
-        if oversized:
-            logger.debug(
-                "[lx solver relayout] %d relayout group(s) skipped: destination "
-                "span exceeds the %d-byte LX budget",
-                oversized,
-                capacity,
-            )
-        return copies
 
     def _division_space(
         self, op: Operation, readers: Sequence[ComputedBuffer] = ()
@@ -1775,235 +1665,6 @@ class TableCandidates:
             )
             for parent, edge in edges.items()
         }
-
-    @staticmethod
-    def _cap_relayout_groups(
-        parent: str,
-        consumer: str,
-        candidates: list[RelayoutCandidate],
-        consumer_divs: list[CoreDivision],
-        consumer_costs: dict[int, float] | None = None,
-        pinned_consumer_divisions: frozenset[int] = frozenset(),
-    ) -> list[RelayoutCandidate]:
-        """Keep the candidates of the ``config.lx_solver_relayout_groups_per_edge``
-        cheapest destination views of one (source, consumer) edge.
-
-        Each distinct consumer read partition is its own
-        relayout group, and every group becomes a copy buffer the solver must
-        place, though the consumer will read through at most one of them. A
-        group is ranked by copy plus consumer execution cost, not copy cost
-        alone: a cheap copy can feed an expensive matmul division. This is a
-        shortlist estimate, not the whole-graph objective. Ties favor more
-        consumer cores, the solver's existing preference. Dropping a group only
-        removes an option:
-        a consumer division without a copy is treated exactly like an unpriced
-        pair (match for free or spill), and every fired relayout is still
-        certified at materialization.
-
-        ``pinned_consumer_divisions`` (divisions another parent already
-        matches for free, per ``_cd_parent_matches``) are kept regardless of
-        cost rank: cost alone can't see that reaching one of them lets every
-        parent land on the same division, so the cap must not drop it.
-        """
-        cap = config.lx_solver_relayout_groups_per_edge
-        if cap <= 0 or not candidates:
-            return candidates
-        by_group: dict[int, list[RelayoutCandidate]] = {}
-        for candidate in candidates:
-            by_group.setdefault(candidate.group, []).append(candidate)
-        if len(by_group) <= cap:
-            return candidates
-
-        pinned_groups = {
-            group
-            for group, members in by_group.items()
-            if any(c.consumer_division in pinned_consumer_divisions for c in members)
-        }
-
-        def rank(item: tuple[int, list[RelayoutCandidate]]) -> tuple:
-            group, members = item
-            best = min(
-                c.cost_ns
-                + (
-                    consumer_costs[c.consumer_division]
-                    if consumer_costs is not None
-                    else 0.0
-                )
-                for c in members
-            )
-            cores = max(consumer_divs[c.consumer_division].cores_used for c in members)
-            return (best, -cores, group)
-
-        remaining = cap - len(pinned_groups)
-        ranked = [item for item in by_group.items() if item[0] not in pinned_groups]
-        cost_kept = {
-            group for group, _ in sorted(ranked, key=rank)[: max(remaining, 0)]
-        }
-        kept = pinned_groups | cost_kept
-        logger.debug(
-            "[lx solver relayout] %s -> %s: keeping %d of %d destination views"
-            " (%d pinned by a sibling parent match)",
-            parent,
-            consumer,
-            len(kept),
-            len(by_group),
-            len(pinned_groups),
-        )
-        return [c for c in candidates if c.group in kept]
-
-    @staticmethod
-    def _relayout_consumer_costs(consumer_op, consumer_divs, parent, candidates):
-        """Reuse the execution model to shortlist copies feeding this consumer.
-
-        Price this input in LX and the remaining arguments in HBM. The solver
-        still decides their actual placement and prices complete bundles.
-        Extract once per consumer division, not once per source/destination pair.
-        """
-        from torch_spyre._inductor.cost_model import predict_ops
-        from torch_spyre._inductor.dump_cost_model import extract_op_features
-        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
-
-        is_lx = {dep.name: False for dep in op_read_writes(consumer_op).reads}
-        is_lx[consumer_op.get_name()] = False
-        is_lx[parent] = True
-        candidate_work_slices = [
-            _work_slices(consumer_op, division) for division in consumer_divs
-        ]
-        return {
-            j: float(
-                predict_ops(
-                    [
-                        extract_op_features(
-                            consumer_op,
-                            _work_slices(consumer_op, consumer_divs[j]),
-                            is_lx=is_lx,
-                            candidate_work_slices=candidate_work_slices,
-                        )
-                    ],
-                    params=_COST_PARAMS,
-                )
-            )
-            for j in sorted({c.consumer_division for c in candidates})
-        }
-
-    def _cd_parent_relayouts(
-        self,
-        graph: GraphLowering,
-        consumer_op: Optional[Operation],
-        consumer_divs: list[CoreDivision],
-        parent_names: list[str],
-        divisions: dict[str, list[CoreDivision]],
-        op_by_name: dict[str, Operation],
-        prep_cache: dict,
-        residency_by_buf: dict[str, Optional[str]],
-        cd_parent_matches: Optional[dict[str, list[tuple[int, int]]]] = None,
-    ) -> dict[str, list[RelayoutCandidate]]:
-        """Priced relayout candidates for each divided producer this op reads.
-
-        Sibling of :meth:`_cd_parent_matches`: where that method records the
-        division pairs whose per-core views are EQUAL (residency is free), this
-        one records the pairs whose views DIFFER but are relayout-compatible -
-        the producer could stay LX-resident by paying a shuffle - as
-        :class:`RelayoutCandidate` records priced by the fitted relayout law. The division-independent edge gates (single non-indirect
-        write, activation source, pointwise-or-matmul consumer, ...) mirror
-        ``collect_lx_relayout_plans``; the per-pair gates (permutation
-        compatibility, projectable ownership on both frames, the law's fitted
-        split range) live in ``solver_relayout_pair_cost``. Gated on the
-        solver's ``decides_lx_relayouts``.
-
-        ``cd_parent_matches`` (the caller's own ``_cd_parent_matches`` result)
-        gives each parent's cap-and-rank step the other parents' already-free
-        divisions, so it won't drop the one group that would let this parent
-        join them.
-        """
-        if (
-            not self.factory.offers_relayouts
-            or config.ktir_emitter
-            or self.factory.relation == "derived"
-        ):
-            return {}
-        if consumer_op is None:
-            return {}
-        relayouts: dict[str, list[RelayoutCandidate]] = {}
-        for parent, edge in self._relayout_edges(
-            graph, consumer_op, parent_names, op_by_name, residency_by_buf
-        ).items():
-            parent_divs = divisions[parent]
-            prod_views = edge.source_views(parent_divs, prep_cache)
-            cons_views = edge.consumer_views(consumer_divs, prep_cache)
-            candidates: list[RelayoutCandidate] = []
-            # Destination views are interned per parent across every consumer
-            # of this solve: two consumers whose candidates land on the same
-            # physical view of the same parent share one group, hence one
-            # shuffle (interned by ownership, so spelling cannot split a group).
-            view_groups = self._relayout_view_groups.setdefault(parent, {})
-            for i, pv in enumerate(prod_views):
-                if pv is None:
-                    continue
-                for j, cv in enumerate(cons_views):
-                    # Physical ownership, not structural equality: two slot
-                    # spellings of one partition are a match, never a shuffle.
-                    if cv is None or pv.same_partition(cv):
-                        continue
-                    priced = edge.price(
-                        pv, cv, parent_divs[i].cores_used, consumer_divs[j].cores_used
-                    )
-                    if priced is None:
-                        continue
-                    cost, source_span, destination_span = priced
-                    candidates.append(
-                        RelayoutCandidate(
-                            parent=parent,
-                            consumer=consumer_op.get_name(),
-                            source_division=i,
-                            consumer_division=j,
-                            group=_intern_view_group(view_groups, cv),
-                            source_view=pv,
-                            destination_view=cv,
-                            cost_ns=cost,
-                            source_footprint_bytes=source_span,
-                            destination_footprint_bytes=destination_span,
-                        )
-                    )
-            consumer_costs = None
-            cap = config.lx_solver_relayout_groups_per_edge
-            if cap > 0 and len({c.group for c in candidates}) > cap:
-                try:
-                    consumer_costs = self._relayout_consumer_costs(
-                        consumer_op, consumer_divs, parent, candidates
-                    )
-                except (ValueError, RuntimeError, TypeError) as exc:
-                    logger.warning(
-                        "relayout shortlist consumer cost unavailable for %s: %s; "
-                        "using copy cost only",
-                        consumer_op.get_name(),
-                        exc,
-                    )
-            sibling_pinned = frozenset(
-                j
-                for other_parent, pairs in (cd_parent_matches or {}).items()
-                if other_parent != parent
-                for _, j in pairs
-            )
-            candidates = self._cap_relayout_groups(
-                parent,
-                consumer_op.get_name(),
-                candidates,
-                consumer_divs,
-                consumer_costs,
-                sibling_pinned,
-            )
-            if candidates:
-                relayouts[parent] = candidates
-                logger.debug(
-                    "[lx solver relayout] %s -> %s: %d priced candidate pair(s), "
-                    "cheapest %.1f ns",
-                    parent,
-                    consumer_op.get_name(),
-                    len(candidates),
-                    min(c.cost_ns for c in candidates),
-                )
-        return relayouts
 
     def _relayout_edges(
         self,

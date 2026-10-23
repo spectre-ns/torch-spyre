@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import heapq
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Optional, Callable
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
-    MemoryPlanSolver,
     _check_in_place_relationships,
 )
 from torch_spyre._inductor.scratchpad.utils import round_up_to_alignment
@@ -78,7 +78,7 @@ def _topological_sort(
     return result
 
 
-class FirstFitLayoutSolver(MemoryPlanSolver):
+class FirstFitLayoutSolver:
     """Allocates buffers by priority score, placing each in the first gap that fits.
 
     Buffers are sorted topologically (parents before children) with ties broken by ascending
@@ -93,6 +93,30 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
     the child inherits that address.  Buffers that cannot fit within self.limit are evicted
     (address=None).
     """
+
+    def __init__(
+        self, buffers: Sequence[LifetimeBoundBuffer], size: int, alignment: int = 128
+    ) -> None:
+        self.buffers: list[LifetimeBoundBuffer] = list(buffers)
+        self.limit = size  # bytes
+        self.alignment = alignment
+
+    def partition(
+        self,
+    ) -> tuple[list[LifetimeBoundBuffer], list[LifetimeBoundBuffer]]:
+        """``(placeable, excluded)``: a buffer is excluded by its residency
+        reason, or when even its smallest footprint exceeds the capacity; the
+        reason is written to its ``spill_reason``."""
+        placeable: list[LifetimeBoundBuffer] = []
+        excluded: list[LifetimeBoundBuffer] = []
+        for b in self.buffers:
+            b.spill_reason = b.residency_reason
+            if b.spill_reason is None and b.min_footprint > self.limit:
+                b.spill_reason = (
+                    f"min footprint {b.min_footprint} B > LX capacity {self.limit} B"
+                )
+            (placeable if b.spill_reason is None else excluded).append(b)
+        return placeable, excluded
 
     def _all_minus(
         self,

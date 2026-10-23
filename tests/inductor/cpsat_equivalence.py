@@ -14,8 +14,8 @@
 
 """Equivalence harness for refactors of the CP-SAT layout solver.
 
-Records, for every ``CpSatLayoutSolver`` solve, the model proto and outcome of
-each ladder stage plus the decisions written back to the buffers, then diffs
+Records, for every ``ModelSolver`` solve, the model proto and outcome of
+each ladder stage plus the decisions read off the solved graph, then diffs
 two recordings. A refactor that claims "identical CP model" must produce an
 empty diff.
 
@@ -131,26 +131,6 @@ class _Recorder:
             }
         self._write(decisions, error)
 
-    def finish(self, buffers, error: Optional[str]) -> None:
-        decisions = {}
-        for b in buffers:
-            chosen = getattr(b, "chosen_relayouts", None) or {}
-            decisions[b.name] = {
-                "address": b.address,
-                "spill_reason": b.spill_reason,
-                "chosen_division": getattr(b, "chosen_division", None),
-                "chosen_relayouts": {
-                    parent: [
-                        c.candidate.group,
-                        c.candidate.source_division,
-                        c.candidate.consumer_division,
-                        c.destination_address,
-                    ]
-                    for parent, c in sorted(chosen.items())
-                },
-            }
-        self._write(decisions, error)
-
     def _write(self, decisions: dict, error: Optional[str]) -> None:
         record = {
             "case": self.case,
@@ -168,18 +148,15 @@ _RECORDER: Optional[_Recorder] = None
 
 
 def install(out: str | Path) -> _Recorder:
-    """Patch ``ModelSolver`` (and its buffer form ``CpSatLayoutSolver``) so
-    every solve is recorded under ``out``."""
+    """Patch ``ModelSolver`` so every solve is recorded under ``out``."""
     global _RECORDER
     from torch_spyre._inductor.scratchpad import ilp_solver_ortools as mod
 
     _RECORDER = _Recorder(Path(out))
-    cls = mod.CpSatLayoutSolver
     engine = mod.ModelSolver
-    if getattr(cls, "_cpsat_equiv_installed", False):
+    if getattr(engine, "_cpsat_equiv_installed", False):
         return _RECORDER
     orig_record = engine._solve_and_record
-    orig_generic = cls._plan_layout_generic
 
     def _solve_and_record(self, solver, model, *, objective=False):
         solver.parameters.num_search_workers = 1
@@ -190,19 +167,6 @@ def install(out: str | Path) -> _Recorder:
         if _RECORDER is not None:
             _RECORDER.stage(solver, model, status, objective)
         return status
-
-    def _plan_layout_generic(self, *args, **kwargs):
-        rec = _RECORDER
-        if rec is None or not self.buffers:
-            return orig_generic(self, *args, **kwargs)
-        rec.stages = []
-        try:
-            result = orig_generic(self, *args, **kwargs)
-        except Exception as exc:
-            rec.finish(self.buffers, f"{type(exc).__name__}: {exc}")
-            raise
-        rec.finish(self.buffers, None)
-        return result
 
     orig_solve = engine.solve
 
@@ -220,9 +184,8 @@ def install(out: str | Path) -> _Recorder:
         return plan
 
     engine._solve_and_record = _solve_and_record
-    cls._plan_layout_generic = _plan_layout_generic
     engine.solve = solve
-    cls._cpsat_equiv_installed = True
+    engine._cpsat_equiv_installed = True
     return _RECORDER
 
 
@@ -325,19 +288,30 @@ def pytest_runtest_setup(item) -> None:
 # ---- device-free replay ----------------------------------------------------
 
 
-def _solve(case: str, buffers, limit: int, alignment: int, cost_expr, joint=True):
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+def _solve(case: str, buffers, limit: int, alignment: int, cost_expr) -> None:
+    """Solve the graph of ``buffers``; a buffer with no candidate divisions is
+    committed, so its node is placement-only."""
+    from torch_spyre._inductor.scratchpad.buffer_graph import build_graph, empty_graph
+    from torch_spyre._inductor.scratchpad.encoding_strategy import (
+        CandidateTables,
+        EnumerationFactory,
+    )
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
     assert _RECORDER is not None
     _RECORDER.begin_case(case)
-    solver = CpSatLayoutSolver(
-        copy.deepcopy(buffers), limit, alignment, time_limit_seconds=0
+    buffers = copy.deepcopy(buffers)
+    graph = build_graph(
+        buffers,
+        alignment,
+        limit // alignment,
+        empty_graph(limit, alignment).settings,
+        {b.name: b.residency_reason for b in buffers if b.residency_reason},
     )
+    tables = CandidateTables.of_buffers(buffers)
+    strategy = EnumerationFactory().strategy_from_tables(tables)
     try:
-        if joint:
-            solver.plan_layout_and_core_divisions(cost_expr)
-        else:
-            solver.plan_layout()
+        ModelSolver(limit, time_limit_seconds=0).solve(graph, strategy, cost_expr)
     except Exception as exc:  # recorded by the patch; keep replaying
         print(f"  {case}: {type(exc).__name__}: {exc}", flush=True)
 
@@ -364,13 +338,18 @@ def _replay(out: str, caps: list[str]) -> None:
                 flat = copy.deepcopy(g.buffers)
                 for b in flat:
                     b.core_divisions = []
-                _solve(f"{group}/{name}[{i}]/placement", flat, limit, 128, None, False)
+                _solve(f"{group}/{name}[{i}]/placement", flat, limit, 128, None)
     for caps_dir in caps:
         for path in sorted(Path(caps_dir).glob("*.pkl")):
-            with open(path, "rb") as f:
-                cap = pickle.load(f)
             case = f"{Path(caps_dir).name}/{path.stem}"
             print(case, flush=True)
+            try:
+                with open(path, "rb") as f:
+                    cap = pickle.load(f)
+            except (AttributeError, TypeError) as exc:
+                # Pickled with a class this tree no longer has.
+                print(f"  {case}: not loadable here: {exc}", flush=True)
+                continue
             with config.patch(
                 sencores=cap["sencores"], auto_coarse_tiling=cap["auto_coarse_tiling"]
             ):

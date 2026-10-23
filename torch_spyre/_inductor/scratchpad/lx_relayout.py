@@ -99,9 +99,8 @@ class LXRelayoutPlan:
 class RelayoutCandidate:
     """One priced way for a divided producer to stay LX-resident for one consumer.
 
-    Born in the allocator's enumeration (``_cd_parent_relayouts``) and carried
-    unchanged through the CP-SAT model, the extraction and the commit path: the
-    solver keys its pair literal by this record, extraction attaches the solved
+    Built from a fired lazy relayout (``LazyRelayouts.fired``) and carried
+    unchanged through the extraction and the commit path: extraction attaches the solved
     placement (:class:`ChosenRelayout`), and the commit path folds the fired
     members of one fired group into a :class:`LXRelayoutPlan`
     (:class:`FiredRelayoutGroup`). Nothing downstream re-derives a view, a core
@@ -111,9 +110,8 @@ class RelayoutCandidate:
 
     ``group`` identifies the DESTINATION per-core view of ``parent``, interned
     per parent by the allocator for one solve: every candidate that lands on
-    the same view of the same parent shares one shuffle and one LX destination
-    (``RelayoutCopyBuffer``), so the solver prices and places the group once,
-    not per edge.
+    the same view of the same parent shares one shuffle and one LX destination,
+    so the solver prices and places the group once, not per edge.
 
     Each view carries the physical core count it was built for (every core's
     owner slot within its split), so ``num_cores`` is the source view's and
@@ -196,7 +194,7 @@ class ChosenRelayout:
     """A fired :class:`RelayoutCandidate` with the solved address of its copy.
 
     Every consumer of one (parent, group) the solver served reads the group's
-    single copy (``RelayoutCopyBuffer``), so all of them carry the same
+    single copy, so all of them carry the same
     address; the commit path folds them into one plan
     (:meth:`FiredRelayoutGroup.from_chosen`).
     """
@@ -720,10 +718,9 @@ def solver_relayout_edge_context(
     # (the same marker _distribute_work's division gate checks): that
     # mechanism already owns this edge's placement, so relayout must not
     # also offer a candidate for it. The fitted relayout law still prices
-    # one tile's worth; _cd_parent_relayouts (allocator.py) scales that by
-    # the parent's own loop trip count before handing a same-group candidate
-    # to the solver, so a repeated shuffle is priced at its real total cost,
-    # not once.
+    # one tile's worth; ``RelayoutEdge`` scales that by the parent's own loop
+    # trip count, so a repeated shuffle is priced at its real total cost, not
+    # once.
     producer_loop_info = getattr(producer, "loop_info", None)
     consumer_loop_info = getattr(consumer, "loop_info", None)
     same_tile_group = (

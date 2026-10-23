@@ -65,7 +65,6 @@ from torch_spyre._inductor.scratchpad.first_fit import FirstFitLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionBuffer,
-    CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
     TileAxis,
     TileSpec,
@@ -711,7 +710,7 @@ class _ViewRelation(_EdgeRelation):
         return self._up[child.key]
 
 
-class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
+class SaCoOptimizingSolver:
     """SA joint core-division + LX-placement engine.
 
     The search is fully determined by the module constants above; there is
@@ -742,10 +741,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         size: int,
         alignment: int = 128,
     ) -> None:
-        super().__init__(buffers, size, alignment)
+        self.buffers: list[LifetimeBoundBuffer] = list(buffers)
+        self.limit = size  # bytes
+        self.alignment = alignment
         # Narrowed from the contravariant parameter type (see the ``buffers``
-        # arg). Same objects as the base's ``self.buffers``, so write-back
-        # through either name is visible in both.
+        # arg). Same objects as ``self.buffers``, so write-back through either
+        # name is visible in both.
         self._bufs: Sequence[CoreDivisionBuffer] = cast(
             "list[CoreDivisionBuffer]", list(buffers)
         )
@@ -767,15 +768,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         self._n_eligible: int
 
     # -- public interface ----------------------------------------------------
-
-    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
-        """Not supported: this engine is joint-only (committed divisions are
-        menus of one); the allocator only calls
-        :meth:`plan_layout_and_core_divisions`."""
-        raise NotImplementedError(
-            "SaCoOptimizingSolver is a joint core-division + placement engine; "
-            "use plan_layout_and_core_divisions"
-        )
 
     def plan_layout_and_core_divisions(
         self, cost_expr: Optional[sympy.Expr] = None
@@ -827,8 +819,7 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
             value_of[buf.sym_is_lx] = lambda chosen, resident, name=buf.name: (
                 1 if name in resident else 0
             )
-            # The division's identity, for table terms over candidates (the
-            # relayout price is one; see RelayoutCopyBuffer.cost_term). It is the
+            # The division's identity, for table terms over candidates. It is the
             # menu position, not the key, so equal configs need not bind alike: a
             # generated config has no position at all. Sound only while no such
             # term reaches the annealer, which ``decides_lx_relayouts()`` ensures
@@ -1182,8 +1173,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         producer writes a partial sum no child may read from LX -- so such a
         producer is always gated out here."""
         b = self._bufs[idx]
-        # Not ``MemoryPlanSolver.excluded()``: that folds in a ``min_footprint >
-        # limit`` test, which is division-dependent and is the next gate down.
+        # The residency reason alone: the footprint test is division-dependent
+        # and is the next gate down.
         if b.residency_reason is not None:
             return False
         if self._per_core_size(idx, self.chosen[idx]) > self.limit:
@@ -1235,9 +1226,11 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         """Plain lifetime buffers the packer and FirstFit consume; ``sizes`` are
         the current per-core footprints.
 
-        ``residency_reason`` is carried so ``MemoryPlanSolver.excluded()`` sees the
-        fixed pins during the FirstFit seed pass; the packer ignores it, taking an
-        explicit ``eligible`` mask instead.
+        ``residency_reason`` is carried so FirstFit's exclusion sees the fixed
+        pins during the seed pass; the packer ignores it, taking an
+        explicit ``eligible`` mask instead. An in-place parent smaller per core
+        than its child cannot hand over its slot under these sizes, so the
+        pair is dropped.
         """
         out = []
         for i, b in enumerate(self._bufs):
@@ -1248,7 +1241,10 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
                     uses=list(b.uses),
                     first_use_is_read=b.first_use_is_read,
                     in_place_parents=[
-                        p for p in b.in_place_parents if p in self._name_to_idx
+                        p
+                        for p in b.in_place_parents
+                        if p in self._name_to_idx
+                        and sizes[self._name_to_idx[p]] >= sizes[i]
                     ],
                     residency_reason=b.residency_reason,
                     lifetime_start_override=b.lifetime_start_override,

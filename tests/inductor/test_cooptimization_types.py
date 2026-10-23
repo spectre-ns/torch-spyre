@@ -23,8 +23,7 @@ turned into this file, which pins the engine to the real classes:
 * the captured graphs rehydrate into real :class:`CoreDivisionBuffer` objects
   that are well-formed, self-consistent, and a valid seed state (every op at
   division index 0);
-* the engine really is a :class:`CoreDivisionLayoutSolver` and accepts those
-  objects;
+* the engine accepts those objects;
 * the two capture-derived assumptions the loader and the objective rest on hold:
   the ``boundary_cost`` -> ``BufferType`` mapping is exact, and ``read_count``
   equals the consumer count the old objective scaled by.
@@ -37,8 +36,6 @@ from unittest import TestCase
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionBuffer,
-    CoreDivisionLayoutSolver,
-    MemoryPlanSolver,
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 
@@ -59,20 +56,6 @@ def _all_captures():
         for case, graphs in cases.items():
             for gi, g in enumerate(graphs):
                 yield f"{case}[{gi}]", g
-
-
-class _NoOpSolver(CoreDivisionLayoutSolver):
-    """Minimal concrete engine: seeds every buffer, spills everything."""
-
-    def plan_layout(self, log_lx_usage=False):
-        return list(self.buffers)
-
-    def plan_layout_and_core_divisions(self, cost_expr=None):
-        for b in self.buffers:
-            b.chosen_division = SEED_DIVISION_INDEX
-            b.address = None  # spilled
-            b.spill_reason = "no-op solver spills everything"
-        return list(self.buffers)
 
 
 class CaptureRehydrationTest(TestCase):
@@ -232,11 +215,7 @@ class CaptureAssumptionsTest(TestCase):
 
 
 class EngineBindingTest(TestCase):
-    """The engine is bound to the real substrate ABC and consumes real buffers."""
-
-    def test_engine_is_a_core_division_layout_solver(self):
-        self.assertTrue(issubclass(SaCoOptimizingSolver, CoreDivisionLayoutSolver))
-        self.assertTrue(issubclass(SaCoOptimizingSolver, MemoryPlanSolver))
+    """The engine consumes real buffers."""
 
     def test_engine_accepts_real_core_division_buffers(self):
         """The check whose absence let the protocol drift from the real class.
@@ -257,12 +236,6 @@ class EngineBindingTest(TestCase):
             if b.address is None:
                 self.assertIsNotNone(b.spill_reason)
 
-    def test_placement_only_path_is_refused(self):
-        """Joint-only engine: ``plan_layout`` is a loud stub, not a silent no-op."""
-        solver = SaCoOptimizingSolver([], 1 << 20, 128)
-        with self.assertRaises(NotImplementedError):
-            solver.plan_layout()
-
     def test_pinned_buffers_are_never_resident(self):
         """The fixed pin gate, asserted on the returned layout.
 
@@ -282,27 +255,6 @@ class EngineBindingTest(TestCase):
                     by_name[name].address,
                     f"{tag} {name}: pinned out of LX but given an address",
                 )
-
-
-class NoOpSolverABCTest(TestCase):
-    """The real ABC still behaves as a usable base for a trivial engine."""
-
-    def test_cannot_instantiate_abstract_base(self):
-        with self.assertRaises(TypeError):
-            CoreDivisionLayoutSolver(1024)  # type: ignore[abstract]
-
-    def test_concrete_subclass_solves_and_writes_outputs(self):
-        _, graph = next(_all_captures())
-        solver = _NoOpSolver(graph.buffers, size=4096, alignment=128)
-        self.assertEqual(solver.limit, 4096)
-        self.assertEqual(solver.alignment, 128)
-
-        out = solver.plan_layout_and_core_divisions()
-        self.assertEqual(len(out), len(graph.buffers))
-        for b in out:
-            self.assertEqual(b.chosen_division, SEED_DIVISION_INDEX)
-            self.assertIsNone(b.address)
-            self.assertIsNotNone(b.spill_reason)
 
 
 class SpillCostTest(TestCase):

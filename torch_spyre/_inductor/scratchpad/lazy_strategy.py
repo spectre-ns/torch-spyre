@@ -279,10 +279,8 @@ class LazyStrategy(TableStrategy):
         self.point_menus: set[str] = set()
 
     @classmethod
-    def from_tables(
-        cls, tables, reasons=None, relation: str = "table", **settings
-    ) -> LazyStrategy:
-        strategy = super().from_tables(tables, reasons, relation, **settings)
+    def from_tables(cls, tables, **kwargs) -> LazyStrategy:
+        strategy = super().from_tables(tables, derived=True, **kwargs)
         assert isinstance(strategy, LazyStrategy)
         strategy.spaces = dict(tables.lazy_spaces)
         strategy.point_menus = set(tables.point_menus)
@@ -293,7 +291,6 @@ class LazyStrategy(TableStrategy):
         tabled = {
             name for edge, pairs in self.matches.items() if pairs for name in edge
         }
-        tabled |= {name for edge in self.relayout_candidates for name in edge}
         self._lazy, self._grid = {}, {}
         for node in graph.get_nodes():
             space = self.spaces.get(node.name)

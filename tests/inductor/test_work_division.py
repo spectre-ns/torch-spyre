@@ -77,7 +77,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     ScratchpadAllocator,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
-from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     TileAxis,
@@ -2273,7 +2273,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         )
 
     def test_match_table_is_the_expected_pairs(self):
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         with self._patches():
             actual = self._table(allocator)
         # A rejected producer ("spilled") gets no entry. The wide matmul
@@ -2292,7 +2292,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         )
 
     def test_multi_axis_matmul_requires_a_representable_finished_write(self):
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         for partial, representable in ((True, True), (False, False)):
             with self.subTest(partial=partial, representable=representable):
                 self.parents["matmul"] = (
@@ -2322,7 +2322,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 return (second_views[index], False, True)
             return self._view_for_div(op, dep, buf_name, division, prep_cache)
 
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         with (
             self._patches(),
             patch.object(
@@ -2335,7 +2335,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         )
 
     def test_loop_carry_update_is_a_storage_ownership_edge(self):
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         storage_op = self.op_by_name["plain"]
         record = LoopCarryRecord(
             storage_name=storage_op.get_name(),
@@ -2380,7 +2380,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         # The update writes through the carry's storage, so a later read of the
         # update's name reads the storage's LX bytes: it needs the storage's
         # ownership, although the update itself is never an LX buffer.
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         update_op = self._carry_update()
         x = _isym("x")
         self.rw[self.consumer_op].reads.append(MemoryDep("update", x, (x,), (8,)))
@@ -2476,7 +2476,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         :class:`SolvedPlan` the push read.
         """
         allocator = ScratchpadAllocator(
-            CpSatLayoutSolver, size=4096, division_mode="open"
+            ModelSolver(4096), size=4096, division_mode="open"
         )
         with ExitStack() as stack:
             stack.enter_context(self._patches())
@@ -2499,7 +2499,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             stack.enter_context(
                 patch.object(
                     allocator.candidates,
-                    "_cd_parent_relayouts",
+                    "_relayout_edges",
                     side_effect=lambda *a: {},
                 )
             )
@@ -2731,7 +2731,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         return consumer_view is not None and parent_view.same_partition(consumer_view)
 
     def test_compatible_agrees_with_the_table(self):
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         with self._patches():
             table = self._table(allocator)
             for parent, pairs in table.items():
@@ -2805,7 +2805,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                             self.assertIsNone(edge)
 
     def test_no_consumer_op_matches_nothing(self):
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         with self._patches():
             edges = allocator.candidates._parent_residency_edges(
                 None, [], {}, {}, self.residency
@@ -2850,7 +2850,7 @@ class TestCloneDivisionMatching(unittest.TestCase):
         return (self.views[index], False, True)
 
     def _menu(self):
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         with ExitStack() as stack:
             for target, kwargs in [
                 ("_view_for_div", {"side_effect": self._view_for_div}),
@@ -2880,7 +2880,7 @@ class TestJointAllocator(unittest.TestCase):
         op = _computed_buffer((2, 128, 1024), name="direct_read_restickify")
         op._read_copy_elision_record = MagicMock()
         graph = MagicMock(operations=[op])
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         fixed = CoreDivision(splits={head: 2, sequence: 16})
 
         with (
@@ -2922,7 +2922,7 @@ class TestJointAllocator(unittest.TestCase):
         op.data = MagicMock(spec=Pointwise)
         op.name = "fixed_op"
         graph = MagicMock(operations=[op])
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         fixed = CoreDivision()
 
         with (
@@ -2953,7 +2953,7 @@ class TestJointAllocator(unittest.TestCase):
         op = _computed_buffer((4, 64), name="constrained_out")
         graph = MagicMock(operations=[op])
         allocator = ScratchpadAllocator(
-            CpSatLayoutSolver, size=1, prune=True, division_mode="open"
+            ModelSolver(1), size=1, prune=True, division_mode="open"
         )
         safe = {batch: 1, m: 8}
         unsafe = {batch: 4, m: 8}
@@ -3025,11 +3025,16 @@ class TestJointAllocator(unittest.TestCase):
         rw = MagicMock()
         rw.writes = [MagicMock(index=0)]
         rw.reads = []
-        # The enumerated (table) menu; the lazy one never enumerates.
-        with patch.object(allocator_module.config, "lx_division_encoding", "table"):
-            allocator = ScratchpadAllocator(
-                CpSatLayoutSolver, size=1, division_mode="open"
-            )
+        # The SA co-optimizer's enumerated (table) menu; the lazy one never
+        # enumerates.
+        from torch_spyre._inductor.scratchpad.graph_solvers import BufferSolver
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
+        )
+
+        allocator = ScratchpadAllocator(
+            BufferSolver(SaCoOptimizingSolver, 1), size=1, division_mode="open"
+        )
 
         fixed = CoreDivision(splits={1: 2})
         with (
@@ -3070,7 +3075,7 @@ class TestJointAllocator(unittest.TestCase):
         op = _computed_buffer((4, 64), name="over_budget_out")
         graph = MagicMock(operations=[op])
         allocator = ScratchpadAllocator(
-            CpSatLayoutSolver, size=1, prune=True, division_mode="open"
+            ModelSolver(1), size=1, prune=True, division_mode="open"
         )
         over_budget = {batch: 4, m: 16}  # 64 cores against a 32-core budget
         rw = MagicMock(
@@ -3131,7 +3136,7 @@ class TestJointAllocator(unittest.TestCase):
             )
         )
         plan = allocator_module.SolvedPlan.of_buffers([buf])
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(ModelSolver(1), size=1, division_mode="open")
         # Priced at 1024 bytes over 1 core x 4 tiles = 256; a smaller applied
         # footprint fits the interval.
         for applied in (256, 128):
@@ -3248,7 +3253,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                 ]
             )
             allocator = ScratchpadAllocator(
-                CpSatLayoutSolver, size=1, division_mode="open"
+                ModelSolver(1), size=1, division_mode="open"
             )
             with (
                 patch.object(EnumerationFactory, "applies_tilings", True),

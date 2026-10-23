@@ -15,7 +15,7 @@ The code:
   Its from-scratch counterpart, `ReferencePermutationBasedLayoutSolver`, lives in
   `tests/inductor/reference_perm_layout.py` and is a test oracle only.
 - **`torch_spyre/_inductor/scratchpad/plan_solver.py`** — the shared `LifetimeBoundBuffer` data
-  type and the `MemoryPlanSolver` ABC.
+  type.
 - **`torch_spyre/_inductor/scratchpad/first_fit.py`** — `FirstFitLayoutSolver`, which seeds the
   co-optimizer's initial permutation.
 

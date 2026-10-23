@@ -136,17 +136,6 @@ lx_planner_relayout: bool = os.getenv("SPYRE_LX_PLANNER_RELAYOUT", "1").lower() 
     "yes",
 )
 
-# How many destination views the CP-SAT relayout enumeration keeps per
-# (source, consumer) edge, cheapest first: a consumer with many equal-core
-# divisions induces one distinct destination partition (one relayout copy the
-# solver must place) per division, though it will read through at most one.
-# On the spyre_attn decode graph with 16 unrolled KV blocks the unbounded
-# enumeration built 5789 copies and CP-SAT's presolve outlived the time limit.
-# 0 keeps every view.
-lx_solver_relayout_groups_per_edge: int = int(
-    os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
-)
-
 # Skip CP-SAT's presolve above this many free relayout copies in one solve;
 # 0 (the default) never skips it, priced or not. Presolve once scaled
 # super-linearly in the number of free copy residency literals (measured on the
@@ -311,39 +300,6 @@ layout_solver: Literal["cpsat", "simulated_annealing"] = os.environ.get(
 # the limit.
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
-)
-
-# How the CP-SAT layout solve encodes the relations over each dependency edge
-# (``EnumerationFactory``). "derived" (the default): equality of per-node view
-# ids, tile-view ids and core counts, derived by the strategy from each edge's
-# ResidencyEdge (an input clone's from its CloneRead); the candidate generator
-# builds pair tables only for loop-carry edges. "table": a pair table over the
-# two ends' candidate indices on every edge. A solver that reads menus and
-# pair tables (the annealing co-optimizer, exhaustive search) always gets the
-# table model.
-lx_view_relation: Literal["table", "derived"] = os.environ.get(  # type: ignore[assignment]
-    "LX_VIEW_RELATION", "derived"
-)
-
-# How the CP-SAT layout solve encodes relayouts: "lazy" (the default; per
-# edge, a legality and price table over the two ends' view ids, copies shared
-# by reified view equality, each owner's lifetime a variable; no cap) or
-# "table" (capped, priced copy groups over division pairs). "lazy" needs
-# lx_view_relation = "derived", under which "table" offers none.
-lx_relayout_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
-    "LX_RELAYOUT_ENCODING", "lazy"
-)
-
-# How the CP-SAT layout solve encodes an open work split: "lazy" (the
-# default; one split var per axis and a tiling choice, legality posted from
-# each tiling frame's WorkDivisionContext, every per-division quantity a table
-# over the axes it depends on, views related in digit form where they have
-# one) or "table" (an index into the candidate menu). "lazy" needs
-# lx_view_relation = "derived"; nodes on a pair-table edge stay "table", and
-# the candidate generator hands a Lazy node its space's points instead of
-# enumerating its legal menu.
-lx_division_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
-    "LX_DIVISION_ENCODING", "lazy"
 )
 
 

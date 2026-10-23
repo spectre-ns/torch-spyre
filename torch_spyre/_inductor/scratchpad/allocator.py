@@ -64,7 +64,6 @@ from torch_spyre._inductor.scratchpad.residency_rules import (
 from torch_spyre._inductor.scratchpad.graph_solvers import (
     BufferSolver,
     GraphSolver,
-    graph_solver_for,
 )
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
@@ -76,8 +75,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
-    MemoryPlanSolver,
-    RelayoutCopyBuffer,
     SolveError,
     TileSpec,
     ceil_div,
@@ -303,8 +300,7 @@ class SolvedPlan:
             empty_graph,
         )
 
-        real = [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)]
-        graph = build_graph(real, 1, 1 << 62, empty_graph(0).settings)
+        graph = build_graph(buffers, 1, 1 << 62, empty_graph(0).settings)
         tables = CandidateTables.of_buffers(buffers)
         strategy = EnumerationFactory().strategy_from_tables(tables)
         by_name = {b.name: b for b in buffers}
@@ -371,12 +367,6 @@ class SolvedPlan:
             b.chosen_division = self.division_index(node)
             b.spill_reason = node.spill_reason
             out.append(b)
-        transforms = {t.name: t for t in self.strategy.transforms}
-        for copy in self.tables.copies:
-            t = transforms.get(copy.name)
-            copy.address = None if t is None else self.address(t)
-            copy.chosen_division = 0
-            out.append(copy)
         return out
 
 
@@ -406,7 +396,7 @@ class ScratchpadAllocator:
 
     def __init__(
         self,
-        layout_planning: GraphSolver | type[MemoryPlanSolver],
+        solver: GraphSolver,
         size: int,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
@@ -416,10 +406,8 @@ class ScratchpadAllocator:
         """Configure the allocator with a graph solver and graph passes.
 
         Args:
-            layout_planning: The graph solver that fills the solve's open
-                decisions (``graph_solvers.GraphSolver``), or a solver class
-                naming one (``graph_solvers.graph_solver_for``). Its
-                capabilities say what the solve offers it.
+            solver: The graph solver that fills the solve's open decisions;
+                its capabilities say what the solve offers it.
             size: LX size
             pre_optimization_passes: Graph passes applied before layout planning.
                 Defaults to no passes.
@@ -431,7 +419,7 @@ class ScratchpadAllocator:
                 needs a solver that chooses divisions.
             prune: Enable heuristic pruning of the core-division search space.
         """
-        self.solver = graph_solver_for(layout_planning, size)
+        self.solver = solver
         self.capabilities = self.solver.capabilities
         if division_mode == "open" and not self.capabilities.chooses_core_divisions:
             raise ValueError(
@@ -458,7 +446,7 @@ class ScratchpadAllocator:
         # Per op ``_apply_chosen_tilings`` tiled, its pre-apply iteration
         # symbols to its live ones; read through :meth:`_live_splits`.
         self._tiling_symbol_remaps: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
-        self.factory = EnumerationFactory.from_config(self.capabilities)
+        self.factory = EnumerationFactory(self.capabilities)
         # Candidate generation belongs to the solve's table encoding; this
         # allocator dispatches the solve and applies the result.
         self.candidates = self.factory.candidates(size, prune, committed=not self.joint)

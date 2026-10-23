@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import sympy
 
@@ -40,9 +40,11 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
-    CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
 )
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 
 logger = logging.getLogger(__name__)
 
@@ -161,9 +163,6 @@ def buffers_of(graph: SpyreOptimizationGraph, tables: Any) -> list[CoreDivisionB
             cd_parent_matches={
                 k[0]: tables.matches[k] for k in keys if k in tables.matches
             },
-            cd_parent_relayouts={
-                k[0]: tables.relayouts[k] for k in keys if k in tables.relayouts
-            },
             residency_edges={
                 k[0]: tables.residency[k] for k in keys if k in tables.residency
             },
@@ -174,7 +173,8 @@ def buffers_of(graph: SpyreOptimizationGraph, tables: Any) -> list[CoreDivisionB
             lifetime_end_override=(
                 node.end_time if node.end_time > uses[-1] + 1 else None
             ),
-            op_position=tables.positions.get(node.name),
+            # Its place on the chain of execution edges.
+            op_position=node.produced_at,
             boundary=node.boundary,
         )
         b.division_space = node.space
@@ -192,18 +192,20 @@ class BufferSolver(GraphSolver):
         chooses_core_divisions=True, generates_divisions=True, chooses_tilings=True
     )
 
-    def __init__(self, inner: type[CoreDivisionLayoutSolver], capacity: int) -> None:
+    def __init__(self, inner: type[SaCoOptimizingSolver], capacity: int) -> None:
         super().__init__(capacity)
         self.inner = inner
         self.last: list[LifetimeBoundBuffer] = []
-        self._engine: Optional[CoreDivisionLayoutSolver] = None
+        self._engine: Optional[SaCoOptimizingSolver] = None
 
     @property
     def name(self) -> str:
         return self.inner.__name__
 
     def accepts(self, strategy: Any) -> bool:
-        return strategy.division == "table" and strategy.relayout == "data"
+        from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+
+        return not isinstance(strategy, LazyStrategy)
 
     def off_expression_ns(self) -> dict[str, float]:
         return {} if self._engine is None else self._engine.off_expression_ns()
@@ -239,19 +241,3 @@ class BufferSolver(GraphSolver):
                 node.work_split = WorkSplit.of(b.core_divisions[b.chosen_division])
                 strategy.solved[node] = b.chosen_division
         return graph.execution_plan()
-
-
-def graph_solver_for(solver: Any, capacity: int) -> GraphSolver:
-    """The graph solver a solver class names (a graph solver is returned as
-    given): ``CpSatLayoutSolver`` posts a model; the annealing co-optimizer
-    reads buffers."""
-    if isinstance(solver, GraphSolver):
-        return solver
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-        CpSatLayoutSolver,
-        ModelSolver,
-    )
-
-    if issubclass(solver, CpSatLayoutSolver):
-        return ModelSolver(capacity)
-    return BufferSolver(solver, capacity)

@@ -27,7 +27,6 @@ from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
 from torch_spyre._inductor.scratchpad.first_fit import FirstFitLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
-    MemoryPlanSolver,
     LifetimeBoundBuffer as Buffer,
 )
 
@@ -452,7 +451,7 @@ class PatternTests:
 
         return hbm_usage
 
-    def run_pattern(self, solver_type: type[MemoryPlanSolver], pattern: Pattern):
+    def run_pattern(self, solver_type: type[FirstFitLayoutSolver], pattern: Pattern):
         buffers_to_plan = [
             copy.deepcopy(buf)
             for buf in pattern.buffers.values()

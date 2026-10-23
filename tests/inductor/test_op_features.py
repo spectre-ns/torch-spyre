@@ -47,7 +47,6 @@ from torch_spyre._inductor.cost_model import (
 from torch_spyre._inductor.scratchpad import pricing
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
-from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "cooptimization_op_features.json")
 
@@ -77,7 +76,7 @@ class CandidateDivisionTest(TestCase):
         ):
             self.assertEqual(_work_slices(op, division), expected)
 
-    def test_symbolic_and_concrete_prices_receive_the_whole_legal_menu(self):
+    def test_symbolic_price_receives_the_whole_legal_menu(self):
         m, n, k, split = sympy.symbols("m n k split", integer=True, positive=True)
         op = SimpleNamespace(get_name=lambda: "out")
         divisions = [CoreDivision(splits={m: 16}), CoreDivision(splits={m: 8, n: 2})]
@@ -94,28 +93,12 @@ class CandidateDivisionTest(TestCase):
                 "torch_spyre._inductor.dump_cost_model.extract_op_features"
             ) as extract,
             patch("torch_spyre._inductor.cost_model.predict_ops", return_value=1.0),
-            patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.op_read_writes",
-                return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
-            ),
         ):
             pricing.extract_op_features(None, "out", buffers, {}, op=op)
             self.assertEqual(
                 extract.call_args.kwargs["candidate_work_slices"], expected
             )
             self.assertEqual(extract.call_args.args[1], {m: split, n: 1, k: 1})
-            extract.reset_mock()
-
-            # Shortlisting prices only candidate 0, but applicability must still
-            # see candidate 1. Otherwise symbolic and concrete prices disagree.
-            TableCandidates._relayout_consumer_costs(
-                op, divisions, "weight", [SimpleNamespace(consumer_division=0)]
-            )
-            extract.assert_called_once()
-            self.assertEqual(
-                extract.call_args.kwargs["candidate_work_slices"], expected
-            )
-            self.assertEqual(extract.call_args.args[1], expected[0])
 
 
 class FixturePresentTest(TestCase):

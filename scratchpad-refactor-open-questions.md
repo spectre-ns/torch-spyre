@@ -28,7 +28,11 @@ it CP-SAT time (Q12). The report has the full tables and an implementation guide
 | 3e exhaustive search as `DecomposedPlacement`; annealer charges `spill_cost` | done; annealer adjacency stays `op_position` (Q14) |
 | 3f tests moved with the API | done for 3a-3g |
 | 3g one allocator (`division_mode`), `CoOptimizingAllocator` deleted; the allocator builds no buffers: graph from the IR, `solve_graph`, commit from the solved graph | done; same-plans 80/80 before this step, rerun in progress (Q15) |
-| Final cleanup: delete redundant code (superseded encodings/arms, the merged allocator subclass, dead helpers) | requested 2026-10-22; last step |
+| Constraint encodings the default (derived relation, Lazy split, lazy relayouts) | done 2026-10-23 (df7359e6); the table encodings and their flags then deleted (Q17) |
+| Graph solvers declare `Capabilities`; the allocator takes a graph solver; op rules out of the allocator (`residency_rules`, `division_menus`, `drain_plans`, `pricing`) | done 2026-10-23 (3df2ccf6) |
+| Placement-only solvers replaced by fixed divisions (Q16) | done 2026-10-23 (de1bd4f2) |
+| Solver classes deleted: `CpSatLayoutSolver`, `MemoryPlanSolver`, `CoreDivisionLayoutSolver`, `graph_solver_for`; the annealer and first-fit are plain engines (Q18) | done 2026-10-23 |
+| Final cleanup: delete redundant code | done with the steps above |
 
 ## Q1. Stage 9: extraction or generation from the op?
 
@@ -200,9 +204,10 @@ graphs `op_position` equals each op output's `produced_at`. But 21 annealer test
 build synthetic buffers whose `uses` all start at tick 0 and rely on `op_position`
 alone, so deriving positions from the chain makes them collide.
 
-- Assumed (recommended): keep `op_position` for the annealer; its spill cost now is
-  `buffer_graph.spill_cost`.
-- Answer needed: rewrite those fixtures (distinct ticks) and drop `op_position`?
+- Resolved (2026-10-23): on the graph path the annealer's positions come from each
+  node's `produced_at` (`graph_solvers.buffers_of`); `CandidateTables.positions` is
+  gone. The engine still takes `op_position` on its buffers, so the synthetic fixtures
+  are unchanged.
 
 ## Q15. How far "delete the allocator's buffer construction" goes (answered)
 
@@ -211,13 +216,51 @@ IR buffers in the graph and solve; the allocator should just coordinate solving 
 committing of results."
 
 Done:
-- The placement-mode graph is built from the IR: `graph_builder.placement_graph`.
-- The open mode's candidate generator builds the graph plus the strategy's
-  `CandidateTables`: `TableCandidates.prepare_graph`.
-- Every solver takes the graph through `MemoryPlanSolver.solve_graph`.
+- The candidate generator builds the graph plus the strategy's `CandidateTables`:
+  `TableCandidates.prepare_graph` (the committed mode is the same generator with every
+  menu pinned, Q16).
+- The allocator hands the graph to its graph solver (`GraphSolver.solve`, Q18).
 - The commit path reads the solved graph (`SolvedPlan`).
 
 `_generate_buffers`, `_build_bound_buffers`, `_append_lx_relayout_destinations`,
 `_build_cd_bound_buffers` and `_relayout_copy_buffers` are deleted. Buffers remain only
 as the solvers' buffer form (unit tests and capture replay) and as the annealing
 co-optimizer's internals, built from the graph and tables (`graph_solvers.buffers_of`).
+
+## Q16. Placement-only solvers (answered)
+
+Answer (2026-10-23): "We don't need placement only solvers. That will be covered by
+fixed strategies."
+
+Done: greedy, best-fit, placement-only SA, exhaustive search and the committed-mode
+builder are deleted. `co_optimizing_lx_planning=False` is the same solve with every
+op's menu pinned to its committed division, priced like the open mode. Greedy's
+committed relayout plans, ownership anchoring and the fixed-division residency
+branches went with it. A failed open-mode solve replans with the committed divisions;
+if that fails too nothing is placed in LX.
+
+Known loss: no relayout serves a *completed reduction* (a reduction finished on fewer
+cores, e.g. an MoE down projection). Only the deleted committed collector built those
+routes; the solver's relayout edges never have. The two device tests now assert the
+HBM read and exact numerics. Restoring it means a completed-reduction `RelayoutEdge`.
+
+## Q17. Obsolete equivalence-only code (answered)
+
+Answer (2026-10-23): "Don't keep obsolete stuff just for equivalency tests."
+
+Done: `LX_VIEW_RELATION`, `LX_DIVISION_ENCODING`, `LX_RELAYOUT_ENCODING` and
+`LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE` are deleted, with the table relation and table
+work split as CP-SAT encodings and the capped `RelayoutCopyBuffer` path. The factory is
+built from the solver's capabilities alone: a model-posting solver gets
+`LazyStrategy`, the annealer `TableStrategy`. Old capture pickles holding
+`RelayoutCopyBuffer` no longer load; the replay skips them.
+
+## Q18. The solver classes (answered)
+
+Answer (2026-10-23): "I expected the solvers to essentially drop by the end."
+
+Done: the allocator is configured with a graph solver (`ModelSolver` for CP-SAT,
+`BufferSolver(SaCoOptimizingSolver)` for the annealer). `CpSatLayoutSolver`, the
+`MemoryPlanSolver` / `CoreDivisionLayoutSolver` bases and `graph_solver_for` are
+deleted. Tests solve buffers with `build_graph` + `ModelSolver.solve` and read the
+decisions through `SolvedPlan`. `build_graph` checks the buffer form's in-place pairs.

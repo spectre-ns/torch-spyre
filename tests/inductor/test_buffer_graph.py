@@ -47,9 +47,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (  # noqa: E402
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
-    RelayoutCopyBuffer,
 )
-from torch_spyre._inductor.scratchpad.table_candidates import relayout_copies_of
 
 _SETTINGS = SolveSettings(time_limit_seconds=None, bottom_justify=True, record=None)
 
@@ -114,13 +112,6 @@ def test_add_node_commits_a_buffer_without_candidates():
     assert graph_input.boundary == BufferType.Input
     assert graph_input.produced_at is None
     assert not plain.sym_core_divs and not empty.sym_tile_counts
-
-
-def test_add_node_refuses_a_relayout_copy():
-    graph = _graph()
-    copy = RelayoutCopyBuffer(name="copy", size=128, uses=[1, 2])
-    with pytest.raises(AssertionError):
-        graph.add_node(copy)
 
 
 def test_add_child_shares_one_edge_object():
@@ -207,7 +198,7 @@ def test_a_parent_read_twice_is_one_edge_gated_twice():
 
 def test_build_graph_keeps_an_unread_in_place_parent():
     """The merge still needs the edge; the read gate and cuts must not see it."""
-    buffers = [_cd("a", [0, 2]), _cd("c", [1, 3], in_place_parents=["a"])]
+    buffers = [_cd("a", [0, 1]), _cd("c", [1, 3], in_place_parents=["a"])]
     graph = build_graph(buffers, 128, 16, _SETTINGS)
     (edge,) = graph.nodes["c"].inputs
     assert edge.in_place and not edge.reads
@@ -215,13 +206,10 @@ def test_build_graph_keeps_an_unread_in_place_parent():
 
 @pytest.mark.parametrize("case,buffers", _corpus(), ids=lambda v: v)
 def test_build_graph_matches_the_allocator_buffers(case, buffers):
-    buffers = [*buffers, *relayout_copies_of(buffers)]
     graph = build_graph(buffers, 128, 1 << 14, _SETTINGS)
     names = {b.name for b in buffers}
+    assert set(graph.nodes) == names
     for b in buffers:
-        if isinstance(b, RelayoutCopyBuffer):
-            assert b.name not in graph.nodes
-            continue
         node = graph.nodes[b.name]
         assert [e.src.name for e in node.inputs if e.in_place] == b.in_place_parents
         reads = [p for p in getattr(b, "parents", ()) if p in names]
@@ -233,10 +221,10 @@ def test_build_graph_matches_the_allocator_buffers(case, buffers):
         assert {e.src.name for e in node.inputs} == {*reads, *b.in_place_parents}
         for e in node.inputs:
             assert e in e.src.outputs
+    # The buffer form carries no relayout edges, so the strategy adds no copies.
     strategy = TableStrategy.from_buffers(buffers)
     strategy.prepare(graph)
-    copies = [b.name for b in buffers if isinstance(b, RelayoutCopyBuffer)]
-    assert [t.name for t in strategy.transforms] == copies
+    assert strategy.transforms == ()
 
 
 def _graph_of(buffers, capacity=16) -> SpyreOptimizationGraph:

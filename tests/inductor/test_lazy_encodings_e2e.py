@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End to end: every CP-SAT encoding (the table model; the derived view
-relation, ``Lazy`` work split and relayouts as constraints, alone and together,
-which is the default) plans graphs that compile and compute the right numbers
-on device."""
+"""End to end: the default CP-SAT encodings (the derived view relation,
+``Lazy`` work split and relayouts as constraints) plan graphs that compile and
+compute the right numbers on device."""
 
 import pytest
 
@@ -32,34 +31,6 @@ _BASE = {
     "layout_solver": "cpsat",
 }
 
-_MODES = {
-    "table": {
-        "lx_view_relation": "table",
-        "lx_division_encoding": "table",
-        "lx_relayout_encoding": "table",
-    },
-    "derived": {
-        "lx_view_relation": "derived",
-        "lx_division_encoding": "table",
-        "lx_relayout_encoding": "table",
-    },
-    "lazy": {
-        "lx_view_relation": "derived",
-        "lx_division_encoding": "lazy",
-        "lx_relayout_encoding": "table",
-    },
-    "lazy_relayouts": {
-        "lx_view_relation": "derived",
-        "lx_division_encoding": "table",
-        "lx_relayout_encoding": "lazy",
-    },
-    "all": {
-        "lx_view_relation": "derived",
-        "lx_division_encoding": "lazy",
-        "lx_relayout_encoding": "lazy",
-    },
-}
-
 
 def _mlp(x, g, u, d):
     return (x @ u * torch.nn.functional.silu(x @ g)) @ d
@@ -70,9 +41,8 @@ def _norm_chain(x, w):
     return torch.relu(y) + y.softmax(-1)
 
 
-@pytest.mark.parametrize("mode", sorted(_MODES))
 @pytest.mark.parametrize("model", ["mlp", "norm_chain"])
-def test_experimental_encodings_compute_the_reference(mode, model):
+def test_default_encodings_compute_the_reference(model):
     torch.manual_seed(0)
     if model == "mlp":
         fn = _mlp
@@ -93,6 +63,6 @@ def test_experimental_encodings_compute_the_reference(mode, model):
         tolerance = {"rtol": 1e-2, "atol": 1e-2}
     expected = fn(*[a.float() for a in args]).half()
     torch._inductor.codecache.FxGraphCache.clear()
-    with config.patch({**_BASE, **_MODES[mode]}):
+    with config.patch(_BASE):
         got = torch.compile(fn, dynamic=False)(*[a.to("spyre") for a in args])
     torch.testing.assert_close(got.cpu(), expected, **tolerance)

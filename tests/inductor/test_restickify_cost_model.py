@@ -566,7 +566,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     from torch_spyre._inductor.scratchpad.allocator import (
         ScratchpadAllocator,
     )
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
@@ -574,7 +574,9 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     commit_iteration_space_ownership(consumer, committed)
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
-    allocator = ScratchpadAllocator(CpSatLayoutSolver, size=2**20, division_mode="open")
+    allocator = ScratchpadAllocator(
+        ModelSolver(2**20), size=2**20, division_mode="open"
+    )
     ordinary, _ = allocator.candidates._enumerate_core_divisions(
         consumer, config.sencores
     )
@@ -625,7 +627,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
     )
     from torch_spyre._inductor.scratchpad import allocator as am
     from torch_spyre._inductor.scratchpad import table_candidates as tcm
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
@@ -676,13 +678,12 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
             tcm, "has_resolved_work_div_hint", lambda op: op is consumer
         )
     allocator = am.ScratchpadAllocator(
-        CpSatLayoutSolver, size=2**20, division_mode="open"
+        ModelSolver(2**20), size=2**20, division_mode="open"
     )
     if failure in ("source_clone", "relayout"):
         from torch_spyre._inductor.scratchpad.plan_solver import (
             BufferType,
             CoreDivision,
-            RelayoutCopyBuffer,
         )
 
         build = allocator.candidates._build_graph
@@ -703,15 +704,8 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
                 )
                 tables.menus["input"] = (CoreDivision(),)
             else:
-                tables.copies.append(
-                    RelayoutCopyBuffer(
-                        "shuffle",
-                        128,
-                        [0, 1],
-                        core_divisions=[CoreDivision()],
-                        relayout_parent=stage.name,
-                    )
-                )
+                # The staging copy may be relaid out to its consumer.
+                tables.relayout_edges[(stage.name, consumer.name)] = object()
             return solve_graph, tables
 
         monkeypatch.setattr(

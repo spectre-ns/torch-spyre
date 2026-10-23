@@ -773,8 +773,8 @@ class _SympyExprToCpSat(Printer):
     def _print_gated_product(self, ints, name):
         """A product with boolean factors as the product of the others, gated
         by each boolean: a variable equal to it while the booleans hold and 0
-        otherwise, two linear constraints enforced on the literal (as in
-        ``_print_RelayoutCharge``), instead of a ``multiplication_equality``
+        otherwise, two linear constraints enforced on the literal, instead of a
+        ``multiplication_equality``
         the solver can only propagate through bounds."""
         gates = [arg for arg in ints if arg.is_boolean]
         rest = [arg for arg in ints if not arg.is_boolean]
@@ -833,38 +833,6 @@ class _SympyExprToCpSat(Printer):
         if wrapper is None:
             raise NotImplementedError(f"no division variable for {symbols[0]}")
         return wrapper.division_is(int(constants[0]))
-
-    def _print_RelayoutCharge(self, expr):
-        """``RelayoutCharge(is_lx, division_X, price_0, ...)`` (a relayout
-        copy's ``cost_term``) -> one ``element`` lookup of X's division into the
-        price table plus a charge variable equal to that price while the copy
-        is resident and 0 otherwise: two constraints per copy, against one
-        boolean product per (copy, priced division) had the table been written
-        as a sum of deltas. Divisions past the table read 0; a source that is
-        not a division-choosing buffer of this solve prices at 0, as it can
-        never fire (``TableStrategy.encode_transform_use``)."""
-        is_lx, division, *prices = expr.args
-        table = [int(p) for p in prices]
-        lit = self._print(is_lx)
-        if division.is_Integer:
-            i = int(division)
-            return lit * (table[i] if 0 <= i < len(table) else 0)
-        wrapper = self._sym_map.get(f"_division_of_{division.name}")
-        if wrapper is None:
-            return 0
-        table += [0] * (len(wrapper.buffer.core_divisions) - len(table))
-        table = table[: len(wrapper.buffer.core_divisions)]
-        top = max(table, default=0)
-        if top <= 0:
-            return 0
-        name = is_lx.name if is_lx.is_Symbol else str(self._count)
-        self._count += 1
-        price = self._model.new_int_var(0, top, f"relayout_price_{name}")
-        self._tie(wrapper, table, price)
-        charge = self._model.new_int_var(0, top, f"relayout_charge_{name}")
-        self._model.add(charge == price).only_enforce_if(lit)
-        self._model.add(charge == 0).only_enforce_if(lit.Not())
-        return charge
 
     def _print_AppliedUndef(self, expr):
         """An implemented function of one buffer's splits (a functor of its work

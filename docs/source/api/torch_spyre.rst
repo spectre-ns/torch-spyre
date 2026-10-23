@@ -816,10 +816,6 @@ Environment Variables
      - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
        lowering with per-buffer LX dump and restore clones, so LX-resident
        buffers survive the call (default ``1``; set ``0`` to disable)
-   * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
-     - Number of destination views the CP-SAT relayout enumeration keeps per
-       (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
-       every view)
    * - ``SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES``
      - For unpriced CP-SAT solves, skip presolve above this many relayout
        copies (default ``0``, which disables the threshold)

@@ -193,11 +193,6 @@ def cost_expr(
             raise
         return None, []
 
-    # One price term per relayout copy (a source and one destination view,
-    # however many consumers share it): the fitted shuffle cost of the
-    # source's chosen division, charged while the copy is resident.
-    for copy in sorted(plan.tables.copies, key=lambda b: b.name):
-        cost_expr = cost_expr + copy.cost_term()
     return cost_expr, bundle_terms
 
 

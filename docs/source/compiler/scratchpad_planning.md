@@ -271,7 +271,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | File | Responsibility |
 |---|---|
 | `allocator.py` | `ScratchpadAllocator` (open and committed division modes), `ScratchpadOptimizationPass`, `select_allocator`, `scratchpad_planning`, and the commit back to the IR (`commit_divisions`, `commit_lx_views`, `_push_allocation`) |
-| `table_candidates.py` | `TableCandidates`: builds the solve's graph from the IR (`prepare_graph`) and the table encoding's candidates (division menus, view tables, input clones, priced relayouts and copies) |
+| `table_candidates.py` | `TableCandidates`: builds the solve's graph from the IR (`prepare_graph`) and the strategies' candidates (division menus or Lazy spaces, view tables and relations, input clones, relayout edges) |
 | `residency_rules.py` | Why an op output or graph input may not reside in LX (`_residency_reasons`, one reason per buffer), and which reads may take over a producer's storage in place |
 | `division_menus.py` | An op's candidate work divisions read from the IR: split options, legality and stick-fit checks, matmul and reduction axis parsing, the read-distance filter, and the pruned menu (`_enum_split_options`, `prune=True`) |
 | `drain_plans.py` | Lifetimes around coarse-tile loops: the in-place handoff tick, loop trip counts, and post-loop drain plans (`validated_drain_plans`) |
@@ -279,15 +279,15 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `encoding_strategy.py` | `EncodingStrategy` / `TableStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables); `EnumerationFactory` |
 | `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
 | `lazy_relayout.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
-| `graph_solvers.py` | Graph solvers and their `Capabilities`: `GraphSolver`, `BufferSolver` (runs a buffer-form solver, the annealing co-optimizer, over the graph), `graph_solver_for` |
-| `ilp_solver_ortools.py` | `ModelSolver` (`layout_solver="cpsat"`), which posts the graph through the strategy to CP-SAT, and `CpSatLayoutSolver`, its buffer form for tests and capture replay |
-| `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat`, `Decomposed`, `Mip`, `BruteForce`, `Annealing`, and the `GraphSolver` protocol |
+| `graph_solvers.py` | Graph solvers and their `Capabilities`: `GraphSolver`, `BufferSolver` (runs the annealing co-optimizer over the buffer form of the graph) |
+| `ilp_solver_ortools.py` | `ModelSolver` (`layout_solver="cpsat"`), which posts the graph through the strategy to CP-SAT |
+| `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat`, `Decomposed`, `Mip`, `BruteForce`, `Annealing` |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `pricing.py` | The priced objective (`cost_expr`) over each node's symbolic work split and residency, and its dump (`dump_cost_expr`) |
 | `sa_cooptimizer.py` | `SaCoOptimizingSolver`, the simulated-annealing co-optimizer (`layout_solver="simulated_annealing"`) |
 | `first_fit.py` | `FirstFitLayoutSolver`, which seeds the annealer's permutation |
 | `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer the annealer composes |
-| `plan_solver.py` | The buffer form: `LifetimeBoundBuffer`, `CoreDivisionBuffer`, `CoreDivision`, `TileSpec`, relayout copy buffers, the `MemoryPlanSolver` / `CoreDivisionLayoutSolver` ABCs, and `SolveError` |
+| `plan_solver.py` | The buffer form: `LifetimeBoundBuffer`, `CoreDivisionBuffer`, `CoreDivision`, `TileSpec`, and `SolveError` |
 | `coarse_tiling.py` | `CoarseTilingPass`, which applies chosen coarse tilings (`TileSpec`s) to the graph |
 | `lx_relayout.py` | LX relayouts: candidates, fired groups (`FiredRelayoutGroup` to `LXRelayoutPlan`) and `materialize_lx_relayouts` |
 | `lx_context_switching.py` | `LxContextSwitchingPass`, LX dump/restore around opaque `FallbackKernel` calls |
@@ -347,8 +347,7 @@ solver so it keeps participating in slicing matching and in-place chains: a
 forced-out consumer keeps its producers' residency viable instead of
 orphaning them, and an in-place parent reference always resolves. Honouring
 the verdict is therefore each solver's responsibility: CP-SAT pins a barred
-node non-resident, and the buffer-form solvers route it through
-`MemoryPlanSolver.excluded`.
+node non-resident, and the annealer never places one.
 
 **Where a check belongs.** Precomputable from the graph ⇒ it lives in
 `_residency_reasons` as a reason string. Depends on the solver's free variables ⇒
@@ -357,8 +356,7 @@ the two ends' divisions and the in-place merge gate. The relation applies in
 both division modes, so a producer and a consumer that slice a buffer
 differently keep it out of LX unless the solve places a relayout copy for
 that edge (CP-SAT only).
-Capacity is solver state, so it is checked by the solver
-(`MemoryPlanSolver.excluded` in the buffer form).
+Capacity is solver state, so it is checked by the solver.
 
 The checks, in evaluation order (the first failure is the reason reported):
 

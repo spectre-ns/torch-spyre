@@ -16,8 +16,7 @@
 (``config.layout_solver == "cpsat"``).
 
 :class:`ModelSolver` is the graph solver the allocator configures for
-``layout_solver="cpsat"``; :class:`CpSatLayoutSolver` is its buffer form for
-tests and capture replay. The graph (``buffer_graph.py``) has one :class:`ResourceNode` per op output or graph input,
+``layout_solver="cpsat"``. The graph (``buffer_graph.py``) has one :class:`ResourceNode` per op output or graph input,
 a :class:`DependencyEdge` per (producer, consumer) read (``in_place`` when the
 consumer may take over the producer's storage), and :class:`ExecutionEdge`\\ s
 chaining op outputs in execution order. Each node's decisions -- its work
@@ -55,26 +54,20 @@ After the solve, each in-place-merged placement unit slides down to the lowest
 free address (``buffer_graph.justify``); when that would not fit, the solver's
 own offsets are kept.
 
-**LX relayouts.** The allocator hands the solver one ``RelayoutCopyBuffer`` per
-relayout group (a source and one destination per-core view, however many
-consumers read it); the strategy holds each as a candidate
-:class:`Transform`, live from the group's first consumer to its last. The
-copy's residency IS the decision to shuffle, its rectangle sits in the same
-no-overlap as every node, and its price is an ordinary term of the cost
-expression (``RelayoutCopyBuffer.cost_term``). A resident copy needs its
-source resident under a division it was priced for, a consumer reads the copy
-only under a division pair its candidates list, and a resident copy serves at
-least one consumer. Under the fallback ladder a shuffle is unpriced and would
-look free, so every copy is pinned out there.
+**LX relayouts.** An edge the candidate generator offers a relayout
+(``RelayoutEdge``) may be read through a copy of its source in another
+per-core view (``lazy_relayout``): one copy per (source, destination view),
+shared by every consumer that reads that view, a :class:`Transform` whose
+residency IS the decision to shuffle and whose rectangle sits in the same
+no-overlap as every node; its price is a strategy objective term. Under the
+fallback ladder a shuffle is unpriced and would look free, so every copy is
+pinned out there.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional, cast
-
-import sympy
+from typing import TYPE_CHECKING, Optional
 
 
 if TYPE_CHECKING:
@@ -95,25 +88,17 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     SOLVER_CHOSE_SPILL,
     ResourceNode,
     SolveSettings,
-    build_graph,
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
-    EnumerationFactory,
     _gate_divisions,
 )
 from torch_spyre._inductor.scratchpad.graph_solvers import Capabilities, GraphSolver
-from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    CoreDivisionBuffer,
-    CoreDivisionLayoutSolver,
-    LifetimeBoundBuffer,
-    RelayoutCopyBuffer,
-    _check_in_place_relationships,
     ceil_div,
 )
 from torch_spyre._inductor import config
 
-__all__ = ["CpSatLayoutSolver", "ModelSolver", "_gate_divisions"]
+__all__ = ["ModelSolver", "_gate_divisions"]
 
 logger = logging.getLogger(__name__)
 
@@ -178,10 +163,6 @@ class ModelSolver(GraphSolver):
         )
         self.bottom_justify = bottom_justify
 
-    @property
-    def name(self) -> str:
-        return "CpSatLayoutSolver"
-
     def solve(self, graph, strategy, cost_expr=None) -> list[ResourceNode]:
         """A node the allocator did not bar is barred here when even its
         smallest per-core footprint exceeds LX."""
@@ -233,112 +214,3 @@ class ModelSolver(GraphSolver):
             "objective_used": objective,
         }
         return status
-
-
-class CpSatLayoutSolver(CoreDivisionLayoutSolver):
-    """The buffer form of :class:`ModelSolver`: solves a list of buffers and
-    writes the decisions back onto them."""
-
-    def __init__(
-        self,
-        buffers: Sequence[LifetimeBoundBuffer],
-        size: int,
-        alignment: int = 128,
-        time_limit_seconds: Optional[float] = None,
-        bottom_justify: bool = True,
-    ) -> None:
-        super().__init__(buffers, size, alignment)
-        self.engine = ModelSolver(size, time_limit_seconds, bottom_justify)
-
-    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
-        """Place buffers on their already-fixed core divisions (placement-only).
-
-        Same model as :meth:`plan_layout_and_core_divisions` minus the joint
-        division choice: each buffer's footprint is its ``size``, so there is no
-        slicing gate on residency and no parallelism step -- the solve reduces
-        to minimising HBM traffic under the 2D no-overlap with in-place reuse.
-        Dispatch is per buffer and keys on whether it carries candidate
-        divisions, not on its class, so a :class:`CoreDivisionBuffer` with an
-        empty candidate list is placed here rather than divided."""
-        return cast("list[LifetimeBoundBuffer]", list(self._plan_layout_generic()))
-
-    def plan_layout_and_core_divisions(
-        self, cost_expr: sympy.Expr | None = None
-    ) -> list[CoreDivisionBuffer]:
-        """Jointly choose each buffer's core division and its LX placement.
-
-        The full model described in the module docstring. Every buffer must
-        carry enumerated candidate divisions; the chosen index is written back
-        to ``chosen_division`` for the allocator to commit."""
-        buffers = cast("Sequence[CoreDivisionBuffer]", self.buffers)
-        assert all(len(b.core_divisions) != 0 for b in buffers), (
-            "All buffers must have at least 1 valid core division"
-        )
-        return cast(
-            "list[CoreDivisionBuffer]",
-            list(self._plan_layout_generic(cost_expr=cost_expr)),
-        )
-
-    def _plan_layout_generic(
-        self,
-        log_lx_usage: bool = False,
-        cost_expr: sympy.Expr | None = None,
-    ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
-        buffers = self.buffers
-        if not buffers:
-            return []
-        assert all(b.address is None for b in buffers), (
-            "Buffers cannot be previously or partially planned"
-        )
-
-        _check_in_place_relationships(buffers)
-
-        # Declarative exclusion, shared with every other solver: whatever the
-        # allocator barred (each buffer's ``residency_reason``), plus the
-        # capacity check. Barred buffers stay in the model (they must stay
-        # available for slicing matching and in-place chains), pinned
-        # non-resident.
-        forced_reasons = dict(self.record_exclusions())
-        graph = build_graph(
-            buffers,
-            self.alignment,
-            self.limit // self.alignment,
-            SolveSettings(None, self.engine.bottom_justify, _unrecorded),
-            forced_reasons,
-        )
-        strategy = EnumerationFactory.from_config().strategy(buffers, forced_reasons)
-        self.engine.solve(graph, strategy, cost_expr)
-
-        # Write the decisions back onto the caller's buffers, in bytes.
-        order = {name: i for i, name in enumerate(graph.nodes)}
-        transforms = {t.name: t for t in strategy.transforms}
-        for b in buffers:
-            item = graph.nodes.get(b.name) or transforms[b.name]
-            b.address = None if item.offset is None else item.offset * self.alignment
-            b.spill_reason = item.spill_reason
-            if isinstance(b, RelayoutCopyBuffer):
-                b.chosen_division = 0
-            if not isinstance(item, ResourceNode) or not isinstance(
-                b, CoreDivisionBuffer
-            ):
-                continue
-            if item in strategy.solved:
-                b.chosen_division = strategy.solved[item]
-            chosen = dict(b.chosen_relayouts)
-            for edge in sorted(item.inputs, key=lambda e: order[e.src.name]):
-                if edge.transform is not None and edge.transform.offset is not None:
-                    chosen[edge.src.name] = ChosenRelayout(
-                        strategy.fired[edge], edge.transform.offset
-                    )
-            b.chosen_relayouts = {
-                parent: c.scaled(self.alignment) for parent, c in chosen.items()
-            }
-        return list(buffers)
-
-    @property
-    def last_solve_stats(self) -> dict:
-        return self.engine.last_solve_stats
-
-
-def _unrecorded(*args, **kwargs) -> int:
-    raise AssertionError("ModelSolver.solve sets the recording hook")

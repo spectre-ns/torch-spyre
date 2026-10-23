@@ -9732,11 +9732,11 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             )
 
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
+            ModelSolver,
         )
 
         allocator = ScratchpadAllocator(
-            CpSatLayoutSolver, size=4096, division_mode="open"
+            ModelSolver(4096), size=4096, division_mode="open"
         )
         allocator.candidates.drain_plans = {
             "carry": SimpleNamespace(storage_name="carry", collective=None)
@@ -9786,7 +9786,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 allocator.candidates, "_parent_residency_edges", return_value={}
             ),
             patch.object(allocator.candidates, "_cd_parent_matches", return_value={}),
-            patch.object(allocator.candidates, "_cd_parent_relayouts", return_value={}),
+            patch.object(allocator.candidates, "_relayout_edges", return_value={}),
         ):
             in_place = allocator.candidates._determine_in_place_division_invariant(
                 graph
@@ -9846,10 +9846,10 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             ScratchpadAllocator,
         )
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
+            ModelSolver,
         )
 
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(ModelSolver(2**20), 2**20)
         storage_op = _SentinelOp("buf2")
         update_op = _SentinelOp("buf2_update")
         plan = self._isolation_plan()
@@ -9943,10 +9943,10 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             ScratchpadAllocator,
         )
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
+            ModelSolver,
         )
 
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(ModelSolver(2**20), 2**20)
         plan = self._isolation_plan()
         allocator._validated_drain_plans = {"buf2": plan}
         storage_op = _SentinelOp("buf2")
@@ -10306,10 +10306,10 @@ class TestHoistedInputClone(unittest.TestCase):
             ScratchpadAllocator,
         )
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
+            ModelSolver,
         )
 
-        allocator = ScratchpadAllocator(CpSatLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(ModelSolver(2**20), 2**20)
         graph = MagicMock()
         graph.operations = list(ops)
         graph.get_output_names.return_value = []

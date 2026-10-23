@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 import sympy
 
@@ -49,7 +49,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
-    RelayoutCopyBuffer,
     ceil_div,
     division_symbol,
 )
@@ -61,8 +60,6 @@ if TYPE_CHECKING:
 Var = Any  # a backend variable or literal
 Model = Any  # cp_model.CpModel until 3a, a Backend after
 Item = ResourceNode | Transform
-AxisSetting = Literal["table", "lazy", "pruned"]
-RelayoutSetting = Literal["data", "pruned", "lazy"]
 
 
 def _owner_key(view) -> Optional[tuple]:
@@ -221,9 +218,6 @@ class EncodingStrategy:
     configuration alone; ``prepare(graph)`` resets the per-solve state, and
     the ``encode_*`` methods add to it."""
 
-    division: AxisSetting = "table"
-    tiling: AxisSetting = "table"
-    relayout: RelayoutSetting = "data"
     # per-solve state
     transforms: tuple[Transform, ...] = ()
     vars: dict[Item, NodeVars] = field(default_factory=dict)
@@ -327,33 +321,28 @@ class EncodingStrategy:
 class CandidateTables:
     """The table strategy's candidates for one solve, generated from the IR
     (``TableCandidates``): per node its candidate menu (and, for a ``Lazy``
-    split, its space), per edge its pair table, relayout candidates and the
-    relations a derived encoding uses, and the candidate relayout copies.
+    split, its space), per edge its pair table and the relations and
+    relayout edges a derived encoding uses.
     Keyed by node name, or by ``(parent, child)``; ``parents`` lists each
     child's parents (reads and in-place) in the solve, in order."""
 
     menus: dict[str, tuple[CoreDivision, ...]] = field(default_factory=dict)
     parents: dict[str, list[str]] = field(default_factory=dict)
     matches: dict[tuple[str, str], list[tuple[int, int]]] = field(default_factory=dict)
-    relayouts: dict[tuple[str, str], list] = field(default_factory=dict)
     residency: dict[tuple[str, str], Any] = field(default_factory=dict)
     clone_reads: dict[tuple[str, str], Any] = field(default_factory=dict)
     relayout_edges: dict[tuple[str, str], Any] = field(default_factory=dict)
-    copies: list[RelayoutCopyBuffer] = field(default_factory=list)
     lazy_spaces: dict[str, Any] = field(default_factory=dict)
     point_menus: set[str] = field(default_factory=set)
     tile_reads: dict[str, dict] = field(default_factory=dict)
-    positions: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def of_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> CandidateTables:
         """The candidates the buffer form carries (tests, capture replay)."""
         names = {b.name for b in buffers}
-        tables = cls(copies=[b for b in buffers if isinstance(b, RelayoutCopyBuffer)])
+        tables = cls()
         for b in buffers:
-            if isinstance(b, RelayoutCopyBuffer) or not isinstance(
-                b, CoreDivisionBuffer
-            ):
+            if not isinstance(b, CoreDivisionBuffer):
                 continue
             if b.core_divisions:
                 tables.menus[b.name] = tuple(b.core_divisions)
@@ -368,15 +357,10 @@ class CandidateTables:
                 key = (p, b.name)
                 if p in b.cd_parent_matches:
                     tables.matches[key] = b.cd_parent_matches[p]
-                if p in b.cd_parent_relayouts:
-                    tables.relayouts[key] = b.cd_parent_relayouts[p]
                 if p in b.residency_edges:
                     tables.residency[key] = b.residency_edges[p]
             if getattr(b, "tile_reads", None):
                 tables.tile_reads[b.name] = b.tile_reads
-            position = getattr(b, "op_position", None)
-            if position is not None:
-                tables.positions[b.name] = position
         return tables
 
 
@@ -392,10 +376,6 @@ class TableStrategy(EncodingStrategy):
         self,
         menus: Mapping[str, Sequence[CoreDivision]] | None = None,
         matches: Mapping[tuple[str, str], Sequence[tuple[int, int]]] | None = None,
-        relayout_candidates: Mapping[tuple[str, str], Sequence[RelayoutCandidate]]
-        | None = None,
-        copies: Sequence[RelayoutCopyBuffer] = (),
-        copy_reasons: Mapping[str, str] | None = None,
         residency: Mapping[tuple[str, str], Any] | None = None,
         clone_reads: Mapping[tuple[str, str], Any] | None = None,
         relayout_edges: Mapping[tuple[str, str], Any] | None = None,
@@ -413,30 +393,16 @@ class TableStrategy(EncodingStrategy):
         self.relayout_edges = dict(relayout_edges or {})
         self.menus = {k: tuple(v) for k, v in (menus or {}).items()}
         self.matches = {k: list(v) for k, v in (matches or {}).items()}
-        self.relayout_candidates = {
-            k: list(v) for k, v in (relayout_candidates or {}).items()
-        }
-        self.copies = list(copies)
-        self.copy_reasons = dict(copy_reasons or {})
         self.fired: dict[DependencyEdge, RelayoutCandidate] = {}
         self.solved: dict[Item, int] = {}
 
     @classmethod
     def from_tables(
-        cls,
-        tables: CandidateTables,
-        reasons: Mapping[str, str] | None = None,
-        relation: str = "table",
-        **settings,
+        cls, tables: CandidateTables, *, derived: bool = False, **kwargs
     ) -> TableStrategy:
-        """The strategy over ``tables``: per edge a pair table, or under the
-        derived relation the clone or residency relation where there is one;
-        the relayout candidates on groups with a copy in this solve; the
-        copies in copy order."""
-        reasons = reasons or {}
-        groups = {c.group_key for c in tables.copies}
-        derived = relation == "derived"
-        matches, relayouts, residency, clone_reads = {}, {}, {}, {}
+        """The strategy over ``tables``: per edge a pair table, or with
+        ``derived`` the clone or residency relation where there is one."""
+        matches, residency, clone_reads = {}, {}, {}
         for child, parents in tables.parents.items():
             for parent in parents:
                 key = (parent, child)
@@ -447,44 +413,27 @@ class TableStrategy(EncodingStrategy):
                     residency[key] = tables.residency[key]
                 else:
                     matches[key] = tables.matches.get(key, [])
-                cands = [
-                    c for c in tables.relayouts.get(key, ()) if c.group_key in groups
-                ]
-                if cands:
-                    relayouts[key] = cands
         relayout_edges = {
             key: edge
             for key, edge in tables.relayout_edges.items()
             if key[0] in tables.parents.get(key[1], ())
         }
-        copies = tables.copies
         strategy = cls(
             menus=tables.menus,
             matches=matches,
-            relayout_candidates=relayouts,
-            copies=copies,
-            copy_reasons={c.name: reasons[c.name] for c in copies if c.name in reasons},
             residency=residency,
             clone_reads=clone_reads,
             relayout_edges=relayout_edges,
-            **settings,
+            **kwargs,
         )
         strategy.tables = tables
         return strategy
 
     @classmethod
-    def from_buffers(
-        cls,
-        buffers: Sequence[LifetimeBoundBuffer],
-        reasons: Mapping[str, str] | None = None,
-        relation: str = "table",
-        **settings,
-    ) -> TableStrategy:
+    def from_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> TableStrategy:
         """The strategy over candidates given as buffers (tests, capture
         replay): see :meth:`CandidateTables.of_buffers`."""
-        return cls.from_tables(
-            CandidateTables.of_buffers(buffers), reasons, relation, **settings
-        )
+        return cls.from_tables(CandidateTables.of_buffers(buffers))
 
     # ---- whole-graph hooks ----
 
@@ -508,32 +457,9 @@ class TableStrategy(EncodingStrategy):
         self._check: Optional[list] = (
             [] if os.environ.get("LX_RELATION_CHECK") else None
         )
-        self._serves: dict[Transform, list[Var]] = {}
-        self._candidates_of: dict[Transform, tuple[RelayoutCandidate, ...]] = {}
-        self._priced: dict[Transform, list[int]] = {}
         self._incoming: dict[Item, list[Var]] = {}
         self._enum: dict[Item, Any] = {}
-        transforms = []
-        for copy in self.copies:
-            transform = Transform(
-                producer=graph.nodes.get(copy.relayout_parent),
-                name=copy.name,
-                group=copy.group,
-                size=ceil_div(copy.size, graph.alignment),
-                read_count=copy.read_count,
-                division=copy.core_divisions[0],
-                start_time=copy.start_time,
-                end_time=copy.end_time,
-                residency_reason=self.copy_reasons.get(copy.name),
-            )
-            transforms.append(transform)
-            self._candidates_of[transform] = copy.candidates
-            self._priced[transform] = sorted(copy.cost_by_source_division)
-            self._enum[transform] = _Table((transform.division,))
-        self.transforms = tuple(transforms)
-        self._transform_by_group = {
-            (c.relayout_parent, c.group): t for c, t in zip(self.copies, transforms)
-        }
+        self.transforms = ()
         for node in graph.get_nodes():
             self._enum[node] = self._enumeration(node)
         self._lazy_relayouts = None
@@ -552,10 +478,6 @@ class TableStrategy(EncodingStrategy):
                     self._nest_ids.setdefault(
                         cd.tiling.level_counts, len(self._nest_ids)
                     )
-        for transform in self.transforms[: len(self.copies)]:
-            self._nest_ids.setdefault(
-                transform.division.tiling.level_counts, len(self._nest_ids)
-            )
         self._tiling_on = len(self._nest_ids) > 1
         self._levels: dict[Item, list[Var]] = {}
         self._tiled: dict[Item, Var] = {}
@@ -613,18 +535,13 @@ class TableStrategy(EncodingStrategy):
     def encode_transform(self, transform: Transform, model: Model) -> None:
         v = self._base_vars(transform, model)
         self.vars[transform] = v
-        if self._is_lazy_copy(transform):
-            assert self._lazy_relayouts is not None
-            self._lazy_relayouts.encode_transform(transform, v, model)
-            return
-        self._split_vars(transform, v, model)
+        self._relayouts.encode_transform(transform, v, model)
 
-    def _is_lazy_copy(self, item: Item) -> bool:
-        return (
-            self._lazy_relayouts is not None
-            and isinstance(item, Transform)
-            and item in self._lazy_relayouts.copies
-        )
+    @property
+    def _relayouts(self) -> Any:
+        """The lazy relayouts: every transform is one of their copies."""
+        assert self._lazy_relayouts is not None
+        return self._lazy_relayouts
 
     def _base_vars(self, item: Item, model: Model) -> NodeVars:
         return NodeVars(
@@ -944,69 +861,17 @@ class TableStrategy(EncodingStrategy):
             self._lazy_relayouts.encode_read(edge, model)
             return
         for _ in range(edge.reads):
-            self._encode_one_read(edge, model)
-
-    def _encode_one_read(self, edge: DependencyEdge, model: Model) -> None:
-        src, dst = self.vars[edge.src], self.vars[edge.dst]
-        by_transform: dict[Transform, list] = {}
-        for c in self.relayout_candidates.get((edge.src.name, edge.dst.name), ()):
-            transform = self._transform_by_group.get(c.group_key)
-            if transform is not None:
-                by_transform.setdefault(transform, []).append(c)
-        served: dict[Transform, Var] = {}
-        for transform, cands in sorted(by_transform.items(), key=lambda i: i[0].group):
-            lit = model.BoolVar(
-                f"served_{edge.src.name}__{edge.dst.name}__g{transform.group}"
-            )
-            _gate_divisions(
-                model,
-                [(c.source_division, c.consumer_division) for c in cands],
-                src.division,
-                dst.division,
-                lit,
-            )
-            model.AddImplication(lit, self.vars[transform].in_buffer)
-            served[transform] = lit
-            self._serves.setdefault(transform, []).append(lit)
-        if not served:
-            self._relate(edge, src.in_buffer, model)
-            return
-        self.served.setdefault(edge, []).extend(served.items())
-        match = model.BoolVar(f"match_{edge.src.name}__{edge.dst.name}")
-        self._relate(edge, match, model)
-        model.AddBoolOr([match, *served.values()]).OnlyEnforceIf(src.in_buffer)
-
-    # ---- 6. transforms ----
+            self._relate(edge, self.vars[edge.src].in_buffer, model)
 
     def encode_transform_use(self, transform: Transform, model: Model) -> None:
-        """A resident relayout needs its producer resident under a division
-        it was priced for, and must serve some read. One whose producer is not
-        in the solve, or chooses no division, never fires."""
-        if self._is_lazy_copy(transform):
-            assert self._lazy_relayouts is not None
-            self._lazy_relayouts.encode_use(transform, model)
-            return
-        v = self.vars[transform]
-        source = transform.producer
-        if source is None or not self.chooses_split(source):
-            model.Add(v.in_buffer == 0)
-            return
-        sv = self.vars[source]
-        model.AddImplication(v.in_buffer, sv.in_buffer)
-        priced = [sv.division_is(i) for i in self._priced[transform]]
-        model.AddBoolOr(priced).OnlyEnforceIf(v.in_buffer)
-        serves = self._serves.get(transform, [])
-        if serves:
-            model.AddBoolOr(serves).OnlyEnforceIf(v.in_buffer)
-        else:
-            model.Add(v.in_buffer == 0)
-
-    # ---- 7. coarse tiling ----
+        """A resident relayout copy needs its producer resident and serves
+        some read (``lazy_relayout``)."""
+        self._relayouts.encode_use(transform, model)
 
     def encode_tiling_vars(self, item: Item, model: Model) -> None:
         """The item's tile count per nest level (0 past its depth; tied to its
         division like ``eff_size``) and whether it is tiled."""
-        if not self._tiling_on or self._is_lazy_copy(item):
+        if not self._tiling_on or isinstance(item, Transform):
             return
         v = self.vars[item]
         cands = self._candidates(item)
@@ -1163,9 +1028,8 @@ class TableStrategy(EncodingStrategy):
     def encode_lifetime(self, item: Item, model: Model) -> None:
         """Lifetimes are the allocator's constants, except a lazy relayout
         copy's, which lives until its last user."""
-        if self._is_lazy_copy(item):
-            assert self._lazy_relayouts is not None and isinstance(item, Transform)
-            self._lazy_relayouts.encode_lifetime(item, model)
+        if isinstance(item, Transform):
+            self._relayouts.encode_lifetime(item, model)
 
     def extra_cost_terms(self) -> list[Var]:
         """Objective terms the strategy prices itself (lazy relayout
@@ -1218,81 +1082,33 @@ class TableStrategy(EncodingStrategy):
         return WorkSplit.of(self._candidates(item)[i])
 
     def footprint(self, item: Item, solver) -> int:
-        if self._is_lazy_copy(item):
-            assert self._lazy_relayouts is not None and isinstance(item, Transform)
-            return self._lazy_relayouts.footprint(item, solver)
+        if isinstance(item, Transform):
+            return self._relayouts.footprint(item, solver)
         v = self.vars[item]
         return item.size if v.division is None else v.per_core[solver.Value(v.division)]
 
     def record_fired(self, edge: DependencyEdge, solver) -> None:
-        """The relayout candidate the read on ``edge`` fired through: the one
-        on its copy for this consumer under the solved division pair."""
+        """The relayout candidate the read on ``edge`` fired through."""
         assert edge.transform is not None
-        if self._is_lazy_copy(edge.transform):
-            assert self._lazy_relayouts is not None
-            self.fired[edge] = self._lazy_relayouts.fired(edge, solver)
-            return
-        i = solver.Value(self.vars[edge.src].division)
-        j = solver.Value(self.vars[edge.dst].division)
-        (self.fired[edge],) = [
-            c
-            for c in self._candidates_of[edge.transform]
-            if c.consumer == edge.dst.name
-            and c.source_division == i
-            and c.consumer_division == j
-        ]
+        self.fired[edge] = self._relayouts.fired(edge, solver)
 
 
 @dataclass(frozen=True)
 class EnumerationFactory:
-    """Built from configuration and the solver's capabilities only: how each
-    axis is enumerated, how each relation is encoded, and which candidates the
-    solver can use. The defaults reproduce the table model. It is validated
-    once, here, and never sees a graph."""
+    """Built from the solver's capabilities only: how the solve encodes each
+    axis and relation, and which candidates the solver can use. A solver
+    that posts a model gets the constraint encodings (``LazyStrategy``: a
+    Lazy work split wherever a node can take one, derived view relations,
+    relayouts over view ids); one that reads menus and pair tables (the
+    annealing co-optimizer) gets the table model (``TableStrategy``). It
+    never sees a graph."""
 
-    division: AxisSetting = "table"
-    tiling: AxisSetting = "table"
-    relayout: RelayoutSetting = "data"
-    relation: Literal["table", "derived"] = "table"
-    capabilities: Capabilities = Capabilities()
+    capabilities: Capabilities = Capabilities(posts_model=True)
 
-    def __post_init__(self) -> None:
-        for axis in ("division", "tiling"):
-            if getattr(self, axis) not in ("table", "lazy", "pruned"):
-                raise ValueError(f"unknown {axis} enumeration {getattr(self, axis)!r}")
-        if self.relayout not in ("data", "pruned", "lazy"):
-            raise ValueError(f"unknown relayout enumeration {self.relayout!r}")
-        if self.relation not in ("table", "derived"):
-            raise ValueError(f"unknown view relation {self.relation!r}")
-        # A Lazy split carries its tiling option with it; a separate tiling
-        # axis and a pruned shortlist have no strategy.
-        if self.tiling != "table" or "pruned" in (self.division, self.relayout):
-            raise NotImplementedError(
-                f"no strategy for division={self.division} tiling={self.tiling} "
-                f"relayout={self.relayout}"
-            )
-        if (self.division == "lazy" or self.relayout == "lazy") and (
-            self.relation != "derived"
-        ):
-            raise ValueError(
-                "a lazy work split or lazy relayouts need the derived view relation"
-            )
-
-    @classmethod
-    def from_config(
-        cls, capabilities: Optional[Capabilities] = None
-    ) -> EnumerationFactory:
-        """The configured enumerations, for a solver with ``capabilities``:
-        one that reads candidate menus and pair tables rather than posting a
-        model gets the table model."""
-        if capabilities is not None and not capabilities.posts_model:
-            return cls(capabilities=capabilities)
-        return cls(
-            division=config.lx_division_encoding,
-            relayout="lazy" if config.lx_relayout_encoding == "lazy" else "data",
-            relation=config.lx_view_relation,
-            capabilities=capabilities or Capabilities(),
-        )
+    @property
+    def constraints(self) -> bool:
+        """The constraint encodings, rather than the table model."""
+        return self.capabilities.posts_model
 
     @property
     def offers_relayouts(self) -> bool:
@@ -1334,31 +1150,14 @@ class EnumerationFactory:
 
         return TableCandidates(self, capacity, prune, committed)
 
-    def strategy(
-        self,
-        buffers: Sequence[LifetimeBoundBuffer] = (),
-        reasons: Mapping[str, str] | None = None,
-    ) -> TableStrategy:
+    def strategy(self, buffers: Sequence[LifetimeBoundBuffer] = ()) -> TableStrategy:
         """The strategy over candidates given as buffers (tests, replay)."""
-        return self.strategy_from_tables(CandidateTables.of_buffers(buffers), reasons)
+        return self.strategy_from_tables(CandidateTables.of_buffers(buffers))
 
-    def strategy_from_tables(
-        self,
-        tables: CandidateTables,
-        reasons: Mapping[str, str] | None = None,
-    ) -> TableStrategy:
-        """The strategy for these settings over ``tables``: a ``Lazy`` work
-        split wherever a node can take one, else tables."""
-        cls: type[TableStrategy] = TableStrategy
-        if self.division == "lazy":
-            from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+    def strategy_from_tables(self, tables: CandidateTables) -> TableStrategy:
+        """The strategy over ``tables``."""
+        if not self.constraints:
+            return TableStrategy.from_tables(tables)
+        from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-            cls = LazyStrategy
-        return cls.from_tables(
-            tables,
-            reasons,
-            relation=self.relation,
-            division=self.division,
-            tiling=self.tiling,
-            relayout=self.relayout,
-        )
+        return LazyStrategy.from_tables(tables)

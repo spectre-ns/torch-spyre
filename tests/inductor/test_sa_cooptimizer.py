@@ -423,6 +423,31 @@ class SeedPermutationTest(TestCase):
                             f"{case}[{gi}] cap={cap} {b.name}: pinned but placed",
                         )
 
+    def test_seed_drops_an_in_place_pair_the_child_outgrows(self):
+        """A parent split 4 ways holds 256 bytes per core; its whole 512-byte
+        in-place child cannot take that slot. The first-fit seed packs the
+        per-core sizes, so it must drop the pair rather than reject it."""
+        d0 = sympy.Symbol("d0", integer=True, positive=True)
+        parent = CoreDivisionBuffer(
+            name="parent",
+            size=1024,
+            uses=[0, 1],
+            core_divisions=[CoreDivision(splits={d0: 4})],
+        )
+        child = CoreDivisionBuffer(
+            name="child",
+            size=512,
+            uses=[1, 2],
+            parents=["parent"],
+            in_place_parents=["parent"],
+            core_divisions=[CoreDivision()],
+            cd_parent_matches={"parent": [(0, 0)]},
+        )
+        SaCoOptimizingSolver([parent, child], 768).plan_layout_and_core_divisions()
+        self.assertIsNotNone(parent.address)
+        self.assertIsNotNone(child.address)
+        self.assertNotEqual(parent.address, child.address)
+
 
 class UnsizedBufferTest(TestCase):
     """An unsized buffer (the ``mem_usage`` ``-1`` sentinel) is always a fixed pin.
@@ -1898,17 +1923,16 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
     ``auto_coarse_tiling`` on."""
 
     @staticmethod
-    def _allocator(layout_planning):
+    def _allocator(solver):
         return allocator_module.ScratchpadAllocator(
-            layout_planning=layout_planning, size=1, division_mode="open"
+            solver=solver, size=1, division_mode="open"
         )
 
     def test_only_the_annealer_is_offered_them_and_only_with_the_flag_on(self):
         """Only a search that generates divisions can carry a ``TileSpec``:
         CP-SAT chooses tilings too, but off the menu."""
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            CpSatLayoutSolver,
-        )
+        from torch_spyre._inductor.scratchpad.graph_solvers import BufferSolver
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
         for flag in (False, True):
             with (
@@ -1916,11 +1940,13 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
                 mock.patch.object(ts_config, "auto_coarse_tiling", flag),
             ):
                 self.assertEqual(
-                    self._allocator(SaCoOptimizingSolver).factory.applies_tilings,
+                    self._allocator(
+                        BufferSolver(SaCoOptimizingSolver, 1)
+                    ).factory.applies_tilings,
                     flag,
                 )
                 self.assertFalse(
-                    self._allocator(CpSatLayoutSolver).factory.applies_tilings
+                    self._allocator(ModelSolver(1)).factory.applies_tilings
                 )
 
 

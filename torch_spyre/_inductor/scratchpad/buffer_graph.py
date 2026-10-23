@@ -51,9 +51,9 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
-    RelayoutCopyBuffer,
     SolveError,
     TileSpec,
+    _check_in_place_relationships,
     ceil_div,
 )
 
@@ -482,9 +482,6 @@ class SpyreOptimizationGraph:
         """The buffer form of :meth:`add_ir_node`, for tests and capture
         replay: a node holding ``source``'s incoming data. A buffer with no
         candidate divisions is committed upstream."""
-        assert not isinstance(source, RelayoutCopyBuffer), (
-            "a relayout copy is a transform, not a node"
-        )
         b = source
         divided = b if isinstance(b, CoreDivisionBuffer) and b.core_divisions else None
         return self.add_ir_node(
@@ -1028,21 +1025,21 @@ def build_graph(
     settings: SolveSettings,
     reasons: Mapping[str, str] = {},
 ) -> SpyreOptimizationGraph:
-    """The graph of ``buffers`` (relayout copies excluded; they are the
-    strategy's candidate transforms), sized in ``alignment`` units. ``reasons`` is each
-    barred buffer's residency reason (``MemoryPlanSolver.excluded``).
+    """The graph of ``buffers`` (the buffer form: tests, capture replay), sized
+    in ``alignment`` units. ``reasons`` is each barred buffer's residency
+    reason. Raises ``ValueError`` on an in-place pair no solver may realize.
 
     One edge per (producer, consumer) pair the consumer reads (``parents``),
     ``in_place`` when the producer is one of its ``in_place_parents``; in-place
     inputs come first, in that order, since the merge literals are made in it."""
+    _check_in_place_relationships(buffers)
     graph = SpyreOptimizationGraph(
         alignment=alignment, capacity=capacity, settings=settings
     )
-    real = [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)]
-    for b in real:
+    for b in buffers:
         graph.add_node(b, reasons.get(b.name))
     nodes = graph.nodes
-    for b in real:
+    for b in buffers:
         graph.add_reads(nodes[b.name], getattr(b, "parents", ()), b.in_place_parents)
     graph.link_execution_order()
     return graph
