@@ -25,7 +25,6 @@ from torch_spyre._inductor.scratchpad.utils import round_up_to_alignment
 
 __all__ = [
     "FirstFitLayoutSolver",
-    "BestFitLayoutSolver",
     "_check_in_place_relationships",
 ]
 
@@ -241,29 +240,3 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
                     names_to_addresses[buffer.name] = buffer.address
 
         return list(buffers)
-
-
-class BestFitLayoutSolver(FirstFitLayoutSolver):
-    """Like FirstFitLayoutSolver but places each buffer in the tightest fitting gap.
-
-    Inherits all logic from FirstFitLayoutSolver; only the gap-selection policy
-    differs: instead of picking the first gap large enough to hold the buffer,
-    this picks the gap that minimises leftover space after placement.
-    """
-
-    def _pick_gap(
-        self,
-        gaps: list[Gap],
-        size: int,
-    ) -> Optional[Gap]:
-        """Return the tightest fitting gap, or None."""
-        best_gap: Optional[Gap] = None
-        best_waste: int = 0
-        for gap in gaps:
-            addr = round_up_to_alignment(gap.start, self.alignment)
-            if addr + size <= gap.end:
-                waste = gap.end - addr - size
-                if best_gap is None or waste < best_waste:
-                    best_gap = gap
-                    best_waste = waste
-        return best_gap

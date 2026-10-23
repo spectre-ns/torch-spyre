@@ -9845,9 +9845,11 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
 
-        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, 2**20)
         storage_op = _SentinelOp("buf2")
         update_op = _SentinelOp("buf2_update")
         plan = self._isolation_plan()
@@ -9940,11 +9942,11 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.greedy_solver import (
-            GreedyLayoutSolver,
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
         )
 
-        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, 2**20)
         plan = self._isolation_plan()
         allocator._validated_drain_plans = {"buf2": plan}
         storage_op = _SentinelOp("buf2")
@@ -10303,9 +10305,11 @@ class TestHoistedInputClone(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
+        )
 
-        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, 2**20)
         graph = MagicMock()
         graph.operations = list(ops)
         graph.get_output_names.return_value = []

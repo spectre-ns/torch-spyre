@@ -16,7 +16,7 @@
 """Lifetimes read from the IR around coarse-tile loops: the single-tick
 handoff between an in-place parent and child, a loop's trip count, and the
 post-loop drain plans that extend a loop-carried buffer's lifetime to the
-collective that drains it. Both graph builders set node lifetimes from these;
+collective that drains it. The graph builder sets node lifetimes from these;
 the commit path asserts the plans it consumed were committed."""
 
 from __future__ import annotations
@@ -175,14 +175,11 @@ def _is_reinterpret_output_entry(entry: Any) -> bool:
     return False
 
 
-def validated_drain_plans(
-    graph: GraphLowering, *, division_is_fixed: bool
-) -> dict[str, DrainPlan]:
+def validated_drain_plans(graph: GraphLowering) -> dict[str, DrainPlan]:
     """The validated post-loop materialization plan for every eligible carry.
 
-    Returns ``{}`` unless boundary cloning is on and the joint path (which can
-    choose the update's division) is running; the placement path keeps today's
-    refusal.  A storage is planned only if every predicate holds, and any
+    Returns ``{}`` unless boundary cloning is on; the solver's relation gates
+    the update's division against the carry's.  A storage is planned only if every predicate holds, and any
     failure means that storage is simply absent from the plan -- every consumer
     then keeps today's behavior (the carry stays in HBM and no clone is ever
     created):
@@ -219,7 +216,7 @@ def validated_drain_plans(
     residency and ownership, and an HBM selection emits no copy at all.
     """
 
-    if division_is_fixed or not clone_at_graph_boundaries():
+    if not clone_at_graph_boundaries():
         return {}
     fx_graph = getattr(graph, "graph", None)
     if fx_graph is None:

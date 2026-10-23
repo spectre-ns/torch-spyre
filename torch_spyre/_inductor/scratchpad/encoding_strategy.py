@@ -1296,8 +1296,9 @@ class EnumerationFactory:
 
     @property
     def offers_relayouts(self) -> bool:
-        """Relayout candidates are generated for the solve."""
-        return self.capabilities.decides_lx_relayouts
+        """Relayout candidates are generated for the solve
+        (``lx_planner_relayout``, for a solver that decides relayouts)."""
+        return self.capabilities.decides_lx_relayouts and config.lx_planner_relayout
 
     @property
     def generates_divisions(self) -> bool:
@@ -1321,14 +1322,17 @@ class EnumerationFactory:
             and caps.generates_divisions
         )
 
-    def candidates(self, capacity: int, prune: bool = False) -> TableCandidates:
+    def candidates(
+        self, capacity: int, prune: bool = False, committed: bool = False
+    ) -> TableCandidates:
         """What generates the table candidates for solves over ``capacity``
-        bytes of LX (``prune``: heuristically pruned division menus)."""
+        bytes of LX (``prune``: heuristically pruned division menus;
+        ``committed``: every op keeps its committed division)."""
         from torch_spyre._inductor.scratchpad.table_candidates import (
             TableCandidates,
         )
 
-        return TableCandidates(self, capacity, prune)
+        return TableCandidates(self, capacity, prune, committed)
 
     def strategy(
         self,

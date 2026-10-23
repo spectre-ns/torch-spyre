@@ -24,19 +24,12 @@ import os
 import torch
 
 from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
-from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-    BestFitLayoutSolver,
-    FirstFitLayoutSolver,
-)
-from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingLayoutSolver,
-)
+from torch_spyre._inductor.scratchpad.first_fit import FirstFitLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
     LifetimeBoundBuffer as Buffer,
 )
-from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
 AVAILABLE_LX_SIZE = _lx_planning_size()
 
@@ -1065,40 +1058,8 @@ class TestVerifyPatterns(PatternTests, TestCase, role="verify"):
     pass
 
 
-class TestGreedyPatterns(PatternTests, TestCase, role="solver"):
-    solver_type = GreedyLayoutSolver
-    expected_failures: ClassVar[frozenset[str]] = frozenset(
-        {
-            "simple_fragmentation",
-            "staircase",
-            "downward_staircase",
-            "simple_eviction",
-            "eviction_reallocation",
-        }
-    )
-
-
-class TestBestFitPatterns(PatternTests, TestCase, role="solver"):
-    solver_type = BestFitLayoutSolver
-    expected_failures: ClassVar[frozenset[str]] = frozenset(
-        {"eviction_reallocation", "simple_eviction"}
-    )
-
-
 class TestFirstFitPatterns(PatternTests, TestCase, role="solver"):
     solver_type = FirstFitLayoutSolver
-    expected_failures: ClassVar[frozenset[str]] = frozenset(
-        {"eviction_reallocation", "simple_eviction"}
-    )
-
-
-class TestSimulatedAnnealingPatterns(PatternTests, TestCase, role="solver"):
-    solver_type = SimulatedAnnealingLayoutSolver
-    # Simulated annealing is a permutation-based layout solver: it assigns each buffer a
-    # single fixed address for its whole lifetime and never evicts or reallocates.
-    # The two eviction patterns require moving a buffer to HBM and back (possibly
-    # at a different address), which this abstraction cannot express -- the same
-    # limitation shared by best-fit and first-fit.
     expected_failures: ClassVar[frozenset[str]] = frozenset(
         {"eviction_reallocation", "simple_eviction"}
     )

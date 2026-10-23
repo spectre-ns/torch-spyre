@@ -5,7 +5,9 @@
 layout solver, taken 2026-08-12. The Python packer it was compared against, and
 the harness that produced these tables, were both removed in #4545 (which
 fixes #4173), so the comparison can no longer be re-run — the page is kept for
-the reasoning and the shape of the result, not as a benchmark to repeat.
+the reasoning and the shape of the result, not as a benchmark to repeat. The
+placement-only simulated-annealing solver it was measured under has since been
+removed too; the packer is now driven by the simulated-annealing co-optimizer.
 
 ## What was being compared
 
@@ -14,7 +16,7 @@ then-canonical Python `PermutationBasedLayoutSolver` and the C++ accelerator —
 selected by `config.native_layout_packer` / `TORCH_SPYRE_NATIVE_PACKER`. They were
 behaviourally identical, asserted bit-for-bit by the differential and
 SA-equivalence suites. See
-[Simulated annealing layout planner](simulated_annealing_layout.md) for the packer
+[The permutation layout packer](permutation_packer.md) for the packer
 as it stands now.
 
 That identity is what made the comparison clean: layout quality was not a random

@@ -47,7 +47,6 @@ from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_module
 from torch_spyre._inductor.scratchpad import utils
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
-    _MAX_STEPS,
     DivisionConfig,
     SaCoOptimizingSolver,
     _canonical_key,
@@ -774,16 +773,6 @@ class StepBudgetTest(TestCase):
     def test_ceiling_caps_large_graphs(self):
         self.assertEqual(_step_budget(250), 50_000)
         self.assertEqual(_step_budget(251), 50_000)
-
-    def test_ceiling_is_higher_than_the_layout_only_annealer(self):
-        """The joint engine searches divisions too, so it wants a larger budget
-        at the same buffer count (and must not silently inherit the smaller one).
-        """
-        from torch_spyre._inductor.scratchpad.cooling_schedules import (
-            SelfCalibratingReheatingSchedule,
-        )
-
-        self.assertGreater(_MAX_STEPS, SelfCalibratingReheatingSchedule().max_steps)
 
 
 def _n_eligible_recomputed(solver):

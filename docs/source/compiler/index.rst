@@ -65,7 +65,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    work_division_planning
    scratchpad_planning
    co_optimizer
-   simulated_annealing_layout
    sa_co_optimization
+   permutation_packer
    native_packer_performance
    hbm_pool_planning

@@ -40,7 +40,7 @@ from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Callable, ClassVar, Literal, Optional, TYPE_CHECKING
+from typing import Any, Callable, ClassVar, Optional, TYPE_CHECKING
 
 import sympy
 import torch
@@ -151,15 +151,10 @@ class ResourceNode:
     op: Optional[Operation] = None
     space: Optional[OpSplitSpace] = None  # None: committed upstream
     residency_reason: Optional[str] = None  # applied by encode_op_constraints
-    # The placement view: the access ticks, the size in bytes, and the
-    # committed per-core view and relayout plans (placement-only path).
+    # The access ticks, the size in bytes, and the committed per-core view.
     uses: tuple[int, ...] = ()
     nbytes: int = 0
     lx_view: Any = None
-    lx_relayout_plans: list = field(default_factory=list)
-    # Transforms required before the solve (a committed relayout's
-    # destinations), placed all-or-nothing with the node.
-    pinned_transforms: list[Transform] = field(default_factory=list)
     # decisions
     work_split: Optional[WorkSplit] = None
     resident: Optional[bool] = None
@@ -248,6 +243,20 @@ def _integer_objective(cp: Any) -> Any:
     expr = sum(round(c * scale) * var(v) for v, c in pairs if round(c * scale))
     cp.minimize(expr)
     return expr
+
+
+def _unposted(*args, **kwargs) -> int:
+    raise AssertionError("the solver sets the solve settings")
+
+
+def empty_graph(capacity_bytes: int, alignment: int = 128) -> SpyreOptimizationGraph:
+    """A graph to build from the IR: ``alignment`` bytes per unit (one stick,
+    what every solver aligns to); the solver sets the solve settings."""
+    return SpyreOptimizationGraph(
+        alignment=alignment,
+        capacity=capacity_bytes // alignment,
+        settings=SolveSettings(None, False, _unposted),
+    )
 
 
 def spill_cost(item: Any, size: Optional[int] = None) -> int:
@@ -387,7 +396,6 @@ class SpyreOptimizationGraph:
     alignment: int  # bytes per unit
     capacity: int  # LX capacity in alignment units
     settings: SolveSettings
-    division_mode: Literal["open", "committed"] = "open"
     nodes: dict[str, ResourceNode] = field(default_factory=dict)
     first: Optional[ResourceNode] = None
     solver: Any = None  # a Backend class or a GraphSolver; None: CpSat
@@ -408,7 +416,6 @@ class SpyreOptimizationGraph:
         sym_core_divs: Mapping[SplitKey, sympy.Symbol] = {},
         sym_tile_counts: Mapping[TileKey, sympy.Symbol] = {},
         lx_view: Any = None,
-        lx_relayout_plans: Sequence = (),
         open_split: bool = False,
     ) -> ResourceNode:
         """A node for IR buffer ``name``: an op output, or a graph input read
@@ -446,7 +453,6 @@ class SpyreOptimizationGraph:
             uses=tuple(uses),
             nbytes=nbytes,
             lx_view=lx_view,
-            lx_relayout_plans=list(lx_relayout_plans),
             work_split=None if open_split else WorkSplit.COMMITTED,
         )
         self.nodes[name] = node
@@ -494,45 +500,8 @@ class SpyreOptimizationGraph:
             sym_core_divs=divided.sym_core_divs if divided else {},
             sym_tile_counts=divided.sym_tile_counts if divided else {},
             lx_view=b.lx_view,
-            lx_relayout_plans=b.lx_relayout_plans,
             open_split=divided is not None,
         )
-
-    def pin_transform(
-        self,
-        source: ResourceNode,
-        name: str,
-        *,
-        nbytes: int,
-        uses: Sequence[int],
-        start_override: Optional[int] = None,
-        end_override: Optional[int] = None,
-        lx_view: Any = None,
-        residency_reason: Optional[str] = None,
-    ) -> Transform:
-        """A committed relayout destination of ``source``: a transform with a
-        fixed view, placed all-or-nothing with it."""
-        uses = list(uses)
-        start = min(uses[0], start_override) if start_override is not None else uses[0]
-        end = uses[-1] + 1
-        if end_override is not None:
-            end = max(end, end_override)
-        transform = Transform(
-            producer=source,
-            name=name,
-            group=len(source.pinned_transforms),
-            size=ceil_div(nbytes, self.alignment),
-            read_count=max(0, len(uses) - 1),
-            division=CoreDivision(),
-            start_time=start,
-            end_time=end,
-            residency_reason=residency_reason,
-            uses=tuple(uses),
-            nbytes=nbytes,
-            lx_view=lx_view,
-        )
-        source.pinned_transforms.append(transform)
-        return transform
 
     def get_nodes(self) -> Iterator[ResourceNode]:
         return iter(self.nodes.values())
@@ -1060,8 +1029,7 @@ def build_graph(
     reasons: Mapping[str, str] = {},
 ) -> SpyreOptimizationGraph:
     """The graph of ``buffers`` (relayout copies excluded; they are the
-    strategy's candidate transforms; a committed relayout's destinations
-    become transforms pinned on their source), sized in ``alignment`` units. ``reasons`` is each
+    strategy's candidate transforms), sized in ``alignment`` units. ``reasons`` is each
     barred buffer's residency reason (``MemoryPlanSolver.excluded``).
 
     One edge per (producer, consumer) pair the consumer reads (``parents``),
@@ -1070,27 +1038,10 @@ def build_graph(
     graph = SpyreOptimizationGraph(
         alignment=alignment, capacity=capacity, settings=settings
     )
-    pinned = {id(d) for b in buffers for d in b.paired_with}
-    real = [
-        b
-        for b in buffers
-        if not isinstance(b, RelayoutCopyBuffer) and id(b) not in pinned
-    ]
+    real = [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)]
     for b in real:
         graph.add_node(b, reasons.get(b.name))
     nodes = graph.nodes
-    for b in real:
-        for dest in b.paired_with:
-            graph.pin_transform(
-                nodes[b.name],
-                dest.name,
-                nbytes=dest.size,
-                uses=dest.uses,
-                start_override=dest.lifetime_start_override,
-                end_override=dest.lifetime_end_override,
-                lx_view=dest.lx_view,
-                residency_reason=dest.residency_reason,
-            )
     for b in real:
         graph.add_reads(nodes[b.name], getattr(b, "parents", ()), b.in_place_parents)
     graph.link_execution_order()

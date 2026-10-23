@@ -91,10 +91,6 @@ class _Observed:
         from torch_spyre._inductor import op_spec as opspec_mod
 
         self.plans: list = []
-        # The committed path's own plans for the SAME committed graph, taken at
-        # the moment the solver's plans are materialized (see
-        # assert_fired_edges_are_committed_eligible).
-        self.committed: list = []
         self.demotions: list = []
         self.emitted: set[tuple[int, int]] = set()  # (src, dst) LX addresses
         # One entry per emitted LX relayout op, recorded where spyre_kernel
@@ -112,14 +108,10 @@ class _Observed:
         def spy_materialize(graph, plans):
             from torch_spyre._inductor.pass_utils import op_read_writes
             from torch_spyre._inductor.scratchpad.lx_relayout import (
-                collect_lx_relayout_plans,
                 materialized_lx_relayouts,
             )
 
             self.plans.extend(plans)
-            # Divisions are committed by now and nothing is materialized yet:
-            # exactly the state the committed collector expects.
-            self.committed.extend(collect_lx_relayout_plans(graph))
             result = real_materialize(graph, plans)
             self.copies = {
                 edge: copy_name
@@ -207,44 +199,6 @@ class _Observed:
                     f"{consumer} does not read the relayout copy {copy_name} "
                     f"(reads {sorted(self.consumer_reads[consumer])})"
                 )
-        self.assert_fired_edges_are_committed_eligible()
-
-    def assert_fired_edges_are_committed_eligible(self) -> None:
-        """Parity with the committed path.
-
-        The solver enumerates candidates before divisions exist, so it mirrors
-        the committed path's eligibility gates instead of calling them. Those
-        gates are being rewritten under it (#4284, #3440, #4153). This pins the
-        one direction that must always hold: every edge the solver fired is one
-        the committed collector, run on the same committed graph, also
-        certifies, with the same physical source and destination ownership,
-        core count and per-core LX spans (the sizes both allocators reserve for
-        the shuffle's endpoints, #3440). (The reverse need not hold: the solver may decline an
-        eligible edge on economics or capacity.) A solver segment's consumers
-        are a subset of the committed plan's, which groups every consumer of a
-        destination view together.
-        """
-        for plan in self.plans:
-            twins = [
-                c
-                for c in self.committed
-                if c.source_name == plan.source_name
-                and set(plan.consumer_names) <= set(c.consumer_names)
-                and c.num_cores == plan.num_cores
-                and c.source_view.same_partition(plan.source_view)
-                and c.destination_view.same_partition(plan.destination_view)
-                and c.source_footprint_bytes == plan.source_footprint_bytes
-                and c.destination_footprint_bytes == plan.destination_footprint_bytes
-            ]
-            assert twins, (
-                f"solver fired {plan.source_name} -> {plan.consumer_names} "
-                f"(src {dict(plan.source_view.work_slice_dims)}, dst "
-                f"{dict(plan.destination_view.work_slice_dims)}, {plan.num_cores} "
-                f"cores, spans {plan.source_footprint_bytes}/"
-                f"{plan.destination_footprint_bytes} B) but the committed collector "
-                "certifies no such edge on the committed graph; committed plans: "
-                f"{[(c.source_name, c.consumer_names, dict(c.source_view.work_slice_dims), dict(c.destination_view.work_slice_dims), c.source_footprint_bytes, c.destination_footprint_bytes) for c in self.committed]}"
-            )
 
     def assert_nothing_emitted(self) -> None:
         """No plan, no demotion, and no identity op codegen took for an LX
@@ -424,7 +378,6 @@ def test_gather_respects_shuffle_register_budget(monkeypatch, fragments):
         observed.assert_emitted_in_lx(expected_plans=1)
     else:
         observed.assert_nothing_emitted()
-        assert observed.committed == []
     torch.testing.assert_close(out.cpu(), fn(hx, hw), rtol=2e-2, atol=2e-2)
 
 
@@ -443,9 +396,6 @@ def test_grouped_relayout_fires_under_cpsat(monkeypatch, kind):
     destination) LX address pair matches the pair emitted by codegen, exactly
     one shuffle op was recorded by spyre_kernel, and every plan consumer
     reads the materialized copy buffer.
-    - The parity sub-check runs the committed collector on the same committed
-    graph and verifies the same edge with matching core count, work-slice
-    partition, and per-endpoint LX footprint.
     - plan.num_cores and destination_view.num_cores match the fixture's
     source_cores / destination_cores expectations, verifying that the
     solver preserves the core counts from the grouped graph.

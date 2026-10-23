@@ -6,18 +6,21 @@ a finer division shrinks a buffer's per-core footprint, which changes what fits 
 changes whether the division was worth taking — so solving them separately leaves the
 interaction on the table.
 
-For the placement-only annealer (a *different* class, with its own schedule) see
-[Simulated Annealing Layout Planner](simulated_annealing_layout.md). For the surrounding
-allocator and the other solvers, see [Scratchpad Planning](scratchpad_planning.md).
+For the packer that places the permutation, see
+[The permutation layout packer](permutation_packer.md). For the surrounding allocator and the
+CP-SAT solver, see [Scratchpad Planning](scratchpad_planning.md).
 
 ## Where it sits
 
-`config.layout_solver = "simulated_annealing"` with `co_optimizing_lx_planning` routes to
-`ScratchpadAllocator(layout_planning=SaCoOptimizingSolver, division_mode="open")`. The allocator builds one
-`CoreDivisionBuffer` per graph buffer — carrying the candidate division menu, the
-`cd_parent_matches` compatibility relation, and, where it could derive them, the per-candidate
-machinery that stands in for both (`division_space` and `residency_edges`) — and hands the list to
-the solver, which mutates it in place with a `chosen_division` and an `address`.
+`config.layout_solver = "simulated_annealing"` gives the allocator the graph solver
+`graph_solvers.BufferSolver(SaCoOptimizingSolver, size)`, in the open division mode with
+`co_optimizing_lx_planning` and the committed one without (every op's menu is then its committed
+division). `BufferSolver` turns the solve's graph and the table strategy's candidates into one
+`CoreDivisionBuffer` per node (`buffers_of`) — carrying the candidate division menu, the
+`cd_parent_matches` compatibility relation, and, where they could be derived, the per-candidate
+machinery that stands in for both (`division_space` and `residency_edges`). The engine sets a
+`chosen_division` and an `address` on each, and `BufferSolver` writes them back onto the
+nodes.
 
 It runs as a **pre-scheduling pass**: `V.graph` is live but
 `V.graph.scheduler` is still `None`, so fusion has not happened yet. Anything the engine wants to
@@ -80,9 +83,9 @@ tiling. What a tiling does is divide `_per_core_size` by `output_tile_count` as 
 `output_partition`, which can bring a buffer under `_eligible`'s capacity gate and be repaid in the
 HBM traffic residency then frees.
 
-The tiling half is attached only where `ScratchpadAllocator._solver_chooses_tilings` holds: a
-solver that both `generates_divisions()` and `chooses_tilings()` (this engine), and
-`config.auto_coarse_tiling` (off by default; see its comment).
+The tiling half is attached only where the graph solver's `Capabilities` declare both
+`generates_divisions` and `chooses_tilings` (`BufferSolver` does), and
+`config.auto_coarse_tiling` is on (off by default; see its comment).
 
 Three move types:
 
@@ -136,7 +139,7 @@ never one.
 `CoreDivisionBuffer.sym_tile_counts` declares one symbol per tileable axis, keyed
 `(host_dim, is_reduction)`. This engine's menu lists no tiling, so its keys are every output dim the
 buffer's division space may tile, and the annealer binds each through the chosen config's
-`TileSpec.count_for`, 1 for an axis it leaves untiled. `ScratchpadAllocator._extract_op_features`
+`TileSpec.count_for`, 1 for an axis it leaves untiled. `pricing.extract_op_features`
 resolves each axis to the op's loop variable and hands the symbols to the extractor as a candidate
 tiling (`dump_cost_model._candidate_tiling`). `tiles_output_dim` is then a condition over them, and
 every branch on it a `Piecewise` (`cost_model._select`). With the derates pinned and the loop
@@ -161,8 +164,8 @@ tiled buffer's applied per-core footprint is the one it was placed at.
 
 ## The objective
 
-**`cost_expr`** is `ScratchpadAllocator._solve`'s symbolic prediction for the whole graph —
-`sympy.sympify(predict_by_bundle(graph.operations, op_features, params=_COST_PARAMS))`, built from
+**`cost_expr`** is `pricing.cost_expr`'s symbolic prediction for the whole graph — the sum of
+`predict_bundles(ops, op_features, params=_COST_PARAMS)`'s per-bundle terms, built from
 every buffer's own `sym_is_lx`/`sym_core_divs` (the same symbols the CP-SAT engine's cost
 expression is built from). `plan_layout_and_core_divisions(cost_expr)` compiles it once, per
 solve, into a fast `(chosen, resident) -> fixed-point ns` callable (`_build_score_fn`): every free
@@ -248,9 +251,8 @@ and resolve normally.
 
 ## Related documents
 
-* [Scratchpad Planning](scratchpad_planning.md) — the allocator, the other solvers, and the
+* [Scratchpad Planning](scratchpad_planning.md) — the allocator, the CP-SAT solver, and the
   co-optimization concept
-* [Simulated Annealing Layout Planner](simulated_annealing_layout.md) — the placement-only
-  annealer and its schedule
+* [The permutation layout packer](permutation_packer.md) — the packer that places `pi`
 * [Work Division Planning](work_division_planning.md) — where the candidate core divisions come
   from

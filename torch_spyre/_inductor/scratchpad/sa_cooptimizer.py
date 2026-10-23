@@ -14,8 +14,8 @@
 
 """Joint work-division + LX-layout simulated-annealing engine.
 
-``SaCoOptimizingSolver`` is a third co-optimization engine alongside the
-substrate's CP-SAT and DFS solvers. It anneals the joint state ``(pi, W)``:
+``SaCoOptimizingSolver`` is the co-optimization engine alongside CP-SAT. It
+anneals the joint state ``(pi, W)``:
 
 * ``pi`` -- the layout permutation, held in a *composed* (not subclassed)
   :class:`NativePermutationLayoutSolver` packer, because this loop mixes move
@@ -61,10 +61,7 @@ from torch_spyre._inductor.work_division import (
     ResidencyEdge,
 )
 from torch_spyre._inductor.scratchpad.buffer_graph import spill_cost
-from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-    FirstFitLayoutSolver,
-)
-from torch_spyre._inductor.scratchpad.simulated_annealing import SolverToPermutation
+from torch_spyre._inductor.scratchpad.first_fit import FirstFitLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionBuffer,
@@ -84,6 +81,36 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
 logger = get_inductor_logger("scratchpad.sa_cooptimizer")
+
+
+class SolverToPermutation:
+    def __init__(self, solver: FirstFitLayoutSolver):
+        self.solver = solver
+
+    def permutation(self, buffers: list[LifetimeBoundBuffer]) -> list[int]:
+        """Lay out ``self.solver``'s own buffers, then sort ``buffers`` by the
+        resulting addresses (looked up by name). Any non-allocated buffers come
+        after all allocated buffers. Return this ordering as a list of indices;
+        the first index is i such that buffers[i] is one of the buffers
+        allocated at address 0, etc. This yields a permutation that gives the
+        given layout, or an equivalent one, or occasionally even a better one.
+
+        ``buffers`` need not be (and, to protect them from mutation, should not
+        be) the same objects backing ``self.solver`` -- only their names need to
+        match, which is how the resulting addresses are looked up."""
+        allocated_buffers = self.solver.plan_layout()
+
+        max_address = max(
+            (b.address for b in allocated_buffers if b.address is not None), default=0
+        )
+        name_to_address = {
+            b.name: (b.address if b.address is not None else max_address + 1)
+            for b in allocated_buffers
+        }
+        return sorted(
+            list(range(len(buffers))), key=lambda i: name_to_address[buffers[i].name]
+        )
+
 
 # RNG seed; fixes the (deterministic) search trajectory.
 _SEED = 0
@@ -742,14 +769,12 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
     # -- public interface ----------------------------------------------------
 
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
-        """Not supported: this engine is joint-only. :class:`MemoryPlanSolver`
-        declares it abstract, but placement-only annealing belongs to the
-        standalone layout-only annealer, and the joint ``ScratchpadAllocator`` only ever
-        calls :meth:`plan_layout_and_core_divisions`."""
+        """Not supported: this engine is joint-only (committed divisions are
+        menus of one); the allocator only calls
+        :meth:`plan_layout_and_core_divisions`."""
         raise NotImplementedError(
             "SaCoOptimizingSolver is a joint core-division + placement engine; "
-            "use plan_layout_and_core_divisions, or "
-            "SimulatedAnnealingLayoutSolver for placement-only annealing."
+            "use plan_layout_and_core_divisions"
         )
 
     def plan_layout_and_core_divisions(
@@ -1764,9 +1789,8 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         return min(n - 1, last + 1)
 
     def _step_reorder(self, temperature: float, cur: int) -> int:
-        """One best-first reinsertion reorder, the layout-only annealer's move
-        (:meth:`SimulatedAnnealingLayoutSolver.annealing_step_rotate`) ported to
-        the joint objective. Returns the objective after the step.
+        """One best-first reinsertion reorder under the joint objective.
+        Returns the objective after the step.
 
         Lift the buffer at position ``i`` out, probe every reinsertion position by
         rotating it to 0 and bubbling it forward one adjacent swap at a time, then

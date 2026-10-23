@@ -56,9 +56,11 @@ from torch_spyre._inductor.work_division import (
     _view_for_div,
 )
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.scratchpad.buffer_graph import SpyreOptimizationGraph
+from torch_spyre._inductor.scratchpad.buffer_graph import (
+    SpyreOptimizationGraph,
+    empty_graph,
+)
 from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
-from torch_spyre._inductor.scratchpad.graph_builder import empty_graph
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     LifetimeBoundBuffer,
@@ -91,7 +93,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
     core_domain_rejection,
     grouped_gather_rejection,
-    LXRelayoutPlan,
     partition_footprint,
     RelayoutCandidate,
     solver_relayout_edge_context,
@@ -147,7 +148,7 @@ def relayout_copies_of(
         [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)],
         1,
         1 << 62,
-        empty_graph(0, "open").settings,
+        empty_graph(0).settings,
     )
     return TableCandidates._relayout_copies(
         graph, CandidateTables.of_buffers(buffers), capacity
@@ -417,16 +418,22 @@ def _has_legal_division(context) -> bool:
 
 
 class TableCandidates:
-    """The table strategy's candidate generation for open-division solves
-    over ``capacity`` bytes of LX: the graph from the IR, each node's menu,
-    the pair tables, relations and relayout candidates."""
+    """The table strategy's candidate generation for solves over ``capacity``
+    bytes of LX: the graph from the IR, each node's menu, the pair tables,
+    relations and relayout candidates. ``committed``: every op keeps the
+    division work division committed, a menu of one."""
 
     def __init__(
-        self, factory: EnumerationFactory, capacity: int, prune: bool = False
+        self,
+        factory: EnumerationFactory,
+        capacity: int,
+        prune: bool = False,
+        committed: bool = False,
     ) -> None:
         self.factory = factory
         self.capacity = capacity  # bytes
         self.prune = prune
+        self.committed = committed
         # The post-loop drain plans validated for the last graph.
         self.drain_plans: dict[str, DrainPlan] = {}
         # Set for the re-plan after applied tilings: no further tilings.
@@ -438,19 +445,15 @@ class TableCandidates:
         self.point_menus: set[str] = set()
 
     def prepare_graph(
-        self,
-        graph: GraphLowering,
-        *,
-        lx_relayout_plans: list[LXRelayoutPlan] | None = None,
+        self, graph: GraphLowering
     ) -> tuple[SpyreOptimizationGraph, CandidateTables]:
-        """The open-mode graph of ``graph`` and the table strategy's
-        candidates for it."""
-        # Joint selection derives its own divisions; fixed-division plans do not apply.
+        """The solve's graph of ``graph`` and the table strategy's candidates
+        for it."""
         # Validate the post-loop drain plans exactly once, here, before the
         # solver runs: the residency gate, the lifetime extension and the push
         # must all consume this same object.  Re-deriving it after the solve
         # could disagree with what residency actually admitted.
-        self.drain_plans = validated_drain_plans(graph, division_is_fixed=False)
+        self.drain_plans = validated_drain_plans(graph)
         in_place = self._determine_in_place_division_invariant(graph)
         division_map = self._division_map(graph, allow_deferred_read_candidates=True)
         divisions = division_map.divisions
@@ -598,6 +601,9 @@ class TableCandidates:
         result = {}
         enumerated = set()
         for op in graph.operations:
+            if self.committed:
+                result[op.name] = [_fixed_core_division(op)]
+                continue
             reason: Optional[str] = None
             if _is_cpu_host_buffer(op):
                 reason = "cpu/host buffer"
@@ -979,18 +985,14 @@ class TableCandidates:
         LX, else the reason it may not.
 
         Every buffer is handed to the solver so it participates in the slicing
-        match, but participation is not residency. The predicate is the shared
-        one in :meth:`_buffer_residency_reason` -- the same list the placement
-        path uses -- with ``division_is_fixed=False``: this allocator *chooses*
-        each op's core division, so pre-rejecting a buffer whose users disagree
-        under the upstream-committed division would be premature. The solver's
-        ``cd_parent_matches`` slicing gate decides that instead. ``ncores`` is
-        therefore not needed here.
+        match, but participation is not residency
+        (``residency_rules._buffer_residency_reason``). Whether a buffer's
+        users slice it alike is the solver's relation to decide, over the
+        divisions it may choose.
         """
         return residency_rules._residency_reasons(
             graph,
             list(mem_usage),
-            division_is_fixed=False,
             lifetimes=lifetimes,
             drain_plans=drain_plans,
         )
@@ -1050,7 +1052,7 @@ class TableCandidates:
                         readers_by_name.setdefault(name, []).append(reader)
 
         prep_cache: dict = {}
-        g = empty_graph(self.capacity, "open")
+        g = empty_graph(self.capacity)
         tables = CandidateTables()
         node_reads: list[tuple[str, list[str], list[str]]] = []
         residency_by_buf = self._residency_by_buf(
@@ -1607,17 +1609,15 @@ class TableCandidates:
     ) -> list[str]:
         """Graph inputs eligible to be cloned into LX.
 
-        The same shared predicate the placement path's input loop uses, with
-        ``division_is_fixed=False``: the core division is deferred to the solver,
-        since a clone can take any division for which some valid choice
-        satisfies all its children. That constraint is enforced by requiring
-        each child to match the parent, not by pre-rejecting here.
+        ``residency_rules._input_residency_reason``; the clone's division is
+        the solver's to choose, constrained by requiring each child to match
+        it.
         """
         return [
             name
             for name in graph.graph_input_names
             if residency_rules._input_residency_reason(
-                graph, name, lifetimes.get(name, []), division_is_fixed=False
+                graph, name, lifetimes.get(name, [])
             )
             is None
         ]
@@ -2015,8 +2015,8 @@ class TableCandidates:
     ) -> dict[str, RelayoutEdge]:
         """The edges into ``consumer_op`` that may read through a relayout
         copy: the division-independent edge gates (single non-indirect write,
-        activation source, pointwise-or-matmul consumer, ...), mirroring
-        ``collect_lx_relayout_plans``."""
+        activation source, pointwise-or-matmul consumer, ...;
+        ``solver_relayout_edge_context``)."""
         edges: dict[str, RelayoutEdge] = {}
         for parent in parent_names:
             if parent not in op_by_name:

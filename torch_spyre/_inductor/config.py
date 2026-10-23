@@ -293,43 +293,21 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # Set SPYRE_INDUCTOR_SDSC_CACHE=0 to disable.
 sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 
-# Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
-# Options:
-#  "greedy":       GreedyLayoutSolver,
-#  "bestfit":      BestFitLayoutSolver,
-#  "firstfit":     FirstFitLayoutSolver,
-#  "simulated_annealing":  SimulatedAnnealingLayoutSolver, or -- when
-#              ``co_optimizing_lx_planning`` is set -- SaCoOptimizingSolver, the
-#              joint work-division + LX-placement annealer. Two different
-#              solvers sharing one config value, not one solver in two modes.
-#  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
-#              LX placement, minimizing HBM transfer traffic) (default).
-#
-# For "cpsat" and "simulated_annealing" the value names a solver *family* whose
-# joint-ness is selected by ``co_optimizing_lx_planning``; for the gap-based
-# solvers, co-optimization instead requires wrapping them in
-# ExhaustiveSearchSolver -- see ``allow_exhaustive_search`` below, which gates
-# that wrapping.
-
-layout_solver: Literal[
-    "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
-] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
-
-# co_optimizing_lx_planning requires a layout_solver whose solver is natively
-# core-division-capable ("cpsat" with ortools installed, or
-# "simulated_annealing"). Every other combination -- "greedy"/"bestfit"/
-# "firstfit", or "cpsat" without ortools -- can only participate in
-# co-optimization by wrapping the placement-only solver in
-# ExhaustiveSearchSolver, an expensive DFS over core-division candidates.
-# That is opt-in: select_allocator() raises ValueError for such a combination
-# unless this is explicitly set. Set ALLOW_EXHAUSTIVE_SEARCH=1 to opt in.
-allow_exhaustive_search: bool = os.environ.get("ALLOW_EXHAUSTIVE_SEARCH", "0") == "1"
+# The LX layout solver:
+#  "cpsat":    OR-Tools CP-SAT over the solve's graph (default).
+#  "simulated_annealing":  SaCoOptimizingSolver, the joint work-division +
+#              LX-placement annealer.
+# Either chooses core divisions and coarse tilings jointly with placement under
+# ``co_optimizing_lx_planning``, and otherwise keeps the committed divisions.
+layout_solver: Literal["cpsat", "simulated_annealing"] = os.environ.get(
+    "LAYOUT_SOLVER", "cpsat"
+)  # type: ignore[assignment]
 
 # Wall-clock budget for one CP-SAT solve, in seconds. This applies to the cost
 # objective or to each phase of the fallback lexicographic objective, not the
 # whole compilation. A timeout can return a feasible plan without proving
 # optimality; without an incumbent it raises SolveError and scratchpad_planning
-# falls back to greedy placement. Override for difficult graphs; 0 disables
+# replans with the committed divisions. Override for difficult graphs; 0 disables
 # the limit.
 cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")

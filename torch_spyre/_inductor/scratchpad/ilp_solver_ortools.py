@@ -168,7 +168,7 @@ class ModelSolver(GraphSolver):
                 "The 'cpsat' layout solver requires the 'ortools' package, which "
                 f"could not be imported ({_CP_MODEL_IMPORT_ERROR or 'not installed'}). "
                 "Install it with 'pip install ortools' "
-                "or select a different layout_solver (e.g. 'greedy')."
+                "or select layout_solver='simulated_annealing'."
             )
         super().__init__(capacity)
         self.time_limit_seconds = (

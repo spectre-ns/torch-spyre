@@ -1844,7 +1844,7 @@ def _multi_arg_pointwise_layouts(
 
     # LX in-place: promote a same-frame input's layout to FIRST so the beam
     # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
-    # (graph_builder.py _in_place). Two skips guard it:
+    # (residency_rules._inplace_edge_ok). Two skips guard it:
     #   - footprint mismatch: an fp8-unpack layout has a different total device
     #     element count than the plain output, so its stride_map cannot tile the
     #     output's host strides (copy_tensor rejects it at runtime).

@@ -17,8 +17,6 @@ and the graph solvers. Device-free."""
 
 from __future__ import annotations
 
-import copy
-
 import pytest
 
 pytest.importorskip("ortools")
@@ -30,14 +28,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (  # noqa: E402
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (  # noqa: E402
     TableStrategy,
-)
-from torch_spyre._inductor.scratchpad.graph_solvers import (  # noqa: E402
-    DecomposedPlacement,
-    PlacementSolver,
-    solve_buffers,
-)
-from torch_spyre._inductor.scratchpad.greedy_solver import (  # noqa: E402
-    GreedyLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (  # noqa: E402
     CoreDivision,
@@ -112,67 +102,3 @@ def test_a_graph_solver_that_refuses_the_strategy_is_not_run():
     graph.set_solver(Refuses())
     with pytest.raises(ValueError, match="cannot solve"):
         graph.solve()
-
-
-def _placement_buffers() -> list[LifetimeBoundBuffer]:
-    source = LifetimeBoundBuffer("source", 256, [1, 2, 6])
-    dest = LifetimeBoundBuffer("dest", 128, [2, 3, 5])
-    source.paired_with.append(dest)
-    return [
-        dest,
-        source,
-        LifetimeBoundBuffer("other", 256, [0, 4]),
-        LifetimeBoundBuffer("barred", 128, [0, 7], residency_reason="op not allowed"),
-    ]
-
-
-def test_placement_solver_packs_the_views_as_the_solver_packs_buffers():
-    direct = _placement_buffers()
-    GreedyLayoutSolver(direct, 512).plan_layout()
-    buffers = _placement_buffers()
-    graph = build_graph(
-        buffers, 128, 4, _settings(), {b.name: b.residency_reason for b in buffers}
-    )
-    # A committed relayout's destination is a transform pinned on its source.
-    assert [t.name for t in graph.nodes["source"].pinned_transforms] == ["dest"]
-    assert "dest" not in graph.nodes
-    graph.set_solver(PlacementSolver(GreedyLayoutSolver, 512))
-    graph.solve()
-    placed = {
-        item.name: item.offset
-        for node in graph.get_nodes()
-        for item in (node, *node.pinned_transforms)
-    }
-    assert placed == {
-        b.name: None if b.address is None else b.address // 128 for b in direct
-    }
-
-
-def test_solve_buffers_writes_the_placement_back():
-    direct = _placement_buffers()
-    GreedyLayoutSolver(direct, 512).plan_layout()
-    buffers = _placement_buffers()
-    solve_buffers(GreedyLayoutSolver(buffers, 512))
-    assert [(b.name, b.address, b.spill_reason) for b in buffers] == [
-        (b.name, b.address, b.spill_reason) for b in direct
-    ]
-
-
-def test_decomposed_placement_keeps_the_leaf_with_least_hbm_traffic():
-    buffers = _menu_buffers()
-    graph = build_graph(buffers, 128, 48, _settings())
-    strategy = TableStrategy.from_buffers(buffers)
-    graph.set_solver(DecomposedPlacement(GreedyLayoutSolver, 48 * 128))
-    graph.solve(None, None, strategy)
-    best = _spilled_bytes(graph)
-    # Every other leaf spills at least as much.
-    import itertools
-
-    for leaf in itertools.product(range(2), repeat=3):
-        trial = copy.deepcopy(_menu_buffers())
-        for b, i in zip(trial, leaf):
-            b.core_divisions = [b.core_divisions[i]]
-        leaf_graph = build_graph(trial, 128, 48, _settings())
-        leaf_graph.set_solver(DecomposedPlacement(GreedyLayoutSolver, 48 * 128))
-        leaf_graph.solve(None, None, TableStrategy.from_buffers(trial))
-        assert _spilled_bytes(leaf_graph) >= best

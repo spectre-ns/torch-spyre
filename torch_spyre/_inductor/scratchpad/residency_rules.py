@@ -15,12 +15,12 @@
 
 """LX residency rules read from the IR: why an op output or a graph input may
 not reside in LX, and which reads may take over a producer's storage in place.
-Both graph builders set each node's ``residency_reason`` and in-place parents
-from these."""
+The graph builder (``table_candidates``) sets each node's ``residency_reason``
+and in-place parents from these."""
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from typing import Any, Optional
 
 from torch._inductor.dependencies import MemoryDep
@@ -37,18 +37,13 @@ from torch._inductor.ir import (
 from torch_spyre._inductor import config
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor.loop_info import LoopCarryRecord
-from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.pass_utils import (
-    _per_core_view_on_buf,
     indirect_info_from_op,
     op_read_writes,
     op_short_name,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import (
     GraphEditor,
-)
-from torch_spyre._inductor.scratchpad.lx_relayout import (
-    LXRelayoutPlan,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE,
@@ -59,7 +54,6 @@ from torch_spyre._inductor.scratchpad.utils import (
     buffer_not_read_in_full,
     calculate_liveness,
     clone_at_graph_boundaries,
-    get_ncores_for_buffers,
     get_op_pointwise_inputs,
     is_empty_tiled_layout,
 )
@@ -129,9 +123,7 @@ def _get_op_name(op: Any) -> str:
     return op_short_name(op)
 
 
-def _op_output_good_for_lx_reuse(
-    op: Any, planned_lx_buffers: frozenset[str] = frozenset()
-) -> bool:
+def _op_output_good_for_lx_reuse(op: Any) -> bool:
     if not isinstance(op, ComputedBuffer):
         return False
     if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
@@ -140,13 +132,10 @@ def _op_output_good_for_lx_reuse(
     # with no device_layout and can never be LX-pinned.
     if not isinstance(op.layout, FixedTiledLayout):
         return False
-    # A planned source intentionally bypasses the profitability denylist:
-    # the relayout planner has already applied its stricter structural gates.
     return (
         _is_loop_carry_storage(op)
         or config.allow_all_ops_in_lx_planning
         or _get_op_name(op) not in OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE
-        or op.get_name() in planned_lx_buffers
     )
 
 
@@ -204,12 +193,7 @@ def _buffer_residency_reason(
     mutated_buffers: set[str],
     graph_output_names: set[str],
     reinterpret_output_names: set[str],
-    ncores: dict[str, int],
-    ncores_reasons: dict[str, str],
-    division_is_fixed: bool,
     buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]],
-    planned_lx_buffers: frozenset[str] = frozenset(),
-    lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
     drain_plans: Collection[str] = (),
 ) -> Optional[str]:
     """The first check ``name`` fails, or ``None`` if it clears them all.
@@ -218,7 +202,7 @@ def _buffer_residency_reason(
     everything below assumes a placeable ``ComputedBuffer``; the back-gap
     probe comes last because it touches ``device_layout`` and is the most
     expensive. The graph-wide facts (``mutated_buffers``,
-    ``graph_output_names``, ``ncores`` ...) are computed once per solve by
+    ``graph_output_names`` ...) are computed once per solve by
     :meth:`_residency_reasons` and passed in, so this stays O(1) in the graph.
 
     Args:
@@ -227,14 +211,10 @@ def _buffer_residency_reason(
             :meth:`_input_residency_reason`).
         uses: ``name``'s liveness (the op indices where it is accessed).
         op: ``name``'s producing op, or ``None`` if it has none.
-        division_is_fixed: True on the placement path, where each op's core
-            division was committed upstream and a mismatch between a buffer's
-            users is fatal. False on the joint path, where the solver chooses
-            the division and its slicing gate decides instead.
         buf_user_deps: every buffer's ``(op, dep)`` users, from
             :func:`_get_buffer_user_deps`, for the read-side advancing check.
     """
-    if op is None or not _op_output_good_for_lx_reuse(op, planned_lx_buffers):
+    if op is None or not _op_output_good_for_lx_reuse(op):
         return "op not allowed"
     if not hasattr(getattr(op, "layout", None), "device_layout"):
         # No device layout => no computable footprint (e.g. a
@@ -245,12 +225,9 @@ def _buffer_residency_reason(
         # The joint solver does not consult the fixed-division judge until
         # after placement, so it must share this pre-allocation exclusion.
         return "empty tensor"
-    # A counted-loop carry may stay resident only when the joint solver can
-    # also choose the update's division.  Fixed-division placement cannot
-    # repair a mismatched update and therefore keeps the mutation target in
-    # HBM, like every other mutation.
-    loop_carry_is_safe = not division_is_fixed and _is_loop_carry_storage(op)
-    if name in mutated_buffers and not loop_carry_is_safe:
+    # A counted-loop carry may stay resident: the solver's relation gates its
+    # update's division against the carry's.
+    if name in mutated_buffers and not _is_loop_carry_storage(op):
         return "mutation target"
     if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
         # LX addresses cannot be expressed as affine.apply symbols today (see
@@ -262,24 +239,6 @@ def _buffer_residency_reason(
         # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
         # copied into a nested tile every outer iteration).
         return "tiled (advancing)"
-    if division_is_fixed:
-        # On the joint path this same geometric check runs again per
-        # candidate division pair, as part of the solver's own residency
-        # gate (``_cd_parent_matches`` / ``encode_read``): a
-        # restickify reader is an ordinary consumer edge there, and an
-        # edge with no compatible pair already forces ``in_buffer`` false
-        # (see ``encode_read``'s docstring). Applying the barrier
-        # here too would instead test the read against whatever division
-        # the op happens to carry on ``iteration_space_ownership`` before
-        # the solver has chosen anything -- stale, provisional, and
-        # unrelated to any candidate the solver could actually pick -- and
-        # can reject a buffer the solver would otherwise place correctly
-        # (issue #4655).
-        restickify = _restickify_barrier(
-            graph, name, uses, lx_relayout_plans=lx_relayout_plans
-        )
-        if restickify is not None:
-            return restickify
     # PR3683's guard: reject residency outright rather than let LX context
     # switching (dump/restore around the risky call) handle it. Kept behind
     # the flag, not deleted, so the old (conservative) and new (context
@@ -321,9 +280,6 @@ def _buffer_residency_reason(
             return "graph output mutated after production"
     if buffer_not_read_in_full(graph, name):
         return "partial/offset read"
-    if division_is_fixed and ncores.get(name, -1) < 0:
-        reason = ncores_reasons.get(name, "core div mismatch")
-        return f"core div mismatch: {reason}"
     if _read_count(uses) == 0:
         # Only the producer's write touches it, so residency saves nothing.
         return "no consumer reads it from LX"
@@ -338,10 +294,6 @@ def _input_residency_reason(
     graph: GraphLowering,
     name: str,
     uses: list[int],
-    *,
-    ncores: Optional[dict[str, int]] = None,
-    ncores_reasons: Optional[dict[str, str]] = None,
-    division_is_fixed: bool,
 ) -> Optional[str]:
     """The residency verdict for a *graph input*, which is pinned by cloning
     it into LX rather than by placing it directly.
@@ -352,10 +304,6 @@ def _input_residency_reason(
     once is already in HBM and would need one transfer to clone, so pinning
     it saves nothing -- which ``_read_count`` (first use excluded) states
     directly.
-
-    ``ncores``/``ncores_reasons`` are consulted only on the placement path
-    (``division_is_fixed``); the joint path defers the core division to the
-    solver and passes neither.
     """
     if not clone_at_graph_boundaries():
         return "graph input (no clone)"
@@ -377,16 +325,6 @@ def _input_residency_reason(
         return "use is not rewritable to the clone"
     if buffer_not_read_in_full(graph, name):
         return "partial/offset read"
-    if division_is_fixed:
-        # See the matching comment in _buffer_residency_reason: on the
-        # joint path this is redundant with (and less accurate than) the
-        # solver's own per-candidate residency gate.
-        restickify = _restickify_barrier(graph, name, uses)
-        if restickify is not None:
-            return restickify
-    if division_is_fixed and (ncores or {}).get(name, -1) < 0:
-        reason = (ncores_reasons or {}).get(name, "core div mismatch")
-        return f"core div mismatch: {reason}"
     if _would_produce_lx_back_gap(graph, name, uses):
         return "lx back gap"
     return None
@@ -396,23 +334,14 @@ def _residency_reasons(
     graph: GraphLowering,
     names: "list[str] | set[str]",
     *,
-    division_is_fixed: bool,
     lifetimes: Optional[dict[str, list[int]]] = None,
-    ncores: Optional[dict[str, int]] = None,
-    ncores_reasons: Optional[dict[str, str]] = None,
-    planned_lx_buffers: frozenset[str] = frozenset(),
-    lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
     drain_plans: Collection[str] = (),
 ) -> dict[str, Optional[str]]:
     """:meth:`_buffer_residency_reason` over ``names``, as ``name -> reason``.
 
     Computes the graph-wide facts the per-buffer check needs once, here, and
-    passes them down -- there is no shared context object. ``lifetimes`` and
-    ``ncores`` are accepted so a caller that already has them (the placement
-    path, the co-opt search) skips recomputing; ``ncores`` is built only on
-    the placement path, since the joint path's slicing gate decides core
-    division and ``_buffer_residency_reason`` skips that check when
-    ``division_is_fixed`` is False.
+    passes them down -- there is no shared context object. ``lifetimes`` is
+    accepted so a caller that already has it skips recomputing.
     """
     if lifetimes is None:
         lifetimes = calculate_liveness(graph)
@@ -429,10 +358,6 @@ def _residency_reasons(
         if isinstance(go, ReinterpretView)
         or isinstance(getattr(go, "data", None), ReinterpretView)
     }
-    if division_is_fixed and ncores is None:
-        ncores, ncores_reasons, _ = get_ncores_for_buffers(graph)
-    ncores = ncores or {}
-    ncores_reasons = ncores_reasons or {}
     buf_user_deps = _get_buffer_user_deps(graph)
     return {
         name: _buffer_residency_reason(
@@ -443,12 +368,7 @@ def _residency_reasons(
             mutated_buffers=mutated_buffers,
             graph_output_names=graph_output_names,
             reinterpret_output_names=reinterpret_output_names,
-            ncores=ncores,
-            ncores_reasons=ncores_reasons,
-            division_is_fixed=division_is_fixed,
             buf_user_deps=buf_user_deps,
-            planned_lx_buffers=planned_lx_buffers,
-            lx_relayout_plans=lx_relayout_plans,
             drain_plans=drain_plans,
         )
         for name in names
@@ -462,112 +382,6 @@ def _op_inputs_good_for_lx_inplace(op: Any) -> list[str]:
     # A pointwise ATen target can consume a transposed/broadcast view after
     # lowering. Its tag does not prove element-for-element storage reuse.
     return get_op_pointwise_inputs(op)
-
-
-def _restickify_barrier(
-    graph: GraphLowering,
-    name: str,
-    uses: Sequence[int],
-    *,
-    lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
-) -> Optional[str]:
-    """The ``residency_reason`` for a buffer a restickify *reads*, else ``None``.
-
-    Restickify moves the stick dimension: its per-core read frame and write
-    frame are transposes, so a per-core (LX) slice of the OUTPUT can need
-    bytes from another core's slice of the INPUT. The hazard is one-sided --
-    it only bites when the input is core-sliced in LX -- so only a buffer a
-    restickify reads is barred. The restickify's own output (the use whose op
-    *is* this buffer's producer) is a normal core-local write and takes the
-    ordinary residency path. ``is_restickify_op`` shares the coordinate
-    predicate used by codegen, so residency never depends on an operation's
-    display name.
-
-    Only the placement path (``division_is_fixed=True``) calls this: it
-    has one committed division per op and no other mechanism to catch a
-    cross-core restickify read. The joint path skips it -- the solver's
-    own per-candidate residency gate (``_cd_parent_matches`` /
-    ``encode_read``) subsumes it there, correctly, over every
-    division the solver could actually choose (see the call sites for
-    why testing it here, against whatever division the op happens to
-    carry pre-solve, is not just redundant but wrong; issue #4655).
-    """
-    readers = [
-        graph.operations[u]
-        for u in uses
-        if graph.operations[u].name != name
-        and is_restickify_op(graph.operations[u], graph)
-    ]
-    if not readers:
-        return None
-    if not config.lx_planner_relayout:
-        return "read by restickify (cross-frame barrier)"
-    if all(
-        _restickify_read_is_core_local(
-            graph,
-            name,
-            reader,
-            lx_relayout_plans=lx_relayout_plans,
-        )
-        for reader in readers
-    ):
-        return None
-    return "read by restickify (local-read proof failed)"
-
-
-def _restickify_read_is_core_local(
-    graph: GraphLowering,
-    name: str,
-    reader: Operation,
-    *,
-    lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
-) -> bool:
-    """Whether ``reader`` consumes exactly ``name``'s same-core slice.
-
-    The proof compares complete physical owner maps. A relayout destination
-    is synthetic until allocation commits, so in that case the plan's
-    certified destination view is the ownership the private copy provides.
-    """
-
-    reads = [
-        dep
-        for dep in op_read_writes(reader).reads
-        if isinstance(dep, MemoryDep) and dep.name == name
-    ]
-    if len(reads) != 1 or reads[0].is_indirect():
-        return False
-    read_view, partial, representable = _per_core_view_on_buf(reader, reads[0], name)
-    if partial or not representable:
-        return False
-
-    planned_views = [
-        plan.destination_view
-        for plan in lx_relayout_plans
-        if plan.source_name == name and reader.get_name() in plan.consumer_names
-    ]
-    if planned_views:
-        return all(
-            read_view.same_partition(planned_view) for planned_view in planned_views
-        )
-
-    producer = next((op for op in graph.operations if op.get_name() == name), None)
-    if not isinstance(producer, ComputedBuffer):
-        return False
-    writes = [
-        dep
-        for dep in op_read_writes(producer).writes
-        if isinstance(dep, MemoryDep) and dep.name == name
-    ]
-    if len(writes) != 1 or writes[0].is_indirect():
-        return False
-    write_view, write_partial, write_representable = _per_core_view_on_buf(
-        producer, writes[0], name
-    )
-    return (
-        not write_partial
-        and write_representable
-        and write_view.same_partition(read_view)
-    )
 
 
 def _inplace_edge_ok(
@@ -605,9 +419,8 @@ def _inplace_edge_ok(
     preconditions are checked.
 
     This is the sole definition of a legal in-place edge, shared by
-    ``graph_builder._in_place`` / ``graph_builder._entries`` (placement path) and
-    ``_determine_in_place_division_invariant`` / ``TableCandidates._build_graph``
-    (co-optimizing path), so they cannot drift.
+    ``TableCandidates._determine_in_place_division_invariant`` and
+    ``TableCandidates._build_graph``, so they cannot drift.
     """
     base_ok = (
         parent_name in child_pointwise_inputs

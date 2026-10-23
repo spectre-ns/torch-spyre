@@ -15,7 +15,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, cast
 
 import sympy
@@ -29,7 +29,7 @@ from torch._inductor.ir import (
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor import config
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import (
     PerCoreView,
     commit_iteration_space_ownership,
@@ -44,10 +44,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
     CandidateTables,
     EnumerationFactory,
-)
-from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-    BestFitLayoutSolver,
-    FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import (
     GraphEditor,
@@ -67,11 +63,9 @@ from torch_spyre._inductor.scratchpad.residency_rules import (
 )
 from torch_spyre._inductor.scratchpad.graph_solvers import (
     BufferSolver,
-    DecomposedPlacement,
     GraphSolver,
     graph_solver_for,
 )
-from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
     FiredRelayoutGroup,
@@ -89,9 +83,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     ceil_div,
 )
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
-from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingLayoutSolver,
-)
 from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_entry,
     counted_loop_group_path,
@@ -307,22 +298,21 @@ class SolvedPlan:
         """A solved plan given in buffer form (tests): the graph of
         ``buffers`` in byte units, each decision read off its buffer
         (``address``, ``chosen_division``, ``lx_view``, ``spill_reason``)."""
-        from torch_spyre._inductor.scratchpad.buffer_graph import build_graph
-        from torch_spyre._inductor.scratchpad.graph_builder import empty_graph
+        from torch_spyre._inductor.scratchpad.buffer_graph import (
+            build_graph,
+            empty_graph,
+        )
 
         real = [b for b in buffers if not isinstance(b, RelayoutCopyBuffer)]
-        graph = build_graph(real, 1, 1 << 62, empty_graph(0, "open").settings)
+        graph = build_graph(real, 1, 1 << 62, empty_graph(0).settings)
         tables = CandidateTables.of_buffers(buffers)
         strategy = EnumerationFactory().strategy_from_tables(tables)
         by_name = {b.name: b for b in buffers}
         for node in graph.get_nodes():
             b = by_name[node.name]
-            items: list[tuple[Any, LifetimeBoundBuffer]] = [(node, b)]
-            items += [(t, by_name[t.name]) for t in node.pinned_transforms]
-            for item, src in items:
-                item.resident = src.address is not None
-                item.offset = src.address
-                item.spill_reason = src.spill_reason
+            node.resident = b.address is not None
+            node.offset = b.address
+            node.spill_reason = b.spill_reason
             chosen = getattr(b, "chosen_division", None)
             if chosen is not None and node.name in tables.menus:
                 strategy.solved[node] = chosen
@@ -435,10 +425,10 @@ class ScratchpadAllocator:
                 Defaults to no passes.
             post_optimization_passes: Graph passes applied after layout planning.
                 Defaults to no passes.
-            division_mode: ``"committed"`` plans placement over the divisions
-                work division committed upstream; ``"open"`` chooses each
-                buffer's core division (and coarse tiling) jointly with its
-                placement, which needs a solver that chooses divisions.
+            division_mode: ``"committed"`` keeps the divisions work division
+                committed upstream; ``"open"`` chooses each buffer's core
+                division (and coarse tiling) jointly with its placement, which
+                needs a solver that chooses divisions.
             prune: Enable heuristic pruning of the core-division search space.
         """
         self.solver = graph_solver_for(layout_planning, size)
@@ -469,36 +459,16 @@ class ScratchpadAllocator:
         # symbols to its live ones; read through :meth:`_live_splits`.
         self._tiling_symbol_remaps: dict[str, dict[sympy.Symbol, sympy.Symbol]] = {}
         self.factory = EnumerationFactory.from_config(self.capabilities)
-        if not self.joint:
-            return
-        if config.lx_planner_relayout and not self.factory.offers_relayouts:
-            logger.debug(
-                "%s does not decide LX relayouts; continuing without relayout",
-                self.solver.name,
-            )
         # Candidate generation belongs to the solve's table encoding; this
         # allocator dispatches the solve and applies the result.
-        self.candidates = self.factory.candidates(size, prune)
+        self.candidates = self.factory.candidates(size, prune, committed=not self.joint)
 
     @property
     def joint(self) -> bool:
         """Whether divisions are open: chosen jointly with placement."""
         return self.division_mode == "open"
 
-    @staticmethod
-    def _planned_lx_buffer_names(
-        plans: Sequence[LXRelayoutPlan],
-    ) -> frozenset[str]:
-        return frozenset(
-            name for plan in plans for name in (plan.source_name, plan.destination_name)
-        )
-
-    def plan_allocation(
-        self,
-        graph: GraphLowering,
-        *,
-        lx_relayout_plans: list[LXRelayoutPlan] | None = None,
-    ):
+    def plan_allocation(self, graph: GraphLowering):
         """Run pre-passes, plan LX for ``graph``, then run post-passes.
 
         The allocator coordinates; it builds no buffers. The solve's graph is
@@ -512,13 +482,8 @@ class ScratchpadAllocator:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
                 addresses where viable.
         """
-        if self.pre_optimization_passes:
-            # A pre-pass may change layouts or ownership: reuse no earlier proof.
-            if lx_relayout_plans is not None:
-                logger.debug("Recollect LX relayout plans after allocator pre-passes")
-            lx_relayout_plans = None
         self._run_passes(self.pre_optimization_passes, graph)
-        plan = self._solve(graph, lx_relayout_plans)
+        plan = self._solve(graph)
         plan = self._materialize_selection(graph, plan)
         accepted_lx_relayouts = self._finalize_lx_relayout_allocation(plan, graph)
         self._post_solve(graph, plan, accepted_lx_relayouts)
@@ -535,37 +500,19 @@ class ScratchpadAllocator:
             p.apply_pass(graph)
 
     def _build_graph(
-        self,
-        graph: GraphLowering,
-        lx_relayout_plans: list[LXRelayoutPlan] | None = None,
+        self, graph: GraphLowering
     ) -> tuple[SpyreOptimizationGraph, CandidateTables]:
         """The solve's graph, built from the IR, and the table strategy's
-        candidates for it: placement over the committed divisions, or in the
-        open mode the candidate generator's graph."""
-        if self.joint:
-            built = self.candidates.prepare_graph(
-                graph, lx_relayout_plans=lx_relayout_plans
-            )
-            self._validated_drain_plans = self.candidates.drain_plans
-            return built
-        from torch_spyre._inductor.scratchpad.graph_builder import placement_graph
+        candidates for it."""
+        built = self.candidates.prepare_graph(graph)
+        self._validated_drain_plans = self.candidates.drain_plans
+        return built
 
-        return placement_graph(self, graph, lx_relayout_plans), CandidateTables()
-
-    def _solve(
-        self,
-        graph: GraphLowering,
-        lx_relayout_plans: list[LXRelayoutPlan] | None = None,
-    ) -> SolvedPlan:
-        """Build the graph and solve it with the configured solver: in the
-        open mode under the priced cost expression."""
-        solve_graph, tables = self._build_graph(graph, lx_relayout_plans)
-        factory = self.factory if self.joint else EnumerationFactory()
-        strategy = factory.strategy_from_tables(tables)
+    def _solve(self, graph: GraphLowering) -> SolvedPlan:
+        """Build the graph and solve it under the priced cost expression."""
+        solve_graph, tables = self._build_graph(graph)
+        strategy = self.factory.strategy_from_tables(tables)
         plan = SolvedPlan(solve_graph, strategy, self.solver, tables)
-        if not self.joint:
-            self.solver.solve(solve_graph, strategy)
-            return plan
         cost_expr, bundle_terms = pricing.cost_expr(graph, plan, self.factory)
         self.solver.solve(solve_graph, strategy, cost_expr)
         if config.dump_cost_expr_file and cost_expr is not None:
@@ -587,9 +534,9 @@ class ScratchpadAllocator:
 
         Ordering is solve-before-apply: a ``SolveError`` from the first solve
         propagates over the *unmutated* graph, so ``scratchpad_planning``'s
-        greedy fallback never runs on a half-tiled graph (a second-solve
+        committed replan never runs on a half-tiled graph (a second-solve
         ``SolveError`` falls back over the fully-tiled graph, which is a valid
-        outcome). A placement-only solve selects nothing to materialize.
+        outcome). A committed solve selects nothing to materialize.
         """
         if not self.joint or not self.capabilities.replans_after_tiling:
             return plan
@@ -618,34 +565,50 @@ class ScratchpadAllocator:
     def _finalize_lx_relayout_allocation(
         self, plan: SolvedPlan, graph: GraphLowering
     ) -> list[LXRelayoutPlan]:
-        """The relayout plans to materialize. Placement-only: each committed
-        plan whose source and destinations were all placed, disjoint; a
-        partial group is unplaced. Open mode: the solver's fired relayouts,
-        regrouped by (source, destination view) and checked against the
-        committed divisions and the copy's address."""
-        if self.joint:
-            return self._joint_finalize_lx_relayout_allocation(plan, graph)
-        plans = [p for node in plan.nodes for p in node.lx_relayout_plans]
-        if not plans:
-            return []
-        complete = self._allocated_lx_relayout_sources(plan)
-        rejected = {p.source_name for p in plans} - complete
-        if rejected:
-            for source_name in sorted(rejected):
-                source = plan.graph.nodes[source_name]
-                group: list[ResourceNode | Transform] = [
-                    source,
-                    *source.pinned_transforms,
-                ]
-                logger.debug(
-                    "rejected LX relayout group source=%s allocations=%s; "
-                    "every member must be allocated and destinations must not "
-                    "overlap the source",
-                    source_name,
-                    {item.name: (plan.address(item), item.nbytes) for item in group},
+        """Turn the solver's fired relayouts into materializable plans.
+
+        The solver already guaranteed what a materialization needs: the
+        copy's residency IS the decision, the served consumers'
+        division pairs are pinned by the literals that require the copy
+        resident, and the 2D no-overlap kept source and copy disjoint. The
+        fired candidates carry the views the enumeration priced, so nothing is
+        re-derived here: the fired edges regroup by (source, destination view),
+        the committed divisions and the copy's address are checked against
+        them, and ``materialize_lx_relayouts`` gets one plan per fired group.
+        """
+        nodes = plan.graph.nodes
+        plans: list[LXRelayoutPlan] = []
+        for group in FiredRelayoutGroup.from_chosen(plan.chosen_relayouts()):
+            source = nodes[group.parent]
+            address = plan.address(source)
+            assert plan.division_index(source) == group.source_division, (
+                f"relayout group {group.parent}/g{group.group} chose source "
+                f"division {group.source_division} but "
+                f"{plan.division_index(source)} was committed"
+            )
+            assert address is not None, (
+                f"relayout source {group.parent} has no LX address"
+            )
+            for member in group.members:
+                consumer = nodes[member.candidate.consumer]
+                (edge,) = [e for e in consumer.inputs if e.src is source]
+                assert edge.transform is not None
+                copy_address = plan.address(edge.transform)
+                assert copy_address == group.destination_address, (
+                    f"relayout group {group.parent}/g{group.group}: consumers read "
+                    f"the copy at {group.destination_address} but it was placed "
+                    f"at {copy_address}"
                 )
-            self._clear_lx_relayout_groups(plan, rejected)
-        return self._accepted_plans(plan)
+                assert (
+                    plan.division_index(consumer) == member.candidate.consumer_division
+                ), (
+                    f"relayout pair ({group.source_division}, "
+                    f"{member.candidate.consumer_division}) disagrees with committed "
+                    f"division {plan.division_index(consumer)} on {group.parent} -> "
+                    f"{consumer.name}"
+                )
+            plans.append(group.plan(address))
+        return plans
 
     def _post_solve(
         self,
@@ -653,14 +616,11 @@ class ScratchpadAllocator:
         plan: SolvedPlan,
         accepted_lx_relayouts: Sequence[LXRelayoutPlan],
     ) -> None:
-        """In the open mode, commit the chosen tilings, divisions and views
-        before the push; placement-only has nothing to commit.
+        """Commit the chosen tilings, divisions and views before the push.
 
         Apply before commit: ``commit_iteration_space_ownership`` builds the
         ownership off ``iteration_space_from_op``, whose symbols come from the
         write dep's ranges -- which ``_divide_ranges`` invalidates."""
-        if not self.joint:
-            return
         tiled = self._apply_chosen_tilings(graph, plan)
         self._check_priced_footprints(graph, plan, tiled)
         # The divisions must be committed such that any buffer clones can
@@ -688,59 +648,6 @@ class ScratchpadAllocator:
             for n in plan.nodes
             if not n.resident
         }
-
-    def _allocated_lx_relayout_sources(self, plan: SolvedPlan) -> set[str]:
-        complete = set()
-        for source in plan.nodes:
-            if not source.lx_relayout_plans:
-                continue
-            names = {p.destination_name for p in source.lx_relayout_plans}
-            destinations = [t for t in source.pinned_transforms if t.name in names]
-            members: list[ResourceNode | Transform] = [source, *destinations]
-            allocated = [plan.address(item) is not None for item in members]
-            assert all(allocated) or not any(allocated), (
-                f"paired-buffer group for {source.name} was only partially allocated"
-            )
-            if not allocated[0]:
-                continue
-            base = plan.address(source)
-            assert base is not None
-            assert all(
-                (addr := plan.address(d)) is not None
-                and not (base < addr + d.nbytes and addr < base + source.nbytes)
-                for d in destinations
-            ), f"paired-buffer group for {source.name} has overlapping placements"
-            complete.add(source.name)
-        return complete
-
-    def _clear_lx_relayout_groups(self, plan: SolvedPlan, sources: set[str]) -> None:
-        for name in sources:
-            source = plan.graph.nodes[name]
-            names = {p.destination_name for p in source.lx_relayout_plans}
-            source.lx_relayout_plans = []
-            for item in (
-                source,
-                *(t for t in source.pinned_transforms if t.name in names),
-            ):
-                item.resident = False
-                item.offset = None
-
-    def _accepted_plans(self, plan: SolvedPlan) -> list[LXRelayoutPlan]:
-        return [
-            replace(
-                p,
-                source_address=plan.address(node),
-                destination_address=plan.address(
-                    next(
-                        t
-                        for t in node.pinned_transforms
-                        if t.name == p.destination_name
-                    )
-                ),
-            )
-            for node in plan.nodes
-            for p in node.lx_relayout_plans
-        ]
 
     def _log_lx_pinning(self, graph: GraphLowering, reasons: dict) -> None:
         """Log the final LX pinning decision for every op in the graph."""
@@ -876,54 +783,6 @@ class ScratchpadAllocator:
         layout.lx_view = lx_view
 
     # ---- the joint (open division mode) solve ----
-
-    def _joint_finalize_lx_relayout_allocation(
-        self, plan: SolvedPlan, graph: GraphLowering
-    ) -> list[LXRelayoutPlan]:
-        """Turn the solver's fired relayouts into materializable plans.
-
-        The solver already guaranteed everything the greedy path checks after
-        the fact: the copy's residency IS the decision, the served consumers'
-        division pairs are pinned by the literals that require the copy
-        resident, and the 2D no-overlap kept source and copy disjoint. The
-        fired candidates carry the views the enumeration priced, so nothing is
-        re-derived here: the fired edges regroup by (source, destination view),
-        the committed divisions and the copy's address are checked against
-        them, and ``materialize_lx_relayouts`` gets one plan per fired group.
-        """
-        nodes = plan.graph.nodes
-        plans: list[LXRelayoutPlan] = []
-        for group in FiredRelayoutGroup.from_chosen(plan.chosen_relayouts()):
-            source = nodes[group.parent]
-            address = plan.address(source)
-            assert plan.division_index(source) == group.source_division, (
-                f"relayout group {group.parent}/g{group.group} chose source "
-                f"division {group.source_division} but "
-                f"{plan.division_index(source)} was committed"
-            )
-            assert address is not None, (
-                f"relayout source {group.parent} has no LX address"
-            )
-            for member in group.members:
-                consumer = nodes[member.candidate.consumer]
-                (edge,) = [e for e in consumer.inputs if e.src is source]
-                assert edge.transform is not None
-                copy_address = plan.address(edge.transform)
-                assert copy_address == group.destination_address, (
-                    f"relayout group {group.parent}/g{group.group}: consumers read "
-                    f"the copy at {group.destination_address} but it was placed "
-                    f"at {copy_address}"
-                )
-                assert (
-                    plan.division_index(consumer) == member.candidate.consumer_division
-                ), (
-                    f"relayout pair ({group.source_division}, "
-                    f"{member.candidate.consumer_division}) disagrees with committed "
-                    f"division {plan.division_index(consumer)} on {group.parent} -> "
-                    f"{consumer.name}"
-                )
-            plans.append(group.plan(address))
-        return plans
 
     def _chosen_tilings(
         self, graph: GraphLowering, plan: SolvedPlan
@@ -1299,140 +1158,47 @@ def log_solver_decisions(graph: GraphLowering, plan: SolvedPlan) -> None:
         )
 
 
-def _cpsat_solver_class() -> type[MemoryPlanSolver]:
-    """``CpSatLayoutSolver``, or ``GreedyLayoutSolver`` when ortools is
-    unavailable.
+def _graph_solver(size: int) -> GraphSolver:
+    """The graph solver ``layout_solver`` names: CP-SAT posting the graph, or
+    the annealing co-optimizer."""
+    if config.layout_solver == "cpsat":
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
-    Resolved to a class once, when the allocator is selected, so the
-    capabilities the allocator asks of it are the chosen solver's.
-    ``ilp_solver_ortools`` imports without ortools and leaves ``cp_model``
-    ``None``; it is imported lazily so every non-cpsat path skips it.
-    """
-    from torch_spyre._inductor.scratchpad import ilp_solver_ortools
-
-    if ilp_solver_ortools.cp_model is not None:
-        return ilp_solver_ortools.CpSatLayoutSolver
-    # Once per process: this runs for every compile.
-    warn_once(
-        logger,
-        "cpsat_unavailable",
-        "cpsat layout solver unavailable (%s); falling back to the "
-        "default greedy allocator.",
-        ilp_solver_ortools._CP_MODEL_IMPORT_ERROR or "ortools is not installed",
-    )
-    return GreedyLayoutSolver
-
-
-_PLACEMENT_SOLVERS: dict[str, type[MemoryPlanSolver]] = {
-    "greedy": GreedyLayoutSolver,
-    "bestfit": BestFitLayoutSolver,
-    "firstfit": FirstFitLayoutSolver,
-    "simulated_annealing": SimulatedAnnealingLayoutSolver,
-}
+        return ModelSolver(size)
+    if config.layout_solver == "simulated_annealing":
+        return BufferSolver(SaCoOptimizingSolver, size)
+    raise ValueError(f"Invalid layout_solver config option '{config.layout_solver}'.")
 
 
 def select_allocator() -> ScratchpadAllocator:
-    """Build the scratchpad allocator and inject its graph solver from config.
+    """The scratchpad allocator for the configured solver: the one place that
+    maps config to an (allocator, solver) pair, so the allocator never
+    inspects config. With ``co_optimizing_lx_planning`` it chooses core
+    divisions (and coarse tilings) jointly with placement; without, every op
+    keeps the division work division committed.
 
-    This is the single place that maps config to an (allocator, solver) pair, so
-    the allocator takes an explicit graph solver and never inspects config:
-
-    * Without ``co_optimizing_lx_planning``, returns a :class:`ScratchpadAllocator`
-      that solves for LX placement only (the committed division mode).
-    * With ``co_optimizing_lx_planning``, returns one in the open division
-      mode, which chooses core divisions jointly with placement. ``"simulated_annealing"`` is served by
-      :class:`SaCoOptimizingSolver`, the joint work-division + LX engine.
-      Otherwise a core-division-capable factory (currently only ``"cpsat"``, and
-      only when ortools is available) is used directly; every other factory
-      would need a :class:`DecomposedPlacement`, an exhaustive search of all
-      the core division options -- allowed only when
-      ``allow_exhaustive_search`` is set, else this raises ``ValueError``.
-
-    The annealer is deliberately not wrapped in :class:`DecomposedPlacement`:
-    that wrapper solves the layout once per enumerated division candidate, so
-    nesting a full anneal there would cost one anneal per candidate. It is also a
-    separate class from :class:`SimulatedAnnealingLayoutSolver` rather than one
-    class in two modes (unlike the cpsat pair, where the same solver simply does
-    less work): the layout-only annealer stays a usable
-    :class:`MemoryPlanSolver`, while the joint engine composes the same packer
-    and adds the division moves. Do not merge them.
-    """
-    size = _lx_planning_size()
-
-    if config.layout_solver == "cpsat":
-        solver_cls = _cpsat_solver_class()
-    else:
-        try:
-            solver_cls = _PLACEMENT_SOLVERS[config.layout_solver]
-        except KeyError:
-            raise ValueError(
-                f"Invalid layout_solver config option '{config.layout_solver}'."
-            )
-
-    # LxContextSwitchingPass replaces PR3683's blanket "never pin a buffer to
-    # LX across an extern kernel" guard with a real fix (bracket the risky
-    # call with per-buffer dump/restore instead). Both are gated by the same
-    # flag -- see the matching comments on _extern_kernel_in_live_range's two
-    # call sites -- so this list is empty exactly when that guard is active.
-    # Imported locally: lx_context_switching imports ScratchpadOptimizationPass
-    # from this module, so a top-level import here would be circular.
+    ``LxContextSwitchingPass`` replaces PR3683's blanket "never pin a buffer
+    to LX across an extern kernel" guard with per-buffer dump/restore around
+    the risky call; both are gated by the same flag, so the pass list is
+    empty exactly when that guard is active."""
+    # lx_context_switching imports ScratchpadOptimizationPass from this module.
     from torch_spyre._inductor.scratchpad.lx_context_switching import (
         LxContextSwitchingPass,
     )
 
-    post_optimization_passes: list[ScratchpadOptimizationPass] = (
-        [LxContextSwitchingPass()] if config.enable_lx_context_switching else []
-    )
-
-    if config.co_optimizing_lx_planning:
-        if config.layout_solver == "simulated_annealing":
-            return ScratchpadAllocator(
-                division_mode="open",
-                layout_planning=BufferSolver(SaCoOptimizingSolver, size),
-                size=size,
-            )
-        solver = graph_solver_for(solver_cls, size)
-        if not solver.capabilities.chooses_core_divisions:
-            if not config.allow_exhaustive_search:
-                raise ValueError(
-                    f"co_optimizing_lx_planning=True with layout_solver="
-                    f"'{config.layout_solver}' has no core-division-capable "
-                    "solver to co-optimize with (this requires layout_solver="
-                    "'cpsat' with ortools installed, or "
-                    "layout_solver='simulated_annealing'); the only way to "
-                    "proceed is to fall back to ExhaustiveSearchSolver, an "
-                    "expensive DFS over core-division candidates. Set "
-                    "allow_exhaustive_search=True (or "
-                    "ALLOW_EXHAUSTIVE_SEARCH=1) to allow that fallback, or "
-                    "set co_optimizing_lx_planning=False (or "
-                    "CO_OPTIMIZING_LX_PLANNING=0) to avoid it."
-                )
-            return ScratchpadAllocator(
-                division_mode="open",
-                layout_planning=DecomposedPlacement(solver_cls, size),
-                size=size,
-                prune=True,
-                post_optimization_passes=post_optimization_passes,
-            )
-        return ScratchpadAllocator(
-            division_mode="open",
-            layout_planning=solver,
-            size=size,
-            post_optimization_passes=post_optimization_passes,
-        )
-
+    size = _lx_planning_size()
     return ScratchpadAllocator(
-        layout_planning=graph_solver_for(solver_cls, size),
+        _graph_solver(size),
         size=size,
-        post_optimization_passes=post_optimization_passes,
+        division_mode="open" if config.co_optimizing_lx_planning else "committed",
+        post_optimization_passes=(
+            [LxContextSwitchingPass()] if config.enable_lx_context_switching else []
+        ),
     )
 
 
 def scratchpad_planning(
-    graph: GraphLowering,
-    allocator: Optional[ScratchpadAllocator] = None,
-    *,
-    lx_relayout_plans: list[LXRelayoutPlan] | None = None,
+    graph: GraphLowering, allocator: Optional[ScratchpadAllocator] = None
 ) -> None:
     """Assign LX scratchpad addresses to eligible buffers in a lowered graph.
 
@@ -1443,32 +1209,34 @@ def scratchpad_planning(
         graph: Lowered graph to plan scratchpad memory for.
         allocator: Allocator strategy to use. Defaults to the config-selected
             allocator (see :func:`select_allocator`).
-        lx_relayout_plans: Plans from immediately preceding ownership anchoring.
-            None requests collection; an empty list is a completed empty result.
-            The caller must not mutate the graph between collection and this call.
     """
     if allocator is None:
         allocator = select_allocator()
     try:
-        allocator.plan_allocation(graph, lx_relayout_plans=lx_relayout_plans)
+        allocator.plan_allocation(graph)
+        return
     except SolveError as error:
         # Strong exception guarantee: SolveError comes from the solve, before the
         # allocator commits divisions, relayouts or addresses, and select_allocator
-        # configures no pre-passes. The graph is unchanged, so greedy placement
-        # replans it with the work divisions already committed and recollects
-        # relayout plans itself.
-        # Keep the failed allocator's post-allocation passes: select_allocator
-        # adds LxContextSwitchingPass under the same flag that lets residency skip
-        # the extern-kernel liveness guard, so dropping it would leave LX buffers
-        # unprotected across FallbackKernel calls.
+        # configures no pre-passes, so the graph is unchanged.
+        failed = error
+    if allocator.joint:
+        # Keep the failed allocator's post-allocation passes: they protect LX
+        # buffers across FallbackKernel calls (see select_allocator).
         logger.info(
-            "LX layout solve failed with layout_solver=%s (%s); falling back to "
-            "greedy LX placement with the committed work divisions",
+            "LX layout solve failed with layout_solver=%s (%s); replanning with "
+            "the committed work divisions",
             config.layout_solver,
-            error,
+            failed,
         )
-        ScratchpadAllocator(
-            GreedyLayoutSolver,
-            size=_lx_planning_size(),
-            post_optimization_passes=allocator.post_optimization_passes,
-        ).plan_allocation(graph)
+        size = _lx_planning_size()
+        try:
+            ScratchpadAllocator(
+                _graph_solver(size),
+                size=size,
+                post_optimization_passes=allocator.post_optimization_passes,
+            ).plan_allocation(graph)
+            return
+        except SolveError as error:
+            failed = error
+    logger.info("LX layout solve failed (%s); nothing is placed in LX", failed)

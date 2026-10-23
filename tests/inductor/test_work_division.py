@@ -76,9 +76,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     CoreDivision,
     ScratchpadAllocator,
 )
-from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
-from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -140,11 +138,6 @@ from torch_spyre._inductor.scratchpad import drain_plans
 from torch_spyre._inductor.scratchpad import residency_rules
 
 
-# A solver class for allocator tests that never solve: never built, only asked
-# for its capabilities.
-_UNBUILT_SOLVER = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)
-
-
 def _isym(name):
     """Symbol with the (integer, positive) assumptions real Inductor loop
     vars carry -- required for sympy's floor-division to simplify a stick
@@ -192,9 +185,6 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
 
 
 class TestLoopCarryLxEligibility(unittest.TestCase):
-    def setUp(self):
-        self.allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
-
     @staticmethod
     def _tagged_carry(name="carry"):
         op = _computed_buffer((64, 64), name=name)
@@ -203,6 +193,22 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             update_name="carry_update",
         )
         return op
+
+    @staticmethod
+    def _clear_later_checks():
+        stack = ExitStack()
+        for target in (
+            "_is_tiled_advancing",
+            "_is_read_advancing_anywhere",
+            "_multi_output_extern_kernel_in_live_range",
+            "buffer_not_read_in_full",
+            "_would_produce_lx_back_gap",
+            "_is_index_or_indirectly_accessed",
+        ):
+            stack.enter_context(
+                patch.object(residency_rules, target, return_value=False)
+            )
+        return stack
 
     def test_loop_carry_bypasses_output_profitability_denylist(self):
         op = self._tagged_carry()
@@ -215,7 +221,7 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             )
             self.assertFalse(residency_rules._op_output_good_for_lx_reuse(op))
 
-    def test_only_joint_solver_accepts_tagged_loop_carry_mutation_target(self):
+    def test_tagged_loop_carry_clears_the_mutation_target_refusal(self):
         graph = SimpleNamespace(operations=[])
         common = dict(
             graph=graph,
@@ -224,9 +230,6 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             mutated_buffers={"carry"},
             graph_output_names=set(),
             reinterpret_output_names=set(),
-            ncores={},
-            ncores_reasons={},
-            division_is_fixed=False,
             buf_user_deps={},
         )
         ordinary = _computed_buffer((64, 64), name="carry")
@@ -236,44 +239,17 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
         )
 
         carry = self._tagged_carry()
-        with (
-            patch.object(residency_rules, "_is_tiled_advancing", return_value=False),
-            patch.object(
-                residency_rules, "_is_read_advancing_anywhere", return_value=False
-            ),
-            patch.object(
-                residency_rules,
-                "_multi_output_extern_kernel_in_live_range",
-                return_value=False,
-            ),
-            patch.object(
-                residency_rules, "buffer_not_read_in_full", return_value=False
-            ),
-            patch.object(
-                residency_rules, "_would_produce_lx_back_gap", return_value=False
-            ),
-            patch.object(residency_rules, "_restickify_barrier", return_value=None),
-            patch.object(
-                residency_rules, "_is_index_or_indirectly_accessed", return_value=False
-            ),
-        ):
+        with self._clear_later_checks():
             self.assertIsNone(
                 residency_rules._buffer_residency_reason(op=carry, **common)
-            )
-            common["division_is_fixed"] = True
-            self.assertEqual(
-                residency_rules._buffer_residency_reason(op=carry, **common),
-                "mutation target",
             )
 
     def test_mutated_graph_output_clears_only_with_validated_drain_plan(self):
         """The graph-output-mutation refusal is lifted only by a validated plan.
 
         This is the exact guard that pins a returned ``for_each_tile``
-        accumulator to HBM today (refusal reason "graph output mutated
-        after production").  A ``drain_plans`` entry clears it; the plan is
-        never produced on the fixed-division (placement) path, and the
-        pre-existing mutation-target refusal above it is untouched.
+        accumulator to HBM (refusal reason "graph output mutated after
+        production"). A ``drain_plans`` entry clears it.
         """
         graph = SimpleNamespace(operations=[])
         common = dict(
@@ -283,130 +259,19 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             mutated_buffers={"carry"},
             graph_output_names={"carry"},
             reinterpret_output_names=set(),
-            ncores={},
-            ncores_reasons={},
-            division_is_fixed=False,
             buf_user_deps={},
         )
         carry = self._tagged_carry()
-        with (
-            patch.object(residency_rules, "_is_tiled_advancing", return_value=False),
-            patch.object(
-                residency_rules, "_is_read_advancing_anywhere", return_value=False
-            ),
-            patch.object(
-                residency_rules,
-                "_multi_output_extern_kernel_in_live_range",
-                return_value=False,
-            ),
-            patch.object(
-                residency_rules, "buffer_not_read_in_full", return_value=False
-            ),
-            patch.object(
-                residency_rules, "_would_produce_lx_back_gap", return_value=False
-            ),
-            patch.object(residency_rules, "_restickify_barrier", return_value=None),
-            patch.object(
-                residency_rules, "_is_index_or_indirectly_accessed", return_value=False
-            ),
-        ):
-            # No plan: today's refusal stands.
+        with self._clear_later_checks():
             self.assertEqual(
                 residency_rules._buffer_residency_reason(op=carry, **common),
                 "graph output mutated after production",
             )
-            # A validated plan clears exactly this branch.
             self.assertIsNone(
                 residency_rules._buffer_residency_reason(
                     op=carry, drain_plans={"carry"}, **common
                 )
             )
-            # The placement path never receives plans, but even if one leaked,
-            # the earlier mutation-target refusal still fires first.
-            common["division_is_fixed"] = True
-            self.assertEqual(
-                residency_rules._buffer_residency_reason(
-                    op=carry, drain_plans={"carry"}, **common
-                ),
-                "mutation target",
-            )
-
-
-class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
-    """Issue #4655: the restickify barrier tests one committed division
-
-    (``op.iteration_space_ownership``) that reflects whatever a prior pass
-    happened to leave on the op, not any division the joint solver could
-    actually pick. On the joint path (``division_is_fixed=False``) that
-    committed division may disagree with a perfectly compatible candidate the
-    solver's own ``cd_parent_matches``/``encode_read`` gate would
-    later select, permanently barring a buffer the solver would otherwise
-    place. The fixed-division (placement) path has no such downstream gate,
-    so it must still apply the barrier up front.
-    """
-
-    def setUp(self):
-        self.allocator = ScratchpadAllocator(
-            _UNBUILT_SOLVER, 2**20, division_mode="open"
-        )
-        self.op = _computed_buffer((64, 64), name="buf")
-        self.common = dict(
-            graph=SimpleNamespace(operations=[]),
-            name="buf",
-            uses=[0, 1],
-            op=self.op,
-            mutated_buffers=set(),
-            graph_output_names=set(),
-            reinterpret_output_names=set(),
-            ncores={},
-            ncores_reasons={},
-            buf_user_deps={},
-        )
-
-    def test_joint_path_does_not_consult_the_barrier(self):
-        with (
-            patch.object(
-                residency_rules, "_op_output_good_for_lx_reuse", return_value=True
-            ),
-            patch.object(residency_rules, "is_empty_tiled_layout", return_value=False),
-            patch.object(residency_rules, "_is_tiled_advancing", return_value=False),
-            patch.object(
-                residency_rules, "_is_read_advancing_anywhere", return_value=False
-            ),
-            patch.object(
-                residency_rules,
-                "_multi_output_extern_kernel_in_live_range",
-                return_value=False,
-            ),
-            patch.object(
-                residency_rules, "_is_index_or_indirectly_accessed", return_value=False
-            ),
-            patch.object(
-                residency_rules, "buffer_not_read_in_full", return_value=False
-            ),
-            patch.object(
-                residency_rules, "_would_produce_lx_back_gap", return_value=False
-            ),
-            patch.object(
-                residency_rules,
-                "_restickify_barrier",
-                return_value="read by restickify (local-read proof failed)",
-            ) as barrier,
-        ):
-            self.assertIsNone(
-                residency_rules._buffer_residency_reason(
-                    division_is_fixed=False, **self.common
-                )
-            )
-            barrier.assert_not_called()
-
-            self.assertEqual(
-                residency_rules._buffer_residency_reason(
-                    division_is_fixed=True, **self.common
-                ),
-                "read by restickify (local-read proof failed)",
-            )
-            barrier.assert_called_once()
 
 
 class TestEmptyLxEligibility(unittest.TestCase):
@@ -441,9 +306,7 @@ class TestEmptyLxEligibility(unittest.TestCase):
         with patch.object(
             residency_rules, "clone_at_graph_boundaries", return_value=True
         ):
-            reason = residency_rules._input_residency_reason(
-                graph, "value", [0, 1], division_is_fixed=False
-            )
+            reason = residency_rules._input_residency_reason(graph, "value", [0, 1])
         self.assertEqual(reason, "empty tensor")
         with patch.object(
             residency_rules, "_op_output_good_for_lx_reuse", return_value=True
@@ -456,9 +319,6 @@ class TestEmptyLxEligibility(unittest.TestCase):
                 mutated_buffers=set(),
                 graph_output_names=set(),
                 reinterpret_output_names=set(),
-                ncores={},
-                ncores_reasons={},
-                division_is_fixed=False,
                 buf_user_deps={},
             )
         self.assertEqual(reason, "empty tensor")
@@ -2396,6 +2256,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         ]:
             for module in (
                 allocator_module,
+                drain_plans,
                 table_candidates_module,
                 work_division_module,
             ):
@@ -2412,7 +2273,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         )
 
     def test_match_table_is_the_expected_pairs(self):
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         with self._patches():
             actual = self._table(allocator)
         # A rejected producer ("spilled") gets no entry. The wide matmul
@@ -2431,7 +2292,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         )
 
     def test_multi_axis_matmul_requires_a_representable_finished_write(self):
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         for partial, representable in ((True, True), (False, False)):
             with self.subTest(partial=partial, representable=representable):
                 self.parents["matmul"] = (
@@ -2461,7 +2322,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 return (second_views[index], False, True)
             return self._view_for_div(op, dep, buf_name, division, prep_cache)
 
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         with (
             self._patches(),
             patch.object(
@@ -2474,7 +2335,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         )
 
     def test_loop_carry_update_is_a_storage_ownership_edge(self):
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         storage_op = self.op_by_name["plain"]
         record = LoopCarryRecord(
             storage_name=storage_op.get_name(),
@@ -2519,7 +2380,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         # The update writes through the carry's storage, so a later read of the
         # update's name reads the storage's LX bytes: it needs the storage's
         # ownership, although the update itself is never an LX buffer.
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         update_op = self._carry_update()
         x = _isym("x")
         self.rw[self.consumer_op].reads.append(MemoryDep("update", x, (x,), (8,)))
@@ -2621,9 +2482,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             stack.enter_context(self._patches())
             for target, kwargs in (
                 ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
-                ("allocator.clone_at_graph_boundaries", {"return_value": True}),
                 ("table_candidates.clone_at_graph_boundaries", {"return_value": True}),
-                ("allocator.mem_usage_by_buf", {"return_value": mem_usage}),
                 ("table_candidates.mem_usage_by_buf", {"return_value": mem_usage}),
                 ("allocator.materialize_lx_relayouts", {}),
             ):
@@ -2653,7 +2512,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 GraphEditor.collective_operand_name
             )
 
-            plans = drain_plans.validated_drain_plans(graph, division_is_fixed=False)
+            plans = drain_plans.validated_drain_plans(graph)
+            allocator.candidates.drain_plans = plans
             allocator._validated_drain_plans = plans
             solve_graph, tables = allocator.candidates._build_graph(
                 graph, {}, division_menus._DivisionMap(divisions, set())
@@ -2871,7 +2731,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         return consumer_view is not None and parent_view.same_partition(consumer_view)
 
     def test_compatible_agrees_with_the_table(self):
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         with self._patches():
             table = self._table(allocator)
             for parent, pairs in table.items():
@@ -2945,7 +2805,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                             self.assertIsNone(edge)
 
     def test_no_consumer_op_matches_nothing(self):
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         with self._patches():
             edges = allocator.candidates._parent_residency_edges(
                 None, [], {}, {}, self.residency
@@ -2990,7 +2850,7 @@ class TestCloneDivisionMatching(unittest.TestCase):
         return (self.views[index], False, True)
 
     def _menu(self):
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         with ExitStack() as stack:
             for target, kwargs in [
                 ("_view_for_div", {"side_effect": self._view_for_div}),
@@ -3020,7 +2880,7 @@ class TestJointAllocator(unittest.TestCase):
         op = _computed_buffer((2, 128, 1024), name="direct_read_restickify")
         op._read_copy_elision_record = MagicMock()
         graph = MagicMock(operations=[op])
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         fixed = CoreDivision(splits={head: 2, sequence: 16})
 
         with (
@@ -3062,7 +2922,7 @@ class TestJointAllocator(unittest.TestCase):
         op.data = MagicMock(spec=Pointwise)
         op.name = "fixed_op"
         graph = MagicMock(operations=[op])
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         fixed = CoreDivision()
 
         with (
@@ -3093,7 +2953,7 @@ class TestJointAllocator(unittest.TestCase):
         op = _computed_buffer((4, 64), name="constrained_out")
         graph = MagicMock(operations=[op])
         allocator = ScratchpadAllocator(
-            _UNBUILT_SOLVER, size=1, prune=True, division_mode="open"
+            CpSatLayoutSolver, size=1, prune=True, division_mode="open"
         )
         safe = {batch: 1, m: 8}
         unsafe = {batch: 4, m: 8}
@@ -3165,7 +3025,11 @@ class TestJointAllocator(unittest.TestCase):
         rw = MagicMock()
         rw.writes = [MagicMock(index=0)]
         rw.reads = []
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        # The enumerated (table) menu; the lazy one never enumerates.
+        with patch.object(allocator_module.config, "lx_division_encoding", "table"):
+            allocator = ScratchpadAllocator(
+                CpSatLayoutSolver, size=1, division_mode="open"
+            )
 
         fixed = CoreDivision(splits={1: 2})
         with (
@@ -3206,7 +3070,7 @@ class TestJointAllocator(unittest.TestCase):
         op = _computed_buffer((4, 64), name="over_budget_out")
         graph = MagicMock(operations=[op])
         allocator = ScratchpadAllocator(
-            _UNBUILT_SOLVER, size=1, prune=True, division_mode="open"
+            CpSatLayoutSolver, size=1, prune=True, division_mode="open"
         )
         over_budget = {batch: 4, m: 16}  # 64 cores against a 32-core budget
         rw = MagicMock(
@@ -3267,7 +3131,7 @@ class TestJointAllocator(unittest.TestCase):
             )
         )
         plan = allocator_module.SolvedPlan.of_buffers([buf])
-        allocator = ScratchpadAllocator(_UNBUILT_SOLVER, size=1, division_mode="open")
+        allocator = ScratchpadAllocator(CpSatLayoutSolver, size=1, division_mode="open")
         # Priced at 1024 bytes over 1 core x 4 tiles = 256; a smaller applied
         # footprint fits the interval.
         for applied in (256, 128):
@@ -3384,7 +3248,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                 ]
             )
             allocator = ScratchpadAllocator(
-                _UNBUILT_SOLVER, size=1, division_mode="open"
+                CpSatLayoutSolver, size=1, division_mode="open"
             )
             with (
                 patch.object(EnumerationFactory, "applies_tilings", True),

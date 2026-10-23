@@ -220,8 +220,7 @@ class CpSat:
 class Decomposed(CpSat):
     """Enumerates the ``Table`` axes the strategy marked (``MarkTableAxis``)
     and solves the rest of the model at each leaf with CP-SAT, keeping the
-    best leaf: today's ``ExhaustiveSearchSolver`` generalized to any posted
-    model. The model is posted once; a leaf pins the marked index vars by
+    best leaf: an exhaustive search over the menus of any posted model. The model is posted once; a leaf pins the marked index vars by
     narrowing their domains, so nothing is rebuilt per leaf. It costs one
     inner solve per leaf per ladder stage and is exact when every leaf ends
     OPTIMAL or INFEASIBLE."""
@@ -284,18 +283,6 @@ class Decomposed(CpSat):
 def _set_domain(var_proto, domain: list[int]) -> None:
     var_proto.domain.clear()
     var_proto.domain.extend(domain)
-
-
-class GraphSolver(Protocol):
-    """A solver that works on the graph directly instead of a posted model
-    (greedy, first-fit, best-fit, simulated annealing): it reads the nodes,
-    enforces the rules a strategy would encode itself (it is built for one
-    configuration, which ``accepts`` checks), and fills the nodes' decisions
-    as ``SpyreOptimizationGraph.solve`` does."""
-
-    def accepts(self, strategy: Any) -> bool: ...
-
-    def solve(self, graph: Any, strategy: Any, cost_expr: Any) -> list: ...
 
 
 class _SolvedRecording(CpSat):

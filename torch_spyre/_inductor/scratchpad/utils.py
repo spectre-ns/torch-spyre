@@ -88,8 +88,8 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     exactly "written but never read" for a computed buffer.
 
     Note: previously, unused graph inputs did not appear in the returned dict at
-    all.  Now they appear with an empty list, and ``graph_builder.placement_graph`` skips
-    them on ``not uses``."""
+    all.  Now they appear with an empty list, and the graph builder skips them on
+    ``not uses``."""
     liveness: dict[str, list[int]] = {}
     for input_name in graph.graph_input_names:
         liveness[input_name] = []

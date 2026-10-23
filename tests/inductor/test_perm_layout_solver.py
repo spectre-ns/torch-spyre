@@ -910,15 +910,12 @@ class NativeSolverDifferentialTests(TestCase):
     def test_loop_start_override_does_not_change_unrelated_preloop_plan(self):
         import sympy
 
-        from torch_spyre._inductor.scratchpad.exhaustive_search import (
-            ExhaustiveSearchSolver,
-        )
-        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-            FirstFitLayoutSolver,
-        )
         from torch_spyre._inductor.scratchpad.plan_solver import (
             CoreDivision,
             CoreDivisionBuffer,
+        )
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import (
+            SaCoOptimizingSolver,
         )
 
         loop_carry = LifetimeBoundBuffer(
@@ -951,7 +948,7 @@ class NativeSolverDifferentialTests(TestCase):
         before = CoreDivisionBuffer(
             "before", 128, [0, 1], core_divisions=[CoreDivision()]
         )
-        result = ExhaustiveSearchSolver.wrapping(FirstFitLayoutSolver)(
+        result = SaCoOptimizingSolver(
             [unrelated, before], 160, alignment=1
         ).plan_layout_and_core_divisions()
 
@@ -1277,12 +1274,10 @@ class NativePermutationViewTests(TestCase):
       the ``py::keep_alive`` securing this was initially attached to the property
       rather than to the getter, where it silently does nothing, and the whole
       suite passed regardless.
-    - It must stay **live**. ``annealing_step_swap`` captures the view once and
-      re-reads it after each ``swap``, so a snapshot would make the search read
-      pre-swap values. That degrades rather than breaks: the search would simply
-      explore a different trajectory and still return a feasible layout, so only
-      the cross-packer equivalence test could notice, and only because it demands
-      bit-identical trajectories.
+    - It must stay **live**. A caller that captures the view once and re-reads
+      it after each ``swap`` would, with a snapshot, read pre-swap values. That
+      degrades rather than breaks: a search would simply explore a different
+      trajectory and still return a feasible layout.
 
     These are failures where the program keeps running and produces plausible
     output, which is why they are asserted against the mechanism directly.
@@ -1317,7 +1312,7 @@ class NativePermutationViewTests(TestCase):
         self.assertEqual(len(churn), 200)  # keep the churn alive to this point
 
     def test_captured_view_observes_later_mutation(self):
-        """The liveness half: ``annealing_step_swap`` depends on this exactly."""
+        """The liveness half."""
         plan = self._plan()
         view = plan.permutation  # captured ONCE, before the mutation
         plan.swap(0)

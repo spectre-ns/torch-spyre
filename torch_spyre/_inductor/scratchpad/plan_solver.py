@@ -15,7 +15,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import ClassVar, Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
 import itertools
 import math
@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     )
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         ChosenRelayout,
-        LXRelayoutPlan,
         RelayoutCandidate,
     )
 
@@ -98,15 +97,6 @@ class LifetimeBoundBuffer:
     # manufacture reads or inflate residency/spill benefit.
     lifetime_start_override: Optional[int] = None
     lifetime_end_override: Optional[int] = None
-    # Buffers that must be placed atomically with this one. Despite the name,
-    # this is one-to-many: only the group root carries the complete partner list.
-    paired_with: list["LifetimeBoundBuffer"] = field(
-        default_factory=list, repr=False, compare=False
-    )
-    # LX relayout plans for which this buffer is the source.
-    lx_relayout_plans: list["LXRelayoutPlan"] = field(
-        default_factory=list, repr=False, compare=False
-    )
     # The physical per-core ownership accepted by the residency judge. Placement
     # writes this beside the LX address; it must never derive another view.
     lx_view: Optional["PerCoreView"] = field(default=None, repr=False, compare=False)
@@ -329,10 +319,7 @@ class CoreDivision:
 @dataclass
 class CoreDivisionBuffer(LifetimeBoundBuffer):
     """A :class:`LifetimeBoundBuffer` carrying the joint core-division metadata
-
-    The placement-only solvers (greedy/first-fit/best-fit) never look at these
-    fields, so they stay on this subclass rather than the shared base.
-    """
+    (the buffer form of an open node)."""
 
     core_divisions: list[CoreDivision] = field(default_factory=list)
     # Producer buffer names; defines the producer->consumer edges for matching.
@@ -976,11 +963,6 @@ class MemoryPlanSolver(ABC):
     solvers that can also choose the division.
     """
 
-    # Places a committed LX relayout's source and destinations as a pair
-    # (``LifetimeBoundBuffer.paired_with``); the allocator collects committed
-    # relayout plans only for such a solver (``Capabilities``).
-    pairs_buffers: ClassVar[bool] = False
-
     def __init__(
         self, buffers: Sequence["LifetimeBoundBuffer"], size: int, alignment: int = 128
     ):
@@ -1004,9 +986,6 @@ class MemoryPlanSolver(ABC):
                 defaults to.
         """
         self.buffers: list["LifetimeBoundBuffer"] = list(buffers)
-        assert self.pairs_buffers or not any(
-            buffer.paired_with for buffer in self.buffers
-        ), f"{type(self).__name__} does not support paired-buffer placement"
         self.limit = size
         self.alignment = alignment
 

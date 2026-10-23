@@ -50,8 +50,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     TileSpec,
     solved_bindings,
 )
-from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
-from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -73,14 +71,10 @@ except ImportError:
     _HAS_ORTOOLS = False
     CpSatLayoutSolver = None  # type: ignore[assignment,misc]
 
-from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
-    BestFitLayoutSolver,
+from torch_spyre._inductor.scratchpad.first_fit import (
     FirstFitLayoutSolver,
     _check_in_place_relationships,
     _topological_sort,
-)
-from torch_spyre._inductor.scratchpad.simulated_annealing import (
-    SimulatedAnnealingLayoutSolver,
 )
 
 LARGE_SIZE = 512
@@ -117,106 +111,7 @@ class TestCoreDivision(TestCase):
         )
 
 
-class TestExhaustiveSearchResidency(TestCase):
-    def test_mismatched_consumer_spills_the_producer(self):
-        """A consumer mismatch makes its input unsafe in LX, not its output."""
-
-        producer = CoreDivisionBuffer(
-            "producer", 128, [0, 1], core_divisions=[CoreDivision()]
-        )
-        consumer = CoreDivisionBuffer(
-            "consumer",
-            128,
-            [1, 2],
-            core_divisions=[CoreDivision()],
-            parents=["producer"],
-            cd_parent_matches={"producer": []},
-        )
-        sink = CoreDivisionBuffer(
-            "sink",
-            128,
-            [2, 3],
-            core_divisions=[CoreDivision()],
-            parents=["consumer"],
-            cd_parent_matches={"consumer": [(0, 0)]},
-            residency_reason="no consumer reads it from LX",
-        )
-
-        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
-            [producer, consumer, sink], size=512, alignment=1
-        )
-        result = {
-            buffer.name: buffer for buffer in solver.plan_layout_and_core_divisions()
-        }
-
-        self.assertIsNone(result["producer"].address)
-        self.assertIsNotNone(result["consumer"].address)
-        self.assertEqual(result["producer"].spill_reason, "core div mismatch")
-
-    @staticmethod
-    def _four_output_cores():
-        return CoreDivision(splits={sympy.Symbol("output"): 4})
-
-    @staticmethod
-    def _solve(buffers, lx_size):
-        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
-            buffers, size=lx_size, alignment=1
-        )
-        return {b.name: b for b in solver.plan_layout_and_core_divisions()}
-
-    def test_tiled_candidates_are_rejected(self):
-        """A tile-sized reservation is unsafe without matching graph tiling."""
-        buffer = CoreDivisionBuffer(
-            "buffer",
-            1024,
-            [0, 1],
-            core_divisions=[
-                CoreDivision(),
-                CoreDivision(tiling=TileSpec((TileAxis(host_dim=0, count=4),))),
-            ],
-        )
-        with self.assertRaisesRegex(ValueError, "requires untiled candidates"):
-            self._solve([buffer], lx_size=256)
-
-    def test_in_place_reuse_compares_per_core_sizes(self):
-        """In-place reuse compares the bytes that one core holds of each buffer."""
-        # In each case, the child starts at the last use of the parent. At that
-        # tick, both buffers are live.
-        with self.subTest("partitioned parent, whole child"):
-            parent = CoreDivisionBuffer(
-                "parent", 1024, [0, 1], core_divisions=[self._four_output_cores()]
-            )
-            child = CoreDivisionBuffer(
-                "child",
-                512,
-                [1, 2],
-                core_divisions=[CoreDivision()],
-                in_place_parents=["parent"],
-            )
-            # Each core holds 256 bytes of the parent. The 512-byte child
-            # cannot reuse that slot; both fit side by side in 768 bytes.
-            result = self._solve([parent, child], lx_size=768)
-            self.assertEqual(result["parent"].address, 0)
-            self.assertEqual(result["child"].address, 256)
-
-        with self.subTest("whole parent, partitioned child"):
-            parent = CoreDivisionBuffer(
-                "parent", 512, [0, 1], core_divisions=[CoreDivision()]
-            )
-            child = CoreDivisionBuffer(
-                "child",
-                1024,
-                [1, 2],
-                core_divisions=[self._four_output_cores()],
-                in_place_parents=["parent"],
-            )
-            # Each core holds 256 bytes of the child, which fits in the
-            # parent's 512-byte slot. LX is full, so the child must reuse it.
-            result = self._solve([parent, child], lx_size=512)
-            self.assertEqual(result["parent"].address, 0)
-            self.assertEqual(result["child"].address, 0)
-
-
+@unittest.skipUnless(_HAS_ORTOOLS, "ortools not installed")
 class TestAllocatorSpillReasons(TestCase):
     """The allocator reports spill reasons from the solved plan alone."""
 
@@ -226,30 +121,29 @@ class TestAllocatorSpillReasons(TestCase):
         )
         first = LifetimeBoundBuffer("first", 128, [0, 2])
         return SolvedPlan.of_buffers(
-            GreedyLayoutSolver([barred, first, *extra], 128, 1).plan_layout()
+            CpSatLayoutSolver([barred, first, *extra], 128, 1).plan_layout()
         )
 
-    def test_placement_allocator(self):
-        # "late" is live while "first" fills the scratchpad.
+    def test_committed_allocator(self):
+        # "late" is live while "first" fills the scratchpad, so one of the two
+        # spills; which one is the solver's choice.
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
-        reasons = ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(
+        spilled = {n.name for n in allocation.graph.get_nodes() if not n.resident}
+        self.assertEqual(len(spilled - {"barred"}), 1)
+        reasons = ScratchpadAllocator(CpSatLayoutSolver, 128)._get_spill_reasons(
             allocation
         )
-        self.assertEqual(set(reasons), {"barred", "late"})
+        self.assertEqual(set(reasons), spilled)
         self.assertEqual(reasons["barred"], "op not allowed")
-        # Greedy gives a capacity spill no reason of its own.
-        self.assertEqual(reasons["late"], SOLVER_CHOSE_SPILL)
+        (capacity_spill,) = spilled - {"barred"}
+        self.assertEqual(reasons[capacity_spill], SOLVER_CHOSE_SPILL)
 
-    def test_joint_allocator_reports_as_placement_does(self):
+    def test_open_allocator_reports_as_committed_does(self):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
-        joint = ScratchpadAllocator(
-            ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver),
-            128,
-            division_mode="open",
-        )
+        joint = ScratchpadAllocator(CpSatLayoutSolver, 128, division_mode="open")
         self.assertEqual(
             joint._get_spill_reasons(allocation),
-            ScratchpadAllocator(GreedyLayoutSolver, 128)._get_spill_reasons(allocation),
+            ScratchpadAllocator(CpSatLayoutSolver, 128)._get_spill_reasons(allocation),
         )
 
 
@@ -373,7 +267,7 @@ def _two_gap_buffers():
     b_left(40,70) and b_right(70,100), x sees two gaps:
       (0,40)   waste = 30
       (100,120) waste = 10
-    FirstFit picks (0,40) → addr=0; BestFit picks (100,120) → addr=100.
+    FirstFit picks (0,40) → addr=0, not the tighter (100,120).
     """
     return [
         LifetimeBoundBuffer("b_mid", 40, [2, 3]),
@@ -483,7 +377,7 @@ class BaseLayoutSolverTests:
     def make_buffer(self, name, size, uses, **kwargs):
         """Build the buffer flavour the solver under test consumes.
 
-        The placement-only solvers (greedy/first-fit/best-fit) read only the
+        The placement-only solvers (first-fit, CP-SAT's plan_layout) read only the
         fields on :class:`LifetimeBoundBuffer`, so the base suite constructs
         those. :class:`JointDivisionSolverTests` overrides this to emit
         :class:`CoreDivisionBuffer`s carrying whole-buffer divisions, since the
@@ -735,11 +629,7 @@ class BaseLayoutSolverTests:
             self.make_buffer("buffer2", 100, [2, 3]),
             self.make_buffer("buffer3", 100, [3]),
         ]
-        if self.solver_class == GreedyLayoutSolver:
-            self.verify_layout(buffers, [0, 256, 384, 256], LARGE_SIZE, ALIGNMENT)
-        else:
-            # Other solvers are smarter than greedy
-            self.verify_layout(buffers, [256, 0, 128, 0], LARGE_SIZE, ALIGNMENT)
+        self.verify_layout(buffers, [256, 0, 128, 0], LARGE_SIZE, ALIGNMENT)
 
     def test_inplace_allocation(self):
         # Test that adding inplace options allows for more efficient peak usage
@@ -1027,7 +917,7 @@ def _run_determinism_snippets(solver_class_name, solver_module):
 
 
 class ScoreOrderingTests:
-    """Tests for the priority-score ordering in FirstFit/BestFit, plus a
+    """Tests for the priority-score ordering in FirstFit, plus a
     cross-process determinism check for in-place parent selection.
 
     Buffers are placed in ascending order of ``(span - discount) / len(uses)``
@@ -1035,9 +925,8 @@ class ScoreOrderingTests:
     relationship. These tests isolate the two terms the old
     shortest-lifetime-first heuristic ignored: ``len(uses)`` and the in-place
     discount, plus a regression check that in-place parent selection does not
-    depend on ``PYTHONHASHSEED``. They do not apply to the Greedy solver,
-    whose time-stepped plan_layout does not score buffers and does not share
-    the ``_build_gaps``/in-place-parent-selection logic being guarded here.
+    depend on ``PYTHONHASHSEED`` (the SA co-optimizer seeds its permutation
+    from this layout, so the seed would vary with it).
     """
 
     def test_higher_use_count_placed_first(self):
@@ -1117,21 +1006,12 @@ class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCa
         self.assertEqual(x_addr, 0)
 
 
-class TestBestFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
-    solver_class = BestFitLayoutSolver
-
-    def test_picks_tightest_gap(self):
-        result = self.solver_class(_two_gap_buffers(), 120, 1).plan_layout()
-        x_addr = next(b.address for b in result if b.name == "x")
-        self.assertEqual(x_addr, 100)
-
-
 def _assert_legal_packing(test, result, expected_addresses, size, alignment):
     """Assert a CP-SAT layout is *valid* rather than address-for-address equal to
     the gap heuristics' answer.
 
     The solver is a satisfiability search, so it returns some legal packing, not
-    the specific addresses first-fit/best-fit pick. Shared by both CP-SAT entry
+    the specific addresses first-fit picks. Shared by both CP-SAT entry
     points: the joint suite and the placement-only suite check the same
     invariants (aligned, within capacity, no overlap between live buffers) plus
     "places at least as many buffers as the heuristic", which holds because the
@@ -2715,28 +2595,6 @@ class TestCpSatUnallocatedReads(TestCase):
             ]
         )
         self.assertNotIn("b0", pinned)
-
-
-class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
-    solver_class = GreedyLayoutSolver
-
-
-class TestSimulatedAnnealingLayoutSolver(
-    ScoreOrderingTests, BaseLayoutSolverTests, TestCase
-):
-    solver_class = SimulatedAnnealingLayoutSolver
-
-    def test_largest_buffer_evicted_when_full(self):
-        # unlike other solvers, simulated annealing finds the optimal solution
-        self.verify_layout(
-            [
-                LifetimeBoundBuffer("a", 10, [0, 3]),
-                LifetimeBoundBuffer("b", 20, [0, 3]),
-                LifetimeBoundBuffer("c", 30, [0, 3]),
-            ],
-            [None, 0, 20],
-            size=50,
-        )
 
 
 class TestTopologicalSort(TestCase):

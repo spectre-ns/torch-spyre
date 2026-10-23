@@ -9,7 +9,7 @@ working on next.
 Scratchpad planning runs by default. The pass is gated by `lx_planning`,
 which has defaulted to `1` since [#2459](https://github.com/torch-spyre/torch-spyre/pull/2459).
 The OR-Tools CP-SAT solver (`config.layout_solver = "cpsat"`) is the
-default. Greedy, first-fit, and best-fit are available as opt-ins;
+default; `"simulated_annealing"` selects the annealing co-optimizer instead.
 `layout_solver` can also be set from the `LAYOUT_SOLVER` environment
 variable.
 
@@ -91,8 +91,8 @@ measured result is fixed per-bundle overhead.
 
 The four stages map onto code under `torch_spyre/_inductor/scratchpad/`:
 LX-eligible op outputs (stage 2), in-place reuse (stage 3), and
-input-boundary cloning (stage 4), which `ScratchpadAllocator` performs
-inline via `_eligible_clone_inputs`, gated by `clone_at_graph_boundaries()`.
+input-boundary cloning (stage 4), where a graph input the solve places in
+LX is cloned there, gated by `clone_at_graph_boundaries()`.
 
 ## Assumptions
 
@@ -205,9 +205,10 @@ the graph input and graph output, for `3MN` bytes total, a 62% reduction.
 
 **Stage 4, clone the input to LX.** The graph input is read by several
 ops. Without a clone each reader would re-fetch from HBM.
-`ScratchpadAllocator._eligible_clone_inputs` detects multi-use inputs that
-fit in LX and inserts a `clone` op at the front of the graph, gated by
-`clone_at_graph_boundaries()`. The clone reads HBM once and
+`TableCandidates._eligible_clone_inputs` offers the solve every multi-use
+input that may reside, gated by `clone_at_graph_boundaries()`; for each one
+the solve places in LX, `_push_allocation` inserts a `clone` op before its
+first reader. The clone reads HBM once and
 writes LX; every subsequent op reads from LX. After stage 4 total HBM is
 `2MN`, the input read plus the output write, which is the theoretical
 minimum for this graph.
@@ -253,82 +254,91 @@ stuck on HBM. That mismatch is what motivates co-optimization (below).
 Scratchpad planning has three layers with separate concerns:
 
 :::{figure} ../_static/images/lx/allocator-architecture.svg
-:alt: ScratchpadAllocator delegates to a pluggable MemoryPlanSolver and runs optional graph passes around it
+:alt: ScratchpadAllocator builds the solve's graph, hands it to the configured graph solver, and runs optional graph passes around it
 :width: 480px
 :align: center
 
-`ScratchpadAllocator` runs pre-passes (clone insertion), builds the solve's
-graph from the IR (one node per IR buffer), hands it to a pluggable solver,
-then commits the solved graph: the chosen LX addresses onto buffer layouts.
-In its open division mode (`division_mode="open"`) the same allocator also
-chooses each op's core division, jointly with placement.
+`ScratchpadAllocator` runs pre-passes, builds the solve's graph from the IR
+(one node per IR buffer), hands it to the configured graph solver, then
+commits the solved graph: divisions, relayouts and the chosen LX addresses.
+In its open division mode (`division_mode="open"`) the solve also chooses
+each op's core division jointly with placement; in the committed mode each
+op keeps the division work division committed.
 :::
 
 The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 
 | File | Responsibility |
 |---|---|
-| `passes.py` | `ScratchpadOptimizationPass` ABC, `_NameSwapHandler` |
-| `plan_solver.py` | `MemoryPlanSolver` ABC (declarative exclusion via `partition`/`excluded`), `LifetimeBoundBuffer` |
-| `greedy_solver.py` | `GreedyLayoutSolver` |
-| `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
-| `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT): `solve_graph` posts the graph through the strategy to the CP-SAT backend; its buffer form solves a buffer list |
-| `graph_builder.py` | The placement-only graph built from the IR (`placement_graph`) |
-| `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat`, `Decomposed`, `Mip`, `BruteForce`, `Annealing`, and the `GraphSolver` protocol |
-| `graph_solvers.py` | Graph solvers: `PlacementSolver` (placement views), `DecomposedPlacement` (the exhaustive search), `BufferSolver` (the annealing co-optimizer over the buffer form of the graph) |
+| `allocator.py` | `ScratchpadAllocator` (open and committed division modes), `ScratchpadOptimizationPass`, `select_allocator`, `scratchpad_planning`, and the commit back to the IR (`commit_divisions`, `commit_lx_views`, `_push_allocation`) |
+| `table_candidates.py` | `TableCandidates`: builds the solve's graph from the IR (`prepare_graph`) and the table encoding's candidates (division menus, view tables, input clones, priced relayouts and copies) |
+| `residency_rules.py` | Why an op output or graph input may not reside in LX (`_residency_reasons`, one reason per buffer), and which reads may take over a producer's storage in place |
+| `division_menus.py` | An op's candidate work divisions read from the IR: split options, legality and stick-fit checks, matmul and reduction axis parsing, the read-distance filter, and the pruned menu (`_enum_split_options`, `prune=True`) |
+| `drain_plans.py` | Lifetimes around coarse-tile loops: the in-place handoff tick, loop trip counts, and post-loop drain plans (`validated_drain_plans`) |
+| `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
+| `encoding_strategy.py` | `EncodingStrategy` / `TableStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables); `EnumerationFactory` |
 | `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
 | `lazy_relayout.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
-| `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
-| `encoding_strategy.py` | `EncodingStrategy` / `TableStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
-| `table_candidates.py` | `TableCandidates`: the table encoding's candidates (division menus, view tables, priced relayouts and copies), built for the joint allocator's solvers |
+| `graph_solvers.py` | Graph solvers and their `Capabilities`: `GraphSolver`, `BufferSolver` (runs a buffer-form solver, the annealing co-optimizer, over the graph), `graph_solver_for` |
+| `ilp_solver_ortools.py` | `ModelSolver` (`layout_solver="cpsat"`), which posts the graph through the strategy to CP-SAT, and `CpSatLayoutSolver`, its buffer form for tests and capture replay |
+| `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat`, `Decomposed`, `Mip`, `BruteForce`, `Annealing`, and the `GraphSolver` protocol |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
-| `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
-| `cooling_schedules.py` | cooling schedules for the annealing search |
-| `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
+| `pricing.py` | The priced objective (`cost_expr`) over each node's symbolic work split and residency, and its dump (`dump_cost_expr`) |
+| `sa_cooptimizer.py` | `SaCoOptimizingSolver`, the simulated-annealing co-optimizer (`layout_solver="simulated_annealing"`) |
+| `first_fit.py` | `FirstFitLayoutSolver`, which seeds the annealer's permutation |
+| `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer the annealer composes |
+| `plan_solver.py` | The buffer form: `LifetimeBoundBuffer`, `CoreDivisionBuffer`, `CoreDivision`, `TileSpec`, relayout copy buffers, the `MemoryPlanSolver` / `CoreDivisionLayoutSolver` ABCs, and `SolveError` |
+| `coarse_tiling.py` | `CoarseTilingPass`, which applies chosen coarse tilings (`TileSpec`s) to the graph |
+| `lx_relayout.py` | LX relayouts: candidates, fired groups (`FiredRelayoutGroup` to `LXRelayoutPlan`) and `materialize_lx_relayouts` |
+| `lx_context_switching.py` | `LxContextSwitchingPass`, LX dump/restore around opaque `FallbackKernel` calls |
 | `graph_editor.py` | `GraphEditor`, the clone/rewrite helper used by input- and output-boundary cloning |
-| `allocator.py` | `ScratchpadAllocator` (committed and open division modes) and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |
 
 ### Entry point
 
 ```python
-scratchpad_planning(graph, allocator=ScratchpadAllocator())
+scratchpad_planning(graph)  # allocator=select_allocator()
 ```
 
-`ScratchpadAllocator` runs the following pipeline:
+`ScratchpadAllocator.plan_allocation` runs the following pipeline:
 
-1. **Input-boundary cloning.** When `clone_at_graph_boundaries()` is set,
-   `_eligible_clone_inputs` walks graph inputs and inserts a `clone` for any
-   HBM input that is read more than once *and* fits on LX. The clone output
-   becomes a fresh LX-eligible buffer.
-2. **The solve's graph.** `graph_builder.placement_graph` (placement only)
-   or `TableCandidates.prepare_graph` (the open division mode) builds one
+1. **Pre-passes.** `pre_optimization_passes`; `select_allocator` configures
+   none.
+2. **The solve's graph.** `TableCandidates.prepare_graph` builds one
    `ResourceNode` per IR buffer, *including* the ones that may not reside,
-   with its lifetime, footprint and in-place edges; the open mode also
-   builds the table strategy's candidates (`CandidateTables`). Nothing is
-   filtered out; `ScratchpadAllocator._residency_reasons` (in `allocator.py`)
+   with its lifetime, footprint and in-place edges, and the table strategy's
+   candidates (`CandidateTables`). In the open mode each op's menu holds its
+   candidate divisions; in the committed mode, only its committed division.
+   When `clone_at_graph_boundaries()` is set, every graph input that clears
+   `residency_rules._input_residency_reason` is a node too
+   (`TableCandidates._eligible_clone_inputs`), so the solve decides whether
+   to clone it into LX. Nothing is filtered out; `residency_rules._residency_reasons`
    decides eligibility and the verdict rides along as the node's
    `residency_reason` (see
    [Declarative exclusion](#declarative-exclusion) below).
-3. **Layout planning.** `MemoryPlanSolver.solve_graph` fills every node's
-   decisions: a placement-only solver packs the nodes' placement views
-   (`graph_solvers.PlacementSolver`), CP-SAT encodes the graph through the
-   strategy, and a node left out of LX stays on HBM with its
-   `spill_reason`.
-4. **Push allocation.** The solved graph (`SolvedPlan`) is committed:
-   successful placements are written to `layout.allocation["lx"] = addr` on
-   each buffer's `FixedTiledLayout`.
-5. **Post-passes.** Reserved for solver-driven graph mutations such as op
-   re-ordering. Output-boundary cloning already runs as part of push
-   allocation: `_push_allocation` calls
+3. **The solve.** The graph solver fills every node's decisions under the
+   priced cost expression (`pricing.cost_expr`): division, residency, offset,
+   and which relayout copies fire. A node left out of LX stays on HBM with
+   its `spill_reason`.
+4. **Commit.** The chosen coarse tilings are applied, divisions and LX views
+   committed, fired relayouts materialized, and the placements written to
+   `layout.allocation["lx"] = addr` on each buffer's `FixedTiledLayout`
+   (`_push_allocation`). Output-boundary cloning runs here:
    `graph_editor.push_allocation_with_clone(..., input=False)` and
-   `change_graph_output` to promote a producer to LX and clone the value
-   back to a graph output.
+   `change_graph_output` promote a producer to LX and clone the value back
+   to a graph output.
+5. **Post-passes.** `LxContextSwitchingPass` when
+   `config.enable_lx_context_switching` is set (see
+   [LX context switching](#lx-context-switching)).
+
+If the solve raises `SolveError` in the open mode, `scratchpad_planning`
+replans once in the committed mode with the same solver; if that fails too,
+nothing is placed in LX.
 
 ### Declarative exclusion
 
-Eligibility is decided in exactly one place, `ScratchpadAllocator._residency_reasons`
-in `allocator.py`, and carried
+Eligibility is decided in exactly one place, `_residency_reasons` (and
+`_input_residency_reason` for graph inputs) in `residency_rules.py`, and carried
 to the solver as a single field, the node's `residency_reason`:
 `None` means the buffer may be pinned, any string is the reason it may not.
 
@@ -336,39 +346,39 @@ to the solver as a single field, the node's `residency_reason`:
 solver so it keeps participating in slicing matching and in-place chains: a
 forced-out consumer keeps its producers' residency viable instead of
 orphaning them, and an in-place parent reference always resolves. Honouring
-the verdict is therefore each solver's responsibility, via
-`MemoryPlanSolver.excluded`, and every solver (greedy, first-fit, best-fit,
-simulated annealing, CP-SAT) routes its exclusions through it.
+the verdict is therefore each solver's responsibility: CP-SAT pins a barred
+node non-resident, and the buffer-form solvers route it through
+`MemoryPlanSolver.excluded`.
 
 **Where a check belongs.** Precomputable from the graph ⇒ it lives in
 `_residency_reasons` as a reason string. Depends on the solver's free variables ⇒
-it stays a constraint in the solver: today that is only CP-SAT's per-edge
-slicing match over the division variables and its in-place merge gate.
-Capacity is the exception that belongs to neither allocator: it is solver
-state, so it lives on `MemoryPlanSolver.excluded` alongside the tag.
+it stays a constraint in the solve: the per-edge residency relation over
+the two ends' divisions and the in-place merge gate. The relation applies in
+both division modes, so a producer and a consumer that slice a buffer
+differently keep it out of LX unless the solve places a relayout copy for
+that edge (CP-SAT only).
+Capacity is solver state, so it is checked by the solver
+(`MemoryPlanSolver.excluded` in the buffer form).
 
 The checks, in evaluation order (the first failure is the reason reported):
 
 | Reason | Why |
 |---|---|
-| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name inside `OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
+| `op not allowed` | not a `ComputedBuffer` with a `FixedTiledLayout`, a mutation layout, or an op name inside `OP_OUTPUT_NOT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate; a counted-loop carry is always allowed) |
 | `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
 | `empty tensor` | A zero-sized tensor needs no LX reservation |
-| `mutation target` | filled by offset writes, so one LX base mis-addresses it |
+| `mutation target` | filled by offset writes, so one LX base mis-addresses it (a counted-loop carry is exempt) |
 | `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
-| `read by restickify (cross-frame barrier)` | the read and write frames are transposes, so a per-core LX slice is not self-sufficient (the buffer a restickify reads; its own output is safe and is not barred) |
-| `read by restickify (local-read proof failed)` | Relayout is enabled, but exact physical ownership could not prove that every restickify read stays on the same core |
-| `extern kernel user` | extern ops read from HBM |
+| `extern kernel user or live across extern kernel` | extern ops read from HBM, and an opaque call can clobber LX (only with `enable_lx_context_switching` off; see [LX context switching](#lx-context-switching)) |
+| `live across multi-output extern kernel` | `LxContextSwitchingPass` does not bracket multi-output `FallbackKernel`s |
 | `index tensor or indirectly accessed` | index tensors and the value tensors they index into are read via data-dependent addressing, so they must stay in HBM |
 | `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
 | `graph output is a ReinterpretView` | output cloning cannot rewrap the view |
+| `graph output mutated after production` | the output clone would copy the value from before a later in-place update (a validated drain plan clears this) |
+| `use is not rewritable to the clone` | graph inputs only: some use cannot be redirected to the clone |
 | `partial/offset read` | a sliced or multi-offset read mis-addresses a single LX base |
-| `core div mismatch: …` | the buffer's users disagree on core slicing (**placement path only**: the joint solver *chooses* the division, so its slicing gate decides instead) |
 | `no consumer reads it from LX` | residency would save nothing |
 | `lx back gap` | `backGap` is supported for HBM but not LX |
-
-That last distinction is the only difference between the two allocators,
-and it is a parameter (`division_is_fixed`) rather than a second predicate.
 
 ### Per-core size and core-division mismatch
 
@@ -418,83 +428,38 @@ Once `layout.allocation["lx"]` is set:
 
 ## Solvers
 
-`config.layout_solver`
-(`"greedy" | "firstfit" | "bestfit" | "cpsat" | "simulated_annealing"`)
-picks the solver; it defaults from the `LAYOUT_SOLVER` environment
-variable (falling back to `"cpsat"`).
+`config.layout_solver` (`"cpsat" | "simulated_annealing"`) picks the graph
+solver; it defaults from the `LAYOUT_SOLVER` environment variable (falling
+back to `"cpsat"`). `config.co_optimizing_lx_planning` picks the division
+mode, the same for either solver.
 
-### GreedyLayoutSolver
+### CP-SAT
 
-Walks transition points in chronological order. At each point it
-deallocates expired buffers, then for each newly-live buffer:
-
-1. If a declared in-place parent is alive at the previous time step and
-   the child fits in the parent's slot, reuse the parent's address.
-2. Otherwise find a free block. Try address 0, then above the high-water
-   mark, then gaps between live allocations.
-
-It is simple, easy to reason about, and in-place reuse is automatic.
-Decisions are local, though. Placing buffer A at address 0 can block a
-later large buffer C that would have benefited from a low address.
-
-### FirstFitLayoutSolver and BestFitLayoutSolver
-
-Both solvers see *all* buffers up front, sort them topologically with
-ties broken by ascending lifetime, and place them shortest-life-first
-into the free address space.
-
-For each buffer, free gaps during its lifetime are computed by
-subtracting the address intervals of every overlapping placed buffer.
-In-place parent addresses are kept as candidate gaps so the child can
-land on top of them.
-
-The two solvers differ only in the gap-selection policy:
-
-- `FirstFitLayoutSolver` picks the first gap large enough.
-- `BestFitLayoutSolver` picks the gap that leaves the smallest remainder
-  after placement.
-
-Both naturally avoid the "buffer at address 0 blocks everything else"
-failure mode of the greedy solver. They are not yet selected by default.
-Once a deeptools dependency clears, first-fit is the expected default.
-
-### CpSatLayoutSolver
-
-`config.layout_solver = "cpsat"` selects an OR-Tools CP-SAT solver that
+`config.layout_solver = "cpsat"` selects `ilp_solver_ortools.ModelSolver`,
+which posts the graph through the encoding strategy to OR-Tools CP-SAT. It
 models placement as a global 2D no-overlap (each resident buffer is an
-optional `[lifetime] × [address, address + size)` rectangle) and
-minimizes total HBM transfer traffic, so a buffer that would be re-read by
-*N* consumers costs `N × size` when spilled. In-place reuse is encoded by
-shortening a parent's lifetime by the single handoff tick, letting the
-in-place child legally share its slot.
+optional `[lifetime] × [address, address + size)` rectangle) and minimizes
+the priced cost expression, or, without one, HBM transfer traffic, so a
+buffer that would be re-read by *N* consumers costs `N × size` when spilled.
+In-place reuse is encoded by shortening a parent's lifetime by the single
+handoff tick, letting the in-place child legally share its slot. In the open
+division mode it also chooses each op's core division (and, with
+`config.auto_coarse_tiling`, its coarse tiling) and which relayout copies
+fire; see [The co-optimizer](co_optimizer.md).
 
-It requires the optional `ortools` package
-(`pip install torch-spyre[cpsat]`); when it is missing, the allocator logs
-a warning and falls back to the greedy solver, so a `"cpsat"` request
-without co-optimization always degrades to a correct plan. Without
-co-optimization the CP-SAT solver only *places* buffers on each op's
-pre-determined core division; with `co_optimizing_lx_planning` it is driven
-by the allocator's open division mode (below), which additionally chooses
-each op's core division -- see [The co-optimizer](co_optimizer.md) for what
-happens to that fallback when `ortools` is missing *and* co-optimization is
-requested.
+`ortools` is a base dependency on the architectures it ships wheels for;
+without it, `"cpsat"` raises `ImportError`.
 
-### SimulatedAnnealingLayoutSolver
+### Simulated annealing
 
 `config.layout_solver = "simulated_annealing"` selects
-`SimulatedAnnealingLayoutSolver`, which takes a first-fit, best-fit, or
-greedy placement as the initial layout and then runs a simulated-annealing
-search over buffer orderings to reduce fragmentation. Each step reinserts a
-buffer and keeps or rejects the new ordering according to a cooling
-schedule, so the search can escape the local minima that trap the
-single-pass solvers. See
-[Simulated Annealing Layout Planner](simulated_annealing_layout.md) for the
-algorithm and the tunable schedule parameters.
-
-Note this is placement-only. With `co_optimizing_lx_planning` the same config
-value instead selects `SaCoOptimizingSolver`, a *different* class that anneals
-the core divisions and the placement jointly. See
-[Joint core-division + LX placement](sa_co_optimization.md).
+`graph_solvers.BufferSolver` around `SaCoOptimizingSolver`, which anneals the
+core divisions and the placement jointly, seeded from a
+`FirstFitLayoutSolver` placement and packed by the C++
+`NativePermutationLayoutSolver`. In the committed mode its division menus
+hold one entry each, so only the placement moves. See
+[Joint core-division + LX placement](sa_co_optimization.md) and
+[The permutation layout packer](permutation_packer.md).
 
 ## Co-optimization with work-distribution
 
@@ -506,10 +471,10 @@ The allocator's open division mode (the default; gated by
 `config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING`)
 treats split choices and LX placement jointly instead of leaving this
 interaction to two independent passes. See [The co-optimizer](co_optimizer.md)
-for why this joint search exists, how its production solvers (CP-SAT and
-simulated annealing), the pruned exhaustive-search fallback, and (for CP-SAT)
-solver-driven coarse tiling each work, and which decisions -- scratchpad
-placement, work division, and coarse tiling -- it covers today.
+for why this joint search exists, how its two solvers (CP-SAT and
+simulated annealing) and solver-driven coarse tiling work, and which
+decisions -- scratchpad placement, work division, and coarse tiling -- it
+covers today.
 
 ## LX context switching
 
@@ -573,17 +538,6 @@ mechanism earns trust in production; removing the guard entirely is a follow-up 
 
 ## Current limitations
 
-### Greedy single-pass, no lookahead (default solver)
-
-The greedy solver processes ops in topological order making irrevocable
-placement decisions without considering future ops. First-fit and
-best-fit mitigate this by sorting all buffers up front before placing.
-
-### No defragmentation
-
-`_find_free_block` can locate holes between allocations but cannot
-compact the address space. Allocate/deallocate cycles fragment LX.
-
 ### Co-optimization is still limited
 
 The open division mode implements the joint
@@ -593,13 +547,6 @@ shared batch-major `B/M` split for matmuls and reductions. It still never
 flips a matmul's split onto a single dim (to protect compute
 utilization). Remaining gaps:
 
-- **The search is exhaustive and per-leaf cost is high.** It scores the
-  full cross-product of candidates with no pruning; each leaf rebuilds the
-  filtered op view. Adding the reduction `B/M` option makes `mha_4h`
-  converge fully on `B/4·M/8` but pushes the search into the tens of
-  seconds (the per-leaf graph-view rebuild dominates). Hoisting the
-  split-invariant work out of the per-leaf path, or pruning the tree, is
-  needed before this is on by default.
 - **Not every producer reconciles.** A matmul input whose producer is a
   plain pointwise op (e.g. an attention `Q·scale` multiply) is not yet
   offered a split matching how the matmul reads it, so that producer can
@@ -629,25 +576,26 @@ ring transfer instructions in the SuperDSC schedule.
 
 ## Target patterns
 
-The test suite `test_scratchpad_patterns.py` encodes patterns the greedy
-allocator cannot handle (`@expectedFailure`). Each documents a class of
-problem to be solved:
+The test suite `test_scratchpad_patterns.py` encodes placement patterns,
+each a buffer set with a known good allocation. `TestVerifyPatterns` checks
+each good allocation; a solver's pattern class checks that the solver meets
+it, with the patterns it misses marked `@expectedFailure`. Each documents a
+class of problem:
 
 | Pattern | Problem | What's needed |
 |---|---|---|
-| Simple fragmentation | Greedy places A at addr 0, blocking later large allocation C | Placement aware of future deallocations |
-| Staircase (up/down) | Increasing or decreasing buffer sizes overflow LX under greedy append | Lookahead and placement-order optimization |
+| Simple fragmentation | Placing A at address 0 blocks a later large allocation C | Placement aware of future deallocations |
+| Staircase (up/down) | Increasing or decreasing buffer sizes overflow LX under append-only placement | Lookahead and placement-order optimization |
 | GQ attention | Large/small buffer lifecycle alternation (Q_K, scores vs. max, denominators) | Size-aware packing exploiting lifecycle patterns |
 | MoE MLP | Many buffers of varying sizes and lifetimes, shared hidden state | Stack-like placement with complex lifetime management |
 
-Best-fit and first-fit pass several patterns the greedy solver fails.
 The remaining `@expectedFailure` cases motivate the items in
 [Future work](#future-work).
 
 ## Future work
 
 The extensions below build on the current co-optimization flow through the
-`MemoryPlanSolver` and `ScratchpadOptimizationPass` interfaces, so they can
+graph-solver and `ScratchpadOptimizationPass` interfaces, so they can
 be added without disturbing the rest of the planner.
 
 ### Richer co-optimization
@@ -656,10 +604,6 @@ Current state: pointwise dim-flips, matmul-tiling seeding, cross-matmul
 split transfer, and a shared batch-major `B/M` split offered to matmuls
 and softmax reductions. Planned extensions:
 
-- **Make the search affordable.** Hoist the split-invariant graph-view /
-  mem-usage build out of the per-leaf path (or prune the cross-product)
-  so the exhaustive search does not run into tens of seconds once
-  reductions also carry options.
 - **Offer matmul-input producers a matching split.** A plain pointwise
   producer feeding a matmul should be able to adopt the split the matmul
   reads it with, so that producer pins to LX (closing the gap with the
@@ -686,10 +630,6 @@ Candidates under evaluation:
   and is only worthwhile when liveness shows it pays off.
 - **Operation re-ordering.** Re-order independent ops to extend or
   shorten lifetimes for better packing.
-- **Driving cloning from the solver.** Input-boundary cloning currently
-  runs inline in `ScratchpadAllocator` with a heuristic. The longer-term
-  plan is for the solver to decide which clones pay off based on the
-  global layout.
 
 ### Cross-core ring transfers
 
