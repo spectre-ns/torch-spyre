@@ -1129,17 +1129,15 @@ class TestSelectAllocator(unittest.TestCase):
         )
         from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-        for strategy, cls, lazy, pair_tables in (
-            ("lazy", LazyStrategy, True, False),
-            ("enumerated", TableStrategy, False, False),
-            ("table", PairTableStrategy, False, True),
+        for strategy, cls in (
+            ("lazy", LazyStrategy),
+            ("enumerated", TableStrategy),
+            ("table", PairTableStrategy),
         ):
             with self.subTest(lx_division_strategy=strategy):
                 with ts_inductor_config.patch(lx_division_strategy=strategy):
                     a = select_allocator()
                 self.assertIs(a.strategy_class, cls)
-                self.assertIs(a.candidates.lazy, lazy)
-                self.assertIs(a.candidates.pair_tables, pair_tables)
 
 
 class TestInplaceEdgeGate(unittest.TestCase):
@@ -1509,7 +1507,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         self.assertTrue(captured, "TableCandidates._build_graph was not called")
         edge_found = False
-        for solve_graph, _ in captured:
+        for solve_graph in captured:
             # Input clones are exactly the nodes whose first access is a read.
             input_clone_names = {
                 n.name for n in solve_graph.get_nodes() if n.first_use_is_read
@@ -1622,7 +1620,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         self.assertTrue(captured, "TableCandidates._build_graph was not called")
         merged = False
-        for solve_graph, _ in captured:
+        for solve_graph in captured:
             for parents in self._in_place_parents(solve_graph).values():
                 # An output-feeding buffer is used as an in-place *parent*: some
                 # consumer names it among its in-place parents (matches the
@@ -1692,7 +1690,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         # named as an in-place parent by some consumer.
         reused = any(
             parents & output_feeders
-            for solve_graph, _ in captured
+            for solve_graph in captured
             for parents in self._in_place_parents(solve_graph).values()
         )
         self.assertTrue(
@@ -1749,7 +1747,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         reused = any(
             parents & output_feeders
-            for solve_graph, _ in captured
+            for solve_graph in captured
             for parents in self._in_place_parents(solve_graph).values()
         )
         self.assertTrue(
