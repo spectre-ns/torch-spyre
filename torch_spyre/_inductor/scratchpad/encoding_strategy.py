@@ -21,12 +21,14 @@ work split is enumerated (a pinned value, a table of candidates), the
 relations over each edge's two ends, the candidate transforms, and every
 CP variable (:class:`NodeVars`). Nodes and edges stay pure data.
 
-:class:`EnumeratedStrategy` encodes each open work split as a ``Table`` over a
-candidate menu, and each edge's relation from its clone read, its residency
-edge or its pair table. Two specializations: ``LazyStrategy``
-(``lazy_strategy.py``, the default) adds the ``Lazy`` work split, and
-:class:`PairTableStrategy` relates every edge by a pair table.
-``config.lx_division_strategy`` picks one of the three.
+:class:`EncodingStrategy` holds the encoding every strategy shares, with each
+open work split a ``Table`` over its menu and each edge's relation from its
+clone read, its residency edge or its pair table. Three strategies refine it:
+:class:`EnumeratedStrategy` keeps the menu index everywhere,
+:class:`PairTableStrategy` also relates every edge by a pair table, and
+``LazyStrategy`` (``lazy_strategy.py``, the default) encodes a node's work
+split as constraints over its space where it can. ``config.lx_division_strategy``
+picks one of the three.
 """
 
 from __future__ import annotations
@@ -215,7 +217,19 @@ class _Table:
 class EncodingStrategy:
     """Encodes a graph into a CP model, one element at a time. Created from
     configuration alone; ``prepare(graph)`` resets the per-solve state, and
-    the ``encode_*`` methods add to it."""
+    the ``encode_*`` methods add to it.
+
+    The encoding every strategy shares: placement, merges, relayout copies,
+    coarse-tiling nests and cuts, and the menu-index work split every
+    strategy falls back to (a ``Table`` over the node's menu, a pinned one
+    ``Fixed``). A subclass changes how a node's work split is encoded
+    (:meth:`_split_vars`, :meth:`keeps_points`) or how an edge's relation is
+    (:meth:`_relation`, :meth:`_relate`).
+
+    Its candidates are the graph's (:meth:`_collect`): each node's menu,
+    filtered to its legal divisions where it is a space's points, and per edge
+    its clone relation, else the pair table the builder fixed, else its
+    residency relation."""
 
     # per-solve state
     transforms: tuple[Transform, ...] = ()
@@ -227,107 +241,7 @@ class EncodingStrategy:
     cut_terms: list[Var] = field(default_factory=list)
     tile_terms: list[Var] = field(default_factory=list)
 
-    # ---- whole-graph hooks ----
-
-    def prepare(self, graph: SpyreOptimizationGraph) -> None:
-        """Reset the per-solve state, decide how each node's axes are
-        enumerated and generate the candidates of table-based axes."""
-        raise NotImplementedError
-
-    def encode_no_overlap(self, graph: SpyreOptimizationGraph, model: Model) -> None:
-        """The 2-D no-overlap over every node's and transform's rectangle."""
-        raise NotImplementedError
-
-    def tiling_segments(self, graph: SpyreOptimizationGraph) -> dict[ResourceNode, int]:
-        """The coarse-tiling segment of each tileable op on the chain."""
-        raise NotImplementedError
-
-    # ---- per element, called by _finalize in emission order ----
-
-    def encode_node(self, node: ResourceNode, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_transform(self, transform: Transform, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_merge(self, edge: DependencyEdge, model: Model) -> None:
-        raise NotImplementedError
-
-    def limit_merges(self, node: ResourceNode, model: Model, incoming: bool) -> None:
-        raise NotImplementedError
-
-    def encode_capacity(self, item: Item, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_op_constraints(self, item: Item, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_read(self, edge: DependencyEdge, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_transform_use(self, transform: Transform, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_tiling_vars(self, item: Item, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_chain_head(self, node: ResourceNode, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_nest(self, edge: ExecutionEdge, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_cuts(
-        self, item: Item, segments: Mapping[ResourceNode, int], model: Model
-    ) -> None:
-        raise NotImplementedError
-
-    def encode_tile_counts(self, item: Item, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_clone(self, node: ResourceNode, model: Model) -> None:
-        raise NotImplementedError
-
-    def encode_lifetime(self, item: Item, model: Model) -> None:
-        raise NotImplementedError
-
-    # ---- objective inputs and extraction ----
-
-    def chooses_split(self, item: Item) -> bool:
-        """Whether ``item``'s work split has vars (it is not COMMITTED)."""
-        raise NotImplementedError
-
-    def objective_terms(self, item: Item) -> tuple[Optional[Var], Optional[Var]]:
-        raise NotImplementedError
-
-    def cost_bindings(self) -> tuple[dict, dict]:
-        raise NotImplementedError
-
-    def chosen_split(self, item: Item, solver) -> WorkSplit:
-        raise NotImplementedError
-
-    def footprint(self, item: Item, solver) -> int:
-        raise NotImplementedError
-
-    def fired(self, edge: DependencyEdge, solver) -> RelayoutCandidate:
-        raise NotImplementedError
-
-    def extra_cost_terms(self) -> list[Var]:
-        return []
-
-
-class EnumeratedStrategy(EncodingStrategy):
-    """Every open work split is an index into its enumerated menu (a
-    ``Table``), a pinned one ``Fixed``, and the view, relayout and nest
-    relations are tables over menu indices.
-
-    Its candidates are the graph's (:meth:`_collect`): each node's menu,
-    filtered to its legal divisions where it is a space's points, and per edge
-    its clone relation, else the pair table the builder fixed, else its
-    residency relation."""
-
-    def __init__(self, **settings) -> None:
-        super().__init__(**settings)
+    def __post_init__(self) -> None:
         self.menus: dict[str, tuple[CoreDivision, ...]] = {}
         self.matches: dict[tuple[str, str], list[tuple[int, int]]] = {}
         # Edges whose relation is derived from their ResidencyEdge (equality of
@@ -399,6 +313,8 @@ class EnumeratedStrategy(EncodingStrategy):
     # ---- whole-graph hooks ----
 
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
+        """Reset the per-solve state, decide how each node's axes are
+        enumerated and generate the candidates of table-based axes."""
         self._collect(graph)
         self.vars = {}
         self.served = {}
@@ -468,6 +384,7 @@ class EnumeratedStrategy(EncodingStrategy):
         return self.menus.get(item.name, ())
 
     def chooses_split(self, item: Item) -> bool:
+        """Whether ``item``'s work split has vars (it is not COMMITTED)."""
         enum = self._enum.get(item)
         return not (isinstance(enum, _Fixed) and enum.index is None)
 
@@ -1051,6 +968,11 @@ class EnumeratedStrategy(EncodingStrategy):
         """The relayout candidate the read on ``edge`` fired through."""
         assert edge.transform is not None
         return self._relayouts.fired(edge, solver)
+
+
+class EnumeratedStrategy(EncodingStrategy):
+    """Every open work split is an index into its enumerated menu: the base
+    encoding, with no space standing in for any node's menu."""
 
 
 class PairTableStrategy(EnumeratedStrategy):

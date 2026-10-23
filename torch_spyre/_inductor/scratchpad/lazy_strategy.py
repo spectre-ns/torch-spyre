@@ -45,7 +45,7 @@ from torch_spyre._inductor.scratchpad.encoding_strategy import (
     Model,
     NodeVars,
     PrinterView,
-    EnumeratedStrategy,
+    EncodingStrategy,
     _Fixed,
     _Table,
 )
@@ -267,8 +267,10 @@ class _LazyVars:
         return True
 
 
-class LazyStrategy(EnumeratedStrategy):
-    """``EnumeratedStrategy`` with ``Lazy`` work splits wherever a node can take one."""
+class LazyStrategy(EncodingStrategy):
+    """A ``Lazy`` work split wherever a node can take one: its legality posted
+    as constraints over the node's space, never enumerated. Any other node
+    keeps the base menu index."""
 
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
