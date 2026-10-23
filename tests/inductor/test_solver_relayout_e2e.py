@@ -37,7 +37,6 @@ import torch
 import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad import allocator as alloc_mod
-from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_module
 
@@ -297,12 +296,18 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
 
 
 def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
-    """The solver's ``decides_lx_relayouts()`` says whether it decides
-    relayouts; when it does not, no candidate is enumerated and the
+    """The solver's ``capabilities.decides_lx_relayouts`` says whether it
+    decides relayouts; when it does not, no candidate is enumerated and the
     co-optimizing solve is exactly what it was before this feature."""
+    import dataclasses
+
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
+
     observed = _arm_forced(monkeypatch)
     monkeypatch.setattr(
-        CpSatLayoutSolver, "decides_lx_relayouts", classmethod(lambda cls: False)
+        ModelSolver,
+        "capabilities",
+        dataclasses.replace(ModelSolver.capabilities, decides_lx_relayouts=False),
     )
 
     def fn(t):

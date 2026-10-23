@@ -15,7 +15,7 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Optional, TYPE_CHECKING
+from typing import ClassVar, Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
 import itertools
 import math
@@ -976,112 +976,10 @@ class MemoryPlanSolver(ABC):
     solvers that can also choose the division.
     """
 
-    # What a solver can do, asked of its class before any instance exists. Every
-    # concrete solver answers each abstract one itself; __init_subclass__ fails
-    # the class definition otherwise, or on a combination that makes no sense.
-
-    # Posts the graph through an encoding strategy to a backend, so it can
-    # realize any enumeration the factory allows; the others read the table
-    # model's menus and match tables.
-    posts_model: ClassVar[bool] = False
-
-    @classmethod
-    def chooses_core_divisions(cls) -> bool:
-        """Chooses each buffer's core division jointly with its placement:
-        exactly the :class:`CoreDivisionLayoutSolver` subclasses."""
-        return False
-
-    @classmethod
-    @abstractmethod
-    def supports_paired_buffers(cls) -> bool:
-        """Places a committed LX relayout's source and destination as a pair
-        (``LifetimeBoundBuffer.paired_with``). The allocator collects committed
-        relayout plans only for such a solver."""
-
-    @classmethod
-    @abstractmethod
-    def decides_lx_relayouts(cls) -> bool:
-        """Places a :class:`RelayoutCopyBuffer` under the coupling its
-        docstring lists and writes ``chosen_relayouts`` back on the consumers it
-        serves. The allocator enumerates relayout candidates only for such a
-        solver; the others never see a copy and their objective carries no
-        relayout term."""
-
-    @classmethod
-    @abstractmethod
-    def generates_divisions(cls) -> bool:
-        """Generates each buffer's candidate divisions from its op's split
-        space (``CoreDivisionBuffer.division_space``) rather than only choosing
-        among the enumerated ``core_divisions``. The allocator builds a split
-        space only for such a solver; with ``chooses_tilings`` too, the space
-        carries the op's tilings, and the allocator applies the ones chosen."""
-
-    @classmethod
-    @abstractmethod
-    def chooses_tilings(cls) -> bool:
-        """Chooses each op's coarse tiling jointly with its core division. With
-        ``linear_cost_only`` too, the allocator hands it no cost expression
-        while ``auto_coarse_tiling`` is on: the cost model cannot score tile
-        size or cut count."""
-
-    @classmethod
-    @abstractmethod
-    def tilings_from_menu(cls) -> bool:
-        """Takes each op's tiling candidates off the menu the allocator
-        enumerates, rather than generating its own. The allocator enumerates
-        tiled candidates only for such a solver."""
-
-    @classmethod
-    @abstractmethod
-    def replans_after_tiling(cls) -> bool:
-        """Needs a second, placement-only solve over the graph once the tilings
-        it chose are applied, rather than its own placement standing
-        (``ScratchpadAllocator._materialize_selection``)."""
-
-    @classmethod
-    @abstractmethod
-    def linear_cost_only(cls) -> bool:
-        """Can only minimize a cost expression that lowers to linear terms, so
-        the objective must avoid the cost model's fractional powers."""
-
-    _CAPABILITIES = (
-        "supports_paired_buffers",
-        "decides_lx_relayouts",
-        "generates_divisions",
-        "chooses_tilings",
-        "tilings_from_menu",
-        "replans_after_tiling",
-        "linear_cost_only",
-    )
-
-    def __init_subclass__(cls, **kwargs) -> None:
-        super().__init_subclass__(**kwargs)
-        abstract = {
-            name
-            for name in dir(cls)
-            if getattr(getattr(cls, name, None), "__isabstractmethod__", False)
-        }
-        if abstract - set(MemoryPlanSolver._CAPABILITIES):
-            return  # still abstract in its solve methods: not a concrete solver
-        if abstract:
-            raise TypeError(f"{cls.__name__} must answer {', '.join(sorted(abstract))}")
-        chooses = cls.chooses_core_divisions()
-        if chooses != issubclass(cls, CoreDivisionLayoutSolver):
-            raise TypeError(
-                f"{cls.__name__}.chooses_core_divisions() must be "
-                f"{not chooses}: it is exactly the CoreDivisionLayoutSolver "
-                "subclasses"
-            )
-        for implied, prerequisite in (
-            ("decides_lx_relayouts", "chooses_core_divisions"),
-            ("generates_divisions", "chooses_core_divisions"),
-            ("chooses_tilings", "chooses_core_divisions"),
-            ("linear_cost_only", "chooses_core_divisions"),
-            ("tilings_from_menu", "chooses_tilings"),
-            ("replans_after_tiling", "chooses_tilings"),
-        ):
-            if getattr(cls, implied)() and not getattr(cls, prerequisite)():
-                raise TypeError(f"{cls.__name__}.{implied}() requires {prerequisite}()")
+    # Places a committed LX relayout's source and destinations as a pair
+    # (``LifetimeBoundBuffer.paired_with``); the allocator collects committed
+    # relayout plans only for such a solver (``Capabilities``).
+    pairs_buffers: ClassVar[bool] = False
 
     def __init__(
         self, buffers: Sequence["LifetimeBoundBuffer"], size: int, alignment: int = 128
@@ -1106,31 +1004,11 @@ class MemoryPlanSolver(ABC):
                 defaults to.
         """
         self.buffers: list["LifetimeBoundBuffer"] = list(buffers)
-        assert self.supports_paired_buffers() or not any(
+        assert self.pairs_buffers or not any(
             buffer.paired_with for buffer in self.buffers
         ), f"{type(self).__name__} does not support paired-buffer placement"
         self.limit = size
         self.alignment = alignment
-
-    def graph_solver(self) -> Any:
-        """What ``SpyreOptimizationGraph.solve`` runs for this solver: a
-        backend class (the posted model's solver) or a graph solver. A
-        placement-only solver packs the nodes' placement views."""
-        from torch_spyre._inductor.scratchpad.graph_solvers import PlacementSolver
-
-        return PlacementSolver(type(self), self.limit)
-
-    def solve_graph(self, graph: Any, strategy: Any, cost_expr: Any = None) -> None:
-        """Fill every open decision of ``graph`` (built from the IR, with
-        ``strategy``'s candidates): the one entry point the allocator solves
-        through. A backend posts the graph through the strategy; a graph
-        solver solves it itself."""
-        spec = self.graph_solver()
-        assert not isinstance(spec, type), (
-            f"{type(self).__name__} posts a model: it overrides solve_graph"
-        )
-        graph.set_solver(spec)
-        graph.solve(cost_expr=cost_expr, strategy=strategy)
 
     def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
         """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
@@ -1196,17 +1074,6 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     Such a solver still satisfies :meth:`plan_layout` -- placement-only is the
     special case where there is nothing to choose.
     """
-
-    @classmethod
-    def chooses_core_divisions(cls) -> bool:
-        return True
-
-    def graph_solver(self) -> Any:
-        """A joint solver that reads its own buffers solves them and fills
-        the graph's nodes from its choices."""
-        from torch_spyre._inductor.scratchpad.graph_solvers import BufferSolver
-
-        return BufferSolver(type(self), self.limit)
 
     def off_expression_ns(self) -> dict[str, float]:
         """The terms this engine's objective adds outside ``cost_expr`` for the

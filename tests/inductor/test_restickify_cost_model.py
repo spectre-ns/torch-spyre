@@ -25,6 +25,8 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import cost_model as cm
 from torch_spyre._inductor import dump_cost_model as dcm
+from torch_spyre._inductor.scratchpad import division_menus
+from torch_spyre._inductor.scratchpad import pricing
 
 
 B, X, N = sympy.symbols("b x n", integer=True, nonnegative=True)
@@ -561,7 +563,9 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
         commit_iteration_space_ownership,
         iteration_space_from_op,
     )
-    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+    from torch_spyre._inductor.scratchpad.allocator import (
+        ScratchpadAllocator,
+    )
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
     graph, stage, consumer = staged_transport_graph
@@ -627,22 +631,22 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
     b, x, n = iteration_space_from_op(consumer)
     commit_iteration_space_ownership(consumer, {b: 8, x: 2, n: 1})
     if failure in ("disabled_pricing", "core_budget"):
-        for module in (am, tcm):
+        for module in (pricing, tcm):
             monkeypatch.setattr(
                 module,
                 "_COST_PARAMS",
-                replace(am._COST_PARAMS, transport_dma_ns_per_request={}),
+                replace(pricing._COST_PARAMS, transport_dma_ns_per_request={}),
             )
         if failure == "core_budget":
             monkeypatch.setattr(config, "sencores", 8)
     elif failure == "unsupported_core_count":
-        rates = dict(am._COST_PARAMS.transport_dma_ns_per_request)
+        rates = dict(pricing._COST_PARAMS.transport_dma_ns_per_request)
         del rates[2]
-        for module in (am, tcm):
+        for module in (pricing, tcm):
             monkeypatch.setattr(
                 module,
                 "_COST_PARAMS",
-                replace(am._COST_PARAMS, transport_dma_ns_per_request=rates),
+                replace(pricing._COST_PARAMS, transport_dma_ns_per_request=rates),
             )
     elif failure == "unknown_geometry":
         monkeypatch.setattr(dcm, "_transport_read_geometry", lambda *args: (None, None))
@@ -718,4 +722,6 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
             allocator._build_graph(graph)
         return
     _, tables = allocator._build_graph(graph)
-    assert list(tables.menus[consumer.name]) == [am._fixed_core_division(consumer)]
+    assert list(tables.menus[consumer.name]) == [
+        division_menus._fixed_core_division(consumer)
+    ]

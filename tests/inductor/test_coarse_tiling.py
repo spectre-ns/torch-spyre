@@ -131,6 +131,9 @@ from torch_spyre._inductor.wsr.tile import (
 )
 import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_module
 from utils_inductor import ir_computed_buffer, ir_input_loader
+from torch_spyre._inductor.scratchpad import division_menus
+from torch_spyre._inductor.scratchpad import residency_rules
+from torch_spyre._inductor.scratchpad import drain_plans, pricing
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -9632,7 +9635,9 @@ class _SentinelOp:
 def _solved_plan(*placements):
     """A ``SolvedPlan`` of one-tick buffers given as ``(name, address,
     lx_view)``; ``address=None`` leaves the buffer in HBM."""
-    from torch_spyre._inductor.scratchpad.allocator import SolvedPlan
+    from torch_spyre._inductor.scratchpad.allocator import (
+        SolvedPlan,
+    )
     from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
     return SolvedPlan.of_buffers(
@@ -9657,7 +9662,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
     """
 
     def test_drain_lifetime_extension_reaches_graph_exit(self):
-        from torch_spyre._inductor.scratchpad.allocator import (
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _drain_lifetime_end_overrides,
         )
 
@@ -9673,7 +9678,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         """The collective reads the storage after the drain, so the storage's
         own lifetime already covers the drain; extending it to the graph exit
         would hold every layer's carry in LX until the last layer."""
-        from torch_spyre._inductor.scratchpad.allocator import (
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _drain_lifetime_end_overrides,
         )
 
@@ -9686,9 +9691,10 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         """A post-loop reader cannot reuse a carry kept live for its drain."""
         from collections import namedtuple
 
-        from torch_spyre._inductor.scratchpad import allocator as allocator_module
         from torch_spyre._inductor.scratchpad import utils as utils_module
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+        )
         from torch_spyre._inductor.scratchpad.graph_solvers import buffers_of
         from torch_spyre._inductor.scratchpad.plan_solver import (
             CoreDivision,
@@ -9732,24 +9738,26 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         allocator = ScratchpadAllocator(
             CpSatLayoutSolver, size=4096, division_mode="open"
         )
-        allocator._validated_drain_plans = {
+        allocator.candidates.drain_plans = {
             "carry": SimpleNamespace(storage_name="carry", collective=None)
         }
         divisions = {op.name: [CoreDivision(splits={})] for op in ops}
         with (
             patch.object(utils_module, "op_read_writes", side_effect=read_writes),
-            patch.object(allocator_module, "op_read_writes", side_effect=read_writes),
+            patch.object(residency_rules, "op_read_writes", side_effect=read_writes),
+            patch.object(drain_plans, "op_read_writes", side_effect=read_writes),
             patch.object(
                 table_candidates_module, "op_read_writes", side_effect=read_writes
             ),
             patch.object(
-                allocator_module, "clone_at_graph_boundaries", return_value=False
+                residency_rules, "clone_at_graph_boundaries", return_value=False
             ),
+            patch.object(drain_plans, "clone_at_graph_boundaries", return_value=False),
             patch.object(
                 table_candidates_module, "clone_at_graph_boundaries", return_value=False
             ),
             patch.object(
-                allocator_module,
+                pricing,
                 "mem_usage_by_buf",
                 return_value={
                     name: {"size": 128, "op_inputs": reads}
@@ -9765,7 +9773,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 },
             ),
             patch.object(
-                allocator,
+                residency_rules,
                 "_op_inputs_good_for_lx_inplace",
                 side_effect=lambda op: inputs[op.name],
             ),
@@ -9785,7 +9793,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             )
             self.assertEqual(in_place["reader"], ["carry"])
             solve_graph, tables = allocator.candidates._build_graph(
-                graph, in_place, allocator_module._DivisionMap(divisions, set())
+                graph, in_place, division_menus._DivisionMap(divisions, set())
             )
 
         # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
@@ -9802,8 +9810,10 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
     def test_missing_drain_anchor_raises_instead_of_falling_back(self):
         """After LX is committed there is no late decline."""
         from torch_spyre._inductor.scratchpad.allocator import (
-            DrainPlan,
             _assert_drain_plan_committed,
+        )
+        from torch_spyre._inductor.scratchpad.drain_plans import (
+            DrainPlan,
         )
 
         plan = DrainPlan(
@@ -9818,7 +9828,9 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             _assert_drain_plan_committed(graph, None, None, {}, plan)
 
     def _isolation_plan(self):
-        from torch_spyre._inductor.scratchpad.allocator import DrainPlan
+        from torch_spyre._inductor.scratchpad.drain_plans import (
+            DrainPlan,
+        )
 
         return DrainPlan(
             storage_name="buf2",
@@ -9830,7 +9842,9 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
 
     def _run_push(self, *, with_plan, address=0x4000):
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+        )
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
         allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
@@ -10012,7 +10026,7 @@ class TestDrainedCollective(unittest.TestCase):
         from torch._inductor.ir import ReinterpretView, StorageBox, TensorBox
 
         from torch_spyre._inductor.ir import AllGatherAsyncFallback
-        from torch_spyre._inductor.scratchpad.allocator import (
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _sole_post_loop_collective,
         )
 
@@ -10286,7 +10300,9 @@ class TestHoistedInputClone(unittest.TestCase):
 
     def _run_input_push(self, ops, users):
         from torch_spyre._inductor.scratchpad import allocator as allocator_module
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+        from torch_spyre._inductor.scratchpad.allocator import (
+            ScratchpadAllocator,
+        )
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
         allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
@@ -10366,10 +10382,11 @@ class TestHoistedInputClone(unittest.TestCase):
 
         from torch_spyre._inductor.scratchpad import utils as utils_module
         from torch_spyre._inductor.scratchpad.allocator import (
-            ScratchpadAllocator,
+            _hoisted_input_clone_entry,
+        )
+        from torch_spyre._inductor.scratchpad.drain_plans import (
             _handoff_child_start,
             _handoff_parent_end,
-            _hoisted_input_clone_entry,
         )
 
         dep = namedtuple("dep", ["name"])
@@ -10404,7 +10421,7 @@ class TestHoistedInputClone(unittest.TestCase):
                     lifetimes = utils_module.calculate_liveness(graph)
                     starts, ends = utils_module.counted_loop_lifetime_overrides(graph)
                 last_reader = ops[lifetimes["x"][-1]]
-                edge = ScratchpadAllocator._inplace_edge_ok(
+                edge = residency_rules._inplace_edge_ok(
                     child_pointwise_inputs=["x"],
                     parent_name="x",
                     child_device_layout=layout,

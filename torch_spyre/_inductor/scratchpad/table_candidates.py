@@ -19,9 +19,9 @@ op's candidate core divisions and coarse tilings (the menus), the view tables
 between a producer's and a consumer's candidates (``cd_parent_matches``,
 including the loop-carry intersection and input-clone overrides), the priced
 relayout candidates, capped per edge, and the relayout copies built from them.
-It hands them to the solvers as ``CoreDivisionBuffer`` objects. The allocator keeps
-the incoming data these read (residency reasons, lifetimes, in-place gates,
-drain plans) and the commit path that applies the solved divisions.
+It builds the open-mode graph with them (``CandidateTables``), reading each op's
+residency rules from ``residency_rules``, its lifetimes and drain plans from
+``drain_plans`` and its split options from ``division_menus``.
 """
 
 from __future__ import annotations
@@ -100,19 +100,13 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
 )
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 
-from torch_spyre._inductor.scratchpad.allocator import (
-    _COST_PARAMS,
+from torch_spyre._inductor.scratchpad.division_menus import (
     _DivisionMap,
-    _coarse_tile_loop_trip_count,
-    _drain_lifetime_end_overrides,
-    _drained_collectives,
     _drop_read_distance_violations,
     _enum_split_options,
     _find_distinct_matmul_splits,
     _fixed_core_division,
     _fused_layout_group_ops,
-    _handoff_child_start,
-    _handoff_parent_end,
     _intern_view_group,
     _is_cpu_host_buffer,
     _is_indirect_access_op,
@@ -120,14 +114,25 @@ from torch_spyre._inductor.scratchpad.allocator import (
     _legal_fixed_division,
     _legal_split_options,
     _reads_offset_slice,
-    logger,
+)
+from torch_spyre._inductor.scratchpad.drain_plans import (
+    DrainPlan,
+    _coarse_tile_loop_trip_count,
+    _drain_lifetime_end_overrides,
+    _drained_collectives,
+    _handoff_child_start,
+    _handoff_parent_end,
     validated_drain_plans,
 )
+from torch_spyre._inductor.scratchpad import residency_rules
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.scratchpad.pricing import _COST_PARAMS
 
 if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
     from torch_spyre._inductor.scratchpad.encoding_strategy import EnumerationFactory
     from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
+
+logger = get_inductor_logger("scratchpad.table_candidates")
 
 
 def relayout_copies_of(
@@ -412,13 +417,20 @@ def _has_legal_division(context) -> bool:
 
 
 class TableCandidates:
-    """The candidate derivations of one the joint :class:`ScratchpadAllocator`."""
+    """The table strategy's candidate generation for open-division solves
+    over ``capacity`` bytes of LX: the graph from the IR, each node's menu,
+    the pair tables, relations and relayout candidates."""
 
     def __init__(
-        self, allocator: ScratchpadAllocator, factory: EnumerationFactory
+        self, factory: EnumerationFactory, capacity: int, prune: bool = False
     ) -> None:
-        self.allocator = allocator
         self.factory = factory
+        self.capacity = capacity  # bytes
+        self.prune = prune
+        # The post-loop drain plans validated for the last graph.
+        self.drain_plans: dict[str, DrainPlan] = {}
+        # Set for the re-plan after applied tilings: no further tilings.
+        self.suppress_tiling = False
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         # Per enumerated op, its divisions as a space (lx_division_encoding).
         self.lazy_spaces: dict[str, Any] = {}
@@ -438,9 +450,7 @@ class TableCandidates:
         # solver runs: the residency gate, the lifetime extension and the push
         # must all consume this same object.  Re-deriving it after the solve
         # could disagree with what residency actually admitted.
-        self.allocator._validated_drain_plans = validated_drain_plans(
-            graph, division_is_fixed=False
-        )
+        self.drain_plans = validated_drain_plans(graph, division_is_fixed=False)
         in_place = self._determine_in_place_division_invariant(graph)
         division_map = self._division_map(graph, allow_deferred_read_candidates=True)
         divisions = division_map.divisions
@@ -554,7 +564,7 @@ class TableCandidates:
         # graph-level facts.
         self._prescribed_ops: frozenset[str] = frozenset()
         self._readers_by_name: dict[str, list[Operation]] = {}
-        if config.auto_coarse_tiling and self.allocator._tilings_from_menu:
+        if self.factory.tiled_menus:
             from torch_spyre._inductor.scratchpad.coarse_tiling import (
                 prescribed_regions,
             )
@@ -624,7 +634,7 @@ class TableCandidates:
 
             if reason is not None:
                 divs = _legal_fixed_division(op, [_fixed_core_division(op)], reason)
-            elif self.allocator.prune and isinstance(op, ComputedBuffer):
+            elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
                     for splits in _legal_split_options(
@@ -818,7 +828,7 @@ class TableCandidates:
         """Coarse-tiling options to pair with ``op``'s divisions.
 
         Unless ``auto_coarse_tiling`` is on and the solver takes its tilings off
-        this menu (``tilings_from_menu()``) the only option is the untiled
+        this menu (``EnumerationFactory.tiled_menus``) the only option is the untiled
         ``TileSpec``, so enumeration and every downstream plan stay
         bit-identical to today. When it does, the op is offered the
         output-axis tilings it could take, minus any whose per-core read span
@@ -856,15 +866,15 @@ class TableCandidates:
         hints of its own.
         """
         untiled = [TileSpec()]
-        if getattr(self.allocator, "_suppress_tiling", False):
+        if self.suppress_tiling:
             return untiled
-        if not (config.auto_coarse_tiling and self.allocator._tilings_from_menu):
+        if not self.factory.tiled_menus:
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled
         if op.get_operation_name() in getattr(self, "_prescribed_ops", ()):
             return untiled
-        if self.allocator._get_op_name(op) == "restickify":
+        if residency_rules._get_op_name(op) == "restickify":
             return untiled
         from torch_spyre._inductor.wsr.enumerate_tilings import enumerate_tile_options
 
@@ -905,7 +915,7 @@ class TableCandidates:
         allow_inplace: dict[str, list[str]] = {}
         mem_usage = mem_usage_by_buf(graph)
         in_place_allowed = {
-            op.name: self.allocator._op_inputs_good_for_lx_inplace(op)
+            op.name: residency_rules._op_inputs_good_for_lx_inplace(op)
             for op in graph.operations
         }
         lifetimes = calculate_liveness(graph)
@@ -944,7 +954,7 @@ class TableCandidates:
                 # pointwise-tagged ops that is every read (a no-op), but for a
                 # non-tagged Pointwise op it drops an input read at a different index
                 # than the output write -- which must not be aliased over the output.
-                if self.allocator._inplace_edge_ok(
+                if residency_rules._inplace_edge_ok(
                     child_pointwise_inputs=in_place_allowed[buf_name],
                     parent_name=input_buf,
                     child_device_layout=out_ten_layout,
@@ -977,7 +987,7 @@ class TableCandidates:
         ``cd_parent_matches`` slicing gate decides that instead. ``ncores`` is
         therefore not needed here.
         """
-        return self.allocator._residency_reasons(
+        return residency_rules._residency_reasons(
             graph,
             list(mem_usage),
             division_is_fixed=False,
@@ -1004,7 +1014,7 @@ class TableCandidates:
         for a solver that generates divisions rather than indexing the list:
         the residency edge to each divided producer, and -- where
         :class:`_DivisionMap` allows one and the solver is one that generates
-        (see :attr:`_solver_generates_divisions`) -- the op's split space.
+        (``EnumerationFactory.generates_divisions``) -- the op's split space.
         """
         divisions = division_map.divisions
         # Per-plan interning of relayout destination views (see
@@ -1018,7 +1028,7 @@ class TableCandidates:
         # after the loop, so a graph-output storage must stay live to the graph
         # exit.  This is inside the solve, so the extension only removes reuse
         # and stays priced -- it adds no cost term and no capacity.
-        drain_plans = self.allocator._validated_drain_plans
+        drain_plans = self.drain_plans
         if drain_plans:
             _drain_lifetime_end_overrides(
                 lifetime_end_overrides, drain_plans, len(graph.operations)
@@ -1033,14 +1043,14 @@ class TableCandidates:
         position_by_name = {op.name: index for index, op in enumerate(graph.operations)}
         graph_output_names = set(graph.get_output_names())
         readers_by_name: dict[str, list[ComputedBuffer]] = {}
-        if self.allocator._solver_chooses_tilings:
+        if self.factory.applies_tilings:
             for reader in graph.operations:
                 if isinstance(reader, ComputedBuffer):
                     for name in {read.name for read in reader.get_read_writes().reads}:
                         readers_by_name.setdefault(name, []).append(reader)
 
         prep_cache: dict = {}
-        g = empty_graph(self.allocator.size, "open")
+        g = empty_graph(self.capacity, "open")
         tables = CandidateTables()
         node_reads: list[tuple[str, list[str], list[str]]] = []
         residency_by_buf = self._residency_by_buf(
@@ -1296,7 +1306,7 @@ class TableCandidates:
             relayout_edges: dict[str, RelayoutEdge] = {}
             if (
                 self.factory.relayout == "lazy"
-                and self.allocator._decides_lx_relayouts
+                and self.factory.offers_relayouts
                 and not config.ktir_emitter
                 and op is not None
             ):
@@ -1332,8 +1342,8 @@ class TableCandidates:
                     or not hasattr(clone_layout, "device_layout")
                 ):
                     continue
-                if self.allocator._inplace_edge_ok(
-                    child_pointwise_inputs=self.allocator._op_inputs_good_for_lx_inplace(
+                if residency_rules._inplace_edge_ok(
+                    child_pointwise_inputs=residency_rules._op_inputs_good_for_lx_inplace(
                         op
                     ),
                     parent_name=clone_name,
@@ -1353,7 +1363,7 @@ class TableCandidates:
             if (
                 op is not None
                 and output_name in division_map.enumerated
-                and self.allocator._solver_generates_divisions
+                and self.factory.generates_divisions
             ):
                 division_space = self._division_space(
                     op, readers_by_name.get(output_name, ())
@@ -1401,9 +1411,7 @@ class TableCandidates:
                     tables.lazy_spaces[output_name] = space
                 if output_name in self.point_menus:
                     tables.point_menus.add(output_name)
-            if self.allocator._solver_chooses_tilings and isinstance(
-                op, ComputedBuffer
-            ):
+            if self.factory.applies_tilings and isinstance(op, ComputedBuffer):
                 tile_reads = self._tile_reads(graph, op, op_by_name)
                 if tile_reads:
                     tables.tile_reads[output_name] = tile_reads
@@ -1415,7 +1423,7 @@ class TableCandidates:
                 if p in g.nodes
             ]
         g.link_execution_order()
-        tables.copies = self._relayout_copies(g, tables, self.allocator.size)
+        tables.copies = self._relayout_copies(g, tables, self.capacity)
         return g, tables
 
     @staticmethod
@@ -1579,7 +1587,7 @@ class TableCandidates:
         """The op's split space; ``readers`` are the ops reading its output.
 
         The tiling half is attached only for the solver that can use it (see
-        :attr:`_solver_chooses_tilings`): deriving it costs a stick-alignment
+        ``EnumerationFactory.applies_tilings``): deriving it costs a stick-alignment
         analysis per output dim, so an engine that would ignore the answer does
         not pay for it.
         """
@@ -1589,7 +1597,7 @@ class TableCandidates:
 
         tiling = (
             build_tiling_space(op, readers=readers)
-            if self.allocator._solver_chooses_tilings
+            if self.factory.applies_tilings
             else None
         )
         return build_op_split_space(op, config.sencores, tiling=tiling)
@@ -1608,7 +1616,7 @@ class TableCandidates:
         return [
             name
             for name in graph.graph_input_names
-            if self.allocator._input_residency_reason(
+            if residency_rules._input_residency_reason(
                 graph, name, lifetimes.get(name, []), division_is_fixed=False
             )
             is None
@@ -1909,7 +1917,7 @@ class TableCandidates:
         join them.
         """
         if (
-            not self.allocator._decides_lx_relayouts
+            not self.factory.offers_relayouts
             or config.ktir_emitter
             or self.factory.relation == "derived"
         ):
@@ -2028,7 +2036,7 @@ class TableCandidates:
                 consumer_op,
                 context,
                 self._relayout_pair_costs,
-                self.allocator.size,
+                self.capacity,
             )
         return edges
 

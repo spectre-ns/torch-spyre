@@ -43,6 +43,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     Transform,
     WorkSplit,
 )
+from torch_spyre._inductor.scratchpad.graph_solvers import Capabilities
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
@@ -54,7 +55,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 
 if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
     from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
     from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
@@ -1245,15 +1245,16 @@ class TableStrategy(EncodingStrategy):
 
 @dataclass(frozen=True)
 class EnumerationFactory:
-    """Built from configuration only: how each axis is enumerated and how
-    each relation is encoded. The defaults reproduce the table model. It is
-    validated once, here and against the solver it will feed (``check``), and
-    never sees a graph."""
+    """Built from configuration and the solver's capabilities only: how each
+    axis is enumerated, how each relation is encoded, and which candidates the
+    solver can use. The defaults reproduce the table model. It is validated
+    once, here, and never sees a graph."""
 
     division: AxisSetting = "table"
     tiling: AxisSetting = "table"
     relayout: RelayoutSetting = "data"
     relation: Literal["table", "derived"] = "table"
+    capabilities: Capabilities = Capabilities()
 
     def __post_init__(self) -> None:
         for axis in ("division", "tiling"):
@@ -1278,25 +1279,56 @@ class EnumerationFactory:
             )
 
     @classmethod
-    def from_config(cls, solver: Optional[type] = None) -> EnumerationFactory:
-        """The configured enumerations, for ``solver``: one that reads
-        candidate menus and pair tables rather than posting a model
-        (``MemoryPlanSolver.posts_model``) gets the table model."""
-        if solver is not None and not getattr(solver, "posts_model", False):
-            return cls()
+    def from_config(
+        cls, capabilities: Optional[Capabilities] = None
+    ) -> EnumerationFactory:
+        """The configured enumerations, for a solver with ``capabilities``:
+        one that reads candidate menus and pair tables rather than posting a
+        model gets the table model."""
+        if capabilities is not None and not capabilities.posts_model:
+            return cls(capabilities=capabilities)
         return cls(
             division=config.lx_division_encoding,
             relayout="lazy" if config.lx_relayout_encoding == "lazy" else "data",
             relation=config.lx_view_relation,
+            capabilities=capabilities or Capabilities(),
         )
 
-    def candidates(self, allocator: ScratchpadAllocator) -> TableCandidates:
-        """What generates the table candidates for ``allocator``'s solves."""
+    @property
+    def offers_relayouts(self) -> bool:
+        """Relayout candidates are generated for the solve."""
+        return self.capabilities.decides_lx_relayouts
+
+    @property
+    def generates_divisions(self) -> bool:
+        """Each open node carries its op's split space for the solver to
+        generate divisions from."""
+        return self.capabilities.generates_divisions
+
+    @property
+    def tiled_menus(self) -> bool:
+        """The menus carry tiled candidates."""
+        return config.auto_coarse_tiling and self.capabilities.tilings_from_menu
+
+    @property
+    def applies_tilings(self) -> bool:
+        """The split spaces carry tilings, and the allocator applies the ones
+        the solver generated."""
+        caps = self.capabilities
+        return (
+            config.auto_coarse_tiling
+            and caps.chooses_tilings
+            and caps.generates_divisions
+        )
+
+    def candidates(self, capacity: int, prune: bool = False) -> TableCandidates:
+        """What generates the table candidates for solves over ``capacity``
+        bytes of LX (``prune``: heuristically pruned division menus)."""
         from torch_spyre._inductor.scratchpad.table_candidates import (
             TableCandidates,
         )
 
-        return TableCandidates(allocator, self)
+        return TableCandidates(self, capacity, prune)
 
     def strategy(
         self,

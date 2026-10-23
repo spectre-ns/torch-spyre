@@ -32,8 +32,10 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
     ScratchpadAllocator,
     SolvedPlan,
-    _coarse_tile_loop_trip_count,
     _lx_planning_size,
+)
+from torch_spyre._inductor.scratchpad.drain_plans import (
+    _coarse_tile_loop_trip_count,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.scratchpad.buffer_graph import SOLVER_CHOSE_SPILL
@@ -2927,7 +2929,9 @@ class TestObjectiveCostParams(TestCase):
 
     def test_the_objective_neutralizes_the_derates(self):
         from torch_spyre._inductor.cost_model import CostParams, coarse_underfill_eff
-        from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+        from torch_spyre._inductor.scratchpad.pricing import (
+            _COST_PARAMS,
+        )
 
         # A symbolic tile height leaves no fractional power behind.
         is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)

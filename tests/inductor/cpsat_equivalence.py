@@ -168,15 +168,17 @@ _RECORDER: Optional[_Recorder] = None
 
 
 def install(out: str | Path) -> _Recorder:
-    """Patch ``CpSatLayoutSolver`` so every solve is recorded under ``out``."""
+    """Patch ``ModelSolver`` (and its buffer form ``CpSatLayoutSolver``) so
+    every solve is recorded under ``out``."""
     global _RECORDER
     from torch_spyre._inductor.scratchpad import ilp_solver_ortools as mod
 
     _RECORDER = _Recorder(Path(out))
     cls = mod.CpSatLayoutSolver
+    engine = mod.ModelSolver
     if getattr(cls, "_cpsat_equiv_installed", False):
         return _RECORDER
-    orig_record = cls._solve_and_record
+    orig_record = engine._solve_and_record
     orig_generic = cls._plan_layout_generic
 
     def _solve_and_record(self, solver, model, *, objective=False):
@@ -202,23 +204,24 @@ def install(out: str | Path) -> _Recorder:
         rec.finish(self.buffers, None)
         return result
 
-    orig_solve_graph = cls.solve_graph
+    orig_solve = engine.solve
 
-    def solve_graph(self, graph, strategy, cost_expr=None):
+    def solve(self, graph, strategy, cost_expr=None):
         rec = _RECORDER
         if rec is None or rec.stages is not None:
-            return orig_solve_graph(self, graph, strategy, cost_expr)
+            return orig_solve(self, graph, strategy, cost_expr)
         rec.stages = []
         try:
-            orig_solve_graph(self, graph, strategy, cost_expr)
+            plan = orig_solve(self, graph, strategy, cost_expr)
         except Exception as exc:
             rec.finish_graph(graph, strategy, f"{type(exc).__name__}: {exc}")
             raise
         rec.finish_graph(graph, strategy, None)
+        return plan
 
-    cls._solve_and_record = _solve_and_record
+    engine._solve_and_record = _solve_and_record
     cls._plan_layout_generic = _plan_layout_generic
-    cls.solve_graph = solve_graph
+    engine.solve = solve
     cls._cpsat_equiv_installed = True
     return _RECORDER
 

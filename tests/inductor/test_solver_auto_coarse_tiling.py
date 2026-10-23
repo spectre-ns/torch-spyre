@@ -50,15 +50,17 @@ from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa
 from torch_spyre._inductor.scratchpad.allocator import (
     ScratchpadAllocator,
     SolvedPlan,
-    _spec_within_read_distance,
     select_allocator,
+)
+from torch_spyre._inductor.scratchpad.division_menus import (
+    _spec_within_read_distance,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.wsr import for_each_tile
 from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_scratchpad_use import _ParameterizedScratchpadMeta  # noqa: E402
+from test_scratchpad_use import _ParameterizedScratchpadMeta
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -849,7 +851,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
             if consumer_menu is not None:
 
                 def offered(alloc, op, max_cores):
-                    if getattr(alloc.allocator, "_suppress_tiling", False):
+                    if alloc.suppress_tiling:
                         return [TileSpec()]
                     if _reads_graph_inputs_only(op):
                         return [_D0_BY_4]
@@ -1080,7 +1082,7 @@ class TileOwnershipGroupingTests(unittest.TestCase):
 
 class ReplanAfterTilingGateTests(unittest.TestCase):
     """``_materialize_selection`` applies chosen tilings and solves again only
-    for an engine whose ``replans_after_tiling()`` is true; any other engine's
+    for a solver whose ``capabilities.replans_after_tiling`` holds; any other's
     first plan stands, whatever tilings it carries."""
 
     _CHOICES = {"buf0": _D0_BY_4}
@@ -1090,7 +1092,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
             co_optimizing_lx_planning=True, layout_solver=layout_solver
         ):
             alloc = select_allocator()
-            plan = SolvedPlan.of_buffers([], alloc._build_solver())
+            plan = SolvedPlan.of_buffers([], alloc.solver)
             graph = SimpleNamespace(operations=[])
             with contextlib.ExitStack() as stack:
                 chosen = stack.enter_context(
@@ -1115,7 +1117,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
 
     def test_annealer_placement_stands(self):
         plan, result, chosen, apply = self._materialize("simulated_annealing")
-        self.assertFalse(plan.solver.replans_after_tiling())
+        self.assertFalse(plan.solver.capabilities.replans_after_tiling)
         self.assertIs(result, plan)
         chosen.assert_not_called()
         apply.assert_not_called()

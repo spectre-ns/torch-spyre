@@ -432,7 +432,7 @@ class UnsizedBufferTest(TestCase):
     capacity gate -- so an unsized buffer that ever reached the search would be
     placed occupying no space and the buffer above it would land on the same
     address. What prevents that is a coupling across ``utils.mem_usage_by_buf``,
-    ``allocator._op_output_good_for_lx_reuse`` and ``_eligible``'s pin gate,
+    ``residency_rules._op_output_good_for_lx_reuse`` and ``_eligible``'s pin gate,
     which no single file states. ``_assert_unsized_buffers_are_pinned`` states
     it; these pin that it holds on the corpus and that it actually bites.
     """
@@ -1927,11 +1927,11 @@ class TestCoarseTilingIsGatedOnTheFlag(TestCase):
                 mock.patch.object(ts_config, "auto_coarse_tiling", flag),
             ):
                 self.assertEqual(
-                    self._allocator(SaCoOptimizingSolver)._solver_chooses_tilings,
+                    self._allocator(SaCoOptimizingSolver).factory.applies_tilings,
                     flag,
                 )
                 self.assertFalse(
-                    self._allocator(CpSatLayoutSolver)._solver_chooses_tilings
+                    self._allocator(CpSatLayoutSolver).factory.applies_tilings
                 )
 
 

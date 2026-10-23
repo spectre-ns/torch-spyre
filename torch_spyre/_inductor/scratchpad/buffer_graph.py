@@ -35,6 +35,7 @@ shape and tile count, each stage holding the previous optimum.
 from __future__ import annotations
 
 import logging
+import math
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -218,6 +219,37 @@ class ResourceNode:
         return edge
 
 
+def _integer_objective(cp: Any) -> Any:
+    """Re-post ``cp``'s objective with integer coefficients and return it,
+    so a later stage can hold its optimum (CP-SAT takes no float constraint).
+    A float objective is scaled the way CP-SAT scales one internally: by the
+    largest power of two that keeps its activity within 2**53."""
+    fo = cp.proto.floating_point_objective
+    obj = cp.proto.objective
+    pairs = (
+        list(zip(fo.vars, fo.coeffs)) if fo.vars else list(zip(obj.vars, obj.coeffs))
+    )
+    if not pairs:
+        return None
+
+    def var(index: int) -> Any:
+        if index >= 0:
+            return cp.get_int_var_from_proto_index(index)
+        return 1 - cp.get_int_var_from_proto_index(-index - 1)
+
+    scale = 1
+    if fo.vars:
+        activity = sum(
+            abs(c)
+            * max(abs(d) for d in cp.proto.variables[v if v >= 0 else -v - 1].domain)
+            for v, c in pairs
+        )
+        scale = 2 ** max(0, min(40, 53 - math.ceil(math.log2(max(activity, 1.0)))))
+    expr = sum(round(c * scale) * var(v) for v, c in pairs if round(c * scale))
+    cp.minimize(expr)
+    return expr
+
+
 def spill_cost(item: Any, size: Optional[int] = None) -> int:
     """Differential HBM traffic a spill adds over residency, in units of
     ``size`` (default ``item.size``): the reads residency would serve, plus
@@ -284,7 +316,7 @@ class Transform:
 class SolveSettings:
     """How ``solve`` runs CP-SAT: the time limit, whether to bottom-justify
     offsets, the hook that solves one ladder stage and records its stats
-    (``CpSatLayoutSolver._solve_and_record``), and where a stats entry goes
+    (``ModelSolver._solve_and_record``), and where a stats entry goes
     when the objective cannot be lowered."""
 
     time_limit_seconds: Optional[float]  # None or 0: no limit
@@ -681,8 +713,8 @@ class SpyreOptimizationGraph:
             )
         tile_terms = strategy.tile_terms
 
-        def solve_stage(stage: str) -> int:
-            result = model.Solve()
+        def solve_stage(stage: str, objective: bool = False) -> int:
+            result = model.Solve(objective=objective)
             if result not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError(
                     f"CP-SAT returned {solver.StatusName(result)} without a plan "
@@ -694,7 +726,23 @@ class SpyreOptimizationGraph:
         core_terms = None
         occupancy: Optional[int] = None
         if cost_expr is not None:
-            status = self._minimize_cost_expr(model, strategy, cost_expr)
+            priced = self._minimize_cost_expr(model, strategy, cost_expr)
+            if priced is not None:
+                status, held = priced
+                # Splits the cost model prices alike (a bandwidth-bound op
+                # with nothing resident) tie; break the tie as the ladder
+                # does, holding the priced optimum.
+                terms = [strategy.objective_terms(item) for item in items]
+                if any(c is not None for c, _ in terms):
+                    if held is not None:
+                        model.Add(held <= model.Value(held))
+                    # The tie is among splits: residency stays as priced.
+                    for item in items:
+                        lit = strategy.vars[item].in_buffer
+                        model.Add(lit == int(model.BooleanValue(lit)))
+                    core_terms, occupancy, status = self._tiebreak(
+                        model, terms, tile_terms, solve_stage, objective=True
+                    )
 
         if status is None:
             # One lexicographic ladder, in priority order: LX residency (HBM
@@ -732,23 +780,12 @@ class SpyreOptimizationGraph:
                     cuts,
                 )
 
-            core_terms = [cores for cores, _ in terms if cores is not None]
-            core_cost_terms = [cost for _, cost in terms if cost is not None]
-            if core_terms:
+            if any(cores is not None for cores, _ in terms):
                 if cut_terms:
                     model.Add(sum(cut_terms) <= cuts)
-                model.Maximize(sum(core_terms))
-                status = solve_stage("parallelism")
-                occupancy = round(solver.ObjectiveValue())
-                model.Add(sum(core_terms) >= occupancy)
-                model.Minimize(sum(core_cost_terms))
-                status = solve_stage("division shape")
-                # Tilings that differ only in count tie on every stage above;
-                # holding the shape optimum, take the fewest tiles.
-                if tile_terms:
-                    model.Add(sum(core_cost_terms) <= round(solver.ObjectiveValue()))
-                    model.Minimize(sum(tile_terms))
-                    status = solve_stage("tile count")
+                core_terms, occupancy, status = self._tiebreak(
+                    model, terms, tile_terms, solve_stage
+                )
 
         if logger.isEnabledFor(logging.DEBUG):
             if status is None:
@@ -783,14 +820,46 @@ class SpyreOptimizationGraph:
                     reasons[name] or SOLVER_CHOSE_SPILL,
                 )
 
+    @staticmethod
+    def _tiebreak(
+        model: Any,
+        terms: list[tuple[Any, Any]],
+        tile_terms: list,
+        solve_stage: Callable[..., int],
+        objective: bool = False,
+    ) -> tuple[list, int, int]:
+        """The ladder's last stages, each holding the previous optimum:
+        parallelism (most cores), division shape, then the fewest tiles.
+        Returns the core terms, the occupancy and the last status."""
+        core_terms = [cores for cores, _ in terms if cores is not None]
+        core_cost_terms = [cost for _, cost in terms if cost is not None]
+        model.Maximize(sum(core_terms))
+        model.HintSolution()
+        solve_stage("parallelism", objective)
+        occupancy = round(model.ObjectiveValue())
+        model.Add(sum(core_terms) >= occupancy)
+        model.Minimize(sum(core_cost_terms))
+        model.HintSolution()
+        status = solve_stage("division shape", objective)
+        # Tilings that differ only in count tie on every stage above; holding
+        # the shape optimum, take the fewest tiles.
+        if tile_terms:
+            model.Add(sum(core_cost_terms) <= round(model.ObjectiveValue()))
+            model.Minimize(sum(tile_terms))
+            model.HintSolution()
+            status = solve_stage("tile count", objective)
+        return core_terms, occupancy, status
+
     def _minimize_cost_expr(
         self,
         model: Any,
         strategy: EncodingStrategy,
         cost_expr: sympy.Expr,
-    ) -> Optional[int]:
-        """Solve once under the lowered cost expression; ``None`` (with the
-        reason in the stats) when it cannot be lowered."""
+    ) -> Optional[tuple[int, Any]]:
+        """Solve once under the lowered cost expression: the status, and the
+        objective as an integer expression a later stage can hold (``None``
+        for a constant cost). ``None`` (with the reason in the stats) when
+        it cannot be lowered."""
         from ortools.sat.python import cp_model
 
         from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
@@ -806,9 +875,11 @@ class SpyreOptimizationGraph:
                 extra = strategy.extra_cost_terms()
                 if extra:
                     cp_cost = cp_cost + sum(extra)
+                held = None
                 if not isinstance(cp_cost, (int, float)):
                     # A constant cost leaves any solution optimal.
                     model.Minimize(cp_cost)
+                    held = _integer_objective(model.model)
             solver = model
             status = model.Solve(objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -816,7 +887,7 @@ class SpyreOptimizationGraph:
                     f"CP-SAT returned {solver.StatusName(status)} without a plan "
                     f"after {solver.WallTime():.2f}s"
                 )
-            return status
+            return status, held
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
                 "[CP-SAT layout solver] cannot linearize the sympy expr: %s", exc

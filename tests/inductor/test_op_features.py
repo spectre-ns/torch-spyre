@@ -44,6 +44,7 @@ from torch_spyre._inductor.cost_model import (
     predict_by_bundle,
     predict_ops,
 )
+from torch_spyre._inductor.scratchpad import pricing
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
 from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
@@ -77,8 +78,6 @@ class CandidateDivisionTest(TestCase):
             self.assertEqual(_work_slices(op, division), expected)
 
     def test_symbolic_and_concrete_prices_receive_the_whole_legal_menu(self):
-        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-
         m, n, k, split = sympy.symbols("m n k split", integer=True, positive=True)
         op = SimpleNamespace(get_name=lambda: "out")
         divisions = [CoreDivision(splits={m: 16}), CoreDivision(splits={m: 8, n: 2})]
@@ -96,17 +95,11 @@ class CandidateDivisionTest(TestCase):
             ) as extract,
             patch("torch_spyre._inductor.cost_model.predict_ops", return_value=1.0),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
-                return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
-            ),
-            patch(
                 "torch_spyre._inductor.scratchpad.table_candidates.op_read_writes",
                 return_value=SimpleNamespace(reads=[SimpleNamespace(name="weight")]),
             ),
         ):
-            ScratchpadAllocator._extract_op_features(
-                None, None, "out", buffers, {}, op=op
-            )
+            pricing.extract_op_features(None, "out", buffers, {}, op=op)
             self.assertEqual(
                 extract.call_args.kwargs["candidate_work_slices"], expected
             )
@@ -212,7 +205,7 @@ class DiscriminationTest(TestCase):
 class SymbolicTiledFeatureTest(TestCase):
     """Coarse-tiled features carrying the co-optimizer's UNDECIDED symbols.
 
-    ``ScratchpadAllocator._extract_op_features`` keys ``is_lx`` and the core
+    ``pricing.extract_op_features`` keys ``is_lx`` and the core
     splits on the solver's own variables, so a coarse-tiled op reaches
     ``predict_ops`` with a symbolic per-core tile height. Every tiling surface
     keyed on it is a piecewise power law, and branching on a symbol raised
@@ -466,7 +459,7 @@ class SymbolicTiledFeatureTest(TestCase):
 class SymbolicMatmulSplitCostTest(TestCase):
     """A matmul whose CORE SPLITS -- not just ``is_lx`` -- are undecided symbols.
 
-    ``ScratchpadAllocator._extract_op_features`` builds the work slices from
+    ``pricing.extract_op_features`` builds the work slices from
     ``plan_solver.sym_core_divs``, so ``dump_cost_model._matmul_features`` sees one
     ``sympy.Symbol`` per split and a matmul reaches ``predict_ops`` with symbolic
     ``m``/``n``/``k``, symbolic ``cores`` and a symbolic ``matmul_rows_per_core``.
@@ -498,7 +491,9 @@ class SymbolicMatmulSplitCostTest(TestCase):
     M, N, K, DTYPE_BYTES = 1024, 1024, 64, 2
 
     def _params(self):
-        from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+        from torch_spyre._inductor.scratchpad.pricing import (
+            _COST_PARAMS,
+        )
 
         return _COST_PARAMS
 

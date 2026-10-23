@@ -14,7 +14,7 @@
 
 import functools
 from collections.abc import Sequence
-from typing import Any, ClassVar, cast
+from typing import ClassVar, cast
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -32,8 +32,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     every open buffer's division menu and places each leaf with a fresh
     placement-only solver, keeping the leaf with the least HBM traffic.
 
-    The inner solver is a class parameter, so that the wrapper is a class the
-    allocator can ask about capabilities: build one with :meth:`wrapping`.
+    The inner solver is a class parameter: build one with :meth:`wrapping`.
     """
 
     _inner_factory: ClassVar[type[MemoryPlanSolver]]
@@ -52,34 +51,6 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
             "__qualname__": name,
         }
         return cast("type[ExhaustiveSearchSolver]", type(name, (cls,), namespace))
-
-    @classmethod
-    def supports_paired_buffers(cls) -> bool:
-        return False
-
-    @classmethod
-    def decides_lx_relayouts(cls) -> bool:
-        return False
-
-    @classmethod
-    def generates_divisions(cls) -> bool:
-        return False
-
-    @classmethod
-    def chooses_tilings(cls) -> bool:
-        return False
-
-    @classmethod
-    def tilings_from_menu(cls) -> bool:
-        return False
-
-    @classmethod
-    def replans_after_tiling(cls) -> bool:
-        return False
-
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return False
 
     def __init__(
         self,
@@ -111,20 +82,9 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
     # CoreDivisionLayoutSolver contract
     # ------------------------------------------------------------------
 
-    def graph_solver(self) -> Any:
-        """The search over the graph: each leaf of the division menus placed
-        by the inner solver."""
-        from torch_spyre._inductor.scratchpad.graph_solvers import (
-            DecomposedPlacement,
-        )
-
-        return DecomposedPlacement(self._inner_factory, self.limit)
-
     def plan_layout_and_core_divisions(
         self, cost_expr=None
     ) -> list[CoreDivisionBuffer]:
         from torch_spyre._inductor.scratchpad.graph_solvers import solve_buffers
 
-        return cast(
-            "list[CoreDivisionBuffer]", solve_buffers(self, cost_expr, joint=True)
-        )
+        return cast("list[CoreDivisionBuffer]", solve_buffers(self, cost_expr))

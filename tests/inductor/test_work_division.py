@@ -68,6 +68,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor import pass_utils as pass_utils_module
 from torch_spyre._inductor.pass_utils import PerCoreView, SchedNodeArg, op_read_writes
+from torch_spyre._inductor.scratchpad.encoding_strategy import EnumerationFactory
 from torch_spyre._inductor.scratchpad import allocator as allocator_module
 from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor import work_division as work_division_module
@@ -134,6 +135,9 @@ from torch_spyre._inductor.work_division_constraints import (
 )
 import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_module
 from utils_inductor import mock_op_split_space
+from torch_spyre._inductor.scratchpad import division_menus
+from torch_spyre._inductor.scratchpad import drain_plans
+from torch_spyre._inductor.scratchpad import residency_rules
 
 
 # A solver class for allocator tests that never solve: never built, only asked
@@ -202,14 +206,14 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
 
     def test_loop_carry_bypasses_output_profitability_denylist(self):
         op = self._tagged_carry()
-        with patch.object(self.allocator, "_get_op_name", return_value="convolution"):
-            self.assertTrue(self.allocator._op_output_good_for_lx_reuse(op))
+        with patch.object(residency_rules, "_get_op_name", return_value="convolution"):
+            self.assertTrue(residency_rules._op_output_good_for_lx_reuse(op))
 
             op._loop_carry_record = LoopCarryRecord(
                 storage_name="some_other_buffer",
                 update_name="carry_update",
             )
-            self.assertFalse(self.allocator._op_output_good_for_lx_reuse(op))
+            self.assertFalse(residency_rules._op_output_good_for_lx_reuse(op))
 
     def test_only_joint_solver_accepts_tagged_loop_carry_mutation_target(self):
         graph = SimpleNamespace(operations=[])
@@ -227,38 +231,38 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
         )
         ordinary = _computed_buffer((64, 64), name="carry")
         self.assertEqual(
-            self.allocator._buffer_residency_reason(op=ordinary, **common),
+            residency_rules._buffer_residency_reason(op=ordinary, **common),
             "mutation target",
         )
 
         carry = self._tagged_carry()
         with (
-            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(residency_rules, "_is_tiled_advancing", return_value=False),
             patch.object(
-                allocator_module, "_is_read_advancing_anywhere", return_value=False
+                residency_rules, "_is_read_advancing_anywhere", return_value=False
             ),
             patch.object(
-                allocator_module,
+                residency_rules,
                 "_multi_output_extern_kernel_in_live_range",
                 return_value=False,
             ),
             patch.object(
-                allocator_module, "buffer_not_read_in_full", return_value=False
+                residency_rules, "buffer_not_read_in_full", return_value=False
             ),
             patch.object(
-                allocator_module, "_would_produce_lx_back_gap", return_value=False
+                residency_rules, "_would_produce_lx_back_gap", return_value=False
             ),
-            patch.object(self.allocator, "_restickify_barrier", return_value=None),
+            patch.object(residency_rules, "_restickify_barrier", return_value=None),
             patch.object(
-                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+                residency_rules, "_is_index_or_indirectly_accessed", return_value=False
             ),
         ):
             self.assertIsNone(
-                self.allocator._buffer_residency_reason(op=carry, **common)
+                residency_rules._buffer_residency_reason(op=carry, **common)
             )
             common["division_is_fixed"] = True
             self.assertEqual(
-                self.allocator._buffer_residency_reason(op=carry, **common),
+                residency_rules._buffer_residency_reason(op=carry, **common),
                 "mutation target",
             )
 
@@ -286,34 +290,34 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
         )
         carry = self._tagged_carry()
         with (
-            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(residency_rules, "_is_tiled_advancing", return_value=False),
             patch.object(
-                allocator_module, "_is_read_advancing_anywhere", return_value=False
+                residency_rules, "_is_read_advancing_anywhere", return_value=False
             ),
             patch.object(
-                allocator_module,
+                residency_rules,
                 "_multi_output_extern_kernel_in_live_range",
                 return_value=False,
             ),
             patch.object(
-                allocator_module, "buffer_not_read_in_full", return_value=False
+                residency_rules, "buffer_not_read_in_full", return_value=False
             ),
             patch.object(
-                allocator_module, "_would_produce_lx_back_gap", return_value=False
+                residency_rules, "_would_produce_lx_back_gap", return_value=False
             ),
-            patch.object(self.allocator, "_restickify_barrier", return_value=None),
+            patch.object(residency_rules, "_restickify_barrier", return_value=None),
             patch.object(
-                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+                residency_rules, "_is_index_or_indirectly_accessed", return_value=False
             ),
         ):
             # No plan: today's refusal stands.
             self.assertEqual(
-                self.allocator._buffer_residency_reason(op=carry, **common),
+                residency_rules._buffer_residency_reason(op=carry, **common),
                 "graph output mutated after production",
             )
             # A validated plan clears exactly this branch.
             self.assertIsNone(
-                self.allocator._buffer_residency_reason(
+                residency_rules._buffer_residency_reason(
                     op=carry, drain_plans={"carry"}, **common
                 )
             )
@@ -321,7 +325,7 @@ class TestLoopCarryLxEligibility(unittest.TestCase):
             # the earlier mutation-target refusal still fires first.
             common["division_is_fixed"] = True
             self.assertEqual(
-                self.allocator._buffer_residency_reason(
+                residency_rules._buffer_residency_reason(
                     op=carry, drain_plans={"carry"}, **common
                 ),
                 "mutation target",
@@ -362,42 +366,42 @@ class TestRestickifyBarrierDeferredOnJointPath(unittest.TestCase):
     def test_joint_path_does_not_consult_the_barrier(self):
         with (
             patch.object(
-                self.allocator, "_op_output_good_for_lx_reuse", return_value=True
+                residency_rules, "_op_output_good_for_lx_reuse", return_value=True
             ),
-            patch.object(allocator_module, "is_empty_tiled_layout", return_value=False),
-            patch.object(allocator_module, "_is_tiled_advancing", return_value=False),
+            patch.object(residency_rules, "is_empty_tiled_layout", return_value=False),
+            patch.object(residency_rules, "_is_tiled_advancing", return_value=False),
             patch.object(
-                allocator_module, "_is_read_advancing_anywhere", return_value=False
+                residency_rules, "_is_read_advancing_anywhere", return_value=False
             ),
             patch.object(
-                allocator_module,
+                residency_rules,
                 "_multi_output_extern_kernel_in_live_range",
                 return_value=False,
             ),
             patch.object(
-                self.allocator, "_is_index_or_indirectly_accessed", return_value=False
+                residency_rules, "_is_index_or_indirectly_accessed", return_value=False
             ),
             patch.object(
-                allocator_module, "buffer_not_read_in_full", return_value=False
+                residency_rules, "buffer_not_read_in_full", return_value=False
             ),
             patch.object(
-                allocator_module, "_would_produce_lx_back_gap", return_value=False
+                residency_rules, "_would_produce_lx_back_gap", return_value=False
             ),
             patch.object(
-                self.allocator,
+                residency_rules,
                 "_restickify_barrier",
                 return_value="read by restickify (local-read proof failed)",
             ) as barrier,
         ):
             self.assertIsNone(
-                self.allocator._buffer_residency_reason(
+                residency_rules._buffer_residency_reason(
                     division_is_fixed=False, **self.common
                 )
             )
             barrier.assert_not_called()
 
             self.assertEqual(
-                self.allocator._buffer_residency_reason(
+                residency_rules._buffer_residency_reason(
                     division_is_fixed=True, **self.common
                 ),
                 "read by restickify (local-read proof failed)",
@@ -434,16 +438,17 @@ class TestEmptyLxEligibility(unittest.TestCase):
         graph = SimpleNamespace(
             try_get_buffer=lambda _name: SimpleNamespace(layout=empty)
         )
-        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
         with patch.object(
-            allocator_module, "clone_at_graph_boundaries", return_value=True
+            residency_rules, "clone_at_graph_boundaries", return_value=True
         ):
-            reason = allocator._input_residency_reason(
+            reason = residency_rules._input_residency_reason(
                 graph, "value", [0, 1], division_is_fixed=False
             )
         self.assertEqual(reason, "empty tensor")
-        with patch.object(allocator, "_op_output_good_for_lx_reuse", return_value=True):
-            reason = allocator._buffer_residency_reason(
+        with patch.object(
+            residency_rules, "_op_output_good_for_lx_reuse", return_value=True
+        ):
+            reason = residency_rules._buffer_residency_reason(
                 graph,
                 "value",
                 [0, 1],
@@ -2648,17 +2653,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 GraphEditor.collective_operand_name
             )
 
-            plans = allocator_module.validated_drain_plans(
-                graph, division_is_fixed=False
-            )
+            plans = drain_plans.validated_drain_plans(graph, division_is_fixed=False)
             allocator._validated_drain_plans = plans
             solve_graph, tables = allocator.candidates._build_graph(
-                graph, {}, allocator_module._DivisionMap(divisions, set())
+                graph, {}, division_menus._DivisionMap(divisions, set())
             )
-            solver = allocator._build_solver()
+            solver = allocator.solver
             strategy = allocator.factory.strategy_from_tables(tables)
             solved = allocator_module.SolvedPlan(solve_graph, strategy, solver, tables)
-            solver.solve_graph(solve_graph, strategy)
+            solver.solve(solve_graph, strategy)
             # commit_divisions would record the committed ownership here.
             for op in graph.operations:
                 op.iteration_space_ownership = object()
@@ -2818,9 +2821,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         }
 
         def run(with_plan):
-            real_plans = allocator_module.validated_drain_plans
+            real_plans = drain_plans.validated_drain_plans
             plans_fn = real_plans if with_plan else (lambda *a, **k: {})
-            with patch.object(allocator_module, "validated_drain_plans", plans_fn):
+            with patch.object(drain_plans, "validated_drain_plans", plans_fn):
                 return self._plan_solve_push(graph, divisions, mem_usage, residency)
 
         with self.subTest("the collective is drained"):
@@ -3042,7 +3045,7 @@ class TestJointAllocator(unittest.TestCase):
                 return_value=fixed,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                "torch_spyre._inductor.scratchpad.division_menus._split_option_is_legal",
                 return_value=True,
             ),
             patch.object(
@@ -3076,7 +3079,7 @@ class TestJointAllocator(unittest.TestCase):
                 return_value=fixed,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                "torch_spyre._inductor.scratchpad.division_menus._split_option_is_legal",
                 return_value=False,
             ),
         ):
@@ -3119,11 +3122,11 @@ class TestJointAllocator(unittest.TestCase):
             # ``_core_division`` reads the write dep from ``work_division``.
             patch.object(work_division_module, "op_read_writes", return_value=rw),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
+                "torch_spyre._inductor.scratchpad.division_menus._split_fits_sticks",
                 return_value=True,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                "torch_spyre._inductor.scratchpad.division_menus._split_option_is_legal",
                 side_effect=lambda _op, splits: splits == safe,
             ) as is_legal,
         ):
@@ -3179,7 +3182,7 @@ class TestJointAllocator(unittest.TestCase):
                 return_value=[],
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                "torch_spyre._inductor.scratchpad.division_menus._split_option_is_legal",
                 return_value=True,
             ),
         ):
@@ -3232,11 +3235,11 @@ class TestJointAllocator(unittest.TestCase):
             # ``_core_division`` reads the write dep from ``work_division``.
             patch.object(work_division_module, "op_read_writes", return_value=rw),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_fits_sticks",
+                "torch_spyre._inductor.scratchpad.division_menus._split_fits_sticks",
                 return_value=True,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                "torch_spyre._inductor.scratchpad.division_menus._split_option_is_legal",
                 return_value=True,
             ),
             self.assertRaisesRegex(
@@ -3384,7 +3387,7 @@ class TestTiledSplitsAfterAUnitTile(unittest.TestCase):
                 _UNBUILT_SOLVER, size=1, division_mode="open"
             )
             with (
-                patch.object(ScratchpadAllocator, "_solver_chooses_tilings", True),
+                patch.object(EnumerationFactory, "applies_tilings", True),
                 patch(
                     "torch_spyre._inductor.scratchpad.coarse_tiling.CoarseTilingPass",
                     tiling_pass,

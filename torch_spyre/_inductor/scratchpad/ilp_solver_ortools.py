@@ -15,16 +15,16 @@
 """Joint core-division + LX-placement solver built on OR-Tools CP-SAT
 (``config.layout_solver == "cpsat"``).
 
-The allocator's buffers become a :class:`SpyreOptimizationGraph`
-(``buffer_graph.py``): one :class:`ResourceNode` per op output or graph input,
+:class:`ModelSolver` is the graph solver the allocator configures for
+``layout_solver="cpsat"``; :class:`CpSatLayoutSolver` is its buffer form for
+tests and capture replay. The graph (``buffer_graph.py``) has one :class:`ResourceNode` per op output or graph input,
 a :class:`DependencyEdge` per (producer, consumer) read (``in_place`` when the
 consumer may take over the producer's storage), and :class:`ExecutionEdge`\\ s
 chaining op outputs in execution order. Each node's decisions -- its work
 split (core division and coarse tiling), whether it is resident in LX, and its
 offset -- are open for the solve to fill. ``graph.solve`` encodes the graph
 through an :class:`EncodingStrategy` (``encoding_strategy.py``), runs the
-objective ladder and fills the decisions; this module builds the graph and the
-strategy from the allocator's buffers and writes the decisions back.
+objective ladder and fills the decisions.
 
 The model the default (table) strategy encodes:
 
@@ -72,7 +72,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 import sympy
 
@@ -101,6 +101,7 @@ from torch_spyre._inductor.scratchpad.encoding_strategy import (
     EnumerationFactory,
     _gate_divisions,
 )
+from torch_spyre._inductor.scratchpad.graph_solvers import Capabilities, GraphSolver
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -112,7 +113,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor import config
 
-__all__ = ["CpSatLayoutSolver", "_gate_divisions"]
+__all__ = ["CpSatLayoutSolver", "ModelSolver", "_gate_divisions"]
 
 logger = logging.getLogger(__name__)
 
@@ -141,47 +142,24 @@ def _backend():
 _SOLVER_CHOSE_SPILL = SOLVER_CHOSE_SPILL
 
 
-class CpSatLayoutSolver(CoreDivisionLayoutSolver):
-    """Joint core-division + LX placement via an OR-Tools CP-SAT search
-    (``config.layout_solver == "cpsat"``). See the module docstring for the
-    model (joint division, slicing-match residency gate, 2D no-overlap with
-    in-place lifetime shortening) and the lexicographic objective
-    (residency, then parallelism, then division balance).
-    """
+class ModelSolver(GraphSolver):
+    """Posts the graph through its strategy to a backend (CP-SAT unless
+    ``SPYRE_LX_BACKEND`` names another), runs the objective ladder and fills
+    every open decision. See the module docstring for the model."""
 
-    @classmethod
-    def supports_paired_buffers(cls) -> bool:
-        return False
-
-    @classmethod
-    def decides_lx_relayouts(cls) -> bool:
-        return True
-
-    @classmethod
-    def generates_divisions(cls) -> bool:
-        return False
-
-    @classmethod
-    def chooses_tilings(cls) -> bool:
-        return True
-
-    @classmethod
-    def tilings_from_menu(cls) -> bool:
-        return True
-
-    @classmethod
-    def replans_after_tiling(cls) -> bool:
-        return True
-
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return True
+    capabilities = Capabilities(
+        chooses_core_divisions=True,
+        decides_lx_relayouts=True,
+        chooses_tilings=True,
+        tilings_from_menu=True,
+        replans_after_tiling=True,
+        linear_cost_only=True,
+        posts_model=True,
+    )
 
     def __init__(
         self,
-        buffers: Sequence[LifetimeBoundBuffer],
-        size: int,
-        alignment: int = 128,
+        capacity: int,
         time_limit_seconds: Optional[float] = None,
         bottom_justify: bool = True,
     ) -> None:
@@ -192,22 +170,85 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "Install it with 'pip install ortools' "
                 "or select a different layout_solver (e.g. 'greedy')."
             )
-        super().__init__(buffers, size, alignment)
-        # What the last solve cost and returned, for the cost-expression dump.
-        # Here rather than on the base class: this is the only solver that
-        # reports it, and the allocator reads it with a default, so the base
-        # contract does not change. Empty until a solve, so a reader can tell
-        # "not recorded" from "no solve".
-        self.last_solve_stats: dict = {}
-        # The solver works in alignment-sized units so every offset it picks is
-        # automatically aligned; plan_layout scales sizes/offsets in and out.
-        self._capacity_units = self.limit // self.alignment
-        self._time_limit_seconds = (
+        super().__init__(capacity)
+        self.time_limit_seconds = (
             config.cpsat_time_limit_seconds
             if time_limit_seconds is None
             else time_limit_seconds
         )
-        self._bottom_justify = bottom_justify
+        self.bottom_justify = bottom_justify
+
+    @property
+    def name(self) -> str:
+        return "CpSatLayoutSolver"
+
+    def solve(self, graph, strategy, cost_expr=None) -> list[ResourceNode]:
+        """A node the allocator did not bar is barred here when even its
+        smallest per-core footprint exceeds LX."""
+        for node in graph.get_nodes():
+            if node.residency_reason is not None:
+                continue
+            menu = strategy.menus.get(node.name, ())
+            footprint = min(
+                (
+                    ceil_div(
+                        node.nbytes, cd.output_partition * cd.tiling.output_tile_count
+                    )
+                    for cd in menu
+                ),
+                default=node.nbytes,
+            )
+            if footprint > self.capacity:
+                node.residency_reason = (
+                    f"min footprint {footprint} B > LX capacity {self.capacity} B"
+                )
+        graph.settings = SolveSettings(
+            time_limit_seconds=self.time_limit_seconds,
+            bottom_justify=self.bottom_justify,
+            record=self._solve_and_record,
+            note_stats=self._note_stats,
+        )
+        return graph.solve(_backend(), cost_expr, strategy)
+
+    def _note_stats(self, stats: dict) -> None:
+        self.last_solve_stats = stats
+
+    def _solve_and_record(
+        self,
+        solver: "cp_model.CpSolver",
+        model: "cp_model.CpModel",
+        *,
+        objective: bool = False,
+    ) -> int:
+        """Solve one ladder stage, and keep what it cost and returned for the
+        cost-expression dump. Bound to solving, so the last record always
+        describes the solve that produced the plan."""
+        status = solver.Solve(model)
+        self.last_solve_stats = {
+            "status": solver.StatusName(status),
+            "solve_s": round(solver.WallTime(), 3),
+            "variables": len(model.proto.variables),
+            "constraints": len(model.proto.constraints),
+            "limit_s": solver.parameters.max_time_in_seconds or None,
+            "objective_used": objective,
+        }
+        return status
+
+
+class CpSatLayoutSolver(CoreDivisionLayoutSolver):
+    """The buffer form of :class:`ModelSolver`: solves a list of buffers and
+    writes the decisions back onto them."""
+
+    def __init__(
+        self,
+        buffers: Sequence[LifetimeBoundBuffer],
+        size: int,
+        alignment: int = 128,
+        time_limit_seconds: Optional[float] = None,
+        bottom_justify: bool = True,
+    ) -> None:
+        super().__init__(buffers, size, alignment)
+        self.engine = ModelSolver(size, time_limit_seconds, bottom_justify)
 
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Place buffers on their already-fixed core divisions (placement-only).
@@ -238,45 +279,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             list(self._plan_layout_generic(cost_expr=cost_expr)),
         )
 
-    posts_model = True
-
-    def graph_solver(self) -> Any:
-        """The CP-SAT backend: the graph is encoded through a strategy and
-        solved by the objective ladder."""
-        from torch_spyre._inductor.scratchpad.backend import CpSat
-
-        return CpSat
-
-    def solve_graph(self, graph, strategy, cost_expr=None) -> None:
-        """Encode ``graph`` through ``strategy``, run the objective ladder and
-        fill every open decision. A node the allocator did not bar is barred
-        here when even its smallest per-core footprint exceeds LX, as
-        :meth:`MemoryPlanSolver.excluded` bars a buffer."""
-        for node in graph.get_nodes():
-            if node.residency_reason is not None:
-                continue
-            menu = strategy.menus.get(node.name, ())
-            footprint = min(
-                (
-                    ceil_div(
-                        node.nbytes, cd.output_partition * cd.tiling.output_tile_count
-                    )
-                    for cd in menu
-                ),
-                default=node.nbytes,
-            )
-            if footprint > self.limit:
-                node.residency_reason = (
-                    f"min footprint {footprint} B > LX capacity {self.limit} B"
-                )
-        graph.settings = SolveSettings(
-            time_limit_seconds=self._time_limit_seconds,
-            bottom_justify=self._bottom_justify,
-            record=self._solve_and_record,
-            note_stats=self._note_stats,
-        )
-        graph.solve(_backend(), cost_expr, strategy)
-
     def _plan_layout_generic(
         self,
         log_lx_usage: bool = False,
@@ -300,12 +302,12 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         graph = build_graph(
             buffers,
             self.alignment,
-            self._capacity_units,
-            SolveSettings(None, self._bottom_justify, self._solve_and_record),
+            self.limit // self.alignment,
+            SolveSettings(None, self.engine.bottom_justify, _unrecorded),
             forced_reasons,
         )
         strategy = EnumerationFactory.from_config().strategy(buffers, forced_reasons)
-        self.solve_graph(graph, strategy, cost_expr)
+        self.engine.solve(graph, strategy, cost_expr)
 
         # Write the decisions back onto the caller's buffers, in bytes.
         order = {name: i for i, name in enumerate(graph.nodes)}
@@ -333,36 +335,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             }
         return list(buffers)
 
-    def _note_stats(self, stats: dict) -> None:
-        self.last_solve_stats = stats
+    @property
+    def last_solve_stats(self) -> dict:
+        return self.engine.last_solve_stats
 
-    def _solve_and_record(
-        self,
-        solver: "cp_model.CpSolver",
-        model: "cp_model.CpModel",
-        *,
-        objective: bool = False,
-    ) -> int:
-        """Solve, and stash what it cost and returned for the cost-expression
-        dump. The one way this class solves.
 
-        Recording is bound to solving rather than left to each call site: the
-        graph solves in its own ladder stages when the cost expression does not
-        lower, and a site that solved without recording would leave its plan
-        described by an earlier call's numbers -- silently wrong data rather
-        than an error. The two paths are exclusive, so the last record always
-        describes the solve that produced this plan.
-
-        Nothing else in the pipeline records this, so "why was that compile
-        slow" currently has no artifact behind it.
-        """
-        status = solver.Solve(model)
-        self.last_solve_stats = {
-            "status": solver.StatusName(status),
-            "solve_s": round(solver.WallTime(), 3),
-            "variables": len(model.proto.variables),
-            "constraints": len(model.proto.constraints),
-            "limit_s": solver.parameters.max_time_in_seconds or None,
-            "objective_used": objective,
-        }
-        return status
+def _unrecorded(*args, **kwargs) -> int:
+    raise AssertionError("ModelSolver.solve sets the recording hook")

@@ -74,7 +74,9 @@ from torch_spyre._inductor.op_spec import (
 )
 from torch_spyre._inductor.pass_utils import PerCoreView
 import torch_spyre._inductor.scratchpad.allocator as allocator_module
-from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+from torch_spyre._inductor.scratchpad.allocator import (
+    ScratchpadAllocator,
+)
 import torch_spyre._inductor.scratchpad.graph_builder as graph_builder_module
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
@@ -83,6 +85,8 @@ from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.spyre_kernel import SpyreKernel, _iter_op_specs
 from torch_spyre._inductor.core_mapping import remap_work_division
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
+from torch_spyre._inductor.scratchpad import division_menus
+from torch_spyre._inductor.scratchpad import residency_rules
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -732,7 +736,7 @@ def test_allocator_reuses_only_unmodified_plans(plans, prepass):
         ) as collect,
         mock_patch.object(graph_builder_module, "_entries", return_value={}) as entries,
         mock_patch.object(graph_builder_module, "_relayout_destinations"),
-        mock_patch.object(allocator, "_build_solver", side_effect=StopIteration),
+        mock_patch.object(allocator.solver, "solve", side_effect=StopIteration),
         pytest.raises(StopIteration),
     ):
         allocator.plan_allocation(graph, lx_relayout_plans=plans)
@@ -813,12 +817,12 @@ def test_fixed_plan_handoff_keeps_feature_gates(mode):
 
 def test_joint_allocation_does_not_consume_fixed_plan_handoff():
     allocator = allocator_module.ScratchpadAllocator(
-        allocator_module.ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver),
+        allocator_module.DecomposedPlacement(GreedyLayoutSolver, 256),
         256,
         division_mode="open",
     )
     graph = _allocation_graph()
-    division_map = allocator_module._DivisionMap({}, set())
+    division_map = division_menus._DivisionMap({}, set())
     with (
         mock_patch.object(
             allocator.candidates,
@@ -941,7 +945,6 @@ def test_consumer_anchoring_commits_the_unique_accepted_owner_order(mode):
 
 
 def test_restickify_lx_read_requires_the_same_physical_owners():
-    allocator = ScratchpadAllocator(GreedyLayoutSolver, 256)
     expected = PerCoreView(((0, 8),), ((0, Mod(_CORE_ID, 8)),), num_cores=8)
     wrong = PerCoreView(((0, 8),), ((0, Mod(_CORE_ID + 1, 8)),), num_cores=8)
     producer = SimpleNamespace(name="source", get_name=lambda: "source")
@@ -959,17 +962,17 @@ def test_restickify_lx_read_requires_the_same_physical_owners():
         with (
             config.patch({"lx_planner_relayout": enabled}),
             mock_patch.object(
-                allocator_module,
+                residency_rules,
                 "is_restickify_op",
                 return_value=structural_restickify,
             ),
-            mock_patch.object(allocator_module, "ComputedBuffer", SimpleNamespace),
-            mock_patch.object(allocator_module, "MemoryDep", SimpleNamespace),
+            mock_patch.object(residency_rules, "ComputedBuffer", SimpleNamespace),
+            mock_patch.object(residency_rules, "MemoryDep", SimpleNamespace),
             mock_patch.object(
-                allocator_module, "op_read_writes", side_effect=read_writes
+                residency_rules, "op_read_writes", side_effect=read_writes
             ),
             mock_patch.object(
-                allocator_module,
+                residency_rules,
                 "_per_core_view_on_buf",
                 side_effect=lambda op, *_args: (
                     write_view if op is producer else expected,
@@ -978,7 +981,7 @@ def test_restickify_lx_read_requires_the_same_physical_owners():
                 ),
             ),
         ):
-            return allocator._restickify_barrier(
+            return residency_rules._restickify_barrier(
                 graph, "source", [1], lx_relayout_plans=plans
             )
 

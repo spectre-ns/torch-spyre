@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Graph solvers (Phase 3a, 3d): solvers that work on the graph directly
-instead of a posted model. ``SpyreOptimizationGraph.solve`` runs one set with
-``set_solver`` in place of encoding and the objective ladder.
+"""What the allocator solves with (Phase 3a, 3d, 3g): a graph solver. It
+fills every open decision of a :class:`SpyreOptimizationGraph`, either by
+posting the graph through the strategy to a backend
+(``ilp_solver_ortools.ModelSolver``) or by reading the nodes itself.
 
-:class:`PlacementSolver` runs a placement-only solver (greedy, first-fit,
-best-fit, simulated annealing) over each node's *placement view* -- name, size
-in bytes, uses, in-place parents and the transforms pinned with it -- and
-writes the decisions back onto the nodes. :class:`BufferSolver` runs a joint
-solver that still reads the allocator's buffers (the simulated-annealing
-co-optimizer, exhaustive search) and fills the nodes from what it chose.
+Each declares its :class:`Capabilities`, which the allocator, the candidate
+generator and the enumeration factory read; an impossible combination is
+refused when it is declared. :class:`PlacementSolver` runs a placement
+algorithm (greedy, first-fit, best-fit, simulated annealing) over each node's
+*placement view* -- name, size in bytes, uses, in-place parents and the
+transforms pinned with it. :class:`DecomposedPlacement` is the exhaustive
+search over the open nodes' menus. :class:`BufferSolver` runs the annealing
+co-optimizer over the buffer form of the graph and candidates.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import sympy
@@ -49,6 +53,90 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """What a solver can realize, asked before any solve.
+
+    - ``chooses_core_divisions``: chooses each node's core division jointly
+      with its placement; the open division mode needs it.
+    - ``supports_paired_buffers``: places a committed relayout's source and
+      destinations all-or-nothing; only such a solver gets relayout plans.
+    - ``decides_lx_relayouts``: places candidate relayout copies, so the
+      candidate generator offers them.
+    - ``generates_divisions``: generates divisions from an op's split space
+      (``node.space``) instead of only choosing among the menu; with
+      ``chooses_tilings`` the allocator applies the tilings it picks.
+    - ``chooses_tilings``: chooses coarse tilings jointly with divisions.
+    - ``tilings_from_menu``: takes tilings off the menu (tiled candidates).
+    - ``replans_after_tiling``: needs a second, placement solve once its
+      tilings are applied.
+    - ``linear_cost_only``: minimizes only a cost expression that lowers to
+      linear terms; withheld under ``auto_coarse_tiling``.
+    - ``posts_model``: encodes the graph through a strategy, so it realizes
+      every enumeration the factory allows; the others read the table model.
+    """
+
+    chooses_core_divisions: bool = False
+    supports_paired_buffers: bool = False
+    decides_lx_relayouts: bool = False
+    generates_divisions: bool = False
+    chooses_tilings: bool = False
+    tilings_from_menu: bool = False
+    replans_after_tiling: bool = False
+    linear_cost_only: bool = False
+    posts_model: bool = False
+
+    def __post_init__(self) -> None:
+        for implied, prerequisite in (
+            ("decides_lx_relayouts", "chooses_core_divisions"),
+            ("generates_divisions", "chooses_core_divisions"),
+            ("chooses_tilings", "chooses_core_divisions"),
+            ("linear_cost_only", "chooses_core_divisions"),
+            ("tilings_from_menu", "chooses_tilings"),
+            ("replans_after_tiling", "chooses_tilings"),
+        ):
+            if getattr(self, implied) and not getattr(self, prerequisite):
+                raise ValueError(f"{implied} requires {prerequisite}")
+
+
+class GraphSolver:
+    """Fills every open decision of a graph: ``solve`` takes the strategy
+    holding the graph's candidates and the priced cost expression (``None``:
+    the solver's own objective). The stats and the off-expression terms
+    describe the last solve, for the cost-expression dump."""
+
+    capabilities = Capabilities()
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity  # bytes
+        self.last_solve_stats: dict = {}
+
+    @property
+    def name(self) -> str:
+        return type(self).__name__
+
+    def accepts(self, strategy: Any) -> bool:
+        return True
+
+    def solve(
+        self,
+        graph: SpyreOptimizationGraph,
+        strategy: Any,
+        cost_expr: Optional[sympy.Expr] = None,
+    ) -> list[ResourceNode]:
+        raise NotImplementedError
+
+    def off_expression_ns(self) -> dict[str, float]:
+        """The terms the objective adds outside ``cost_expr`` for the solved
+        plan, in ns."""
+        return {}
+
+    def score_ns(self) -> Optional[float]:
+        """The total minimized for the solved plan, in ns, where that is not
+        ``cost_expr`` alone."""
+        return None
 
 
 def placement_view(item: ResourceNode | Transform) -> LifetimeBoundBuffer:
@@ -105,14 +193,19 @@ def _write_back(
         item.spill_reason = spill or item.residency_reason or SOLVER_CHOSE_SPILL
 
 
-class PlacementSolver:
-    """A placement-only solver as a graph solver: every node's work split is
-    committed upstream, so it packs the nodes' placement views."""
+class PlacementSolver(GraphSolver):
+    """Placement only: every node's work split is committed upstream, so the
+    placement algorithm ``inner`` packs the nodes' placement views."""
 
     def __init__(self, inner: type[MemoryPlanSolver], capacity: int) -> None:
+        super().__init__(capacity)
         self.inner = inner
-        self.capacity = capacity  # bytes
         self.last: list[LifetimeBoundBuffer] = []
+        self.capabilities = Capabilities(supports_paired_buffers=inner.pairs_buffers)
+
+    @property
+    def name(self) -> str:
+        return self.inner.__name__
 
     def accepts(self, strategy: Any) -> bool:
         return strategy.relayout != "lazy"
@@ -121,7 +214,7 @@ class PlacementSolver:
         self,
         graph: SpyreOptimizationGraph,
         strategy: Any,
-        cost_expr: Optional[sympy.Expr],
+        cost_expr: Optional[sympy.Expr] = None,
     ) -> list[ResourceNode]:
         open_ = [n.name for n in graph.get_nodes() if not n.committed]
         assert not open_, f"{self.inner.__name__} cannot choose work splits: {open_}"
@@ -181,29 +274,45 @@ def buffers_of(graph: SpyreOptimizationGraph, tables: Any) -> list[CoreDivisionB
     return out
 
 
-class BufferSolver:
-    """A joint solver that reads buffers (the annealing co-optimizer) as a
-    graph solver: it solves the buffer form of the graph's nodes and the
-    strategy's candidates, and fills the nodes from what it chose."""
+class BufferSolver(GraphSolver):
+    """The annealing co-optimizer, which reads buffers: it solves the buffer
+    form of the graph's nodes and the strategy's candidates, and fills the
+    nodes from what it chose."""
+
+    capabilities = Capabilities(
+        chooses_core_divisions=True, generates_divisions=True, chooses_tilings=True
+    )
 
     def __init__(self, inner: type[CoreDivisionLayoutSolver], capacity: int) -> None:
+        super().__init__(capacity)
         self.inner = inner
-        self.capacity = capacity  # bytes
         self.last: list[LifetimeBoundBuffer] = []
+        self._engine: Optional[CoreDivisionLayoutSolver] = None
+
+    @property
+    def name(self) -> str:
+        return self.inner.__name__
 
     def accepts(self, strategy: Any) -> bool:
         return strategy.division == "table" and strategy.relayout == "data"
+
+    def off_expression_ns(self) -> dict[str, float]:
+        return {} if self._engine is None else self._engine.off_expression_ns()
+
+    def score_ns(self) -> Optional[float]:
+        return None if self._engine is None else self._engine.score_ns()
 
     def solve(
         self,
         graph: SpyreOptimizationGraph,
         strategy: Any,
-        cost_expr: Optional[sympy.Expr],
+        cost_expr: Optional[sympy.Expr] = None,
     ) -> list[ResourceNode]:
         solver = self.inner(
             buffers_of(graph, strategy.tables), self.capacity, graph.alignment
         )
         solver.plan_layout_and_core_divisions(cost_expr)
+        self._engine = solver
         self.last = list(solver.buffers)
         by_name = {b.name: b for b in self.last}
         # A solver that generates divisions appends the ones it chose that the
@@ -223,7 +332,7 @@ class BufferSolver:
         return graph.execution_plan()
 
 
-class DecomposedPlacement:
+class DecomposedPlacement(GraphSolver):
     """Enumerates the ``Table`` axes (each open node's candidate menu) and
     solves every leaf's placement with an inner placement-only solver,
     keeping the leaf with the least HBM traffic (the total bytes of the
@@ -232,10 +341,16 @@ class DecomposedPlacement:
     division no consumer's matches, and drops an in-place parent smaller per
     core than its child."""
 
+    capabilities = Capabilities(chooses_core_divisions=True)
+
     def __init__(self, inner: type[MemoryPlanSolver], capacity: int) -> None:
+        super().__init__(capacity)
         self.inner = inner
-        self.capacity = capacity  # bytes
         self.last: list[LifetimeBoundBuffer] = []
+
+    @property
+    def name(self) -> str:
+        return f"ExhaustiveSearchSolver[{self.inner.__name__}]"
 
     def accepts(self, strategy: Any) -> bool:
         return hasattr(strategy, "menus") and not getattr(strategy, "residency", {})
@@ -244,7 +359,7 @@ class DecomposedPlacement:
         self,
         graph: SpyreOptimizationGraph,
         strategy: Any,
-        cost_expr: Optional[sympy.Expr],
+        cost_expr: Optional[sympy.Expr] = None,
     ) -> list[ResourceNode]:
         nodes = list(graph.get_nodes())
         menus = {n.name: strategy.menus.get(n.name, ()) for n in nodes}
@@ -335,27 +450,42 @@ class DecomposedPlacement:
         return graph.execution_plan()
 
 
+def graph_solver_for(solver: Any, capacity: int) -> GraphSolver:
+    """The graph solver a solver class names (a graph solver is returned as
+    given): ``CpSatLayoutSolver`` posts a model, ``ExhaustiveSearchSolver
+    .wrapping(placement)`` searches the menus, another joint solver reads
+    buffers, and a placement algorithm packs placement views."""
+    if isinstance(solver, GraphSolver):
+        return solver
+    from torch_spyre._inductor.scratchpad.exhaustive_search import (
+        ExhaustiveSearchSolver,
+    )
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+        CpSatLayoutSolver,
+        ModelSolver,
+    )
+
+    if issubclass(solver, CpSatLayoutSolver):
+        return ModelSolver(capacity)
+    if issubclass(solver, ExhaustiveSearchSolver):
+        return DecomposedPlacement(solver._inner_factory, capacity)
+    if issubclass(solver, CoreDivisionLayoutSolver):
+        return BufferSolver(solver, capacity)
+    return PlacementSolver(solver, capacity)
+
+
 def _unused(*args, **kwargs) -> int:
     raise AssertionError("a graph solver posts no model")
 
 
 def solve_buffers(
-    solver: MemoryPlanSolver,
-    cost_expr: Optional[sympy.Expr] = None,
-    *,
-    joint: bool = False,
+    solver: MemoryPlanSolver, cost_expr: Optional[sympy.Expr] = None
 ) -> list:
-    """The one way the allocator solves: the graph of ``solver``'s buffers,
-    solved with what the solver names (``graph_solver``), its decisions
-    written back onto the buffers. A backend encodes the graph through a
-    strategy, which the solver's own facade sets up; a graph solver gets the
-    graph built here. Raises ``SolveError`` as the solve does."""
-    spec = solver.graph_solver()
-    if isinstance(spec, type):
-        if joint:
-            assert isinstance(solver, CoreDivisionLayoutSolver)
-            return solver.plan_layout_and_core_divisions(cost_expr)
-        return solver.plan_layout(log_lx_usage=True)
+    """The buffer form of a graph solver (tests, capture replay): the graph
+    of ``solver``'s buffers, solved by the graph solver its class names, the
+    decisions written back onto the buffers. Raises ``SolveError`` as the
+    solve does."""
+    spec = graph_solver_for(type(solver), solver.limit)
     from torch_spyre._inductor.scratchpad.buffer_graph import SolveSettings, build_graph
 
     graph = build_graph(
@@ -371,11 +501,10 @@ def solve_buffers(
     )
 
     strategy = EnumerationFactory().strategy(solver.buffers)
-    graph.set_solver(spec)
-    graph.solve(cost_expr=cost_expr, strategy=strategy)
+    spec.solve(graph, strategy, cost_expr)
     by_name = {b.name: b for b in solver.buffers}
     # The inner solver's own reasons: none for a buffer that did not fit.
-    last = spec.last
+    last = getattr(spec, "last", [])
     reasons = {v.name: v.spill_reason for v in last}
     for node in graph.get_nodes():
         items: list[ResourceNode | Transform] = [node, *node.pinned_transforms]

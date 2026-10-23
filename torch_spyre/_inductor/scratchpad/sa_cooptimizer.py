@@ -709,34 +709,6 @@ class SaCoOptimizingSolver(CoreDivisionLayoutSolver):
         alignment: placement alignment (128 = one Spyre stick).
     """
 
-    @classmethod
-    def supports_paired_buffers(cls) -> bool:
-        return False
-
-    @classmethod
-    def decides_lx_relayouts(cls) -> bool:
-        return False
-
-    @classmethod
-    def generates_divisions(cls) -> bool:
-        return True
-
-    @classmethod
-    def chooses_tilings(cls) -> bool:
-        return True
-
-    @classmethod
-    def tilings_from_menu(cls) -> bool:
-        return False
-
-    @classmethod
-    def replans_after_tiling(cls) -> bool:
-        return False
-
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        return False
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],

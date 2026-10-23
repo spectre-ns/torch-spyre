@@ -29,6 +29,11 @@ from typing import TYPE_CHECKING, Any, Optional
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor import config
+from torch_spyre._inductor.scratchpad.drain_plans import (
+    _handoff_child_start,
+    _handoff_parent_end,
+)
+from torch_spyre._inductor.scratchpad import residency_rules
 from torch_spyre._inductor.scratchpad.buffer_graph import (
     SolveSettings,
     SpyreOptimizationGraph,
@@ -91,14 +96,12 @@ def placement_graph(
     committed relayout's source with its destinations
     (``supports_paired_buffers``) gets the relayout plans: collected here
     when ``lx_relayout_plans`` is ``None``, else the ones given."""
-    planning = alloc.layout_planning
-    assert planning is not None
     plans: Sequence[LXRelayoutPlan] = ()
-    if not planning.supports_paired_buffers():
+    if not alloc.capabilities.supports_paired_buffers:
         if config.lx_planner_relayout:
             alloc_logger().debug(
                 "LX relayout is not supported by %s; continuing without relayout",
-                planning.__name__,
+                alloc.solver.name,
             )
         paired = False
     else:
@@ -156,11 +159,6 @@ def _entries(
     directly, so their verdict comes from ``_input_residency_reason`` and
     their footprint is computed here rather than read off ``mem_usage``
     (which covers ops only)."""
-    from torch_spyre._inductor.scratchpad.allocator import (
-        _handoff_child_start,
-        _handoff_parent_end,
-    )
-
     lifetimes = calculate_liveness(graph)
     start_overrides, end_overrides = counted_loop_lifetime_overrides(graph)
     ncores, ncores_reasons, lx_views = get_ncores_for_buffers(graph)
@@ -183,7 +181,7 @@ def _entries(
 
     # Divisions are already committed on this path, so a core-division
     # mismatch between a buffer's users is fatal and is checked here.
-    reasons = alloc._residency_reasons(
+    reasons = residency_rules._residency_reasons(
         graph,
         list(mem_usage),
         division_is_fixed=True,
@@ -220,7 +218,7 @@ def _entries(
         uses = lifetimes.get(input_name, [])
         if not uses:
             continue
-        reason = alloc._input_residency_reason(
+        reason = residency_rules._input_residency_reason(
             graph,
             input_name,
             uses,
@@ -259,8 +257,10 @@ def _entries(
             input_layout, "device_layout"
         ):
             continue
-        if alloc._inplace_edge_ok(
-            child_pointwise_inputs=alloc._op_inputs_good_for_lx_inplace(consumer_op),
+        if residency_rules._inplace_edge_ok(
+            child_pointwise_inputs=residency_rules._op_inputs_good_for_lx_inplace(
+                consumer_op
+            ),
             parent_name=input_name,
             child_size_per_core=consumer.nbytes,
             parent_size_per_core=clone_size,
@@ -305,15 +305,11 @@ def _in_place(
     the pair. A barred buffer has no LX slot to hand over or inherit, so
     pairing with one is meaningless -- and it would let two unsized (-1)
     sentinels match each other on size."""
-    from torch_spyre._inductor.scratchpad.allocator import (
-        _handoff_child_start,
-        _handoff_parent_end,
-    )
-
     start_overrides, end_overrides = counted_loop_lifetime_overrides(graph)
     allow: dict[str, list[str]] = {}
     allowed = {
-        op.name: alloc._op_inputs_good_for_lx_inplace(op) for op in graph.operations
+        op.name: residency_rules._op_inputs_good_for_lx_inplace(op)
+        for op in graph.operations
     }
     for buf_name, info in mem_usage.items():
         allow[buf_name] = []
@@ -329,7 +325,7 @@ def _in_place(
             if reasons.get(input_buf) is not None:
                 continue
             in_layout = graph.get_buffer(input_buf).get_layout().device_layout
-            if alloc._inplace_edge_ok(
+            if residency_rules._inplace_edge_ok(
                 child_pointwise_inputs=allowed[buf_name],
                 parent_name=input_buf,
                 child_size_per_core=info["size_per_core"],
