@@ -213,6 +213,14 @@ class _Table:
     candidates: tuple[CoreDivision, ...]
 
 
+def is_clone_read(relation: Any) -> bool:
+    """Whether an edge's relation is an input clone's read, not a residency
+    edge."""
+    from torch_spyre._inductor.scratchpad.graph_builder import CloneRead
+
+    return isinstance(relation, CloneRead)
+
+
 @dataclass(eq=False)
 class EncodingStrategy:
     """Encodes a graph into a CP model, one element at a time. Created from
@@ -300,12 +308,12 @@ class EncodingStrategy:
         key: tuple[str, str],
         pairs: Optional[list[tuple[int, int]]],
     ) -> None:
-        if edge.clone is not None:
-            self.clone_reads[key] = edge.clone
+        if is_clone_read(edge.relation):
+            self.clone_reads[key] = edge.relation
         elif pairs is not None:
             self.matches[key] = pairs
-        elif edge.residency is not None:
-            self.residency[key] = edge.residency
+        elif edge.relation is not None:
+            self.residency[key] = edge.relation
         else:
             # An empty table forbids the relation.
             self.matches[key] = []
@@ -987,8 +995,8 @@ class PairTableStrategy(EnumeratedStrategy):
         key: tuple[str, str],
         pairs: Optional[list[tuple[int, int]]],
     ) -> None:
-        if pairs is None and edge.residency is not None:
-            pairs = edge.residency.match_pairs(
+        if pairs is None and edge.relation is not None:
+            pairs = edge.relation.match_pairs(
                 list(self.menus[key[0]]), list(self.menus[key[1]])
             )
         self.matches[key] = pairs or []

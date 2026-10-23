@@ -51,6 +51,7 @@ from torch_spyre._inductor.scratchpad.encoding_strategy import (
     EncodingStrategy,
     _Fixed,
     _Table,
+    is_clone_read,
 )
 from torch_spyre._inductor.scratchpad.division_space import DivisionSpace
 from torch_spyre._inductor.scratchpad.plan_solver import (
@@ -485,7 +486,7 @@ class LazyStrategy(EncodingStrategy):
             name
             for node in graph.get_nodes()
             for edge in node.inputs
-            if edge.clone is None and edge.pairs
+            if not is_clone_read(edge.relation) and edge.pairs
             for name in (edge.src.name, node.name)
         }
         self._lazy, self._grid = {}, {}

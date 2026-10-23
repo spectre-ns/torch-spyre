@@ -1310,8 +1310,7 @@ class GraphBuilder:
             for dep in node.inputs:
                 parent = dep.src.name
                 dep.pairs = pairs.get(parent)
-                dep.residency = residency_edges.get(parent)
-                dep.clone = clone_reads.get(parent)
+                dep.relation = clone_reads.get(parent, residency_edges.get(parent))
                 dep.relayout_edge = relayout_edges.get(parent)
         g.link_execution_order()
         return g

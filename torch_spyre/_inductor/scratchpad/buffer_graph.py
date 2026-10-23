@@ -106,11 +106,12 @@ class DependencyEdge:
     reads: int = 1
     # How the two ends' work splits may relate, for the strategy to encode: a
     # table over the two menus' indices the builder fixed (a loop carry, an
-    # input clone), and the relations it may derive one from instead.
+    # input clone), and the relation it may derive one from instead: a
+    # ResidencyEdge (src is an op's output) or a CloneRead (src is an input
+    # clone). ``relayout_edge``: the read may instead go through a copy.
     pairs: Optional[list[tuple[int, int]]] = None
-    residency: Any = None  # ResidencyEdge: same per-core ownership of src
-    clone: Any = None  # CloneRead: the consumer's read of an input clone
-    relayout_edge: Any = None  # RelayoutEdge: may read src through a copy
+    relation: Any = None
+    relayout_edge: Any = None
     # decisions, filled by solve(): an in-place edge whether the child took
     # over the parent's storage; the transform this read goes through (None:
     # it reads ``src`` directly) and the relayout candidate it fired

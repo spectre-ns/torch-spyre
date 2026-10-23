@@ -346,7 +346,7 @@ def build_graph(
         if isinstance(b, CoreDivisionBuffer):
             for edge in node.inputs:
                 edge.pairs = b.cd_parent_matches.get(edge.src.name)
-                edge.residency = b.residency_edges.get(edge.src.name)
+                edge.relation = b.residency_edges.get(edge.src.name)
     graph.link_execution_order()
     return graph
 

@@ -1560,7 +1560,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 # pair table, or the clone relation the derived encoding reads.
                 if any(
                     e.src.name in merged
-                    and (e.pairs is not None or e.clone is not None)
+                    and (e.pairs is not None or e.relation is not None)
                     for e in solve_graph.nodes[child].inputs
                 ):
                     edge_found = True
