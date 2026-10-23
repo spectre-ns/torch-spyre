@@ -15,8 +15,8 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional, cast
+from dataclasses import dataclass, field
+from typing import Callable, Literal, Optional, cast
 
 import sympy
 from torch._inductor.graph import GraphLowering
@@ -40,6 +40,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     ResourceNode,
     SpyreOptimizationGraph,
     Transform,
+    WorkSplit,
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
     CandidateTables,
@@ -248,7 +249,7 @@ def _assert_drain_plan_committed(
             f"drain plan for {plan.storage_name}: committed physical "
             "ownership is missing on the storage or its update"
         )
-    update = solved.graph.nodes.get(plan.update_name)
+    update = solved.by_name.get(plan.update_name)
     storage_menu = solved.tables.menus.get(storage.name)
     update_menu = solved.tables.menus.get(plan.update_name)
     if update is None or not storage_menu or not update_menu:
@@ -270,7 +271,7 @@ def _assert_drain_plan_committed(
         if edge is not None
         else []
     )
-    if chosen not in pairs:
+    if not any(solved.chose(storage, i) and solved.chose(update, j) for i, j in pairs):
         raise AssertionError(
             f"drain plan for {plan.storage_name}: committed divisions "
             f"{chosen} are not an admitted carry pair"
@@ -279,20 +280,36 @@ def _assert_drain_plan_committed(
 
 @dataclass
 class SolvedPlan:
-    """A solved graph as the commit path reads it: the nodes and their
-    decisions, the strategy and its candidates (a node's chosen division is
-    one of them), and the solver that produced it."""
+    """The solver's nodes, each carrying its decisions, as the commit path
+    reads them, with the candidates those decisions were chosen from. A
+    node's offset is in ``alignment`` units."""
 
-    graph: SpyreOptimizationGraph
-    strategy: Any
-    solver: Optional[GraphSolver]
+    nodes: list[ResourceNode]
     tables: CandidateTables
+    alignment: int
+    by_name: dict[str, ResourceNode] = field(init=False)
+    _chosen: dict[str, int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.by_name = {n.name: n for n in self.nodes}
+        # The menu entry each chosen work split names.
+        self._chosen = {}
+        for node in self.nodes:
+            split = node.work_split
+            if split is None or split.committed:
+                continue
+            menu = self.tables.menus.get(node.name, ())
+            index = next(
+                (i for i, cd in enumerate(menu) if WorkSplit.of(cd) == split), None
+            )
+            assert index is not None, (
+                f"{node.name}: chosen work split {split} is not a candidate"
+            )
+            self._chosen[node.name] = index
 
     @classmethod
-    def of_buffers(
-        cls, buffers: Sequence[LifetimeBoundBuffer], solver: Any = None
-    ) -> "SolvedPlan":
-        """A solved plan given in buffer form (tests): the graph of
+    def of_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> "SolvedPlan":
+        """A solved plan given in buffer form (tests): the nodes of
         ``buffers`` in byte units, each decision read off its buffer
         (``address``, ``chosen_division``, ``lx_view``, ``spill_reason``)."""
         from torch_spyre._inductor.scratchpad.buffer_graph import (
@@ -302,7 +319,6 @@ class SolvedPlan:
 
         graph = build_graph(buffers, 1, 1 << 62, empty_graph(0).settings)
         tables = CandidateTables.of_buffers(buffers)
-        strategy = EnumerationFactory().strategy_from_tables(tables)
         by_name = {b.name: b for b in buffers}
         for node in graph.get_nodes():
             b = by_name[node.name]
@@ -310,24 +326,26 @@ class SolvedPlan:
             node.offset = b.address
             node.spill_reason = b.spill_reason
             chosen = getattr(b, "chosen_division", None)
-            if chosen is not None and node.name in tables.menus:
-                strategy.solved[node] = chosen
-        return cls(graph, strategy, solver, tables)
-
-    @property
-    def nodes(self) -> list[ResourceNode]:
-        return list(self.graph.get_nodes())
+            menu = tables.menus.get(node.name, ())
+            if chosen is not None and menu:
+                node.work_split = WorkSplit.of(menu[chosen])
+        return cls(list(graph.get_nodes()), tables, 1)
 
     def address(self, item: ResourceNode | Transform) -> Optional[int]:
         """The item's LX address in bytes, or ``None`` when it is not
         resident."""
         if not item.resident or item.offset is None:
             return None
-        return item.offset * self.graph.alignment
+        return item.offset * self.alignment
 
     def division_index(self, node: ResourceNode) -> Optional[int]:
-        """The index of the node's chosen division in its menu."""
-        return self.strategy.solved.get(node)
+        """The index in the node's menu of its chosen division."""
+        return self._chosen.get(node.name)
+
+    def chose(self, node: ResourceNode, index: int) -> bool:
+        """Whether the node's chosen division is its menu entry ``index``."""
+        menu = self.tables.menus.get(node.name, ())
+        return node.work_split == WorkSplit.of(menu[index])
 
     def division(self, node: ResourceNode) -> Optional[CoreDivision]:
         """The node's chosen division, or ``None`` when it was committed
@@ -349,10 +367,9 @@ class SolvedPlan:
             for edge in node.inputs:
                 t = edge.transform
                 if t is not None and t.offset is not None:
+                    assert edge.relayout is not None
                     out.append(
-                        ChosenRelayout(self.strategy.fired[edge], t.offset).scaled(
-                            self.graph.alignment
-                        )
+                        ChosenRelayout(edge.relayout, t.offset).scaled(self.alignment)
                     )
         return out
 
@@ -361,8 +378,8 @@ class SolvedPlan:
         from torch_spyre._inductor.scratchpad.graph_solvers import buffers_of
 
         out: list[CoreDivisionBuffer] = []
-        for b in buffers_of(self.graph, self.tables):
-            node = self.graph.nodes[b.name]
+        for b in buffers_of(self.nodes, self.tables):
+            node = self.by_name[b.name]
             b.address = self.address(node)
             b.chosen_division = self.division_index(node)
             b.spill_reason = node.spill_reason
@@ -500,11 +517,15 @@ class ScratchpadAllocator:
         """Build the graph and solve it under the priced cost expression."""
         solve_graph, tables = self._build_graph(graph)
         strategy = self.factory.strategy_from_tables(tables)
-        plan = SolvedPlan(solve_graph, strategy, self.solver, tables)
-        cost_expr, bundle_terms = pricing.cost_expr(graph, plan, self.factory)
-        self.solver.solve(solve_graph, strategy, cost_expr)
+        cost_expr, bundle_terms = pricing.cost_expr(
+            graph, solve_graph, tables, self.factory
+        )
+        nodes = self.solver.solve(solve_graph, strategy, cost_expr)
+        plan = SolvedPlan(nodes, tables, solve_graph.alignment)
         if config.dump_cost_expr_file and cost_expr is not None:
-            pricing.dump_cost_expr(graph, plan, cost_expr, bundle_terms, self.size)
+            pricing.dump_cost_expr(
+                graph, plan, self.solver, cost_expr, bundle_terms, self.size
+            )
         return plan
 
     def _materialize_selection(
@@ -564,12 +585,12 @@ class ScratchpadAllocator:
         the committed divisions and the copy's address are checked against
         them, and ``materialize_lx_relayouts`` gets one plan per fired group.
         """
-        nodes = plan.graph.nodes
+        nodes = plan.by_name
         plans: list[LXRelayoutPlan] = []
         for group in FiredRelayoutGroup.from_chosen(plan.chosen_relayouts()):
             source = nodes[group.parent]
             address = plan.address(source)
-            assert plan.division_index(source) == group.source_division, (
+            assert plan.chose(source, group.source_division), (
                 f"relayout group {group.parent}/g{group.group} chose source "
                 f"division {group.source_division} but "
                 f"{plan.division_index(source)} was committed"
@@ -587,9 +608,7 @@ class ScratchpadAllocator:
                     f"the copy at {group.destination_address} but it was placed "
                     f"at {copy_address}"
                 )
-                assert (
-                    plan.division_index(consumer) == member.candidate.consumer_division
-                ), (
+                assert plan.chose(consumer, member.candidate.consumer_division), (
                     f"relayout pair ({group.source_division}, "
                     f"{member.candidate.consumer_division}) disagrees with committed "
                     f"division {plan.division_index(consumer)} on {group.parent} -> "
@@ -923,7 +942,7 @@ class ScratchpadAllocator:
         for source in tiled:
             # Named as ``_insert_copy_op`` names it.
             copy = ops.get(graph.qualify_name(f"coarse_tile_copy_{source}"))
-            cd = plan.division(plan.graph.nodes[source])
+            cd = plan.division(plan.by_name[source])
             if copy is None:
                 # Expected when the op's output stays inside its tiling group.
                 logger.debug("%s: no copy-out to give its core division", source)

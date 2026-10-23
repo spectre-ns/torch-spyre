@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Iterable, Optional, TYPE_CHECKING
 
 import sympy
 
@@ -95,8 +95,9 @@ class Capabilities:
 class GraphSolver:
     """Fills every open decision of a graph: ``solve`` takes the strategy
     holding the graph's candidates and the priced cost expression (``None``:
-    the solver's own objective). The stats and the off-expression terms
-    describe the last solve, for the cost-expression dump."""
+    the solver's own objective) and returns every node, its decisions on it.
+    The stats and the off-expression terms describe the last solve, for the
+    cost-expression dump."""
 
     capabilities = Capabilities()
 
@@ -143,13 +144,12 @@ def _write_back(
         item.spill_reason = spill or item.residency_reason or SOLVER_CHOSE_SPILL
 
 
-def buffers_of(graph: SpyreOptimizationGraph, tables: Any) -> list[CoreDivisionBuffer]:
-    """The buffer form of the graph's nodes and the table strategy's
-    candidates: what a solver that still reads buffers (the annealing
+def buffers_of(nodes: Iterable[ResourceNode], tables: Any) -> list[CoreDivisionBuffer]:
+    """The buffer form of ``nodes`` and the table strategy's candidates: what a solver that still reads buffers (the annealing
     co-optimizer) is handed. Each node's reads keep their count, and its
     lifetime its overrides."""
     out = []
-    for node in graph.get_nodes():
+    for node in nodes:
         uses = list(node.uses)
         keys = [(e.src.name, node.name) for e in node.inputs]
         b = CoreDivisionBuffer(
@@ -220,7 +220,9 @@ class BufferSolver(GraphSolver):
         cost_expr: Optional[sympy.Expr] = None,
     ) -> list[ResourceNode]:
         solver = self.inner(
-            buffers_of(graph, strategy.tables), self.capacity, graph.alignment
+            buffers_of(graph.get_nodes(), strategy.tables),
+            self.capacity,
+            graph.alignment,
         )
         solver.plan_layout_and_core_divisions(cost_expr)
         self._engine = solver
@@ -239,5 +241,4 @@ class BufferSolver(GraphSolver):
             if node.work_split is None and b.core_divisions:
                 assert b.chosen_division is not None
                 node.work_split = WorkSplit.of(b.core_divisions[b.chosen_division])
-                strategy.solved[node] = b.chosen_division
-        return graph.execution_plan()
+        return list(graph.get_nodes())

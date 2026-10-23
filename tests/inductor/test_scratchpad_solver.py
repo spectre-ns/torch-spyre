@@ -88,10 +88,11 @@ SMALL_SIZE = 10
 ALIGNMENT = 128
 
 
-def _cpsat_plan(
-    buffers, size, alignment=1, cost_expr=None, **solver_kwargs
-) -> SolvedPlan:
-    """CP-SAT's plan for ``buffers`` over ``size`` bytes of LX."""
+def _cpsat_solved(
+    buffers, size, alignment=1, cost_expr=None
+) -> tuple[SolvedPlan, ModelSolver]:
+    """CP-SAT's plan for ``buffers`` over ``size`` bytes of LX, and the
+    solver that made it."""
     graph = build_graph(
         buffers,
         alignment,
@@ -101,9 +102,14 @@ def _cpsat_plan(
     )
     tables = CandidateTables.of_buffers(buffers)
     strategy = EnumerationFactory().strategy_from_tables(tables)
-    solver = ModelSolver(size, **solver_kwargs)
-    solver.solve(graph, strategy, cost_expr)
-    return SolvedPlan(graph, strategy, solver, tables)
+    solver = ModelSolver(size)
+    nodes = solver.solve(graph, strategy, cost_expr)
+    return SolvedPlan(nodes, tables, alignment), solver
+
+
+def _cpsat_plan(buffers, size, alignment=1, cost_expr=None) -> SolvedPlan:
+    """CP-SAT's plan for ``buffers`` over ``size`` bytes of LX."""
+    return _cpsat_solved(buffers, size, alignment, cost_expr)[0]
 
 
 @dataclass(frozen=True)
@@ -123,7 +129,7 @@ class _Outcome:
 def _cpsat_solve(buffers, size, alignment=1, cost_expr=None) -> list[_Outcome]:
     """Each buffer's outcome under :func:`_cpsat_plan`, in input order."""
     plan = _cpsat_plan(buffers, size, alignment, cost_expr)
-    nodes = plan.graph.nodes
+    nodes = plan.by_name
     return [
         _Outcome(
             b,
@@ -179,7 +185,7 @@ class TestAllocatorSpillReasons(TestCase):
         # "late" is live while "first" fills the scratchpad, so one of the two
         # spills; which one is the solver's choice.
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
-        spilled = {n.name for n in allocation.graph.get_nodes() if not n.resident}
+        spilled = {n.name for n in allocation.nodes if not n.resident}
         self.assertEqual(len(spilled - {"barred"}), 1)
         reasons = ScratchpadAllocator(ModelSolver(128), 128)._get_spill_reasons(
             allocation
@@ -2481,10 +2487,10 @@ class SolveStatsTest(TestCase):
 
     def test_an_objective_solve_is_recorded_as_one(self):
         bufs = self._bufs()
-        plan = _cpsat_plan(
+        _, solver = _cpsat_solved(
             bufs, 1 << 20, ALIGNMENT, cost_expr=4000 * (1 - bufs[0].sym_is_lx)
         )
-        stats = plan.solver.last_solve_stats
+        stats = solver.last_solve_stats
         self.assertEqual(stats["status"], "OPTIMAL")
         self.assertTrue(stats["objective_used"])
         self.assertGreater(stats["variables"], 0)
@@ -2494,7 +2500,8 @@ class SolveStatsTest(TestCase):
         """``_run`` solves in its own occupancy passes when no objective status
         comes back. Recording only the objective solve would leave those plans
         described by an earlier call's numbers."""
-        stats = _cpsat_plan(self._bufs(), 1 << 20, ALIGNMENT).solver.last_solve_stats
+        _, solver = _cpsat_solved(self._bufs(), 1 << 20, ALIGNMENT)
+        stats = solver.last_solve_stats
         self.assertEqual(stats["status"], "OPTIMAL")
         self.assertFalse(stats["objective_used"], "no objective was minimized")
 
@@ -2505,8 +2512,8 @@ class SolveStatsTest(TestCase):
         bufs = self._bufs()
         unlowerable = sympy.Function("NoSuchNode")(bufs[0].sym_is_lx)
         with config.patch({"_cpsat_warn_on_cost_expr": True}):
-            plan = _cpsat_plan(bufs, 1 << 20, ALIGNMENT, cost_expr=unlowerable)
-        self.assertFalse(plan.solver.last_solve_stats["objective_used"])
+            _, solver = _cpsat_solved(bufs, 1 << 20, ALIGNMENT, cost_expr=unlowerable)
+        self.assertFalse(solver.last_solve_stats["objective_used"])
 
 
 class TestCpSatUnallocatedReads(TestCase):

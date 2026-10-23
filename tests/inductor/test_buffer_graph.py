@@ -241,8 +241,8 @@ def _solve_graph(buffers, pin=lambda graph: None):
 
     graph = _graph_of(buffers)
     pin(graph)
-    plan = graph.solve(cp_model.CpModel(), None, TableStrategy.from_buffers(buffers))
-    return graph, plan
+    nodes = graph.solve(cp_model.CpModel(), None, TableStrategy.from_buffers(buffers))
+    return graph, nodes
 
 
 def _chain3() -> list[CoreDivisionBuffer]:
@@ -255,9 +255,9 @@ def _chain3() -> list[CoreDivisionBuffer]:
     ]
 
 
-def test_solve_fills_every_open_decision_and_returns_the_chain():
-    graph, plan = _solve_graph(_chain3())
-    assert [n.name for n in plan] == ["a", "b", "c"]
+def test_solve_fills_every_open_decision_and_returns_every_node():
+    graph, nodes = _solve_graph(_chain3())
+    assert nodes == list(graph.get_nodes())
     for node in graph.get_nodes():
         assert node.work_split is not None and not node.committed
         assert isinstance(node.resident, bool)

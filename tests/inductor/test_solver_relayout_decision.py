@@ -113,9 +113,8 @@ def _solve(buffers, expr, size=64) -> SolvedPlan:
     )
     tables = CandidateTables.of_buffers(buffers)
     strategy = EnumerationFactory().strategy_from_tables(tables)
-    solver = ModelSolver(size)
-    solver.solve(graph, strategy, expr)
-    return SolvedPlan(graph, strategy, solver, tables)
+    nodes = ModelSolver(size).solve(graph, strategy, expr)
+    return SolvedPlan(nodes, tables, graph.alignment)
 
 
 @pytest.mark.parametrize("priced", [False, True])
@@ -134,7 +133,7 @@ def test_solve_presolves_by_default(monkeypatch, priced):
     monkeypatch.setattr(cp_model.CpSolver, "Solve", solve)
     plan = _solve(buffers, _objective(buffers) if priced else None)
     assert parameters and all(parameters)
-    assert plan.address(plan.graph.nodes["P"]) is not None, (
+    assert plan.address(plan.by_name["P"]) is not None, (
         "P fits and C reads it under a match"
     )
 

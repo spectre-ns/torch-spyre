@@ -9797,7 +9797,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             )
 
         # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
-        _check_in_place_relationships(buffers_of(solve_graph, tables))
+        _check_in_place_relationships(buffers_of(solve_graph.get_nodes(), tables))
         nodes = solve_graph.nodes
         self.assertEqual(nodes["carry"].end_time, len(ops))
 

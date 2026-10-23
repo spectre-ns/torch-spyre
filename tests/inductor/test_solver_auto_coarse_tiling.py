@@ -1092,7 +1092,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
             co_optimizing_lx_planning=True, layout_solver=layout_solver
         ):
             alloc = select_allocator()
-            plan = SolvedPlan.of_buffers([], alloc.solver)
+            plan = SolvedPlan.of_buffers([])
             graph = SimpleNamespace(operations=[])
             with contextlib.ExitStack() as stack:
                 chosen = stack.enter_context(
@@ -1113,11 +1113,11 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
                         patch.object(ScratchpadAllocator, name, return_value=value)
                     )
                 result = alloc._materialize_selection(graph, plan)
-            return plan, result, chosen, apply
+            return alloc, plan, result, chosen, apply
 
     def test_annealer_placement_stands(self):
-        plan, result, chosen, apply = self._materialize("simulated_annealing")
-        self.assertFalse(plan.solver.capabilities.replans_after_tiling)
+        alloc, plan, result, chosen, apply = self._materialize("simulated_annealing")
+        self.assertFalse(alloc.solver.capabilities.replans_after_tiling)
         self.assertIs(result, plan)
         chosen.assert_not_called()
         apply.assert_not_called()
@@ -1125,7 +1125,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
     @unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
     def test_cpsat_applies_and_solves_again(self):
         second_plan = MagicMock()
-        _, result, _, apply = self._materialize("cpsat", _solve=second_plan)
+        _, _, result, _, apply = self._materialize("cpsat", _solve=second_plan)
         apply.assert_called_once_with(self._CHOICES)
         self.assertIs(result, second_plan)
 

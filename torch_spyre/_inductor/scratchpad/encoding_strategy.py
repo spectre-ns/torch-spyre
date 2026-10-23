@@ -310,7 +310,7 @@ class EncodingStrategy:
     def footprint(self, item: Item, solver) -> int:
         raise NotImplementedError
 
-    def record_fired(self, edge: DependencyEdge, solver) -> None:
+    def fired(self, edge: DependencyEdge, solver) -> RelayoutCandidate:
         raise NotImplementedError
 
     def extra_cost_terms(self) -> list[Var]:
@@ -393,7 +393,6 @@ class TableStrategy(EncodingStrategy):
         self.relayout_edges = dict(relayout_edges or {})
         self.menus = {k: tuple(v) for k, v in (menus or {}).items()}
         self.matches = {k: list(v) for k, v in (matches or {}).items()}
-        self.fired: dict[DependencyEdge, RelayoutCandidate] = {}
         self.solved: dict[Item, int] = {}
 
     @classmethod
@@ -443,7 +442,6 @@ class TableStrategy(EncodingStrategy):
         self.provenance = []
         self.cut_terms = []
         self.tile_terms = []
-        self.fired = {}
         self.solved = {}
         self._capacity = graph.capacity
         self._alignment = graph.alignment
@@ -1087,10 +1085,10 @@ class TableStrategy(EncodingStrategy):
         v = self.vars[item]
         return item.size if v.division is None else v.per_core[solver.Value(v.division)]
 
-    def record_fired(self, edge: DependencyEdge, solver) -> None:
+    def fired(self, edge: DependencyEdge, solver) -> RelayoutCandidate:
         """The relayout candidate the read on ``edge`` fired through."""
         assert edge.transform is not None
-        self.fired[edge] = self._relayouts.fired(edge, solver)
+        return self._relayouts.fired(edge, solver)
 
 
 @dataclass(frozen=True)

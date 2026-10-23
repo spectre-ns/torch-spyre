@@ -2520,8 +2520,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
             solver = allocator.solver
             strategy = allocator.factory.strategy_from_tables(tables)
-            solved = allocator_module.SolvedPlan(solve_graph, strategy, solver, tables)
-            solver.solve(solve_graph, strategy)
+            nodes = solver.solve(solve_graph, strategy)
+            solved = allocator_module.SolvedPlan(nodes, tables, solve_graph.alignment)
             # commit_divisions would record the committed ownership here.
             for op in graph.operations:
                 op.iteration_space_ownership = object()
@@ -2588,7 +2588,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
         with self.subTest("reader splits like the storage"):
             plan, solved, editor_cls = run(self.consumer_divs[:2])
-            nodes = solved.graph.nodes
+            nodes = solved.by_name
             storage = nodes["plain"]
             self.assertIsNotNone(solved.address(storage))
             editor = editor_cls.return_value
@@ -2619,7 +2619,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
         with self.subTest("reader splits the storage differently"):
             plan, solved, editor_cls = run([self.consumer_divs[3]])
-            self.assertIsNone(solved.address(solved.graph.nodes["plain"]))
+            self.assertIsNone(solved.address(solved.by_name["plain"]))
             editor = editor_cls.return_value
             editor.push_allocation_with_clone.assert_not_called()
             editor.change_graph_output.assert_not_called()
@@ -2691,7 +2691,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertEqual(set(plans), {"plain"})
             plan = plans["plain"]
             self.assertIs(plan.collective, all_reduce)
-            storage = solved.graph.nodes["plain"]
+            storage = solved.by_name["plain"]
             self.assertIsNotNone(solved.address(storage))
             self.assertNotIn("plain", solved.tables.parents["all_reduce"])
             # Live to the all_reduce (index 3), not to the graph exit (5).
@@ -2713,7 +2713,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
         with self.subTest("without a plan the all_reduce edge keeps it in HBM"):
             _plans, solved, editor_cls = run(with_plan=False)
-            self.assertIsNone(solved.address(solved.graph.nodes["plain"]))
+            self.assertIsNone(solved.address(solved.by_name["plain"]))
             self.assertIn("plain", solved.tables.parents["all_reduce"])
             self.assertNotIn(("plain", "all_reduce"), solved.tables.matches)
             editor_cls.return_value.replace_collective_operand.assert_not_called()

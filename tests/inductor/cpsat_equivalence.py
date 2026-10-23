@@ -114,7 +114,7 @@ class _Recorder:
             for edge in getattr(item, "inputs", ()):
                 t = edge.transform
                 if t is not None and t.offset is not None:
-                    c = strategy.fired[edge]
+                    c = edge.relayout
                     chosen[edge.src.name] = [
                         c.group,
                         c.source_division,

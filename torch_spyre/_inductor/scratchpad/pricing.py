@@ -43,6 +43,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.cost_model import CostParams
 from torch_spyre._inductor.scratchpad.buffer_graph import (
     ResourceNode,
+    SpyreOptimizationGraph,
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
     CandidateTables,
@@ -52,6 +53,7 @@ from torch_spyre._inductor.scratchpad.encoding_strategy import (
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.allocator import SolvedPlan
+    from torch_spyre._inductor.scratchpad.graph_solvers import GraphSolver
     from torch_spyre._inductor.scratchpad.encoding_strategy import EnumerationFactory
 
 logger = get_inductor_logger("scratchpad.pricing")
@@ -97,7 +99,10 @@ class _PricedNode(NamedTuple):
 
 
 def cost_expr(
-    graph: GraphLowering, plan: SolvedPlan, factory: EnumerationFactory
+    graph: GraphLowering,
+    solve_graph: SpyreOptimizationGraph,
+    tables: CandidateTables,
+    factory: EnumerationFactory,
 ) -> tuple[Optional[sympy.Expr], list]:
     """The priced objective of the open-mode solve over the graph's nodes
     and the strategy's candidates, and its per-bundle terms; ``None`` when
@@ -108,11 +113,11 @@ def cost_expr(
         residency_symbols,
     )
 
-    nodes = plan.graph.nodes
+    nodes = solve_graph.nodes
     # Built once here, not per op inside the loop below: every op's residency
     # lookup is against this same whole-graph map.
-    default_is_lx = residency_symbols(plan.graph, plan.tables)
-    pricing_ops = TableCandidates._pricing_operations(graph, plan.graph, plan.tables)
+    default_is_lx = residency_symbols(solve_graph, tables)
+    pricing_ops = TableCandidates._pricing_operations(graph, solve_graph, tables)
     pricing_by_name = {op.get_name(): op for op in pricing_ops}
 
     # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
@@ -160,7 +165,7 @@ def cost_expr(
         )
         return None, []
 
-    priced = {name: _PricedNode.of(node, plan.tables) for name, node in nodes.items()}
+    priced = {name: _PricedNode.of(node, tables) for name, node in nodes.items()}
     bundle_terms: list = []
     # Feature extraction runs inside the same fallback: a candidate tiling
     # can raise Unsupported (an axis with no resolvable loop variable) or
@@ -197,14 +202,17 @@ def cost_expr(
 
 
 def dump_cost_expr(
-    graph: GraphLowering, plan: SolvedPlan, cost_expr, bundle_terms, capacity: int
+    graph: GraphLowering,
+    plan: SolvedPlan,
+    solver: GraphSolver,
+    cost_expr,
+    bundle_terms,
+    capacity: int,
 ) -> None:
     """The objective as solved: its terms, the chosen symbol values and
     the evaluated prices, for the summarize-sdsc skill."""
     from torch_spyre._inductor.dump_common import emit_json_line, origin_op_name
 
-    solver = plan.solver
-    assert solver is not None
     # Ops are named twice because the numeric cost dump names them twice:
     # ``op_names`` matches its block heading and is what a human reads,
     # ``op_ids`` matches its ``output opN`` line and is unique, so it is

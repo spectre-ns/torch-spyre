@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from torch._inductor.ir import Operation
 
     from torch_spyre._inductor.scratchpad.encoding_strategy import EncodingStrategy
+    from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
     from torch_spyre._inductor.work_division import OpSplitSpace
 
 logger = logging.getLogger(__name__)
@@ -108,9 +109,10 @@ class DependencyEdge:
     reads: int = 1
     # decisions, filled by solve(): an in-place edge whether the child took
     # over the parent's storage; the transform this read goes through (None:
-    # it reads ``src`` directly)
+    # it reads ``src`` directly) and the relayout candidate it fired
     merged: Optional[bool] = None
     transform: Optional[Transform] = None
+    relayout: Optional[RelayoutCandidate] = None
 
     def __repr__(self) -> str:
         kind = "in_place" if self.in_place else "read"
@@ -536,8 +538,8 @@ class SpyreOptimizationGraph:
         the nodes, transforms and edges. ``model`` is the backend to post
         to and solve with (a bare ``CpModel`` is wrapped in ``CpSat``; none:
         an instance of :meth:`set_solver`'s backend class). A graph solver set
-        with :meth:`set_solver` solves the graph itself instead. Returns the
-        op outputs in execution order. Raises :class:`SolveError`, writing
+        with :meth:`set_solver` solves the graph itself instead. Returns every
+        node, its decisions filled. Raises :class:`SolveError`, writing
         nothing."""
         if strategy is None:
             from torch_spyre._inductor.scratchpad.encoding_strategy import (
@@ -594,16 +596,7 @@ class SpyreOptimizationGraph:
         )
         self._ladder(backend, strategy, cost_expr)
         self._extract(backend, strategy, justify_offsets)
-        return self.execution_plan()
-
-    def execution_plan(self) -> list[ResourceNode]:
-        """The op outputs along the execution chain."""
-        node = self.first
-        plan = []
-        while node is not None:
-            plan.append(node)
-            node = node.next.after if node.next else None
-        return plan
+        return list(self.get_nodes())
 
     def _finalize(self, model: Any, strategy: EncodingStrategy) -> None:
         """Walk the graph in emission order, calling the strategy once per
@@ -966,7 +959,7 @@ class SpyreOptimizationGraph:
                     f"{fired[0].name}"
                 )
                 edge.transform = fired[0]
-                strategy.record_fired(edge, solver)
+                edge.relayout = strategy.fired(edge, solver)
 
 
 class _ProvenanceRecorder:
