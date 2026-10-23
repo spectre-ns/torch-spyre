@@ -35,7 +35,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     ResourceNode,
     SpyreOptimizationGraph,
     Transform,
-    TransformKind,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision, ceil_div
 
@@ -112,7 +111,6 @@ class RelayoutCopies:
                 division=CoreDivision(),
                 start_time=tick,
                 end_time=max(tick + 1, last_tick),
-                kind=TransformKind.RELAYOUT,
             )
             copy = _Copy(edge, self.edges[(parent, consumer)], transform, tick)
             self.copies[transform] = copy

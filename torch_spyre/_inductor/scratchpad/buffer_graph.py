@@ -39,7 +39,6 @@ import math
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import Any, Callable, ClassVar, Optional, TYPE_CHECKING
 
 import sympy
@@ -285,21 +284,15 @@ def spill_cost(item: Any, size: Optional[int] = None) -> int:
     )
 
 
-class TransformKind(Enum):
-    RELAYOUT = auto()  # another per-core view, LX to LX
-    COPY_OUT = auto()  # a cut tile's full buffer, to HBM
-    TRANSPOSE = auto()  # future: another dim order
-    RESTICKIFY = auto()  # future: another stick dimension
-
-
 @dataclass(eq=False)
 class Transform:
-    """A converted copy of the producer's output that one or more edges read
-    instead of the producer: one per (producer, kind, target), shared by every
-    edge that needs that conversion and priced once. A relayout is held in LX
-    from the first read it serves to the last. Candidates belong to the
-    strategy; ``solve()`` fills the decisions of each one and points the
-    edges that read through it at it (``edge.transform``)."""
+    """A relayout copy of the producer's output that one or more edges read
+    instead of the producer, offered where an edge owns a ``RelayoutEdge``:
+    one per (producer, target view), shared by every edge that needs that view
+    and priced once, held in LX from the first read it serves to the last.
+    Candidates belong to the strategy; ``solve()`` fills the decisions of each
+    one and points the edges that read through it at it
+    (``edge.transform``)."""
 
     producer: Optional[ResourceNode]  # None: source not in this solve
     name: str
@@ -309,7 +302,6 @@ class Transform:
     division: CoreDivision
     start_time: int
     end_time: int
-    kind: TransformKind = TransformKind.RELAYOUT
     residency_reason: Optional[str] = None
     # The placement view of a pinned transform: access ticks, size in bytes,
     # its fixed per-core view.
@@ -322,7 +314,7 @@ class Transform:
     spill_reason: Optional[str] = None
 
     def __repr__(self) -> str:
-        return f"Transform({self.kind.name}, {self.name})"
+        return f"Transform({self.name})"
 
     @property
     def sym_is_lx(self) -> sympy.Symbol:
