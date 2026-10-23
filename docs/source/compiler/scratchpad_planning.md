@@ -29,7 +29,7 @@ An op with no legal candidate raises `Unsupported`.
 - [Pipeline position](#pipeline-position)
 - [Optimizations on softmax](#optimizations-on-softmax)
 - [Implementation](#implementation)
-- [Solvers](#solvers)
+- [The solve](#the-solve)
 - [Co-optimization with work-distribution](#co-optimization-with-work-distribution)
 - [LX context switching](#lx-context-switching)
 - [Current limitations](#current-limitations)
