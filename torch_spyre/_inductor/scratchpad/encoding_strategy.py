@@ -21,7 +21,7 @@ work split is enumerated (a pinned value, a table of candidates), the
 relations over each edge's two ends, the candidate transforms, and every
 CP variable (:class:`NodeVars`). Nodes and edges stay pure data.
 
-:class:`TableStrategy` encodes each open work split as a ``Table`` over a
+:class:`EnumeratedStrategy` encodes each open work split as a ``Table`` over a
 candidate menu, and each edge's relation from its clone read, its residency
 edge or its pair table. Two specializations: ``LazyStrategy``
 (``lazy_strategy.py``, the default) adds the ``Lazy`` work split, and
@@ -316,9 +316,9 @@ class EncodingStrategy:
         return []
 
 
-class TableStrategy(EncodingStrategy):
-    """The default strategy: every open work split is a ``Table`` over its
-    candidate menu, a pinned one ``Fixed``, and the view, relayout and nest
+class EnumeratedStrategy(EncodingStrategy):
+    """Every open work split is an index into its enumerated menu (a
+    ``Table``), a pinned one ``Fixed``, and the view, relayout and nest
     relations are tables over menu indices.
 
     Its candidates are the graph's (:meth:`_collect`): each node's menu,
@@ -1053,7 +1053,7 @@ class TableStrategy(EncodingStrategy):
         return self._relayouts.fired(edge, solver)
 
 
-class PairTableStrategy(TableStrategy):
+class PairTableStrategy(EnumeratedStrategy):
     """The table model in full: every edge's relation is a pair table over
     its two ends' menu indices, never a derived clone or residency relation:
     the builder's table where it fixed one, else the residency relation's

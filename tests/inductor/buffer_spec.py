@@ -36,7 +36,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     WorkSplit,
     empty_graph,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import TableStrategy
+from torch_spyre._inductor.scratchpad.encoding_strategy import EnumeratedStrategy
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
@@ -281,7 +281,7 @@ def check_in_place_relationships(
                 check_in_place_parent_is_read(parent, child.name)
                 # With core_divisions ``size`` is the *total* footprint, so a static
                 # size check doesn't apply; the per-core match is enforced against the
-                # chosen division in ``TableStrategy.encode_merge``. Only
+                # chosen division in ``EnumeratedStrategy.encode_merge``. Only
                 # the division-fixed case (plain ``LifetimeBoundBuffer``, no
                 # ``core_divisions``) keeps the static check.
                 if not (
@@ -351,9 +351,9 @@ def build_graph(
     return graph
 
 
-def strategy_of(buffers: Sequence[LifetimeBoundBuffer]) -> TableStrategy:
+def strategy_of(buffers: Sequence[LifetimeBoundBuffer]) -> EnumeratedStrategy:
     """The table strategy; the buffers' candidates are on their graph."""
-    return TableStrategy()
+    return EnumeratedStrategy()
 
 
 def plan_of(buffers: Sequence[LifetimeBoundBuffer]) -> SolvedPlan:

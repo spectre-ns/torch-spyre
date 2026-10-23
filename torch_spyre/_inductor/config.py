@@ -42,7 +42,7 @@ co_optimizing_lx_planning: bool = (
 # How the solve encodes each op's work split and each edge's relation: "lazy"
 # posts a split's legality as constraints over the op's space where it can
 # (LazyStrategy); "enumerated" enumerates every op's legal divisions and picks
-# one from that menu (TableStrategy), the fallback when a Lazy space
+# one from that menu (EnumeratedStrategy), the fallback when a Lazy space
 # misbehaves; "table" also relates every edge by a pair table over its two
 # ends' menus instead of deriving it (PairTableStrategy), the original model.
 lx_division_strategy: Literal["lazy", "enumerated", "table"] = os.environ.get(

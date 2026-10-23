@@ -592,7 +592,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
     def test_the_symbolic_split_cost_expression_linearizes(self):
         """Run the REAL CP-SAT converter, not a structural proxy.
 
-        ``sym_map``/``buffer_map`` mirror ``TableStrategy.cost_bindings``:
+        ``sym_map``/``buffer_map`` mirror ``EnumeratedStrategy.cost_bindings``:
         the split variable in ``sym_map``, plus a ``buffer_map`` entry
         ``_print_Symbol`` needs to tabulate the ``log2_``/``inv_`` aux variables over
         the candidate divisions.

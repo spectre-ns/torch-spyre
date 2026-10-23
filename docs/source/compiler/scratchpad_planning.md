@@ -273,7 +273,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `division_menus.py` | An op's candidate work divisions read from the IR: split options, legality and stick-fit checks, matmul and reduction axis parsing, the read-distance filter, and the pruned menu (`_enum_split_options`, `prune=True`) |
 | `drain_plans.py` | Lifetimes around coarse-tile loops: the in-place handoff tick, loop trip counts, and post-loop drain plans (`validated_drain_plans`) |
 | `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
-| `encoding_strategy.py` | `EncodingStrategy` / `TableStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
+| `encoding_strategy.py` | `EncodingStrategy` / `EnumeratedStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
 | `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
 | `lazy_relayout.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
 | `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat` (default), `Mip`, `BruteForce`, `Annealing`; `from_env` picks one from `SPYRE_LX_BACKEND` |
@@ -437,7 +437,7 @@ copies fire; see [The co-optimizer](co_optimizer.md).
 - `"lazy"` (the default, `LazyStrategy`) posts a work split's legality as
   constraints over the op's split space where the op has one, and relates
   an edge's two ends by equality of their derived view ids.
-- `"enumerated"` (`TableStrategy`) enumerates every op's legal divisions and
+- `"enumerated"` (`EnumeratedStrategy`) enumerates every op's legal divisions and
   picks one from that menu, with the same derived relations; the fallback
   when a `Lazy` space misbehaves.
 - `"table"` (`PairTableStrategy`) is the original model: enumerated menus,

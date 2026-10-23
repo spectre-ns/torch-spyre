@@ -42,7 +42,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
     PairTableStrategy,
-    TableStrategy,
+    EnumeratedStrategy,
 )
 from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 from torch_spyre._inductor.scratchpad.graph_editor import (
@@ -380,7 +380,7 @@ class ScratchpadAllocator:
             division_strategy: ``"lazy"`` encodes a work split as constraints
                 over its op's space where it can (``LazyStrategy``);
                 ``"enumerated"`` picks every split from its op's enumerated
-                legal divisions (``TableStrategy``); ``"table"`` also relates
+                legal divisions (``EnumeratedStrategy``); ``"table"`` also relates
                 every edge by a pair table (``PairTableStrategy``).
         """
         from torch_spyre._inductor.scratchpad.graph_builder import (
@@ -398,7 +398,7 @@ class ScratchpadAllocator:
         self.division_strategy = division_strategy
         self.strategy_class = {
             "lazy": LazyStrategy,
-            "enumerated": TableStrategy,
+            "enumerated": EnumeratedStrategy,
             "table": PairTableStrategy,
         }[division_strategy]
         self.builder = GraphBuilder(size, prune, committed=not self.joint)
@@ -754,7 +754,7 @@ def commit_divisions(graph: GraphLowering, plan: SolvedPlan) -> None:
 
     The solver optimizes a core division for all buffers, not just resident
     ones: a resident producer and its consumers are pinned by
-    ``TableStrategy.encode_read`` to one shared
+    ``EnumeratedStrategy.encode_read`` to one shared
     slicing (so those commits are mutually consistent), while a spilled
     buffer is free of that gate -- its accesses round-trip through HBM,
     which re-slices on load -- so it takes its most parallel candidate.

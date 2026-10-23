@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.encoding_strategy import (
         Model,
         NodeVars,
-        TableStrategy,
+        EnumeratedStrategy,
     )
     from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
     from torch_spyre._inductor.scratchpad.graph_builder import RelayoutEdge
@@ -70,9 +70,9 @@ class _Copy:
 
 class LazyRelayouts:
     """The relayout half of a strategy whose view relation is derived: built
-    by ``TableStrategy.prepare`` from each consumer's ``RelayoutEdge``s."""
+    by ``EnumeratedStrategy.prepare`` from each consumer's ``RelayoutEdge``s."""
 
-    def __init__(self, strategy: TableStrategy, edges: dict) -> None:
+    def __init__(self, strategy: EnumeratedStrategy, edges: dict) -> None:
         self.strategy = strategy
         self.edges = edges  # (producer, consumer) -> RelayoutEdge
         self.copies: dict[Transform, _Copy] = {}

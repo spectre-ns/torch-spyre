@@ -45,7 +45,7 @@ from torch_spyre._inductor.scratchpad.encoding_strategy import (
     Model,
     NodeVars,
     PrinterView,
-    TableStrategy,
+    EnumeratedStrategy,
     _Fixed,
     _Table,
 )
@@ -267,8 +267,8 @@ class _LazyVars:
         return True
 
 
-class LazyStrategy(TableStrategy):
-    """``TableStrategy`` with ``Lazy`` work splits wherever a node can take one."""
+class LazyStrategy(EnumeratedStrategy):
+    """``EnumeratedStrategy`` with ``Lazy`` work splits wherever a node can take one."""
 
     def __init__(self, **kw) -> None:
         super().__init__(**kw)

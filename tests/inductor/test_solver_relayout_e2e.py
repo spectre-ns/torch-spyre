@@ -138,11 +138,11 @@ class _Observed:
         monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_identity_kernel)
         if force:
             from torch_spyre._inductor.scratchpad.encoding_strategy import (
-                TableStrategy,
+                EnumeratedStrategy,
             )
             from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-            for strategy in (TableStrategy, LazyStrategy):
+            for strategy in (EnumeratedStrategy, LazyStrategy):
                 monkeypatch.setattr(strategy, "_relate", _no_relation)
         torch._inductor.codecache.FxGraphCache.clear()
         torch._dynamo.reset()

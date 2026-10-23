@@ -1125,13 +1125,13 @@ class TestSelectAllocator(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import select_allocator
         from torch_spyre._inductor.scratchpad.encoding_strategy import (
             PairTableStrategy,
-            TableStrategy,
+            EnumeratedStrategy,
         )
         from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
         for strategy, cls in (
             ("lazy", LazyStrategy),
-            ("enumerated", TableStrategy),
+            ("enumerated", EnumeratedStrategy),
             ("table", PairTableStrategy),
         ):
             with self.subTest(lx_division_strategy=strategy):
