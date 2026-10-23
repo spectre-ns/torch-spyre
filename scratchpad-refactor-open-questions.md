@@ -301,3 +301,10 @@ Done: `config.lx_division_strategy` (`LX_DIVISION_STRATEGY`), `"lazy"` (default)
 which picks `LazyStrategy` or `TableStrategy` and builds `TableCandidates(lazy=)`: off,
 no op gets a `Lazy` space or a point menu, so every menu is the op's legal divisions.
 The committed replan keeps the strategy.
+
+Later (2026-10-23): "We should still be able to do the pure table based strategy as
+well ... an additional strategy specialization." Done: `"table"` selects
+`PairTableStrategy(TableStrategy)`, which relates every edge by a pair table, with
+`TableCandidates(pair_tables=True)` building one per edge (clone edges included). Relayouts
+stay the lazy ones; they relate their ends through the strategy's `_relate`, which reads
+the pair table.

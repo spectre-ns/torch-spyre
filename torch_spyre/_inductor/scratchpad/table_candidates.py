@@ -392,7 +392,9 @@ class TableCandidates:
     relations and relayout candidates. ``committed``: every op keeps the
     division work division committed, a menu of one. ``lazy``: an op that can
     take a ``Lazy`` work split gets a space (``lazy_spaces``) and, where the
-    space stands in for it, its points as its menu."""
+    space stands in for it, its points as its menu. ``pair_tables``: every
+    edge gets a pair table over its two ends' menus (``PairTableStrategy``);
+    otherwise only the edges whose relation cannot be derived do."""
 
     def __init__(
         self,
@@ -400,12 +402,15 @@ class TableCandidates:
         prune: bool = False,
         committed: bool = False,
         lazy: bool = True,
+        pair_tables: bool = False,
     ) -> None:
         self.capacity = capacity  # bytes
         self.prune = prune
         self.committed = committed
         # Offer ops a Lazy space; off, every op's menu is its legal divisions.
         self.lazy = lazy
+        # A pair table on every edge, not only where no relation is derived.
+        self.pair_tables = pair_tables
         # The post-loop drain plans validated for the last graph.
         self.drain_plans: dict[str, DrainPlan] = {}
         # Set for the re-plan after applied tilings: no further tilings.
@@ -1062,6 +1067,9 @@ class TableCandidates:
             buffer_users = get_buffer_users(graph)
             for input_name in self._eligible_clone_inputs(graph, lifetimes):
                 consumers = [op for op in buffer_users.get(input_name, [])]
+                if self.pair_tables:
+                    for consumer in consumers:
+                        self._materialize(divisions, consumer.get_name())
                 divs, matches, reads = self._clone_divisions_and_matches(
                     input_name, consumers, divisions, prep_cache
                 )
@@ -1128,14 +1136,18 @@ class TableCandidates:
             # The strategy derives these edges' relation from their
             # ResidencyEdge (an input clone's from its CloneRead); only
             # loop-carry edges, whose table is overridden below, are
-            # materialized here.
+            # materialized here, unless every edge gets a pair table.
             carry_edge = carry_update_edges.get(output_name)
             special = set(
                 self._loop_carry_read_edges(op, carry_update_edges, prep_cache)
             )
             if carry_edge is not None:
                 special.add(carry_edge.buf_name)
-            tabled = {p: e for p, e in residency_edges.items() if p in special}
+            tabled = {
+                p: e
+                for p, e in residency_edges.items()
+                if self.pair_tables or p in special
+            }
             cd_parent_matches = self._cd_parent_matches(
                 tabled, buf_divisions, divisions
             )
@@ -1225,7 +1237,7 @@ class TableCandidates:
                 if input_name not in input_clone_matches:
                     continue
                 read = input_clone_reads[input_name].get(output_name)
-                if read is not None:
+                if read is not None and not self.pair_tables:
                     clone_reads[input_name] = read
                 else:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][

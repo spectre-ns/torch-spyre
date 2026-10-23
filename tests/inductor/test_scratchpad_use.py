@@ -1123,18 +1123,23 @@ class TestSelectAllocator(unittest.TestCase):
 
     def test_division_strategy_picks_the_encoding(self):
         from torch_spyre._inductor.scratchpad.allocator import select_allocator
-        from torch_spyre._inductor.scratchpad.encoding_strategy import TableStrategy
+        from torch_spyre._inductor.scratchpad.encoding_strategy import (
+            PairTableStrategy,
+            TableStrategy,
+        )
         from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-        for strategy, cls, lazy in (
-            ("lazy", LazyStrategy, True),
-            ("enumerated", TableStrategy, False),
+        for strategy, cls, lazy, pair_tables in (
+            ("lazy", LazyStrategy, True, False),
+            ("enumerated", TableStrategy, False, False),
+            ("table", PairTableStrategy, False, True),
         ):
             with self.subTest(lx_division_strategy=strategy):
                 with ts_inductor_config.patch(lx_division_strategy=strategy):
                     a = select_allocator()
                 self.assertIs(a.strategy_class, cls)
                 self.assertIs(a.candidates.lazy, lazy)
+                self.assertIs(a.candidates.pair_tables, pair_tables)
 
 
 class TestInplaceEdgeGate(unittest.TestCase):

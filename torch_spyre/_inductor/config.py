@@ -39,11 +39,13 @@ lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
 )
-# How the solve encodes each op's work split: "lazy" posts the split's legality
-# as constraints over the op's space where it can (LazyStrategy); "enumerated"
-# enumerates every op's legal divisions and picks one from that menu
-# (TableStrategy), the fallback when a Lazy space misbehaves.
-lx_division_strategy: Literal["lazy", "enumerated"] = os.environ.get(
+# How the solve encodes each op's work split and each edge's relation: "lazy"
+# posts a split's legality as constraints over the op's space where it can
+# (LazyStrategy); "enumerated" enumerates every op's legal divisions and picks
+# one from that menu (TableStrategy), the fallback when a Lazy space
+# misbehaves; "table" also relates every edge by a pair table over its two
+# ends' menus instead of deriving it (PairTableStrategy), the original model.
+lx_division_strategy: Literal["lazy", "enumerated", "table"] = os.environ.get(
     "LX_DIVISION_STRATEGY", "lazy"
 )  # type: ignore[assignment]
 hbm_pool_planning: bool = os.getenv("HBM_POOL_PLANNING", "1").lower() in (

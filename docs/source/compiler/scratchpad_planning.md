@@ -430,11 +430,17 @@ its slot. In the open division mode it also chooses each op's core division
 (and, with `config.auto_coarse_tiling`, its coarse tiling) and which relayout
 copies fire; see [The co-optimizer](co_optimizer.md).
 `config.co_optimizing_lx_planning` picks the division mode.
-`config.lx_division_strategy` (`LX_DIVISION_STRATEGY`) picks how a work split
-is encoded: `"lazy"` (the default) posts its legality as constraints over the
-op's split space where the op has one (`LazyStrategy`); `"enumerated"`
-enumerates every op's legal divisions and picks one from that menu
-(`TableStrategy`), the fallback when a `Lazy` space misbehaves.
+`config.lx_division_strategy` (`LX_DIVISION_STRATEGY`) picks the encoding:
+
+- `"lazy"` (the default, `LazyStrategy`) posts a work split's legality as
+  constraints over the op's split space where the op has one, and relates
+  an edge's two ends by equality of their derived view ids.
+- `"enumerated"` (`TableStrategy`) enumerates every op's legal divisions and
+  picks one from that menu, with the same derived relations; the fallback
+  when a `Lazy` space misbehaves.
+- `"table"` (`PairTableStrategy`) is the original model: enumerated menus,
+  and every edge related by a pair table over its two ends' menu indices,
+  built before the solve.
 
 `SPYRE_LX_BACKEND` swaps the backend the model is solved with (`mip:<SCIP|HIGHS|CBC>`,
 `bruteforce`, `anneal[:<budget s>]`); these are for comparing solutions, not

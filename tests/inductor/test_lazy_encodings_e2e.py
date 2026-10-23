@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End to end: both work-split strategies -- ``lazy`` (the default: the derived
-view relation, ``Lazy`` work split and relayouts as constraints) and
-``enumerated`` (every split picked from its op's enumerated menu) -- plan graphs
-that compile and compute the right numbers on device."""
+"""End to end: every division strategy -- ``lazy`` (the default: the derived
+view relation, ``Lazy`` work split and relayouts as constraints),
+``enumerated`` (every split picked from its op's enumerated menu) and
+``table`` (that, with a pair table on every edge) -- plans graphs that compile
+and compute the right numbers on device."""
 
 import pytest
 
@@ -38,7 +39,7 @@ def _norm_chain(x, w):
     return torch.relu(y) + y.softmax(-1)
 
 
-@pytest.mark.parametrize("strategy", ["lazy", "enumerated"])
+@pytest.mark.parametrize("strategy", ["lazy", "enumerated", "table"])
 @pytest.mark.parametrize("model", ["mlp", "norm_chain"])
 def test_division_strategies_compute_the_reference(model, strategy):
     torch.manual_seed(0)

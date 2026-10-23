@@ -23,8 +23,10 @@ CP variable (:class:`NodeVars`). Nodes and edges stay pure data.
 
 :class:`TableStrategy` encodes each open work split as a ``Table`` over a
 candidate menu, and each edge's relation from its clone read, its residency
-edge or its pair table; ``LazyStrategy`` (``lazy_strategy.py``), the one the
-allocator uses, adds the ``Lazy`` work split.
+edge or its pair table. Two specializations: ``LazyStrategy``
+(``lazy_strategy.py``, the default) adds the ``Lazy`` work split, and
+:class:`PairTableStrategy` relates every edge by a pair table.
+``config.lx_division_strategy`` picks one of the three.
 """
 
 from __future__ import annotations
@@ -1083,3 +1085,19 @@ class TableStrategy(EncodingStrategy):
         """The relayout candidate the read on ``edge`` fired through."""
         assert edge.transform is not None
         return self._relayouts.fired(edge, solver)
+
+
+class PairTableStrategy(TableStrategy):
+    """The table model in full: every edge's relation is a pair table over
+    its two ends' menu indices, never a derived clone or residency relation.
+    Its candidates come from ``TableCandidates(pair_tables=True)``, which
+    builds one per edge; an edge without one forbids residency across it."""
+
+    @classmethod
+    def from_tables(cls, tables: CandidateTables, **kwargs) -> TableStrategy:
+        strategy = super().from_tables(tables, **kwargs)
+        for key in [*strategy.clone_reads, *strategy.residency]:
+            strategy.matches[key] = list(tables.matches.get(key, []))
+        strategy.clone_reads = {}
+        strategy.residency = {}
+        return strategy

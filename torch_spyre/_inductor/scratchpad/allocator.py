@@ -42,6 +42,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
     CandidateTables,
+    PairTableStrategy,
     TableStrategy,
 )
 from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
@@ -416,7 +417,7 @@ class ScratchpadAllocator:
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         division_mode: Literal["open", "committed"] = "committed",
         prune: bool = False,
-        division_strategy: Literal["lazy", "enumerated"] = "lazy",
+        division_strategy: Literal["lazy", "enumerated", "table"] = "lazy",
     ):
         """Configure the allocator with graph passes.
 
@@ -433,7 +434,8 @@ class ScratchpadAllocator:
             division_strategy: ``"lazy"`` encodes a work split as constraints
                 over its op's space where it can (``LazyStrategy``);
                 ``"enumerated"`` picks every split from its op's enumerated
-                legal divisions (``TableStrategy``).
+                legal divisions (``TableStrategy``); ``"table"`` also relates
+                every edge by a pair table (``PairTableStrategy``).
         """
         from torch_spyre._inductor.scratchpad.table_candidates import (
             TableCandidates,
@@ -448,10 +450,17 @@ class ScratchpadAllocator:
         self.division_mode = division_mode
         self.prune = prune
         self.division_strategy = division_strategy
-        lazy = division_strategy == "lazy"
-        self.strategy_class = LazyStrategy if lazy else TableStrategy
+        self.strategy_class = {
+            "lazy": LazyStrategy,
+            "enumerated": TableStrategy,
+            "table": PairTableStrategy,
+        }[division_strategy]
         self.candidates = TableCandidates(
-            size, prune, committed=not self.joint, lazy=lazy
+            size,
+            prune,
+            committed=not self.joint,
+            lazy=division_strategy == "lazy",
+            pair_tables=division_strategy == "table",
         )
 
     @property
