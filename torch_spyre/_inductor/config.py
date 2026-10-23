@@ -336,34 +336,36 @@ cpsat_time_limit_seconds: float = float(
 )
 
 # How the CP-SAT layout solve encodes the relations over each dependency edge
-# (``EnumerationFactory``). "table": a pair table over the two ends' candidate
-# indices, built by the allocator (today's model). "derived": equality of
-# per-node view ids, tile-view ids and core counts, derived by the strategy
-# from each edge's ResidencyEdge (an input clone's from its CloneRead); the
-# allocator builds no pair tables for those edges. Experimental.
+# (``EnumerationFactory``). "derived" (the default): equality of per-node view
+# ids, tile-view ids and core counts, derived by the strategy from each edge's
+# ResidencyEdge (an input clone's from its CloneRead); the candidate generator
+# builds pair tables only for loop-carry edges. "table": a pair table over the
+# two ends' candidate indices on every edge. A solver that reads menus and
+# pair tables (the annealing co-optimizer, exhaustive search) always gets the
+# table model.
 lx_view_relation: Literal["table", "derived"] = os.environ.get(  # type: ignore[assignment]
-    "LX_VIEW_RELATION", "table"
+    "LX_VIEW_RELATION", "derived"
 )
 
-# How the CP-SAT layout solve encodes relayouts: "table" (the allocator's
-# capped, priced copy groups over division pairs) or "lazy" (per edge, a
-# legality and price table over the two ends' view ids, copies shared by
-# reified view equality, each owner's lifetime a variable; no cap). "lazy"
-# needs lx_view_relation = "derived", under which "table" offers none.
-# Experimental.
+# How the CP-SAT layout solve encodes relayouts: "lazy" (the default; per
+# edge, a legality and price table over the two ends' view ids, copies shared
+# by reified view equality, each owner's lifetime a variable; no cap) or
+# "table" (capped, priced copy groups over division pairs). "lazy" needs
+# lx_view_relation = "derived", under which "table" offers none.
 lx_relayout_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
-    "LX_RELAYOUT_ENCODING", "table"
+    "LX_RELAYOUT_ENCODING", "lazy"
 )
 
-# How the CP-SAT layout solve encodes an open work split: "table" (an index
-# into the candidate menu) or "lazy" (one split var per axis and a tiling
-# choice, legality posted from each tiling frame's WorkDivisionContext, every
-# per-division quantity a table over the axes it depends on, views related in
-# digit form where they have one). "lazy" needs lx_view_relation = "derived";
-# nodes on a pair-table edge stay "table", and the allocator hands a Lazy
-# node its space's points instead of enumerating its legal menu.
+# How the CP-SAT layout solve encodes an open work split: "lazy" (the
+# default; one split var per axis and a tiling choice, legality posted from
+# each tiling frame's WorkDivisionContext, every per-division quantity a table
+# over the axes it depends on, views related in digit form where they have
+# one) or "table" (an index into the candidate menu). "lazy" needs
+# lx_view_relation = "derived"; nodes on a pair-table edge stay "table", and
+# the candidate generator hands a Lazy node its space's points instead of
+# enumerating its legal menu.
 lx_division_encoding: Literal["table", "lazy"] = os.environ.get(  # type: ignore[assignment]
-    "LX_DIVISION_ENCODING", "table"
+    "LX_DIVISION_ENCODING", "lazy"
 )
 
 

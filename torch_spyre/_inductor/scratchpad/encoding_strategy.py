@@ -1278,33 +1278,17 @@ class EnumerationFactory:
             )
 
     @classmethod
-    def from_config(cls) -> EnumerationFactory:
+    def from_config(cls, solver: Optional[type] = None) -> EnumerationFactory:
+        """The configured enumerations, for ``solver``: one that reads
+        candidate menus and pair tables rather than posting a model
+        (``MemoryPlanSolver.posts_model``) gets the table model."""
+        if solver is not None and not getattr(solver, "posts_model", False):
+            return cls()
         return cls(
             division=config.lx_division_encoding,
             relayout="lazy" if config.lx_relayout_encoding == "lazy" else "data",
             relation=config.lx_view_relation,
         )
-
-    @property
-    def is_table(self) -> bool:
-        """Every axis a table over candidates and every relation a pair table:
-        what a solver that reads menus and match tables needs."""
-        return (self.division, self.relayout, self.relation) == (
-            "table",
-            "data",
-            "table",
-        )
-
-    def check(self, solver: type) -> None:
-        """Reject a solver that cannot realize these enumerations: anything
-        but the table model needs a solver that posts a model
-        (``MemoryPlanSolver.posts_model``)."""
-        if not self.is_table and not getattr(solver, "posts_model", False):
-            raise ValueError(
-                f"{solver.__name__} reads candidate menus and match tables; "
-                f"division={self.division}, relayout={self.relayout}, "
-                f"relation={self.relation} needs the CP-SAT solver"
-            )
 
     def candidates(self, allocator: ScratchpadAllocator) -> TableCandidates:
         """What generates the table candidates for ``allocator``'s solves."""

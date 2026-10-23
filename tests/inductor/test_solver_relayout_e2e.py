@@ -44,9 +44,30 @@ import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_mod
 
 _COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
 
+# The CP-SAT relayout encodings: relayouts as constraints (the default) and the
+# table model's capped copy groups over division pairs.
+_TABLE = {
+    "lx_view_relation": "table",
+    "lx_division_encoding": "table",
+    "lx_relayout_encoding": "table",
+}
+_ENCODINGS = {"constraints": {}, "table": _TABLE}
+
+
+@pytest.fixture(autouse=True, params=sorted(_ENCODINGS))
+def encoding(request):
+    with config.patch(_ENCODINGS[request.param]):
+        yield request.param
+
 
 def _no_matches(self, edges, *args, **kwargs):
     return {parent: [] for parent in edges}
+
+
+def _no_relation(self, edge, lit, model):
+    """No division pair slices an edge's buffer alike: the strategy's form of
+    an empty pair table."""
+    model.Add(lit == 0)
 
 
 class _Observed:
@@ -56,8 +77,10 @@ class _Observed:
     relayout (both args LX-resident with distinct work divisions) together
     with the LX addresses it emitted.
 
-    With ``force=True`` the match table is emptied on every edge, so a
-    relayout is the only route to residency (see the module docstring).
+    With ``force=True`` no division pair matches on any edge (an empty pair
+    table under the table model, the strategy's relation held false under the
+    derived one), so a relayout is the only route to residency (see the
+    module docstring).
     With ``force=False`` the graph is compiled as a user would see it and
     only read-only spies are installed.
     """
@@ -144,7 +167,14 @@ class _Observed:
         monkeypatch.setattr(sdsc_mod, "is_lx_relayout_identity", spy_identity_codegen)
         monkeypatch.setattr(sk_mod, "is_lx_relayout_identity", spy_identity_kernel)
         if force:
+            from torch_spyre._inductor.scratchpad.encoding_strategy import (
+                TableStrategy,
+            )
+            from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+
             monkeypatch.setattr(TableCandidates, "_cd_parent_matches", _no_matches)
+            for strategy in (TableStrategy, LazyStrategy):
+                monkeypatch.setattr(strategy, "_relate", _no_relation)
         torch._inductor.codecache.FxGraphCache.clear()
         torch._dynamo.reset()
 
@@ -711,7 +741,9 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
 
 
-def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch):
+def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(
+    monkeypatch, encoding
+):
     """A coarse-tiled edge within a SINGLE for_each_tile body may be offered a
     relayout candidate (the same-group exception in
     ``solver_relayout_edge_context``, torch-spyre#5057), when
@@ -731,6 +763,11 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     test_cross_group_coarse_tiled_edges_are_never_offered above."""
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
+    if encoding != "table":
+        pytest.skip(
+            "the table encoding's relayout candidates; the constraint "
+            "encoding never relayouts a tiled end"
+        )
     tile_size = 128
 
     def fn(t, u):

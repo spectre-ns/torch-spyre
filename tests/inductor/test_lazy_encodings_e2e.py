@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End to end: the experimental CP-SAT encodings (derived view relation,
-``Lazy`` work split, relayouts as constraints) plan graphs that compile and
-compute the right numbers on device."""
+"""End to end: every CP-SAT encoding (the table model; the derived view
+relation, ``Lazy`` work split and relayouts as constraints, alone and together,
+which is the default) plans graphs that compile and compute the right numbers
+on device."""
 
 import pytest
 
@@ -32,13 +33,24 @@ _BASE = {
 }
 
 _MODES = {
-    "derived": {"lx_view_relation": "derived"},
+    "table": {
+        "lx_view_relation": "table",
+        "lx_division_encoding": "table",
+        "lx_relayout_encoding": "table",
+    },
+    "derived": {
+        "lx_view_relation": "derived",
+        "lx_division_encoding": "table",
+        "lx_relayout_encoding": "table",
+    },
     "lazy": {
         "lx_view_relation": "derived",
         "lx_division_encoding": "lazy",
+        "lx_relayout_encoding": "table",
     },
     "lazy_relayouts": {
         "lx_view_relation": "derived",
+        "lx_division_encoding": "table",
         "lx_relayout_encoding": "lazy",
     },
     "all": {

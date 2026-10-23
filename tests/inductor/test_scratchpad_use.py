@@ -2401,8 +2401,12 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             }
             for child, parents in self._in_place_parents(solve_graph).items():
                 merged = parents & input_clones
-                # The CP-SAT merge also needs the division-match gate populated.
-                if any((p, child) in tables.matches for p in merged):
+                # The CP-SAT merge also needs the division gate populated: a
+                # pair table, or the clone relation the derived encoding reads.
+                if any(
+                    (p, child) in tables.matches or (p, child) in tables.clone_reads
+                    for p in merged
+                ):
                     edge_found = True
                     break
         self.assertTrue(
@@ -2467,6 +2471,10 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 layout_solver="cpsat",
                 co_optimizing_lx_planning=True,
                 _cpsat_warn_on_cost_expr=False,
+                # The table encoding's capped relayout candidates.
+                lx_view_relation="table",
+                lx_division_encoding="table",
+                lx_relayout_encoding="table",
             ):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
