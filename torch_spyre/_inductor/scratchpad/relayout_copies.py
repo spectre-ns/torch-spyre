@@ -35,6 +35,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     ResourceNode,
     SpyreOptimizationGraph,
     Transform,
+    WorkSplit,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision, ceil_div
 
@@ -48,6 +49,21 @@ if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.graph_builder import RelayoutEdge
 
 Var = Any
+
+
+def _solved_entry(node: ResourceNode) -> tuple[int, CoreDivision]:
+    """The node's solved work split as an entry of its menu. A strategy
+    chooses among its own candidates (Lazy's point grid, or a point menu
+    filtered to its legal divisions), so only the menu is indexed alike by
+    the relayout's views and the commit path's checks."""
+    index = next(
+        (i for i, cd in enumerate(node.menu) if WorkSplit.of(cd) == node.work_split),
+        None,
+    )
+    assert index is not None, (
+        f"{node.name}: solved work split {node.work_split} is not in its menu"
+    )
+    return index, node.menu[index]
 
 
 @dataclass(eq=False)
@@ -311,8 +327,8 @@ class RelayoutCopies:
         s = self.strategy
         copy = self.by_edge[edge]
         (owner,) = [o for o, lit in copy.uses if solver.BooleanValue(lit)]
-        i, j = s.solved[edge.src], s.solved[edge.dst]
-        src_cd, dst_cd = s._candidates(edge.src)[i], s._candidates(edge.dst)[j]
+        i, src_cd = _solved_entry(edge.src)
+        j, dst_cd = _solved_entry(edge.dst)
         (pv,) = copy.data.source_views([src_cd], s._prep_cache)
         (cv,) = copy.data.consumer_views([dst_cd], s._prep_cache)
         assert pv is not None and cv is not None
