@@ -41,7 +41,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     WorkSplit,
 )
 from torch_spyre._inductor.scratchpad.encoding_strategy import (
-    CandidateTables,
     PairTableStrategy,
     TableStrategy,
 )
@@ -235,8 +234,8 @@ def _assert_drain_plan_committed(
             "ownership is missing on the storage or its update"
         )
     update = solved.by_name.get(plan.update_name)
-    storage_menu = solved.tables.menus.get(storage.name)
-    update_menu = solved.tables.menus.get(plan.update_name)
+    storage_menu = storage.menu
+    update_menu = () if update is None else update.menu
     if update is None or not storage_menu or not update_menu:
         raise AssertionError(
             f"drain plan for {plan.storage_name}: storage or update is not a "
@@ -265,12 +264,11 @@ def _assert_drain_plan_committed(
 
 @dataclass
 class SolvedPlan:
-    """The solver's nodes, each carrying its decisions, as the commit path
-    reads them, with the candidates those decisions were chosen from. A
-    node's offset is in ``alignment`` units."""
+    """The solver's nodes, each carrying its decisions and the candidates
+    they were chosen from, as the commit path reads them. A node's offset is
+    in ``alignment`` units; a division index is into the node's menu."""
 
     nodes: list[ResourceNode]
-    tables: CandidateTables
     alignment: int
     by_name: dict[str, ResourceNode] = field(init=False)
     _chosen: dict[str, int] = field(init=False)
@@ -283,7 +281,7 @@ class SolvedPlan:
             split = node.work_split
             if split is None or split.committed:
                 continue
-            menu = self.tables.menus.get(node.name, ())
+            menu = node.menu
             index = next(
                 (i for i, cd in enumerate(menu) if WorkSplit.of(cd) == split), None
             )
@@ -305,14 +303,13 @@ class SolvedPlan:
 
     def chose(self, node: ResourceNode, index: int) -> bool:
         """Whether the node's chosen division is its menu entry ``index``."""
-        menu = self.tables.menus.get(node.name, ())
-        return node.work_split == WorkSplit.of(menu[index])
+        return node.work_split == WorkSplit.of(node.menu[index])
 
     def division(self, node: ResourceNode) -> Optional[CoreDivision]:
         """The node's chosen division, or ``None`` when it was committed
         upstream."""
         i = self.division_index(node)
-        return None if i is None else self.tables.menus[node.name][i]
+        return None if i is None else node.menu[i]
 
     def per_core_size(self, node: ResourceNode) -> int:
         cd = self.division(node)
@@ -404,13 +401,7 @@ class ScratchpadAllocator:
             "enumerated": TableStrategy,
             "table": PairTableStrategy,
         }[division_strategy]
-        self.candidates = TableCandidates(
-            size,
-            prune,
-            committed=not self.joint,
-            lazy=division_strategy == "lazy",
-            pair_tables=division_strategy == "table",
-        )
+        self.candidates = TableCandidates(size, prune, committed=not self.joint)
 
     @property
     def joint(self) -> bool:
@@ -448,22 +439,20 @@ class ScratchpadAllocator:
         for p in passes:
             p.apply_pass(graph)
 
-    def _build_graph(
-        self, graph: GraphLowering
-    ) -> tuple[SpyreOptimizationGraph, CandidateTables]:
-        """The solve's graph, built from the IR, and the table strategy's
-        candidates for it."""
+    def _build_graph(self, graph: GraphLowering) -> SpyreOptimizationGraph:
+        """The solve's graph, built from the IR, its candidates on it: the
+        same for every strategy."""
         built = self.candidates.prepare_graph(graph)
         self._validated_drain_plans = self.candidates.drain_plans
         return built
 
     def _solve(self, graph: GraphLowering) -> SolvedPlan:
         """Build the graph and solve it under the priced cost expression."""
-        solve_graph, tables = self._build_graph(graph)
-        strategy = self.strategy_class.from_tables(tables)
-        cost_expr, bundle_terms = pricing.cost_expr(graph, solve_graph, tables)
+        solve_graph = self._build_graph(graph)
+        strategy = self.strategy_class()
+        cost_expr, bundle_terms = pricing.cost_expr(graph, solve_graph)
         nodes = solve_graph.solve(cost_expr=cost_expr, strategy=strategy)
-        plan = SolvedPlan(nodes, tables, solve_graph.alignment)
+        plan = SolvedPlan(nodes, solve_graph.alignment)
         if config.dump_cost_expr_file and cost_expr is not None:
             pricing.dump_cost_expr(
                 graph, plan, solve_graph.solve_stats, cost_expr, bundle_terms, self.size

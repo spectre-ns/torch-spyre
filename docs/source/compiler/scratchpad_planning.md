@@ -298,9 +298,11 @@ scratchpad_planning(graph)  # allocator=select_allocator()
    none.
 2. **The solve's graph.** `TableCandidates.prepare_graph` builds one
    `ResourceNode` per IR buffer, *including* the ones that may not reside,
-   with its lifetime, footprint and in-place edges, and the strategy's
-   candidates (`CandidateTables`). In the open mode each op's menu holds its
-   candidate divisions; in the committed mode, only its committed division.
+   with its lifetime, footprint and in-place edges, its candidates (a menu,
+   and the division space it is drawn from where the op has one) and each
+   edge's relations, the same for every strategy. In the open mode each op's
+   menu holds its candidate divisions; in the committed mode, only its
+   committed division.
    When `clone_at_graph_boundaries()` is set, every graph input that clears
    `residency_rules._input_residency_reason` is a node too
    (`TableCandidates._eligible_clone_inputs`), so the solve decides whether
@@ -636,8 +638,7 @@ Three suites cover the planner:
 
 - `tests/inductor/test_scratchpad_solver.py`: solver-level unit tests.
   Graphs are written as buffers (`tests/inductor/buffer_spec.py`), built
-  into the solve graph and candidate tables (`build_graph`, `tables_of`) and
-  solved.
+  into the solve graph (`build_graph`) and solved.
 - `tests/inductor/test_scratchpad_use.py`: end-to-end op-level checks
   that LX is actually used for representative graphs.
 - `tests/inductor/test_scratchpad_patterns.py`: the patterns above and

@@ -9778,7 +9778,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 graph
             )
             self.assertEqual(in_place["reader"], ["carry"])
-            solve_graph, _ = allocator.candidates._build_graph(
+            solve_graph = allocator.candidates._build_graph(
                 graph, in_place, division_menus._DivisionMap(divisions, set())
             )
 

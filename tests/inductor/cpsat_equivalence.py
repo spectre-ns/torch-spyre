@@ -57,7 +57,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import regex as re
-from buffer_spec import tables_of
 
 _DTIME = float(os.environ.get("CPSAT_EQUIV_DTIME", "10"))
 
@@ -174,13 +173,10 @@ def install(out: str | Path) -> _Recorder:
     orig_solve = SpyreOptimizationGraph.solve
 
     def solve(self, model=None, cost_expr=None, strategy=None):
-        from torch_spyre._inductor.scratchpad.encoding_strategy import (
-            CandidateTables,
-        )
         from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
         if strategy is None:
-            strategy = LazyStrategy.from_tables(CandidateTables())
+            strategy = LazyStrategy()
         self.settings = dataclasses.replace(self.settings, record=_record_stage)
         rec = _RECORDER
         if rec is None or rec.stages is not None:
@@ -315,7 +311,7 @@ def _solve(case: str, buffers, limit: int, alignment: int, cost_expr) -> None:
         SolveSettings(time_limit_seconds=0, record=_record_stage),
         {b.name: b.residency_reason for b in buffers if b.residency_reason},
     )
-    strategy = LazyStrategy.from_tables(tables_of(buffers))
+    strategy = LazyStrategy()
     try:
         graph.solve(cost_expr=cost_expr, strategy=strategy)
     except Exception as exc:  # recorded by the patch; keep replaying

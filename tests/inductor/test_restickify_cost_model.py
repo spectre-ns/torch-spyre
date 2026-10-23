@@ -580,11 +580,11 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     assert len(ordinary) > 1
     # No hand-built menu: go through the same candidate, clone and relayout
     # construction as the real joint solve.
-    solve_graph, tables = allocator._build_graph(graph)
-    assert list(tables.menus[consumer.name]) == ordinary
+    solve_graph = allocator._build_graph(graph)
+    assert list(solve_graph.nodes[consumer.name].menu) == ordinary
     result = allocator._solve(graph)
     chosen = result.division(result.by_name[consumer.name])
-    direct = allocator.candidates._pricing_operations(graph, solve_graph, tables)[0]
+    direct = allocator.candidates._pricing_operations(graph, solve_graph)[0]
     costs = [
         cm._transport_dma_excess_ns(
             [dcm.extract_op_features(direct, splits)], cm.CostParams()
@@ -683,7 +683,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         build = allocator.candidates._build_graph
 
         def with_allocation_choice(*args):
-            solve_graph, tables = build(*args)
+            solve_graph = build(*args)
             # Inject only the allocation-dependent choice, not divisions or
             # the proof. Preparation must use the same context as pricing.
             if failure == "source_clone":
@@ -694,13 +694,17 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
                     uses=[0, 1],
                     first_use_is_read=True,
                     boundary=BufferType.Input,
-                    open_split=True,
+                    menu=(CoreDivision(),),
                 )
-                tables.menus["input"] = (CoreDivision(),)
             else:
                 # The staging copy may be relaid out to its consumer.
-                tables.relayout_edges[(stage.name, consumer.name)] = object()
-            return solve_graph, tables
+                edge = next(
+                    e
+                    for e in solve_graph.nodes[consumer.name].inputs
+                    if e.src.name == stage.name
+                )
+                edge.relayout_edge = object()
+            return solve_graph
 
         monkeypatch.setattr(
             allocator.candidates, "_build_graph", with_allocation_choice
@@ -709,7 +713,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         with pytest.raises(AssertionError, match="fixed direct-read division over"):
             allocator._build_graph(graph)
         return
-    _, tables = allocator._build_graph(graph)
-    assert list(tables.menus[consumer.name]) == [
+    solve_graph = allocator._build_graph(graph)
+    assert list(solve_graph.nodes[consumer.name].menu) == [
         division_menus._fixed_core_division(consumer)
     ]

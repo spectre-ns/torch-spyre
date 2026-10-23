@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Candidate generation for the table encoding of the LX layout solve.
+"""The LX layout solve's graph, built from the IR, the same for every
+encoding strategy.
 
-:class:`TableCandidates` derives what the strategies enumerate: each op's
-candidate core divisions and coarse tilings (the menus, or a Lazy split's
-space), the view tables between a producer's and a consumer's candidates
-(``cd_parent_matches``, including the loop-carry intersection and input-clone
-overrides), the derived relations, and the edges that may read through a
-relayout copy (``RelayoutEdge``).
-It builds the open-mode graph with them (``CandidateTables``), reading each op's
+:class:`TableCandidates` puts on each node its candidate core divisions and
+coarse tilings (a menu, and the space it is drawn from where the op has one)
+and on each edge the relations a strategy encodes it by (``ResidencyEdge``,
+``CloneRead``, ``RelayoutEdge``), with a pair table only where the builder
+must fix one (the loop-carry intersection, input clones). It reads each op's
 residency rules from ``residency_rules``, its lifetimes and drain plans from
 ``drain_plans`` and its split options from ``division_menus``.
 """
@@ -59,11 +58,8 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     SpyreOptimizationGraph,
     empty_graph,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    sym_core_divs_for,
-    sym_tile_counts_for,
     TileSpec,
     BufferType,
 )
@@ -126,7 +122,7 @@ from torch_spyre._inductor.scratchpad.pricing import _COST_PARAMS
 logger = get_inductor_logger("scratchpad.table_candidates")
 
 
-def residency_symbols(graph: SpyreOptimizationGraph, tables: CandidateTables) -> dict:
+def residency_symbols(graph: SpyreOptimizationGraph) -> dict:
     """Each node's residency symbol (``is_lx_<name>``),
     what the cost model prices an LX read or write by."""
     return {n.name: n.sym_is_lx for n in graph.get_nodes()}
@@ -387,30 +383,25 @@ def _has_legal_division(context) -> bool:
 
 
 class TableCandidates:
-    """The candidate generation for solves over ``capacity``
-    bytes of LX: the graph from the IR, each node's menu, the pair tables,
-    relations and relayout candidates. ``committed``: every op keeps the
-    division work division committed, a menu of one. ``lazy``: an op that can
-    take a ``Lazy`` work split gets a space (``lazy_spaces``) and, where the
-    space stands in for it, its points as its menu. ``pair_tables``: every
-    edge gets a pair table over its two ends' menus (``PairTableStrategy``);
-    otherwise only the edges whose relation cannot be derived do."""
+    """The solve's graph from the IR, for solves over ``capacity`` bytes of
+    LX, with each node's candidates and each edge's relations, the same for
+    every encoding strategy. An op whose divisions form a small space gets the
+    space and its points as its menu (never enumerated down to the legal
+    ones); others get their legal divisions. An edge carries the relations a
+    strategy may derive from (``ResidencyEdge``, ``CloneRead``,
+    ``RelayoutEdge``) and a pair table only where the builder must fix one (a
+    loop carry, an input clone). ``committed``: every op keeps the division
+    work division committed, a menu of one."""
 
     def __init__(
         self,
         capacity: int,
         prune: bool = False,
         committed: bool = False,
-        lazy: bool = True,
-        pair_tables: bool = False,
     ) -> None:
         self.capacity = capacity  # bytes
         self.prune = prune
         self.committed = committed
-        # Offer ops a Lazy space; off, every op's menu is its legal divisions.
-        self.lazy = lazy
-        # A pair table on every edge, not only where no relation is derived.
-        self.pair_tables = pair_tables
         # The post-loop drain plans validated for the last graph.
         self.drain_plans: dict[str, DrainPlan] = {}
         # Set for the re-plan after applied tilings: no further tilings.
@@ -421,11 +412,8 @@ class TableCandidates:
         # Ops whose menu is their space's points, not the legal divisions.
         self.point_menus: set[str] = set()
 
-    def prepare_graph(
-        self, graph: GraphLowering
-    ) -> tuple[SpyreOptimizationGraph, CandidateTables]:
-        """The solve's graph of ``graph`` and the table strategy's candidates
-        for it."""
+    def prepare_graph(self, graph: GraphLowering) -> SpyreOptimizationGraph:
+        """The solve's graph of ``graph``, its candidates on it."""
         # Validate the post-loop drain plans exactly once, here, before the
         # solver runs: the residency gate, the lifetime extension and the push
         # must all consume this same object.  Re-deriving it after the solve
@@ -445,23 +433,22 @@ class TableCandidates:
             for name in list(self.point_menus):
                 self._materialize(divisions, name)
         while True:
-            solve_graph, tables = self._build_graph(graph, in_place, division_map)
+            solve_graph = self._build_graph(graph, in_place, division_map)
             if not pending:
-                return solve_graph, tables
+                return solve_graph
             pricing = {
-                op.get_name(): op
-                for op in self._pricing_operations(graph, solve_graph, tables)
+                op.get_name(): op for op in self._pricing_operations(graph, solve_graph)
             }
             rejected = [
                 name
                 for name, op in pending.items()
                 if pricing.get(name) is op
                 or not self._direct_read_candidates_priced(
-                    pricing.get(name), divisions[name], solve_graph, tables
+                    pricing.get(name), divisions[name], solve_graph
                 )
             ]
             if not rejected:
-                return solve_graph, tables
+                return solve_graph
             for name in rejected:
                 op = pending.pop(name)
                 fixed = _fixed_core_division(op)
@@ -479,14 +466,14 @@ class TableCandidates:
             # per deferred read, without changing the graph or the late proof.
 
     @staticmethod
-    def _direct_read_candidates_priced(op, divisions, graph, tables) -> bool:
+    def _direct_read_candidates_priced(op, divisions, graph) -> bool:
         from torch_spyre._inductor.cost_model import transport_dma_cost_available
         from torch_spyre._inductor.dump_cost_model import extract_op_features
         from torch_spyre._inductor.scratchpad.division_menus import _work_slices
 
         if op is None or op.get_name() not in graph.nodes:
             return False
-        is_lx = residency_symbols(graph, tables)
+        is_lx = residency_symbols(graph)
         return all(
             transport_dma_cost_available(
                 extract_op_features(op, _work_slices(op, division), is_lx=is_lx),
@@ -496,20 +483,22 @@ class TableCandidates:
         )
 
     @staticmethod
-    def _pricing_operations(graph, solve_graph, tables):
+    def _pricing_operations(graph, solve_graph):
         from torch_spyre._inductor.read_copy_elision import (
             project_transport_read_copies,
         )
 
-        splits = {
-            n.name: [cd.splits for cd in tables.menus.get(n.name, ())]
-            for n in solve_graph.get_nodes()
-        }
+        splits = {n.name: [cd.splits for cd in n.menu] for n in solve_graph.get_nodes()}
         # A copy that may be relaid out keeps its read: the relayout reads it.
         return project_transport_read_copies(
             graph,
             splits,
-            relayout_sources={parent for parent, _ in tables.relayout_edges},
+            relayout_sources={
+                e.src.name
+                for n in solve_graph.get_nodes()
+                for e in n.inputs
+                if e.relayout_edge is not None
+            },
         )
 
     def _division_map(
@@ -666,7 +655,7 @@ class TableCandidates:
             op.data, (Pointwise, Reduction)
         ):
             return fixed, False
-        points = self._point_menu(op, max_cores) if self.lazy else None
+        points = self._point_menu(op, max_cores)
         if points is not None:
             return points, True
         try:
@@ -717,11 +706,7 @@ class TableCandidates:
                 work_division_context_for_op,
             )
 
-            context = (
-                work_division_context_for_op(op, max_cores, tiling)
-                if self.lazy
-                else None
-            )
+            context = work_division_context_for_op(op, max_cores, tiling)
             if context is not None and tiled_candidates:
                 options.append(LazyOption(tiling, tile_splits, context))
             for candidate in tiled_candidates:
@@ -978,8 +963,8 @@ class TableCandidates:
         graph: GraphLowering,
         in_place: Optional[dict[str, list[str]]],
         division_map: "_DivisionMap",
-    ) -> tuple[SpyreOptimizationGraph, CandidateTables]:
-        """The open-mode graph of ``graph`` and its candidates.
+    ) -> SpyreOptimizationGraph:
+        """The open-mode graph of ``graph``, its candidates on it.
 
         Each node is an op output or an input clone of the IR, sized by its
         *total* device footprint, with an edge to each producer it reads
@@ -987,8 +972,8 @@ class TableCandidates:
         ``output_partition``. Counted-loop lifetimes still filter unsafe
         in-place handoffs before the solver compares those total footprints.
 
-        The tables hold each node's candidate divisions, each edge's pair
-        table or residency relation, and its relayout candidates.
+        Each node holds its candidate divisions, and each edge its relations,
+        relayout candidates and any pair table the builder fixes.
         """
         divisions = division_map.divisions
         lifetimes = calculate_liveness(graph)
@@ -1015,8 +1000,7 @@ class TableCandidates:
 
         prep_cache: dict = {}
         g = empty_graph(self.capacity)
-        tables = CandidateTables()
-        node_reads: list[tuple[str, list[str], list[str]]] = []
+        node_reads: list[tuple[str, list[str], list[str], tuple]] = []
         residency_by_buf = self._residency_by_buf(
             graph, mem_usage, lifetimes, drain_plans
         )
@@ -1067,9 +1051,6 @@ class TableCandidates:
             buffer_users = get_buffer_users(graph)
             for input_name in self._eligible_clone_inputs(graph, lifetimes):
                 consumers = [op for op in buffer_users.get(input_name, [])]
-                if self.pair_tables:
-                    for consumer in consumers:
-                        self._materialize(divisions, consumer.get_name())
                 divs, matches, reads = self._clone_divisions_and_matches(
                     input_name, consumers, divisions, prep_cache
                 )
@@ -1099,12 +1080,8 @@ class TableCandidates:
                     boundary=BufferType.Input,
                     start_override=lifetime_start_overrides.get(input_name),
                     end_override=lifetime_end_overrides.get(input_name),
-                    sym_core_divs=sym_core_divs_for(input_name, divs),
-                    sym_tile_counts=sym_tile_counts_for(input_name, divs),
-                    open_split=True,
+                    menu=divs,
                 )
-                tables.menus[input_name] = tuple(divs)
-                tables.parents[input_name] = []
 
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
@@ -1143,11 +1120,7 @@ class TableCandidates:
             )
             if carry_edge is not None:
                 special.add(carry_edge.buf_name)
-            tabled = {
-                p: e
-                for p, e in residency_edges.items()
-                if self.pair_tables or p in special
-            }
+            tabled = {p: e for p, e in residency_edges.items() if p in special}
             cd_parent_matches = self._cd_parent_matches(
                 tabled, buf_divisions, divisions
             )
@@ -1237,7 +1210,7 @@ class TableCandidates:
                 if input_name not in input_clone_matches:
                     continue
                 read = input_clone_reads[input_name].get(output_name)
-                if read is not None and not self.pair_tables:
+                if read is not None:
                     clone_reads[input_name] = read
                 else:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
@@ -1312,36 +1285,34 @@ class TableCandidates:
                 start_override=lifetime_start_overrides.get(output_name),
                 end_override=lifetime_end_overrides.get(output_name),
                 op=op,
-                sym_core_divs=sym_core_divs_for(output_name, buf_divisions),
-                sym_tile_counts=sym_tile_counts_for(output_name, buf_divisions),
-                open_split=bool(buf_divisions),
+                menu=buf_divisions,
+                space=self.lazy_spaces.get(output_name)
+                if output_name in division_map.enumerated
+                else None,
+                point_menu=output_name in division_map.enumerated
+                and output_name in self.point_menus,
             )
-            if buf_divisions:
-                tables.menus[output_name] = tuple(buf_divisions)
-            node_reads.append((output_name, parent_proj, parents))
-            for parent, pairs in cd_parent_matches.items():
-                tables.matches[(parent, output_name)] = pairs
-            for parent, residency in residency_edges.items():
-                tables.residency[(parent, output_name)] = residency
-            for parent, clone in clone_reads.items():
-                tables.clone_reads[(parent, output_name)] = clone
-            for parent, relayout in relayout_edges.items():
-                tables.relayout_edges[(parent, output_name)] = relayout
-            if output_name in division_map.enumerated:
-                space = self.lazy_spaces.get(output_name)
-                if space is not None:
-                    tables.lazy_spaces[output_name] = space
-                if output_name in self.point_menus:
-                    tables.point_menus.add(output_name)
-        for name, parent_proj, in_place_parents in node_reads:
-            g.add_reads(g.nodes[name], parent_proj, in_place_parents)
-            tables.parents[name] = [
-                p
-                for p in dict.fromkeys([*parent_proj, *in_place_parents])
-                if p in g.nodes
-            ]
+            # Every clone edge keeps its pair table beside its CloneRead.
+            pairs = dict(cd_parent_matches)
+            for input_name in parent_proj:
+                if input_name in input_clone_matches:
+                    pairs.setdefault(
+                        input_name, input_clone_matches[input_name][output_name]
+                    )
+            relations = (pairs, residency_edges, clone_reads, relayout_edges)
+            node_reads.append((output_name, parent_proj, parents, relations))
+        for name, parent_proj, in_place_parents, relations in node_reads:
+            node = g.nodes[name]
+            g.add_reads(node, parent_proj, in_place_parents)
+            pairs, residency_edges, clone_reads, relayout_edges = relations
+            for dep in node.inputs:
+                parent = dep.src.name
+                dep.pairs = pairs.get(parent)
+                dep.residency = residency_edges.get(parent)
+                dep.clone = clone_reads.get(parent)
+                dep.relayout_edge = relayout_edges.get(parent)
         g.link_execution_order()
-        return g, tables
+        return g
 
     @staticmethod
     def _loop_carry_update_edge(

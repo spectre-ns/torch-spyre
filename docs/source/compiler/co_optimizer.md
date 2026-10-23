@@ -108,9 +108,10 @@ in LX.
 
 ### The CP-SAT solve
 
-The allocator builds the solve's graph from the IR (`TableCandidates.prepare_graph`), wraps its
-candidate tables in a strategy (`LazyStrategy.from_tables`), prices it (`pricing.cost_expr`),
-and calls `SpyreOptimizationGraph.solve` (`scratchpad/buffer_graph.py`). That posts the problem
+The allocator builds the solve's graph from the IR (`TableCandidates.prepare_graph`), the same
+graph for every encoding strategy, prices it (`pricing.cost_expr`), and calls
+`SpyreOptimizationGraph.solve` (`scratchpad/buffer_graph.py`) with the configured strategy
+(`LX_DIVISION_STRATEGY`), which derives its encoding from the graph. That posts the problem
 as one global constraint model to Google OR-Tools CP-SAT. Core-division candidates (and, where
 landed, tiling candidates) are decision variables, placement is a 2D no-overlap packing — each
 resident buffer an optional `[lifetime] × [address, address+size)` rectangle — and

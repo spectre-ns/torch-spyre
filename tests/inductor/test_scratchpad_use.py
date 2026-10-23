@@ -1401,8 +1401,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
     @contextmanager
     def _capture_solve_graphs(self):
-        """The allocator's ``(solve graph, tables)`` pairs, in either division
-        mode."""
+        """The allocator's solve graphs, in either division mode."""
         captured: list = []
         orig = TableCandidates._build_graph
 
@@ -1551,7 +1550,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
 
         self.assertTrue(captured, "TableCandidates._build_graph was not called")
         edge_found = False
-        for solve_graph, tables in captured:
+        for solve_graph in captured:
             input_clones = {
                 n.name
                 for n in solve_graph.get_nodes()
@@ -1562,8 +1561,9 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 # The CP-SAT merge also needs the division gate populated: a
                 # pair table, or the clone relation the derived encoding reads.
                 if any(
-                    (p, child) in tables.matches or (p, child) in tables.clone_reads
-                    for p in merged
+                    e.src.name in merged
+                    and (e.pairs is not None or e.clone is not None)
+                    for e in solve_graph.nodes[child].inputs
                 ):
                     edge_found = True
                     break

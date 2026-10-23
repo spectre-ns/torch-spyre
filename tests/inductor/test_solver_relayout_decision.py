@@ -42,7 +42,7 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     RelayoutCandidate,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
-from buffer_spec import CoreDivisionBuffer, build_graph, tables_of
+from buffer_spec import CoreDivisionBuffer, build_graph
 
 _SPILL_NS = 20000.0  # what spilling P charges in the crafted objective
 _CORE = sympy.Symbol("core_id")
@@ -103,9 +103,8 @@ def _objective(buffers) -> sympy.Expr:
 def _solve(buffers, expr, size=64) -> SolvedPlan:
     """CP-SAT's plan for ``buffers`` over ``size`` bytes of LX, in byte units."""
     graph = build_graph(buffers, 1, size, buffer_graph.empty_graph(size, 1).settings)
-    tables = tables_of(buffers)
-    nodes = graph.solve(cost_expr=expr, strategy=LazyStrategy.from_tables(tables))
-    return SolvedPlan(nodes, tables, graph.alignment)
+    nodes = graph.solve(cost_expr=expr, strategy=LazyStrategy())
+    return SolvedPlan(nodes, graph.alignment)
 
 
 @pytest.mark.parametrize("priced", [False, True])

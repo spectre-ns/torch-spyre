@@ -168,6 +168,11 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     return op
 
 
+def _edge(solved, src: str, dst: str):
+    """The solve graph's edge from ``src`` into ``dst``, or ``None``."""
+    return next((e for e in solved.by_name[dst].inputs if e.src.name == src), None)
+
+
 class TestLoopCarryLxEligibility(unittest.TestCase):
     @staticmethod
     def _tagged_carry(name="carry"):
@@ -2497,11 +2502,11 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             plans = drain_plans.validated_drain_plans(graph)
             allocator.candidates.drain_plans = plans
             allocator._validated_drain_plans = plans
-            solve_graph, tables = allocator.candidates._build_graph(
+            solve_graph = allocator.candidates._build_graph(
                 graph, {}, division_menus._DivisionMap(divisions, set())
             )
-            nodes = solve_graph.solve(strategy=LazyStrategy.from_tables(tables))
-            solved = allocator_module.SolvedPlan(nodes, tables, solve_graph.alignment)
+            nodes = solve_graph.solve(strategy=LazyStrategy())
+            solved = allocator_module.SolvedPlan(nodes, solve_graph.alignment)
             # commit_divisions would record the committed ownership here.
             for op in graph.operations:
                 op.iteration_space_ownership = object()
@@ -2584,7 +2589,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor.change_graph_output.assert_called_once_with(storage_op, drain)
             # Why: the reader's edge on the storage admits the identical
             # slicings, and the solver committed one of them.
-            matches = solved.tables.matches.get(("plain", "consumer"))
+            matches = _edge(solved, "plain", "consumer").pairs
             self.assertEqual(matches, [(0, 0), (1, 1)])
             self.assertIn(
                 (
@@ -2604,7 +2609,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor.push_allocation_with_clone.assert_not_called()
             editor.change_graph_output.assert_not_called()
             # Why: the reader's edge on the storage exists but admits no pair.
-            self.assertEqual(solved.tables.matches.get(("plain", "consumer")), [])
+            self.assertEqual(_edge(solved, "plain", "consumer").pairs, [])
 
     def test_post_loop_all_reduce_reads_a_drain_of_the_resident_carry(self):
         """A carry whose only post-loop use is an all_reduce stays in LX.
@@ -2673,7 +2678,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             self.assertIs(plan.collective, all_reduce)
             storage = solved.by_name["plain"]
             self.assertIsNotNone(solved.address(storage))
-            self.assertNotIn("plain", solved.tables.parents["all_reduce"])
+            self.assertIsNone(_edge(solved, "plain", "all_reduce"))
             # Live to the all_reduce (index 3), not to the graph exit (5).
             self.assertEqual(storage.end_time, ops.index(all_reduce) + 1)
             editor = editor_cls.return_value
@@ -2694,8 +2699,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         with self.subTest("without a plan the all_reduce edge keeps it in HBM"):
             _plans, solved, editor_cls = run(with_plan=False)
             self.assertIsNone(solved.address(solved.by_name["plain"]))
-            self.assertIn("plain", solved.tables.parents["all_reduce"])
-            self.assertNotIn(("plain", "all_reduce"), solved.tables.matches)
+            self.assertIsNone(_edge(solved, "plain", "all_reduce").pairs)
             editor_cls.return_value.replace_collective_operand.assert_not_called()
 
     @staticmethod

@@ -45,7 +45,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     ResourceNode,
     SpyreOptimizationGraph,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
 
 
 if TYPE_CHECKING:
@@ -87,19 +86,16 @@ class _PricedNode(NamedTuple):
     core_divisions: Sequence[CoreDivision]
 
     @classmethod
-    def of(cls, node: ResourceNode, tables: CandidateTables) -> "_PricedNode":
-        return cls(
-            node.sym_core_divs, node.sym_tile_counts, tables.menus.get(node.name, ())
-        )
+    def of(cls, node: ResourceNode) -> "_PricedNode":
+        return cls(node.sym_core_divs, node.sym_tile_counts, node.menu)
 
 
 def cost_expr(
     graph: GraphLowering,
     solve_graph: SpyreOptimizationGraph,
-    tables: CandidateTables,
 ) -> tuple[Optional[sympy.Expr], list]:
     """The priced objective of the open-mode solve over the graph's nodes
-    and the strategy's candidates, and its per-bundle terms; ``None`` when
+    and their candidates, and its per-bundle terms; ``None`` when
     it is withheld or cannot be built (the solver then runs its own
     lexicographic ladder)."""
     from torch_spyre._inductor.scratchpad.table_candidates import (
@@ -110,8 +106,8 @@ def cost_expr(
     nodes = solve_graph.nodes
     # Built once here, not per op inside the loop below: every op's residency
     # lookup is against this same whole-graph map.
-    default_is_lx = residency_symbols(solve_graph, tables)
-    pricing_ops = TableCandidates._pricing_operations(graph, solve_graph, tables)
+    default_is_lx = residency_symbols(solve_graph)
+    pricing_ops = TableCandidates._pricing_operations(graph, solve_graph)
     pricing_by_name = {op.get_name(): op for op in pricing_ops}
 
     # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
@@ -155,7 +151,7 @@ def cost_expr(
         )
         return None, []
 
-    priced = {name: _PricedNode.of(node, tables) for name, node in nodes.items()}
+    priced = {name: _PricedNode.of(node) for name, node in nodes.items()}
     bundle_terms: list = []
     # Feature extraction runs inside the same fallback: a candidate tiling
     # can raise Unsupported (an axis with no resolvable loop variable) or
@@ -294,7 +290,6 @@ def cost_expr_record(
     import dataclasses
 
     bindings = solved_bindings(plan)
-    menus = plan.tables.menus
     bundles = [
         {
             "ops": list(names),
@@ -328,8 +323,8 @@ def cost_expr_record(
         # louder of the two signals (issue #4655 was of that kind).
         "divisions": {
             n.name: {
-                "cores": [cd.cores_used for cd in menus[n.name]],
-                "labels": [cd.label for cd in menus[n.name]],
+                "cores": [cd.cores_used for cd in n.menu],
+                "labels": [cd.label for cd in n.menu],
                 "chosen": plan.division_index(n),
                 "parents": [e.src.name for e in n.inputs for _ in range(e.reads)],
                 # Why this buffer never reached the solver, in the allocator's
@@ -339,13 +334,13 @@ def cost_expr_record(
                 # conflate: excluded, weighed and declined, or resident.
                 "reason": n.residency_reason,
                 "matches": {
-                    e.src.name: [list(pair) for pair in plan.tables.matches[key]]
+                    e.src.name: [list(pair) for pair in e.pairs]
                     for e in n.inputs
-                    if (key := (e.src.name, n.name)) in plan.tables.matches
+                    if e.pairs is not None
                 },
             }
             for n in plan.nodes
-            if menus.get(n.name)
+            if n.menu
         },
         "bindings": {str(k): v for k, v in bindings.items()},
         "objective_ns": objective_ns,

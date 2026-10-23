@@ -270,30 +270,28 @@ class _LazyVars:
 class LazyStrategy(TableStrategy):
     """``TableStrategy`` with ``Lazy`` work splits wherever a node can take one."""
 
-    def __init__(self, spaces: Optional[dict[str, LazySpace]] = None, **kw) -> None:
+    def __init__(self, **kw) -> None:
         super().__init__(**kw)
-        self.spaces = dict(spaces or {})
         self._lazy: dict[Item, LazySpace] = {}
         self._grid: dict[Item, tuple[CoreDivision, ...]] = {}
         self._digit_cache: dict = {}
-        self.point_menus: set[str] = set()
 
-    @classmethod
-    def from_tables(cls, tables, **kwargs) -> LazyStrategy:
-        strategy = super().from_tables(tables, **kwargs)
-        assert isinstance(strategy, LazyStrategy)
-        strategy.spaces = dict(tables.lazy_spaces)
-        strategy.point_menus = set(tables.point_menus)
-        return strategy
+    def keeps_points(self, node: ResourceNode) -> bool:
+        return node in self._lazy
 
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
-        # An empty table forbids the relation whatever the indices are.
+        # A node a pair table indexes chooses from a menu. An empty table
+        # forbids the relation whatever the indices are, so it does not count.
         tabled = {
-            name for edge, pairs in self.matches.items() if pairs for name in edge
+            name
+            for node in graph.get_nodes()
+            for edge in node.inputs
+            if edge.clone is None and edge.pairs
+            for name in (edge.src.name, node.name)
         }
         self._lazy, self._grid = {}, {}
         for node in graph.get_nodes():
-            space = self.spaces.get(node.name)
+            space = node.space
             if (
                 space is None
                 or node.committed
@@ -307,17 +305,6 @@ class LazyStrategy(TableStrategy):
         logger.debug(
             "lazy work splits: %d of %d nodes", len(self._lazy), len(graph.nodes)
         )
-        # A point menu holds illegal divisions: only a Lazy node may choose
-        # from it (the allocator gave those nodes no pair table).
-        stray = [
-            n.name
-            for n in graph.get_nodes()
-            if n.name in self.point_menus
-            and n not in self._lazy
-            and n.work_split is None
-            and not n.committed
-        ]
-        assert not stray, f"point menus on non-Lazy nodes: {stray}"
         super().prepare(graph)
         check = os.environ.get("LX_LAZY_CHECK")
         if check:
@@ -328,8 +315,9 @@ class LazyStrategy(TableStrategy):
         with open(path, "a") as f:
             for node, space in self._lazy.items():
                 got = legal_points(space)
+                assert isinstance(node, ResourceNode)
                 menu = self.menus[node.name]
-                if node.name in self.point_menus:
+                if node.point_menu:
                     menu = tuple(
                         space.division(k, s)
                         for k, s in space.points()

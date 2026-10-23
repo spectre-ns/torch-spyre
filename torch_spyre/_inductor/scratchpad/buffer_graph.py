@@ -52,6 +52,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     SolveError,
     TileSpec,
     ceil_div,
+    sym_core_divs_for,
+    sym_tile_counts_for,
 )
 
 if TYPE_CHECKING:
@@ -103,6 +105,13 @@ class DependencyEdge:
     dst: ResourceNode
     in_place: bool = False
     reads: int = 1
+    # How the two ends' work splits may relate, for the strategy to encode: a
+    # table over the two menus' indices the builder fixed (a loop carry, an
+    # input clone), and the relations it may derive one from instead.
+    pairs: Optional[list[tuple[int, int]]] = None
+    residency: Any = None  # ResidencyEdge: same per-core ownership of src
+    clone: Any = None  # CloneRead: the consumer's read of an input clone
+    relayout_edge: Any = None  # RelayoutEdge: may read src through a copy
     # decisions, filled by solve(): an in-place edge whether the child took
     # over the parent's storage; the transform this read goes through (None:
     # it reads ``src`` directly) and the relayout candidate it fired
@@ -152,6 +161,12 @@ class ResourceNode:
     uses: tuple[int, ...] = ()
     nbytes: int = 0
     lx_view: Any = None
+    # The candidate work splits: the menu, and the space it is drawn from when
+    # the op's divisions form one. ``point_menu``: the menu is every point of
+    # the space, illegal ones included, never enumerated down to the legal.
+    menu: tuple[CoreDivision, ...] = ()
+    space: Any = None
+    point_menu: bool = False
     # decisions
     work_split: Optional[WorkSplit] = None
     resident: Optional[bool] = None
@@ -404,17 +419,17 @@ class SpyreOptimizationGraph:
         start_override: Optional[int] = None,
         end_override: Optional[int] = None,
         op: Optional[Operation] = None,
-        sym_core_divs: Mapping[SplitKey, sympy.Symbol] = {},
-        sym_tile_counts: Mapping[TileKey, sympy.Symbol] = {},
         lx_view: Any = None,
-        open_split: bool = False,
+        menu: Sequence[CoreDivision] = (),
+        space: Any = None,
+        point_menu: bool = False,
     ) -> ResourceNode:
         """A node for IR buffer ``name``: an op output, or a graph input read
         (``first_use_is_read``). Its lifetime is its ``uses`` widened by the
         overrides; ``nbytes`` is its LX footprint in bytes (the total, divided
         per candidate, when its work split is open). A work split is open only
-        when the caller has candidates for it (``open_split``); else it was
-        committed upstream."""
+        when the caller has candidates for it (a non-empty ``menu``); else it
+        was committed upstream."""
         assert name not in self.nodes, f"{name} added twice"
         uses = list(uses)
         start = min(uses[0], start_override) if start_override is not None else uses[0]
@@ -435,15 +450,18 @@ class SpyreOptimizationGraph:
                 if first_use_is_read
                 else BufferType.Intermediate
             ),
-            sym_core_divs=sym_core_divs,
-            sym_tile_counts=sym_tile_counts,
+            sym_core_divs=sym_core_divs_for(name, menu),
+            sym_tile_counts=sym_tile_counts_for(name, menu),
             produced_at=uses[0] if uses and not first_use_is_read else None,
             op=op,
             residency_reason=residency_reason,
             uses=tuple(uses),
             nbytes=nbytes,
             lx_view=lx_view,
-            work_split=None if open_split else WorkSplit.COMMITTED,
+            menu=tuple(menu),
+            space=space,
+            point_menu=point_menu,
+            work_split=None if menu else WorkSplit.COMMITTED,
         )
         self.nodes[name] = node
         return node
@@ -504,13 +522,10 @@ class SpyreOptimizationGraph:
         from torch_spyre._inductor.scratchpad.backend import CpSat, from_env
 
         if strategy is None:
-            from torch_spyre._inductor.scratchpad.encoding_strategy import (
-                CandidateTables,
-            )
             from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-            strategy = LazyStrategy.from_tables(CandidateTables())
-        self._bar_oversized(strategy)
+            strategy = LazyStrategy()
+        self._bar_oversized()
         if model is None:
             model = from_env()
         backend = CpSat(model) if isinstance(model, cp_model.CpModel) else model
@@ -550,7 +565,7 @@ class SpyreOptimizationGraph:
         self._extract(backend, strategy, justify_offsets)
         return list(self.get_nodes())
 
-    def _bar_oversized(self, strategy: EncodingStrategy) -> None:
+    def _bar_oversized(self) -> None:
         """Bar each node whose smallest per-core footprint exceeds LX."""
         capacity = self.capacity * self.alignment
         for node in self.get_nodes():
@@ -561,7 +576,7 @@ class SpyreOptimizationGraph:
                     ceil_div(
                         node.nbytes, cd.output_partition * cd.tiling.output_tile_count
                     )
-                    for cd in strategy.menus.get(node.name, ())
+                    for cd in node.menu
                 ),
                 default=node.nbytes,
             )

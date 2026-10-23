@@ -53,7 +53,6 @@ from buffer_spec import (
     LifetimeBoundBuffer,
     build_graph,
     check_in_place_relationships,
-    tables_of,
 )
 
 try:
@@ -90,9 +89,8 @@ def _cpsat_solved(
         empty_graph(size, alignment).settings,
         {b.name: b.residency_reason for b in buffers if b.residency_reason},
     )
-    tables = tables_of(buffers)
-    nodes = graph.solve(cost_expr=cost_expr, strategy=LazyStrategy.from_tables(tables))
-    return SolvedPlan(nodes, tables, alignment), graph
+    nodes = graph.solve(cost_expr=cost_expr, strategy=LazyStrategy())
+    return SolvedPlan(nodes, alignment), graph
 
 
 def _cpsat_plan(buffers, size, alignment=1, cost_expr=None) -> SolvedPlan:

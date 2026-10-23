@@ -316,88 +316,90 @@ class EncodingStrategy:
         return []
 
 
-@dataclass
-class CandidateTables:
-    """The table strategy's candidates for one solve, generated from the IR
-    (``TableCandidates``): per node its candidate menu (and, for a ``Lazy``
-    split, its space), per edge its pair table and the relations and
-    relayout edges a derived encoding uses.
-    Keyed by node name, or by ``(parent, child)``; ``parents`` lists each
-    child's parents (reads and in-place) in the solve, in order."""
-
-    menus: dict[str, tuple[CoreDivision, ...]] = field(default_factory=dict)
-    parents: dict[str, list[str]] = field(default_factory=dict)
-    matches: dict[tuple[str, str], list[tuple[int, int]]] = field(default_factory=dict)
-    residency: dict[tuple[str, str], Any] = field(default_factory=dict)
-    clone_reads: dict[tuple[str, str], Any] = field(default_factory=dict)
-    relayout_edges: dict[tuple[str, str], Any] = field(default_factory=dict)
-    lazy_spaces: dict[str, Any] = field(default_factory=dict)
-    point_menus: set[str] = field(default_factory=set)
-
-
 class TableStrategy(EncodingStrategy):
     """The default strategy: every open work split is a ``Table`` over its
     candidate menu, a pinned one ``Fixed``, and the view, relayout and nest
-    relations are tables over menu indices."""
+    relations are tables over menu indices.
 
-    def __init__(
-        self,
-        menus: Mapping[str, Sequence[CoreDivision]] | None = None,
-        matches: Mapping[tuple[str, str], Sequence[tuple[int, int]]] | None = None,
-        residency: Mapping[tuple[str, str], Any] | None = None,
-        clone_reads: Mapping[tuple[str, str], Any] | None = None,
-        relayout_edges: Mapping[tuple[str, str], Any] | None = None,
-        **settings,
-    ) -> None:
+    Its candidates are the graph's (:meth:`_collect`): each node's menu,
+    filtered to its legal divisions where it is a space's points, and per edge
+    its clone relation, else the pair table the builder fixed, else its
+    residency relation."""
+
+    def __init__(self, **settings) -> None:
         super().__init__(**settings)
-        # Everything the candidates were generated as (``from_tables``).
-        self.tables: Optional[CandidateTables] = None
+        self.menus: dict[str, tuple[CoreDivision, ...]] = {}
+        self.matches: dict[tuple[str, str], list[tuple[int, int]]] = {}
         # Edges whose relation is derived from their ResidencyEdge (equality of
         # per-node view ids, tile-view ids and core counts) instead of a table,
         # and input-clone edges derived from the consumer's CloneRead.
-        self.residency = dict(residency or {})
-        self.clone_reads = dict(clone_reads or {})
+        self.residency: dict[tuple[str, str], Any] = {}
+        self.clone_reads: dict[tuple[str, str], Any] = {}
         # Edges whose relayouts are constraints over view ids (lazy_relayout).
-        self.relayout_edges = dict(relayout_edges or {})
-        self.menus = {k: tuple(v) for k, v in (menus or {}).items()}
-        self.matches = {k: list(v) for k, v in (matches or {}).items()}
+        self.relayout_edges: dict[tuple[str, str], Any] = {}
         self.solved: dict[Item, int] = {}
 
-    @classmethod
-    def from_tables(cls, tables: CandidateTables, **kwargs) -> TableStrategy:
-        """The strategy over ``tables``: per edge its clone relation, else
-        its residency relation when it has no pair table, else its pair
-        table."""
-        matches, residency, clone_reads = {}, {}, {}
-        for child, parents in tables.parents.items():
-            for parent in parents:
-                key = (parent, child)
-                clone = tables.clone_reads.get(key)
-                if clone is not None:
-                    clone_reads[key] = clone
-                elif key not in tables.matches and key in tables.residency:
-                    residency[key] = tables.residency[key]
-                else:
-                    matches[key] = tables.matches.get(key, [])
-        relayout_edges = {
-            key: edge
-            for key, edge in tables.relayout_edges.items()
-            if key[0] in tables.parents.get(key[1], ())
-        }
-        strategy = cls(
-            menus=tables.menus,
-            matches=matches,
-            residency=residency,
-            clone_reads=clone_reads,
-            relayout_edges=relayout_edges,
-            **kwargs,
-        )
-        strategy.tables = tables
-        return strategy
+    def keeps_points(self, node: ResourceNode) -> bool:
+        """Whether the node chooses among its space's points as they are,
+        illegal ones included, because legality is posted another way."""
+        return False
+
+    def _collect(self, graph: SpyreOptimizationGraph) -> None:
+        """The menus and edge relations this strategy encodes, from the graph.
+        A point menu is filtered to its legal points (the space lists them in
+        menu order), and a pair table on it renumbered to match."""
+        self.menus, renumber = {}, {}
+        for node in graph.get_nodes():
+            if not node.menu:
+                continue
+            if node.point_menu and not self.keeps_points(node):
+                space = node.space
+                legal = [
+                    i
+                    for i, (k, splits) in enumerate(space.points())
+                    if space.options[k].context.is_legal(splits)
+                ]
+                self.menus[node.name] = tuple(node.menu[i] for i in legal)
+                renumber[node.name] = {old: new for new, old in enumerate(legal)}
+            else:
+                self.menus[node.name] = node.menu
+        self.matches, self.residency, self.clone_reads = {}, {}, {}
+        self.relayout_edges = {}
+        for node in graph.get_nodes():
+            for edge in node.inputs:
+                key = (edge.src.name, node.name)
+                pairs = edge.pairs
+                if pairs is not None:
+                    src, dst = renumber.get(key[0]), renumber.get(key[1])
+                    pairs = [
+                        (i if src is None else src[i], j if dst is None else dst[j])
+                        for i, j in pairs
+                        if (src is None or i in src) and (dst is None or j in dst)
+                    ]
+                self._relation(edge, key, pairs)
+                if edge.relayout_edge is not None:
+                    self.relayout_edges[key] = edge.relayout_edge
+
+    def _relation(
+        self,
+        edge: DependencyEdge,
+        key: tuple[str, str],
+        pairs: Optional[list[tuple[int, int]]],
+    ) -> None:
+        if edge.clone is not None:
+            self.clone_reads[key] = edge.clone
+        elif pairs is not None:
+            self.matches[key] = pairs
+        elif edge.residency is not None:
+            self.residency[key] = edge.residency
+        else:
+            # An empty table forbids the relation.
+            self.matches[key] = []
 
     # ---- whole-graph hooks ----
 
     def prepare(self, graph: SpyreOptimizationGraph) -> None:
+        self._collect(graph)
         self.vars = {}
         self.served = {}
         self.provenance = []
@@ -1053,15 +1055,18 @@ class TableStrategy(EncodingStrategy):
 
 class PairTableStrategy(TableStrategy):
     """The table model in full: every edge's relation is a pair table over
-    its two ends' menu indices, never a derived clone or residency relation.
-    Its candidates come from ``TableCandidates(pair_tables=True)``, which
-    builds one per edge; an edge without one forbids residency across it."""
+    its two ends' menu indices, never a derived clone or residency relation:
+    the builder's table where it fixed one, else the residency relation's
+    pairs; an edge with neither forbids residency across it."""
 
-    @classmethod
-    def from_tables(cls, tables: CandidateTables, **kwargs) -> TableStrategy:
-        strategy = super().from_tables(tables, **kwargs)
-        for key in [*strategy.clone_reads, *strategy.residency]:
-            strategy.matches[key] = list(tables.matches.get(key, []))
-        strategy.clone_reads = {}
-        strategy.residency = {}
-        return strategy
+    def _relation(
+        self,
+        edge: DependencyEdge,
+        key: tuple[str, str],
+        pairs: Optional[list[tuple[int, int]]],
+    ) -> None:
+        if pairs is None and edge.residency is not None:
+            pairs = edge.residency.match_pairs(
+                list(self.menus[key[0]]), list(self.menus[key[1]])
+            )
+        self.matches[key] = pairs or []

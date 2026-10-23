@@ -14,10 +14,10 @@
 
 """The buffer form: hand-written buffers for solver tests and capture replay.
 
-The compiler builds the solve's graph and ``CandidateTables`` straight from the
-IR (``TableCandidates.prepare_graph``). Tests describe a graph as buffers
-instead; this module turns them into the same graph and tables, and a solved
-plan back into the buffers' terms."""
+The compiler builds the solve's graph straight from the IR
+(``TableCandidates.prepare_graph``). Tests describe a graph as buffers
+instead; this module turns them into the same graph, candidates on its nodes
+and relations on its edges, and a solved plan back into the buffers' terms."""
 
 from __future__ import annotations
 
@@ -36,10 +36,7 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     WorkSplit,
     empty_graph,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import (
-    CandidateTables,
-    TableStrategy,
-)
+from torch_spyre._inductor.scratchpad.encoding_strategy import TableStrategy
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
@@ -305,20 +302,18 @@ def add_node(
 ) -> ResourceNode:
     """A node holding ``b``'s data. A buffer with no candidate divisions is
     committed upstream."""
-    divided = b if isinstance(b, CoreDivisionBuffer) and b.core_divisions else None
+    divided = isinstance(b, CoreDivisionBuffer)
     return graph.add_ir_node(
         b.name,
         nbytes=b.size,
         uses=b.uses,
         first_use_is_read=b.first_use_is_read,
-        boundary=b.boundary if isinstance(b, CoreDivisionBuffer) else None,
+        boundary=b.boundary if divided else None,
         residency_reason=residency_reason,
         start_override=b.lifetime_start_override,
         end_override=b.lifetime_end_override,
-        sym_core_divs=divided.sym_core_divs if divided else {},
-        sym_tile_counts=divided.sym_tile_counts if divided else {},
         lx_view=b.lx_view,
-        open_split=divided is not None,
+        menu=b.core_divisions if divided else (),
     )
 
 
@@ -335,7 +330,9 @@ def build_graph(
 
     One edge per (producer, consumer) pair the consumer reads (``parents``),
     ``in_place`` when the producer is one of its ``in_place_parents``; in-place
-    inputs come first, in that order, since the merge literals are made in it."""
+    inputs come first, in that order, since the merge literals are made in it.
+    An edge carries the consumer's pair table for the producer
+    (``cd_parent_matches``) and its residency relation (``residency_edges``)."""
     check_in_place_relationships(buffers)
     graph = SpyreOptimizationGraph(
         alignment=alignment, capacity=capacity, settings=settings
@@ -344,37 +341,19 @@ def build_graph(
         add_node(graph, b, reasons.get(b.name))
     nodes = graph.nodes
     for b in buffers:
-        graph.add_reads(nodes[b.name], getattr(b, "parents", ()), b.in_place_parents)
+        node = nodes[b.name]
+        graph.add_reads(node, getattr(b, "parents", ()), b.in_place_parents)
+        if isinstance(b, CoreDivisionBuffer):
+            for edge in node.inputs:
+                edge.pairs = b.cd_parent_matches.get(edge.src.name)
+                edge.residency = b.residency_edges.get(edge.src.name)
     graph.link_execution_order()
     return graph
 
 
-def tables_of(buffers: Sequence[LifetimeBoundBuffer]) -> CandidateTables:
-    """The candidates the buffers carry."""
-    names = {b.name for b in buffers}
-    tables = CandidateTables()
-    for b in buffers:
-        if not isinstance(b, CoreDivisionBuffer):
-            continue
-        if b.core_divisions:
-            tables.menus[b.name] = tuple(b.core_divisions)
-        parents = [
-            p for p in dict.fromkeys([*b.parents, *b.in_place_parents]) if p in names
-        ]
-        tables.parents[b.name] = parents
-        # Captured buffers may predate the newer fields.
-        for p in parents:
-            key = (p, b.name)
-            if p in b.cd_parent_matches:
-                tables.matches[key] = b.cd_parent_matches[p]
-            if p in b.residency_edges:
-                tables.residency[key] = b.residency_edges[p]
-    return tables
-
-
 def strategy_of(buffers: Sequence[LifetimeBoundBuffer]) -> TableStrategy:
-    """The table strategy over the buffers' candidates."""
-    return TableStrategy.from_tables(tables_of(buffers))
+    """The table strategy; the buffers' candidates are on their graph."""
+    return TableStrategy()
 
 
 def plan_of(buffers: Sequence[LifetimeBoundBuffer]) -> SolvedPlan:
@@ -383,7 +362,6 @@ def plan_of(buffers: Sequence[LifetimeBoundBuffer]) -> SolvedPlan:
     ``spill_reason``, ``residency_reason``)."""
     reasons = {b.name: b.residency_reason for b in buffers if b.residency_reason}
     graph = build_graph(buffers, 1, 1 << 62, empty_graph(0).settings, reasons)
-    tables = tables_of(buffers)
     by_name = {b.name: b for b in buffers}
     for node in graph.get_nodes():
         b = by_name[node.name]
@@ -391,7 +369,6 @@ def plan_of(buffers: Sequence[LifetimeBoundBuffer]) -> SolvedPlan:
         node.offset = b.address
         node.spill_reason = b.spill_reason
         chosen = getattr(b, "chosen_division", None)
-        menu = tables.menus.get(node.name, ())
-        if chosen is not None and menu:
-            node.work_split = WorkSplit.of(menu[chosen])
-    return SolvedPlan(list(graph.get_nodes()), tables, 1)
+        if chosen is not None and node.menu:
+            node.work_split = WorkSplit.of(node.menu[chosen])
+    return SolvedPlan(list(graph.get_nodes()), 1)
