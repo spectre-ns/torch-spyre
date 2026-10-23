@@ -107,11 +107,11 @@ from torch_spyre._inductor.scratchpad.coarse_tiling import (
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    CoreDivisionBuffer,
     TileAxis,
     TileSpec,
     ceil_div,
 )
+from buffer_spec import CoreDivisionBuffer, plan_of
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.fusion import spyre_fuse_nodes
 from torch_spyre._inductor.scheduler import (
@@ -2744,7 +2744,7 @@ class TestCoarseTile(unittest.TestCase):
         """
         from types import SimpleNamespace
 
-        from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+        from buffer_spec import LifetimeBoundBuffer
         from torch_spyre._inductor.scratchpad.utils import (
             counted_loop_lifetime_overrides,
         )
@@ -9634,12 +9634,9 @@ class _SentinelOp:
 def _solved_plan(*placements):
     """A ``SolvedPlan`` of one-tick buffers given as ``(name, address,
     lx_view)``; ``address=None`` leaves the buffer in HBM."""
-    from torch_spyre._inductor.scratchpad.allocator import (
-        SolvedPlan,
-    )
-    from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+    from buffer_spec import LifetimeBoundBuffer
 
-    return SolvedPlan.of_buffers(
+    return plan_of(
         [
             LifetimeBoundBuffer(
                 name=name, size=128, uses=[0], address=address, lx_view=lx_view

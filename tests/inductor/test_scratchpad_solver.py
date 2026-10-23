@@ -38,20 +38,22 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.scratchpad.buffer_graph import (
     SOLVER_CHOSE_SPILL,
     SpyreOptimizationGraph,
-    build_graph,
     empty_graph,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
 from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
-    CoreDivisionBuffer,
-    LifetimeBoundBuffer,
     TileAxis,
     TileSpec,
-    _check_in_place_relationships,
-    solved_bindings,
+)
+from torch_spyre._inductor.scratchpad.pricing import solved_bindings
+from buffer_spec import (
+    CoreDivisionBuffer,
+    LifetimeBoundBuffer,
+    build_graph,
+    check_in_place_relationships,
+    tables_of,
 )
 
 try:
@@ -88,7 +90,7 @@ def _cpsat_solved(
         empty_graph(size, alignment).settings,
         {b.name: b.residency_reason for b in buffers if b.residency_reason},
     )
-    tables = CandidateTables.of_buffers(buffers)
+    tables = tables_of(buffers)
     nodes = graph.solve(cost_expr=cost_expr, strategy=LazyStrategy.from_tables(tables))
     return SolvedPlan(nodes, tables, alignment), graph
 
@@ -765,7 +767,7 @@ class BaseLayoutSolverTests:
             "C", 15, [3, 8], in_place_parents=["P"]
         )  # uses[0]=3, need P.uses[-1]+1==4
         with self.assertRaises(ValueError):
-            _check_in_place_relationships([p, c])
+            check_in_place_relationships([p, c])
 
     def test_rejects_oversized_child(self):
         p = LifetimeBoundBuffer("P", 10, [0, 4])
@@ -773,7 +775,7 @@ class BaseLayoutSolverTests:
             "C", 15, [4, 8], in_place_parents=["P"]
         )  # child larger than parent
         with self.assertRaises(ValueError):
-            _check_in_place_relationships([p, c])
+            check_in_place_relationships([p, c])
 
     def test_rejects_write_only_computed_parent(self):
         # P's single use is its write, so it is never read: C would take over
@@ -784,7 +786,7 @@ class BaseLayoutSolverTests:
         c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
         self.assertEqual(p.end_time, c.start_time + 1)
         with self.assertRaises(ValueError):
-            _check_in_place_relationships([p, c])
+            check_in_place_relationships([p, c])
 
     def test_allows_single_use_input_parent(self):
         # A graph input's single use is a read, so handing its storage over is
@@ -792,7 +794,7 @@ class BaseLayoutSolverTests:
         # computed buffer above.
         p = LifetimeBoundBuffer("P", 20, [3], first_use_is_read=True)
         c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
-        _check_in_place_relationships([p, c])
+        check_in_place_relationships([p, c])
 
     def test_uses_must_be_strictly_increasing(self):
         # One distinct index per accessing op. A repeat would describe a buffer
@@ -839,14 +841,14 @@ class BaseLayoutSolverTests:
         # message for the same reason.
         p = LifetimeBoundBuffer("P", 20, [2, 3])
         c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
-        _check_in_place_relationships([p, c])  # baseline: accepted
+        check_in_place_relationships([p, c])  # baseline: accepted
         p.uses = [3, 3]  # bypasses __post_init__
         self.assertEqual(p.end_time, c.start_time + 1)  # geometry still holds
         self.assertEqual(p.read_count, 1)  # read_count is fooled...
         with self.assertRaisesRegex(  # ...the invariant is not
             ValueError, "computed buffer that is never read"
         ):
-            _check_in_place_relationships([p, c])
+            check_in_place_relationships([p, c])
 
 
 def _assert_legal_packing(test, result, expected_addresses, size, alignment):
@@ -1089,10 +1091,10 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             residency_reason="no consumer reads it from LX",
         )
         cost = sympy.Integer(32_000) / buf.sym_cores
-        (result,) = _cpsat_solve([buf], size=1 << 20, cost_expr=cost)
+        plan = _cpsat_plan([buf], size=1 << 20, cost_expr=cost)
 
-        self.assertEqual(result.chosen_division, 1)
-        self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
+        self.assertEqual(plan.division_index(plan.by_name["reduction_out"]), 1)
+        self.assertEqual(float(cost.subs(solved_bindings(plan))), 1000.0)
 
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==

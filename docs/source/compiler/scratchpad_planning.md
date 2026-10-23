@@ -279,7 +279,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat` (default), `Mip`, `BruteForce`, `Annealing`; `from_env` picks one from `SPYRE_LX_BACKEND` |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
 | `pricing.py` | The priced objective (`cost_expr`) over each node's symbolic work split and residency, and its dump (`dump_cost_expr`) |
-| `plan_solver.py` | The buffer form: `LifetimeBoundBuffer`, `CoreDivisionBuffer`, `CoreDivision`, `TileSpec`, and `SolveError` |
+| `plan_solver.py` | Candidate work splits (`CoreDivision`, `TileSpec`), their objective symbols, and `SolveError` |
 | `coarse_tiling.py` | `CoarseTilingPass`, which applies chosen coarse tilings (`TileSpec`s) to the graph |
 | `lx_relayout.py` | LX relayouts: candidates, fired groups (`FiredRelayoutGroup` to `LXRelayoutPlan`) and `materialize_lx_relayouts` |
 | `lx_context_switching.py` | `LxContextSwitchingPass`, LX dump/restore around opaque `FallbackKernel` calls |
@@ -635,8 +635,9 @@ boundaries.
 Three suites cover the planner:
 
 - `tests/inductor/test_scratchpad_solver.py`: solver-level unit tests.
-  Buffers are constructed directly as `LifetimeBoundBuffer` lists (the
-  buffer form), built into a graph (`build_graph`) and solved.
+  Graphs are written as buffers (`tests/inductor/buffer_spec.py`), built
+  into the solve graph and candidate tables (`build_graph`, `tables_of`) and
+  solved.
 - `tests/inductor/test_scratchpad_use.py`: end-to-end op-level checks
   that LX is actually used for representative graphs.
 - `tests/inductor/test_scratchpad_patterns.py`: the patterns above and

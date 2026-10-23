@@ -921,8 +921,8 @@ class TableCandidates:
             for input_buf in info["op_inputs"]:
                 # Graph inputs / constants now appear in ``op_inputs`` but are not
                 # solver buffers, so they can't be in-place aliasing parents (the
-                # solver's ``_check_in_place_relationships`` would fail to resolve
-                # them). Skip them, matching the base allocator's guard.
+                # solve graph has no node for them to merge into). Skip them,
+                # matching the base allocator's guard.
                 if input_buf not in mem_usage or not lifetimes[input_buf]:
                     continue
                 in_layout = graph.get_buffer(input_buf).layout

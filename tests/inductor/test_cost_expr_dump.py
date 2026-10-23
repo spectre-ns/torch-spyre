@@ -25,12 +25,12 @@ from torch_spyre._inductor.cost_model import CostParams
 from torch_spyre._inductor.dump_common import emit_json_line
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    CoreDivisionBuffer,
     TileAxis,
     TileSpec,
-    cost_expr_record,
-    solved_bindings,
 )
+from torch_spyre._inductor.scratchpad.pricing import cost_expr_record, solved_bindings
+
+from buffer_spec import CoreDivisionBuffer, plan_of
 
 
 def _buffers():
@@ -54,7 +54,7 @@ def test_solved_bindings_read_the_plan_like_the_annealer():
     p, c = _buffers()
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = None, 0
-    b = solved_bindings([p, c])
+    b = solved_bindings(plan_of([p, c]))
     assert b[p.sym_is_lx] == 1 and b[c.sym_is_lx] == 0
     assert b[p.sym_division] == 1 and b[c.sym_division] == 0
     # division 1 of P splits axis 0 four ways and leaves axis 1 whole.
@@ -78,9 +78,9 @@ def test_solved_bindings_bind_the_chosen_tiling_per_axis():
     )
     t.address, t.chosen_division = 0, 0
     tiles = t.sym_tile_counts
-    b = solved_bindings([t])
+    b = solved_bindings(plan_of([t]))
     assert b[tiles[0, False]] == 4 and b[tiles[1, False]] == 1, "d1 is split, not tiled"
-    rec = cost_expr_record(10 * tiles[0, False] + tiles[1, False], [], [t])
+    rec = cost_expr_record(10 * tiles[0, False] + tiles[1, False], [], plan_of([t]))
     assert rec["objective_ns"] == 41.0
 
 
@@ -93,7 +93,7 @@ def test_record_evaluates_every_term_under_the_solved_plan():
         (["C"], 2000 * (1 - c.sym_is_lx)),
     ]
     cost_expr = sum(term for _, term in bundle_terms)
-    rec = cost_expr_record(cost_expr, bundle_terms, [p, c], CostParams())
+    rec = cost_expr_record(cost_expr, bundle_terms, plan_of([p, c]), CostParams())
     assert rec["buffers"] == ["P", "C"]
     assert [b["value_ns"] for b in rec["bundles"]] == [0.0, 2000.0]
     assert rec["objective_ns"] == 2000.0, "only C spilled"
@@ -163,13 +163,15 @@ def test_the_record_carries_the_context_the_buffers_cannot_show():
         "env": {"sencores": 8, "lx_capacity": 1234},
         "solve": {"status": "OPTIMAL", "solve_s": 0.4},
     }
-    rec = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams(), context=context)
+    rec = cost_expr_record(
+        sympy.Integer(0), [], plan_of([p, c]), CostParams(), context=context
+    )
     assert rec["env"]["lx_capacity"] == 1234 and rec["env"]["sencores"] == 8
     assert rec["solve"]["status"] == "OPTIMAL"
     assert rec["op_names"]["C"] == "amax_1", "the readable name"
     assert rec["op_ids"]["C"] == "op1", "the key the numeric dump joins on"
     # And a record built without context is unchanged, so old readers still work.
-    plain = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())
+    plain = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())
     assert "env" not in plain and "solve" not in plain
 
 
@@ -181,7 +183,11 @@ def test_context_may_not_redefine_the_record():
     c.address, c.chosen_division = 16, 0
     with pytest.raises(AssertionError, match="bundles"):
         cost_expr_record(
-            sympy.Integer(0), [], [p, c], CostParams(), context={"bundles": "oops"}
+            sympy.Integer(0),
+            [],
+            plan_of([p, c]),
+            CostParams(),
+            context={"bundles": "oops"},
         )
 
 
@@ -192,7 +198,9 @@ def test_a_buffer_carries_the_reason_it_never_reached_the_solver():
     p.residency_reason = "op not allowed"
     p.address, p.chosen_division = None, 1
     c.address, c.chosen_division = 16, 0
-    divs = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())["divisions"]
+    divs = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())[
+        "divisions"
+    ]
     assert divs["P"]["reason"] == "op not allowed"
     assert divs["C"]["reason"] is None, "C reached the solver; bindings say the rest"
 
@@ -211,7 +219,7 @@ def test_record_carries_the_divisions_the_choice_was_made_over():
     c.cd_parent_matches = {"P": [(0, 0)]}
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = 16, 0
-    rec = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())
+    rec = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())
     divs = rec["divisions"]
     assert list(divs) == ["P", "C"]
     assert divs["P"]["cores"] == [4, 4] and divs["P"]["chosen"] == 1
@@ -239,10 +247,14 @@ def test_a_parent_the_gate_refused_outright_is_still_listed():
     c.cd_parent_matches = {}  # the gate built no edge for P at all
     p.address, p.chosen_division = 0, 1
     c.address, c.chosen_division = 16, 0
-    divs = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())["divisions"]
+    divs = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())[
+        "divisions"
+    ]
     assert divs["C"]["parents"] == ["P"], "the edge exists in the graph"
     assert "P" not in divs["C"]["matches"], "and the gate refused it outright"
     # The weighed-but-empty case is the other one, and must stay distinguishable.
     c.cd_parent_matches = {"P": []}
-    divs = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams())["divisions"]
+    divs = cost_expr_record(sympy.Integer(0), [], plan_of([p, c]), CostParams())[
+        "divisions"
+    ]
     assert divs["C"]["matches"] == {"P": []}

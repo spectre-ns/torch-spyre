@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import regex as re
+from buffer_spec import tables_of
 
 _DTIME = float(os.environ.get("CPSAT_EQUIV_DTIME", "10"))
 
@@ -300,11 +301,8 @@ def pytest_runtest_setup(item) -> None:
 def _solve(case: str, buffers, limit: int, alignment: int, cost_expr) -> None:
     """Solve the graph of ``buffers``; a buffer with no candidate divisions is
     committed, so its node is placement-only."""
-    from torch_spyre._inductor.scratchpad.buffer_graph import (
-        SolveSettings,
-        build_graph,
-    )
-    from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
+    from torch_spyre._inductor.scratchpad.buffer_graph import SolveSettings
+    from buffer_spec import build_graph
     from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
     assert _RECORDER is not None
@@ -317,7 +315,7 @@ def _solve(case: str, buffers, limit: int, alignment: int, cost_expr) -> None:
         SolveSettings(time_limit_seconds=0, record=_record_stage),
         {b.name: b.residency_reason for b in buffers if b.residency_reason},
     )
-    strategy = LazyStrategy.from_tables(CandidateTables.of_buffers(buffers))
+    strategy = LazyStrategy.from_tables(tables_of(buffers))
     try:
         graph.solve(cost_expr=cost_expr, strategy=strategy)
     except Exception as exc:  # recorded by the patch; keep replaying

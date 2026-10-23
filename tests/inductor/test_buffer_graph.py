@@ -37,16 +37,18 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (  # noqa: E402
     SolveSettings,
     SpyreOptimizationGraph,
     WorkSplit,
-    build_graph,
-)
-from torch_spyre._inductor.scratchpad.encoding_strategy import (  # noqa: E402
-    TableStrategy,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (  # noqa: E402
     BufferType,
     CoreDivision,
+)
+
+from buffer_spec import (  # noqa: E402
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    add_node,
+    build_graph,
+    strategy_of,
 )
 
 _SETTINGS = SolveSettings(time_limit_seconds=None, bottom_justify=True, record=None)
@@ -80,13 +82,14 @@ def _corpus() -> list[tuple[str, list]]:
 def test_add_node_keeps_insertion_order():
     graph = _graph()
     for name in ("c", "a", "b"):
-        graph.add_node(_cd(name, [0, 1]))
+        add_node(graph, _cd(name, [0, 1]))
     assert [n.name for n in graph.get_nodes()] == ["c", "a", "b"]
 
 
 def test_add_node_converts_to_alignment_units_and_reads_the_buffer():
     graph = _graph()
-    node = graph.add_node(
+    node = add_node(
+        graph,
         _cd("x", [3, 5, 9], boundary=BufferType.Output, lifetime_end_override=12),
         residency_reason="barred",
     )
@@ -101,10 +104,10 @@ def test_add_node_converts_to_alignment_units_and_reads_the_buffer():
 
 def test_add_node_commits_a_buffer_without_candidates():
     graph = _graph()
-    plain = graph.add_node(LifetimeBoundBuffer("p", 256, [0, 4]))
-    empty = graph.add_node(_cd("e", [1, 2], menu=[]))
-    graph_input = graph.add_node(
-        LifetimeBoundBuffer("i", 256, [2, 3], first_use_is_read=True)
+    plain = add_node(graph, LifetimeBoundBuffer("p", 256, [0, 4]))
+    empty = add_node(graph, _cd("e", [1, 2], menu=[]))
+    graph_input = add_node(
+        graph, LifetimeBoundBuffer("i", 256, [2, 3], first_use_is_read=True)
     )
     assert plain.work_split is WorkSplit.COMMITTED and plain.committed
     assert empty.work_split is WorkSplit.COMMITTED
@@ -116,8 +119,8 @@ def test_add_node_commits_a_buffer_without_candidates():
 
 def test_add_child_shares_one_edge_object():
     graph = _graph()
-    a = graph.add_node(_cd("a", [0, 1]))
-    b = graph.add_node(_cd("b", [1, 2]))
+    a = add_node(graph, _cd("a", [0, 1]))
+    b = add_node(graph, _cd("b", [1, 2]))
     edge = a.add_child(b, in_place=True)
     assert isinstance(edge, DependencyEdge)
     assert a.outputs == [edge] and b.inputs == [edge]
@@ -135,7 +138,7 @@ def test_nodes_and_edges_carry_no_candidate_data():
 
 def test_add_successor_links_both_ends_and_derives_contiguity():
     graph = _graph()
-    a, b, c = (graph.add_node(_cd(n, [t, t + 1])) for n, t in zip("abc", (0, 1, 3)))
+    a, b, c = (add_node(graph, _cd(n, [t, t + 1])) for n, t in zip("abc", (0, 1, 3)))
     ab = a.add_successor(b)
     bc = b.add_successor(c)
     assert a.next is ab and b.prev is ab and b.next is bc and c.prev is bc
@@ -185,7 +188,7 @@ def test_a_parent_read_twice_is_one_edge_gated_twice():
             _cd("b", [1, 2], parents, menu=menu, cd_parent_matches={"a": [(0, 0)]}),
         ]
         graph = _graph_of(buffers)
-        strategy = TableStrategy.from_buffers(buffers)
+        strategy = strategy_of(buffers)
         graph.solve(cp_model.CpModel(), None, strategy)
         (edge,) = graph.nodes["b"].inputs
         rows = [p for p in strategy.provenance if p.source == "encode_read"]
@@ -222,7 +225,7 @@ def test_build_graph_matches_the_allocator_buffers(case, buffers):
         for e in node.inputs:
             assert e in e.src.outputs
     # The buffer form carries no relayout edges, so the strategy adds no copies.
-    strategy = TableStrategy.from_buffers(buffers)
+    strategy = strategy_of(buffers)
     strategy.prepare(graph)
     assert strategy.transforms == ()
 
@@ -241,7 +244,7 @@ def _solve_graph(buffers, pin=lambda graph: None):
 
     graph = _graph_of(buffers)
     pin(graph)
-    nodes = graph.solve(cp_model.CpModel(), None, TableStrategy.from_buffers(buffers))
+    nodes = graph.solve(cp_model.CpModel(), None, strategy_of(buffers))
     return graph, nodes
 
 
@@ -289,7 +292,7 @@ def test_an_infeasible_pin_raises_and_writes_nothing():
     graph.nodes["b"].residency_reason = "barred"
     graph.nodes["b"].resident = True
     with pytest.raises(SolveError):
-        graph.solve(cp_model.CpModel(), None, TableStrategy.from_buffers(buffers))
+        graph.solve(cp_model.CpModel(), None, strategy_of(buffers))
     for node in graph.get_nodes():
         assert node.work_split is None and node.offset is None
         assert node.spill_reason is None

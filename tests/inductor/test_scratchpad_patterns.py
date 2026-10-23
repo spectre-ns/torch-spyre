@@ -21,9 +21,7 @@ from enum import Enum
 import torch
 
 from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    LifetimeBoundBuffer as Buffer,
-)
+from buffer_spec import LifetimeBoundBuffer as Buffer
 
 AVAILABLE_LX_SIZE = _lx_planning_size()
 

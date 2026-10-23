@@ -74,9 +74,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    CoreDivisionBuffer,
-)
+from buffer_spec import CoreDivisionBuffer, plan_of
 from torch_spyre._inductor.scratchpad.utils import (
     is_empty_tiled_layout,
 )
@@ -2978,7 +2976,7 @@ class TestJointAllocator(unittest.TestCase):
         self.assertEqual(is_legal.call_args_list[1].args[1], unsafe)
 
         op.iteration_space_ownership = MagicMock()
-        plan = allocator_module.SolvedPlan.of_buffers(
+        plan = plan_of(
             [
                 CoreDivisionBuffer(
                     name=op.name,

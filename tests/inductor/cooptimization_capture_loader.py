@@ -43,11 +43,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    BufferType,
-    CoreDivision,
-    CoreDivisionBuffer,
-)
+from torch_spyre._inductor.scratchpad.plan_solver import BufferType, CoreDivision
+from buffer_spec import CoreDivisionBuffer
 
 DEFAULT_CAPTURE_PATH = Path(__file__).parent / "cooptimization_captures.json"
 LARGE_CAPTURE_PATH = Path(__file__).parent / "cooptimization_captures_large.json"

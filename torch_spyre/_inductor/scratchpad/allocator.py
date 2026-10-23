@@ -70,8 +70,6 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
-    CoreDivisionBuffer,
-    LifetimeBoundBuffer,
     SolveError,
     TileSpec,
     ceil_div,
@@ -294,30 +292,6 @@ class SolvedPlan:
             )
             self._chosen[node.name] = index
 
-    @classmethod
-    def of_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> "SolvedPlan":
-        """A solved plan given in buffer form (tests): the nodes of
-        ``buffers`` in byte units, each decision read off its buffer
-        (``address``, ``chosen_division``, ``lx_view``, ``spill_reason``)."""
-        from torch_spyre._inductor.scratchpad.buffer_graph import (
-            build_graph,
-            empty_graph,
-        )
-
-        graph = build_graph(buffers, 1, 1 << 62, empty_graph(0).settings)
-        tables = CandidateTables.of_buffers(buffers)
-        by_name = {b.name: b for b in buffers}
-        for node in graph.get_nodes():
-            b = by_name[node.name]
-            node.resident = b.address is not None
-            node.offset = b.address
-            node.spill_reason = b.spill_reason
-            chosen = getattr(b, "chosen_division", None)
-            menu = tables.menus.get(node.name, ())
-            if chosen is not None and menu:
-                node.work_split = WorkSplit.of(menu[chosen])
-        return cls(list(graph.get_nodes()), tables, 1)
-
     def address(self, item: ResourceNode | Transform) -> Optional[int]:
         """The item's LX address in bytes, or ``None`` when it is not
         resident."""
@@ -358,31 +332,6 @@ class SolvedPlan:
                     out.append(
                         ChosenRelayout(edge.relayout, t.offset).scaled(self.alignment)
                     )
-        return out
-
-    def report(self) -> list[CoreDivisionBuffer]:
-        """The solved plan in buffer form, for the cost-expression dump."""
-        out: list[CoreDivisionBuffer] = []
-        for node in self.nodes:
-            keys = [(e.src.name, node.name) for e in node.inputs]
-            b = CoreDivisionBuffer(
-                name=node.name,
-                size=node.nbytes,
-                uses=list(node.uses),
-                first_use_is_read=node.first_use_is_read,
-                core_divisions=list(self.tables.menus.get(node.name, ())),
-                parents=[e.src.name for e in node.inputs for _ in range(e.reads)],
-                cd_parent_matches={
-                    k[0]: self.tables.matches[k]
-                    for k in keys
-                    if k in self.tables.matches
-                },
-                residency_reason=node.residency_reason,
-            )
-            b.address = self.address(node)
-            b.chosen_division = self.division_index(node)
-            b.spill_reason = node.spill_reason
-            out.append(b)
         return out
 
 

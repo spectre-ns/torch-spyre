@@ -35,17 +35,14 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import buffer_graph
 from torch_spyre._inductor.scratchpad.allocator import SolvedPlan
-from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
 from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
     FiredRelayoutGroup,
     RelayoutCandidate,
 )
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    CoreDivision,
-    CoreDivisionBuffer,
-)
+from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
+from buffer_spec import CoreDivisionBuffer, tables_of
 
 _SPILL_NS = 20000.0  # what spilling P charges in the crafted objective
 _CORE = sympy.Symbol("core_id")
@@ -108,7 +105,7 @@ def _solve(buffers, expr, size=64) -> SolvedPlan:
     graph = buffer_graph.build_graph(
         buffers, 1, size, buffer_graph.empty_graph(size, 1).settings
     )
-    tables = CandidateTables.of_buffers(buffers)
+    tables = tables_of(buffers)
     nodes = graph.solve(cost_expr=expr, strategy=LazyStrategy.from_tables(tables))
     return SolvedPlan(nodes, tables, graph.alignment)
 

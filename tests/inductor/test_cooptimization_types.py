@@ -26,10 +26,8 @@ import unittest
 from collections import Counter
 from unittest import TestCase
 
-from torch_spyre._inductor.scratchpad.plan_solver import (
-    BufferType,
-    CoreDivisionBuffer,
-)
+from torch_spyre._inductor.scratchpad.plan_solver import BufferType
+from buffer_spec import CoreDivisionBuffer
 
 from cooptimization_capture_loader import (
     DEFAULT_CAPTURE_PATH,

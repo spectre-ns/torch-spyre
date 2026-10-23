@@ -29,10 +29,10 @@ from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    cost_expr_record,
     CoreDivision,
     TileSpec,
     TileAxis,
+    division_symbol,
 )
 from torch_spyre._inductor.scratchpad.utils import (
     mem_usage_by_buf,
@@ -231,11 +231,145 @@ def dump_cost_expr(
         cost_expr_record(
             cost_expr,
             bundle_terms,
-            plan.report(),
+            plan,
             _COST_PARAMS,
             context=context,
         ),
     )
+
+
+def solved_bindings(plan: SolvedPlan) -> dict:
+    """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1
+    for a resident node and 0 for a spilled one; a node with a chosen
+    division binds its ``division`` index and each per-axis split symbol to
+    that division's split (1 for an axis it does not split), and each
+    tile-count symbol to that division's tile count (1 for an axis it does
+    not tile)."""
+    bindings: dict = {}
+    for node in plan.nodes:
+        bindings[node.sym_is_lx] = 1 if plan.address(node) is not None else 0
+        cd = plan.division(node)
+        if cd is None:
+            continue
+        bindings[division_symbol(node.name)] = plan.division_index(node)
+        for key, sym in node.sym_core_divs.items():
+            bindings[sym] = cd.splits.get(key, 1)
+        for key, sym in node.sym_tile_counts.items():
+            bindings[sym] = cd.tiling.count_for(key)
+    return bindings
+
+
+def _evaluate(expr: sympy.Expr, bindings: dict) -> float | None:
+    try:
+        return float(sympy.sympify(expr).xreplace(bindings).evalf())
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def cost_expr_record(
+    cost_expr: sympy.Expr,
+    bundle_terms: Sequence[tuple[list[str], sympy.Expr]],
+    plan: SolvedPlan,
+    params: object = None,
+    *,
+    context: dict | None = None,
+) -> dict:
+    """One dump record for a solved co-optimized graph: the objective's
+    per-bundle terms as ``sympy.srepr`` strings (lossless,
+    ``parse_expr`` restores them), the solved symbol bindings, and every term
+    evaluated under them. The plan's node names (the graph's stores) are what
+    a reader joins on.
+
+    ``divisions`` carries each buffer's candidate core counts, the one chosen,
+    its producers, its residency ``reason`` when one kept it out of LX, and the
+    division pairs the residency gate admitted on each incoming edge -- the
+    alternatives a decision was made over, which the objective alone cannot
+    show.
+
+    ``context`` is whatever the caller knows and this function cannot see -- the
+    environment the plan was made in, and how the solve went -- so a reader gets
+    one self-describing record per solve rather than a set of numbers whose
+    meaning depends on flags nobody wrote down. Its keys may not collide with
+    the record's own."""
+    import dataclasses
+
+    bindings = solved_bindings(plan)
+    menus = plan.tables.menus
+    bundles = [
+        {
+            "ops": list(names),
+            "expr": sympy.srepr(sympy.sympify(term)),
+            "value_ns": _evaluate(term, bindings),
+        }
+        for names, term in bundle_terms
+    ]
+    objective_ns = _evaluate(cost_expr, bindings)
+    record = {
+        "buffers": [n.name for n in plan.nodes],
+        # Buffer sizes in bytes: with the names, a key that tells kernels apart
+        # even though every kernel numbers its buffers from buf0.
+        "buffer_sizes": {n.name: n.nbytes for n in plan.nodes},
+        "params": dataclasses.asdict(params)
+        if params is not None
+        and dataclasses.is_dataclass(params)
+        and not isinstance(params, type)
+        else {},
+        "bundles": bundles,
+        # Reading why a division was chosen needs the alternatives it was
+        # chosen over: per buffer the core count and split shape of every
+        # candidate, the index the solver took, and the ``(parent, consumer)``
+        # index pairs the residency gate admitted on each incoming edge. Pairs
+        # are stored as INDICES into the two buffers' ``cores`` lists, so a
+        # reader can render them as core counts without the record repeating
+        # the divisions. Keyed by the CONSUMER, which is where ``parents`` and
+        # ``cd_parent_matches`` are populated. A parent with an EMPTY pair list
+        # divides no way this buffer can read locally; a parent absent from
+        # ``matches`` altogether was refused an edge outright, which is the
+        # louder of the two signals (issue #4655 was of that kind).
+        "divisions": {
+            n.name: {
+                "cores": [cd.cores_used for cd in menus[n.name]],
+                "labels": [cd.label for cd in menus[n.name]],
+                "chosen": plan.division_index(n),
+                "parents": [e.src.name for e in n.inputs for _ in range(e.reads)],
+                # Why this buffer never reached the solver, in the allocator's
+                # own words ("op not allowed", "partial/offset read"). None
+                # means it DID reach the solver, and ``bindings`` says what the
+                # solve then decided -- three outcomes a reader must not
+                # conflate: excluded, weighed and declined, or resident.
+                "reason": n.residency_reason,
+                "matches": {
+                    e.src.name: [list(pair) for pair in plan.tables.matches[key]]
+                    for e in n.inputs
+                    if (key := (e.src.name, n.name)) in plan.tables.matches
+                },
+            }
+            for n in plan.nodes
+            if menus.get(n.name)
+        },
+        "bindings": {str(k): v for k, v in bindings.items()},
+        "objective_ns": objective_ns,
+    }
+    # Additive only: context describes the record, it does not get to redefine
+    # it. Without this a caller key named `bundles` would replace the terms.
+    clashes = set(context or ()) & set(record)
+    assert not clashes, f"context may not override record keys: {sorted(clashes)}"
+    record.update(context or {})
+    # A term that would not evaluate under the solved bindings reads in the JSON
+    # exactly like one deliberately left unpriced. The difference matters: the
+    # second is normal, the first means the objective and the bindings have
+    # drifted apart -- a cost-model change introducing a symbol no engine binds,
+    # say. Say so once, where the CP-SAT path already logs "cannot linearize".
+    unpriced = sum(1 for entry in bundles if entry["value_ns"] is None)
+    if unpriced or objective_ns is None:
+        logger.warning(
+            "cost dump: %d of %d terms did not evaluate under the solved "
+            "bindings%s; objective and bindings may have drifted",
+            unpriced,
+            len(bundles),
+            "" if objective_ns is not None else " (whole objective too)",
+        )
+    return record
 
 
 def extract_op_features(graph, output_name, buffers, is_lx, *, op=None):

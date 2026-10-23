@@ -49,8 +49,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
-    CoreDivisionBuffer,
-    LifetimeBoundBuffer,
     ceil_div,
     division_symbol,
 )
@@ -104,7 +102,7 @@ def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
 
 
 def _sym_core_divs_of(name: str, divisions: Sequence[CoreDivision]) -> dict:
-    """``CoreDivisionBuffer.sym_core_divs`` for a buffer named ``name``."""
+    """The per-axis split symbols of a buffer named ``name``."""
     keys = dict.fromkeys(k for cd in divisions for k in cd.splits)
     return {
         key: sympy.Symbol(f"split_{name}_{key}", integer=True, positive=True)
@@ -336,39 +334,11 @@ class CandidateTables:
     lazy_spaces: dict[str, Any] = field(default_factory=dict)
     point_menus: set[str] = field(default_factory=set)
 
-    @classmethod
-    def of_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> CandidateTables:
-        """The candidates the buffer form carries (tests, capture replay)."""
-        names = {b.name for b in buffers}
-        tables = cls()
-        for b in buffers:
-            if not isinstance(b, CoreDivisionBuffer):
-                continue
-            if b.core_divisions:
-                tables.menus[b.name] = tuple(b.core_divisions)
-            parents = [
-                p
-                for p in dict.fromkeys([*b.parents, *b.in_place_parents])
-                if p in names
-            ]
-            tables.parents[b.name] = parents
-            # Captured buffers may predate the newer fields.
-            for p in parents:
-                key = (p, b.name)
-                if p in b.cd_parent_matches:
-                    tables.matches[key] = b.cd_parent_matches[p]
-                if p in b.residency_edges:
-                    tables.residency[key] = b.residency_edges[p]
-        return tables
-
 
 class TableStrategy(EncodingStrategy):
     """The default strategy: every open work split is a ``Table`` over its
     candidate menu, a pinned one ``Fixed``, and the view, relayout and nest
-    relations are tables over menu indices.
-
-    Until candidate generation moves here, the candidates are the allocator's
-    (:meth:`from_buffers`)."""
+    relations are tables over menu indices."""
 
     def __init__(
         self,
@@ -424,12 +394,6 @@ class TableStrategy(EncodingStrategy):
         )
         strategy.tables = tables
         return strategy
-
-    @classmethod
-    def from_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> TableStrategy:
-        """The strategy over candidates given as buffers (tests, capture
-        replay): see :meth:`CandidateTables.of_buffers`."""
-        return cls.from_tables(CandidateTables.of_buffers(buffers))
 
     # ---- whole-graph hooks ----
 

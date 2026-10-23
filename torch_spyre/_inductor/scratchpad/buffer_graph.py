@@ -49,11 +49,8 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
-    CoreDivisionBuffer,
-    LifetimeBoundBuffer,
     SolveError,
     TileSpec,
-    _check_in_place_relationships,
     ceil_div,
 )
 
@@ -384,7 +381,7 @@ def justify(units: list[_PlacementUnit], capacity: int) -> Optional[dict[str, in
 
 @dataclass(eq=False)
 class SpyreOptimizationGraph:
-    """The solve's input: the nodes (which own the edges) in ``add_node``
+    """The solve's input: the nodes (which own the edges) in ``add_ir_node``
     order, the head of the execution chain, and the global context."""
 
     alignment: int  # bytes per unit
@@ -468,29 +465,6 @@ class SpyreOptimizationGraph:
         for parent, count in reads.items():
             if parent in self.nodes and parent not in in_place_parents:
                 self.nodes[parent].add_child(child, reads=count)
-
-    def add_node(
-        self, source: LifetimeBoundBuffer, residency_reason: Optional[str] = None
-    ) -> ResourceNode:
-        """The buffer form of :meth:`add_ir_node`, for tests and capture
-        replay: a node holding ``source``'s incoming data. A buffer with no
-        candidate divisions is committed upstream."""
-        b = source
-        divided = b if isinstance(b, CoreDivisionBuffer) and b.core_divisions else None
-        return self.add_ir_node(
-            b.name,
-            nbytes=b.size,
-            uses=b.uses,
-            first_use_is_read=b.first_use_is_read,
-            boundary=b.boundary if isinstance(b, CoreDivisionBuffer) else None,
-            residency_reason=residency_reason,
-            start_override=b.lifetime_start_override,
-            end_override=b.lifetime_end_override,
-            sym_core_divs=divided.sym_core_divs if divided else {},
-            sym_tile_counts=divided.sym_tile_counts if divided else {},
-            lx_view=b.lx_view,
-            open_split=divided is not None,
-        )
 
     def get_nodes(self) -> Iterator[ResourceNode]:
         return iter(self.nodes.values())
@@ -1024,30 +998,3 @@ class _Section:
                 range(self.before[1], after[1]),
             )
         )
-
-
-def build_graph(
-    buffers: Sequence[LifetimeBoundBuffer],
-    alignment: int,
-    capacity: int,
-    settings: SolveSettings,
-    reasons: Mapping[str, str] = {},
-) -> SpyreOptimizationGraph:
-    """The graph of ``buffers`` (the buffer form: tests, capture replay), sized
-    in ``alignment`` units. ``reasons`` is each barred buffer's residency
-    reason. Raises ``ValueError`` on an in-place pair no solver may realize.
-
-    One edge per (producer, consumer) pair the consumer reads (``parents``),
-    ``in_place`` when the producer is one of its ``in_place_parents``; in-place
-    inputs come first, in that order, since the merge literals are made in it."""
-    _check_in_place_relationships(buffers)
-    graph = SpyreOptimizationGraph(
-        alignment=alignment, capacity=capacity, settings=settings
-    )
-    for b in buffers:
-        graph.add_node(b, reasons.get(b.name))
-    nodes = graph.nodes
-    for b in buffers:
-        graph.add_reads(nodes[b.name], getattr(b, "parents", ()), b.in_place_parents)
-    graph.link_execution_order()
-    return graph

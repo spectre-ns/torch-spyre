@@ -144,7 +144,7 @@ def _read_count(uses: list[int]) -> int:
     them: it is either the producer's write (an intermediate) or the clone-in
     read a graph input cannot avoid.
 
-    Deliberately not ``LifetimeBoundBuffer.read_count``, which counts the
+    Deliberately not ``ResourceNode.read_count``, which counts the
     buffer's reads and so includes an input's clone-in; this is the savings,
     which discounts it in both cases (as ``spill_cost`` does)."""
     return max(0, len(uses) - 1)
@@ -406,7 +406,8 @@ def _inplace_edge_ok(
     - matching device layout (so the storage can alias);
     - single handoff tick (``parent_end == child_start``: the same op that reads
       the parent as its last use writes the child), the invariant the solvers'
-      in-place relaxation relies on (see ``_check_in_place_relationships``).
+      in-place relaxation relies on (``encode_no_overlap`` shortens the child by
+      that one tick).
       Callers pass ticks widened by counted-loop lifetime overrides
       (``_handoff_child_start`` / ``_handoff_parent_end``), so a buffer kept
       live across a loop never qualifies;

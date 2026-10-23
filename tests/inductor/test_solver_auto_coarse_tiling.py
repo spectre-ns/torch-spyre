@@ -46,7 +46,6 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.allocator import (
     ScratchpadAllocator,
-    SolvedPlan,
     select_allocator,
 )
 from torch_spyre._inductor.scratchpad.division_menus import (
@@ -58,6 +57,7 @@ from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 sys.path.insert(0, os.path.dirname(__file__))
 from test_scratchpad_use import _ParameterizedScratchpadMeta
+from buffer_spec import plan_of
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -1030,7 +1030,7 @@ class ReplanAfterTilingGateTests(unittest.TestCase):
     def _materialize(self, **patches):
         with ts_inductor_config.patch(co_optimizing_lx_planning=True):
             alloc = select_allocator()
-            plan = SolvedPlan.of_buffers([])
+            plan = plan_of([])
             graph = SimpleNamespace(operations=[])
             with contextlib.ExitStack() as stack:
                 chosen = stack.enter_context(
