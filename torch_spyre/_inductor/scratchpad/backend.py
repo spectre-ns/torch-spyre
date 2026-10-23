@@ -1122,131 +1122,151 @@ class _BruteForceSearch:
 
 
 class _AnnealSearch(_BruteForceSearch):
-    """Simulated annealing over the recorded model, no linearization: every
-    constraint kind is evaluated natively (the same checks as the exhaustive
-    search). Offsets are never searched: each resident box goes, in placement
-    order, to the lowest offset clear of the boxes placed before it that
-    share its time.
+    """Simulated annealing over the recorded model, scored natively (the
+    exhaustive search's checks) on the objective plus weighted violations.
 
-    A move reassigns one free var, or moves one box in the placement order,
-    then repairs: while a constraint is violated, it rewrites the free vars
-    behind one violated constraint (a whole table row at once), keeping the
-    candidate that leaves the fewest violations. Valid plans are not one
-    connected region under these moves, so the search may leave them: an
-    excursion through plans with at most ``EXCURSION_VIOLATIONS`` violations
-    (each costing ``EXCURSION_PENALTY`` times the objective's full scale, so
-    leaving the valid plans is rare and short) that finds no valid plan
-    within ``EXCURSION_MOVES`` moves is undone back to the last valid one.
-    Only valid plans are kept as the best. From an invalid start it first
-    descends to a valid plan.
+    A violated constraint costs its weight times its degree (1, plus a linear
+    row's distance from its domain scaled below 1), so the search can cross
+    infeasible plans; only feasible ones are kept. The weights start at the
+    median objective coefficient and grow on the constraints still violated
+    after ``STALL`` moves without a better score (Feasibility Jump's weights).
 
-    Moves are differential: only the defined vars downstream of a change are
-    recomputed, the packer reruns only when a packing input changed, only the
-    constraints watching a changed var are re-checked, and a rejected move is
-    undone from a journal. ``SPYRE_ANNEAL_VERIFY=N`` checks the running state
-    against a from-scratch evaluation every N moves."""
+    A move reassigns one free var (while infeasible, ``FOCUS`` of the time one
+    behind a violated constraint), floods a new value through the tables
+    (every other column keeps its value where the table allows it, else takes
+    an allowed one: a Kempe-chain recolor), or moves one box in the placement
+    order. Up to ``REPAIR_DEPTH`` repairs follow, each the best-scoring single
+    change behind a constraint the move broke, then one Metropolis test. The
+    temperature cools over the budget from the median objective coefficient
+    to ``COOLING`` of it; ``RESTART`` moves without a better plan resume from
+    the best one.
 
-    REPAIR_ROUNDS = 6
-    REPAIR_CANDIDATES = 6
-    EXCURSION_VIOLATIONS = 2
-    EXCURSION_MOVES = 30
-    EXCURSION_PENALTY = 10.0
+    It starts from the hint, else with every objective var at its favourable
+    bound; the all-minimum plan is the incumbent when it is feasible. Offsets
+    are not searched: in placement order each resident box, an in-place group
+    as one over its members' lifetimes, goes to the lowest offset clear of the
+    boxes placed before it that share its time, so a packing never overlaps.
+    Moves are differential and undone from a journal; ``SPYRE_ANNEAL_VERIFY=N``
+    checks the running state against a from-scratch evaluation every N
+    moves."""
 
-    def anneal(self, seed: int, budget_s: float, start=None):
+    REPAIR_DEPTH = 6
+    REPAIR_CANDIDATES = 8
+    FOCUS = 0.5
+    FLOOD = 0.2
+    REORDER = 0.1
+    COOLING = 1e-3
+    BUMP = 1.5
+    STALL = 300
+    RESTART = 3000
+
+    def anneal(self, seed: int, budget_s: float, start=None) -> bool:
         import os
         import random
+        import statistics
 
         rng = random.Random(seed)
         verify = int(os.environ.get("SPYRE_ANNEAL_VERIFY", "0"))
-        self._boxes, self._ties = self._placement()
-        self._doms = doms = [_DomainValues(self.domains[v]) for v in range(self.n)]
-        packed = {b[0] for b in self._boxes if b[0] not in self.defs}
-        self._order_definitions()
-        free = [
-            v
-            for v in range(self.n)
-            if (v not in self.defs or v in self._floating) and v not in packed
-        ]
-        self._free = set(free)
-        self._sources_of: dict = {}
-        self._pack_inputs = self._packing_inputs()
-        self._obj_terms: dict = {}
-        if self.objective:
-            for ref, c in zip(self.objective[0], self.objective[1]):
-                self._obj_terms.setdefault(self._ref(ref), []).append((ref, c))
-        a = [None] * self.n
-        for v in (*free, *packed):
-            a[v] = doms[v][0]
-        if start is not None:  # the previous ladder stage's plan (a hint)
-            for v in (*free, *packed):
-                if v < len(start) and start[v] is not None:
-                    a[v] = start[v]
-        # First fit in the hint's offset order never places a box above its
-        # hinted offset, so the hint's plan still packs.
-        order = sorted(
-            (i for i, b in enumerate(self._boxes) if b[0] in packed),
-            key=lambda i: a[self._boxes[i][0]],
-        )
-        self._evaluate(a, order)
-        self._sat = [self._check(a, ci) for ci in range(len(self.cons))]
-        self._unsat = {ci for ci, ok in enumerate(self._sat) if not ok}
-        self._bad = {d for d in self._topo if not self._in_domain(d, a[d])}
-        self._nviol = len(self._unsat) + len(self._bad)
-        self._violations(a)  # the start's count, for whoever is watching
-        self._objv = self._obj(a)
-        temp = (
-            max(1.0, sum(abs(c) for c in self.objective[1])) if self.objective else 1.0
-        )
-        penalty = self.EXCURSION_PENALTY * temp
-        best = (self._objv, list(a)) if self._nviol == 0 else None
-        excursion: list = []  # the accepted moves since the last valid plan
+        self._setup()
+        coeffs = [abs(c) for c in self.objective[1]] if self.objective else []
+        scale = max(1.0, float(statistics.median(coeffs))) if coeffs else 1.0
+        self._w = [scale] * len(self.cons)
+        self._wb = dict.fromkeys(self._topo, scale)
+        searched = (*self._free_list, *self._packed)
+        best = None
+        a, order = self._fresh({})
+        if not self._nviol:
+            best = (self._objv, list(a))
+        if start is not None:
+            hint = {v: start[v] for v in searched if v < len(start)}
+            a, order = self._fresh({v: x for v, x in hint.items() if x is not None})
+        else:
+            a, order = self._fresh(self._favourable())
+        if not self._nviol and (best is None or self._objv < best[0] - 1e-9):
+            best = (self._objv, list(a))
+        bound = self._objective_bound()
         t0 = time.perf_counter()
-        moves = 0
-        while time.perf_counter() - t0 < budget_s and (free or len(order) > 1):
+        moves = last_better = last_best = 0
+        while self._movable or len(order) > 1:
+            elapsed = time.perf_counter() - t0
+            if elapsed >= budget_s or (best is not None and best[0] <= bound + 1e-9):
+                break
+            temp = scale * self.COOLING ** (elapsed / budget_s)
             moves += 1
             journal: list = []
             flips: list = []
             state = (self._nviol, self._objv)
+            score = self._objv + self._pen
+            self._broken: set = set()
             saved_order = None
-            if len(order) > 1 and (not free or rng.random() < 0.2):
+            r = rng.random()
+            if self._tvars and r < self.FLOOD:
+                v = rng.choice(self._tvars)
+                assign = self._flood(a, v, self._other(v, a[v], rng), rng)
+                if not self._try(a, order, assign, journal, flips):
+                    continue
+            elif len(order) > 1 and (
+                not self._movable or self.FLOOD <= r < self.FLOOD + self.REORDER
+            ):
                 saved_order = list(order)
                 i, j = rng.sample(range(len(order)), 2)
                 order.insert(j, order.pop(i))
                 moved = self._repack(a, order, journal)
                 self._apply(a, order, moved, journal, flips, 0, repacked=True)
             else:
-                v = rng.choice(free)
-                if not self._try(a, order, [(v, rng.choice(doms[v]))], journal, flips):
-                    continue
+                v = self._pick(rng)
+                self._try(a, order, [(v, self._other(v, a[v], rng))], journal, flips)
             self._repair(a, order, journal, flips, rng)
-            if best is None:  # descending to a first valid plan
-                accept = self._nviol <= state[0]
-            elif self._nviol > self.EXCURSION_VIOLATIONS:
-                accept = False
-            else:
-                delta = self._objv - state[1] + penalty * (self._nviol - state[0])
-                accept = delta <= 0 or rng.random() < math.exp(-delta / max(temp, 1e-9))
-            if not accept:
-                self._undo_move(a, order, (journal, flips, state, saved_order))
-            elif self._nviol == 0:
-                excursion.clear()
-                if best is None or self._objv < best[0] - 1e-9:
+            delta = self._objv + self._pen - score
+            if delta <= 0 or rng.random() < math.exp(-delta / temp):
+                if delta < 0:
+                    last_better = moves
+                if not self._nviol and (best is None or self._objv < best[0] - 1e-9):
                     best = (self._objv, list(a))
-            elif best is not None:
-                excursion.append((journal, flips, state, saved_order))
-                if len(excursion) > self.EXCURSION_MOVES:
-                    for move in reversed(excursion):
-                        self._undo_move(a, order, move)
-                    excursion.clear()
+                    last_best = moves
+            else:
+                self._rollback(a, journal, flips, 0, 0, state)
+                if saved_order is not None:
+                    order[:] = saved_order
+            if self._nviol and moves - last_better > self.STALL:
+                self._bump()
+                last_better = moves
+            if best is not None and moves - last_best > self.RESTART:
+                a, order = self._fresh({v: best[1][v] for v in searched})
+                last_best = moves
             if verify and moves % verify == 0:
                 self._verify(a, order)
-            temp = max(temp * 0.9995, 1e-3)
         self.moves = moves
+        if best is not None and not self._feasible(best[1]):
+            best = None
         if best is not None:
             self.best, self.best_a = best
+        self.proved = best is not None and best[0] <= bound + 1e-9
         return best is not None
 
     # ---- moves ----
+
+    def _pick(self, rng) -> int:
+        """A free var to reassign: while infeasible, ``FOCUS`` of the time one
+        behind a violated constraint."""
+        if self._nviol and rng.random() < self.FOCUS:
+            violated = sorted(self._unsat) + [self.defs[d] for d in sorted(self._bad)]
+            sources = [
+                v for v in self._sources(rng.choice(violated)) if v in self._moves_ok
+            ]
+            if sources:
+                return rng.choice(sources)
+        return rng.choice(self._movable)
+
+    def _other(self, v, x, rng):
+        """A value of v's domain other than x."""
+        dom = self._doms[v]
+        if len(dom) == 2:
+            return dom[1] if x == dom[0] else dom[0]
+        y = x
+        while y == x:
+            y = dom[rng.randrange(len(dom))]
+        return y
 
     def _try(self, a, order, assigns, journal, flips) -> bool:
         """Apply ``assigns`` (var, value); False when nothing changes."""
@@ -1261,74 +1281,98 @@ class _AnnealSearch(_BruteForceSearch):
             self._apply(a, order, seeds, journal, flips, j0)
         return bool(seeds)
 
-    def _undo_move(self, a, order, move):
-        journal, flips, state, saved_order = move
-        self._rollback(a, journal, flips, 0, 0, state)
-        if saved_order is not None:
-            order[:] = saved_order
-
     def _rollback(self, a, journal, flips, j0, f0, state):
         for u, old in reversed(journal[j0:]):
             a[u] = old
         for kind, key, old in reversed(flips[f0:]):
-            if kind == "sat":
-                self._sat[key] = old
-                (self._unsat.discard if old else self._unsat.add)(key)
-            else:
-                (self._bad.add if old else self._bad.discard)(key)
+            (self._set_degree if kind == "deg" else self._set_bad)(key, old)
         del journal[j0:], flips[f0:]
-        self._nviol, self._objv = state
+        self._objv = state[1]
+
+    def _flood(self, a, v, x, rng) -> list:
+        """v := x, then across every table v is in, each other free column
+        keeps its value where the table allows it, else takes an allowed one,
+        and floods on from there."""
+        assign = {v: x}
+        queue = [v]
+        while queue:
+            u = queue.pop()
+            for ci in self._tcols.get(u, ()):
+                cols, index = self._table(ci)
+                exprs = self.cons[ci].table.exprs
+                cur = [
+                    assign.get(c, a[c]) if c is not None else self._lin(a, exprs[k])
+                    for k, c in enumerate(cols)
+                ]
+                for k, w in enumerate(cols):
+                    if w is None or w in assign or w not in self._free:
+                        continue
+                    allowed = index[k].get(tuple(cur[:k] + cur[k + 1 :]), ())
+                    if not allowed or cur[k] in allowed:
+                        continue
+                    cur[k] = assign[w] = allowed[rng.randrange(len(allowed))]
+                    queue.append(w)
+        return [(w, y) for w, y in assign.items() if y != a[w]]
 
     def _repair(self, a, order, journal, flips, rng):
-        """Greedily rewrite the free vars behind violated constraints."""
-        for _ in range(self.REPAIR_ROUNDS):
-            if not self._nviol:
+        """While a constraint the move broke is still violated, apply the
+        best-scoring single change behind it if that lowers the score."""
+        for _ in range(self.REPAIR_DEPTH):
+            broken = [ci for ci in self._broken if self._deg[ci]]
+            if not broken:
                 return
-            violated = sorted(self._unsat) + [self.defs[d] for d in sorted(self._bad)]
-            ci = rng.choice(violated)
+            ci = rng.choice(broken)
+            base = self._objv + self._pen
             pick = None
-            for cand in self._candidates(a, ci, rng):
+            for cand in self._repair_candidates(a, ci, rng):
                 j0, f0, state = len(journal), len(flips), (self._nviol, self._objv)
+                was_broken = set(self._broken)
                 if self._try(a, order, cand, journal, flips):
-                    if pick is None or self._nviol < pick[0]:
-                        pick = (self._nviol, cand)
+                    score = self._objv + self._pen
+                    if pick is None or score < pick[0]:
+                        pick = (score, cand)
                     self._rollback(a, journal, flips, j0, f0, state)
-            if pick is None or pick[0] >= self._nviol:
-                return
+                self._broken = was_broken
+            if pick is None or pick[0] >= base:
+                self._broken.discard(ci)
+                continue
             self._try(a, order, pick[1], journal, flips)
 
-    def _candidates(self, a, ci, rng):
-        """Assignments that might satisfy constraint ci: a row for a table's
-        free columns, else one free var behind ci at a new value."""
+    def _repair_candidates(self, a, ci, rng) -> list:
+        """Single changes that might fix ci: for a table, each value one free
+        column may take given the others; else a free var behind ci at
+        another value."""
         c = self.cons[ci]
-        k = self.REPAIR_CANDIDATES
         if c.WhichOneof("constraint") == "table" and not c.table.negated:
-            t = c.table
-            cols = (
-                [
-                    x.vars[0]
-                    if len(x.vars) == 1
-                    and x.coeffs[0] == 1
-                    and not x.offset
-                    and x.vars[0] >= 0
-                    else None
-                    for x in t.exprs
-                ]
-                if len(t.exprs)
-                else list(t.vars)
-            )
-            free = [
-                (j, v) for j, v in enumerate(cols) if v is not None and v in self._free
+            cols, index = self._table(ci)
+            exprs = c.table.exprs
+            cur = [
+                a[v] if v is not None else self._lin(a, exprs[k])
+                for k, v in enumerate(cols)
             ]
-            if free:
-                w = len(cols)
-                rows = len(t.values) // w
-                for r in rng.sample(range(rows), min(k, rows)):
-                    yield [(v, t.values[r * w + j]) for j, v in free]
-                return
-        sources = self._sources(ci)
-        for v in rng.sample(sources, min(k, len(sources))):
-            yield [(v, rng.choice(self._doms[v]))]
+            out = [
+                [(v, x)]
+                for k, v in enumerate(cols)
+                if v is not None and v in self._free
+                for x in index[k].get(tuple(cur[:k] + cur[k + 1 :]), ())
+                if x != cur[k]
+            ]
+            if out:
+                return rng.sample(out, min(len(out), self.REPAIR_CANDIDATES))
+        sources = [v for v in self._sources(ci) if v in self._moves_ok]
+        return [
+            [(v, self._other(v, a[v], rng))]
+            for v in rng.sample(sources, min(len(sources), self.REPAIR_CANDIDATES))
+        ]
+
+    def _bump(self):
+        """Raise the weights of the constraints violated now."""
+        for ci in self._unsat:
+            self._pen += self._w[ci] * (self.BUMP - 1) * self._deg[ci]
+            self._w[ci] *= self.BUMP
+        for d in self._bad:
+            self._pen += self._wb[d] * (self.BUMP - 1) * self._bdeg[d]
+            self._wb[d] *= self.BUMP
 
     def _sources(self, ci):
         """The free vars constraint ci depends on, through definitions."""
@@ -1347,6 +1391,89 @@ class _AnnealSearch(_BruteForceSearch):
         return self._sources_of[ci]
 
     # ---- structure ----
+
+    def _setup(self):
+        self._boxes, self._ties, self._decoded = self._placement()
+        self._doms = [_DomainValues(self.domains[v]) for v in range(self.n)]
+        self._packed = {b[0] for b in self._boxes if b[0] not in self.defs}
+        self._order_definitions()
+        self._free_list = [
+            v
+            for v in range(self.n)
+            if (v not in self.defs or v in self._floating) and v not in self._packed
+        ]
+        self._free = set(self._free_list)
+        self._movable = [v for v in self._free_list if len(self._doms[v]) > 1]
+        self._moves_ok = set(self._movable)
+        self._sources_of: dict = {}
+        self._tables: dict = {}
+        self._rows: dict = {}
+        self._pack_inputs = self._packing_inputs()
+        self._box_exprs = [
+            tuple(self._compiled(e.vars, e.coeffs, e.offset) for e in (xs, xe, ys))
+            for _off, _lit, xs, xe, ys in self._boxes
+        ]
+        self._obj_terms: dict = {}
+        if self.objective:
+            for ref, c in zip(self.objective[0], self.objective[1]):
+                self._obj_terms.setdefault(self._ref(ref), []).append((ref, c))
+        self._tcols: dict = {}
+        for ci, c in enumerate(self.cons):
+            if c.WhichOneof("constraint") == "table" and not c.table.negated:
+                for v in self._table(ci)[0]:
+                    if v is not None and v in self._free:
+                        self._tcols.setdefault(v, []).append(ci)
+        self._tvars = [v for v in self._tcols if v in self._moves_ok]
+
+    def _table(self, ci):
+        """(columns, index): each column's var (None for any other
+        expression) and, per column, the values the rows allow it keyed by
+        the other columns' values."""
+        if ci not in self._tables:
+            t = self.cons[ci].table
+            if len(t.exprs):
+                cols = [
+                    x.vars[0]
+                    if len(x.vars) == 1
+                    and x.coeffs[0] == 1
+                    and not x.offset
+                    and x.vars[0] >= 0
+                    else None
+                    for x in t.exprs
+                ]
+            else:
+                cols = list(t.vars)
+            w = len(cols)
+            rows = [tuple(t.values[r : r + w]) for r in range(0, len(t.values), w)]
+            index = {}
+            for j in range(w):
+                allowed: dict = {}
+                for row in rows:
+                    allowed.setdefault(row[:j] + row[j + 1 :], []).append(row[j])
+                index[j] = allowed
+            self._tables[ci] = (cols, index)
+        return self._tables[ci]
+
+    def _favourable(self) -> dict:
+        """Each free var in the objective at the bound that lowers it."""
+        out = {}
+        for v in self._free_list:
+            for ref, c in self._obj_terms.get(v, ()):
+                dom = self._doms[v]
+                out[v] = dom[-1] if (c < 0) == (ref >= 0) else dom[0]
+        return out
+
+    def _objective_bound(self):
+        """The objective's least value over the domains alone."""
+        if self.objective is None:
+            return 0
+        vs, cs, offset, _ = self.objective
+        low = offset
+        for r, c in zip(vs, cs):
+            dom = self.domains[self._ref(r)]
+            ends = (dom[0], dom[-1]) if r >= 0 else (1 - dom[0], 1 - dom[-1])
+            low += min(c * ends[0], c * ends[1])
+        return low
 
     def _order_definitions(self):
         """Each defined var after the vars its definition reads (Kahn). A var
@@ -1380,19 +1507,130 @@ class _AnnealSearch(_BruteForceSearch):
         """Vars the packer reads: presences, lifetimes, sizes, merge
         literals, and offsets it does not choose."""
         out = set()
-        packed = {b[0] for b in self._boxes if b[0] not in self.defs}
         for off, lit, xs, xe, ys in self._boxes:
             if lit is not None:
                 out.add(self._ref(lit))
             for e in (xs, xe, ys):
                 out |= self._expr_vars(e)
-            if off not in packed:
+            if off not in self._packed:
                 out.add(off)
         for ties in self._ties.values():
             out |= {self._ref(lit) for lit, _ in ties}
         return out
 
+    def _placement(self):
+        """The no-overlap boxes as (offset var, presence lit, x start, x end,
+        y size); each offset's merge ties, (lit, other offset) for a
+        ``lit => off == other``; and the no-overlap constraints whose every
+        box the packer places."""
+        boxes = []
+        decoded = set()
+        for ci, c in enumerate(self.cons):
+            if c.WhichOneof("constraint") != "no_overlap_2d":
+                continue
+            no = c.no_overlap_2d
+            whole = True
+            for xi, yi in zip(no.x_intervals, no.y_intervals):
+                x, y = self.cons[xi], self.cons[yi]
+                s = y.interval.start
+                if len(s.vars) != 1 or s.coeffs[0] != 1 or s.offset or s.vars[0] < 0:
+                    whole = False
+                    continue
+                whole = whole and s.vars[0] not in self.defs
+                lit = y.enforcement_literal[0] if len(y.enforcement_literal) else None
+                boxes.append(
+                    (s.vars[0], lit, x.interval.start, x.interval.end, y.interval.size)
+                )
+            if whole:
+                decoded.add(ci)
+        offsets = {b[0] for b in boxes}
+        ties: dict = {}
+        for c in self.cons:
+            if (
+                c.WhichOneof("constraint") != "linear"
+                or len(c.enforcement_literal) != 1
+            ):
+                continue
+            lin = c.linear
+            if (
+                len(lin.vars) == 2
+                and sorted(lin.coeffs) == [-1, 1]
+                and list(lin.domain) == [0, 0]
+                and all(v >= 0 and v in offsets for v in lin.vars)
+            ):
+                p, q = lin.vars
+                lit = c.enforcement_literal[0]
+                ties.setdefault(p, []).append((lit, q))
+                ties.setdefault(q, []).append((lit, p))
+        return boxes, ties, decoded
+
     # ---- evaluation ----
+
+    def _compiled(self, refs, coeffs, offset) -> tuple:
+        """A linear expression as (offset, ((var, coeff), ...)), a negated
+        literal folded into the offset."""
+        terms = []
+        for r, c in zip(refs, coeffs):
+            if r >= 0:
+                terms.append((r, c))
+            else:
+                offset += c
+                terms.append((-r - 1, -c))
+        return offset, tuple(terms)
+
+    @staticmethod
+    def _value(a, compiled):
+        offset, terms = compiled
+        return offset + sum(c * a[v] for v, c in terms)
+
+    def _degree(self, a, ci) -> float:
+        """0 when constraint ci holds, else 1, plus for a linear row its
+        distance from the domain scaled into [0, 1)."""
+        c = self.cons[ci]
+        k = c.WhichOneof("constraint")
+        if k == "interval" or ci in self._decoded or self._enforced(a, c) is False:
+            return 0.0
+        if k == "linear":
+            if ci not in self._rows:
+                lin = c.linear
+                dom = list(lin.domain)
+                finite = [abs(x) for x in dom if abs(x) < 2**62]
+                self._rows[ci] = (
+                    self._compiled(lin.vars, lin.coeffs, 0),
+                    list(zip(dom[::2], dom[1::2])),
+                    max(1, min(finite)) if finite else 1,
+                )
+            row, spans, scale = self._rows[ci]
+            s = self._value(a, row)
+            gap = min(lo - s if s < lo else s - hi if s > hi else 0 for lo, hi in spans)
+            return 0.0 if gap == 0 else 1.0 + gap / (gap + scale)
+        if k == "bool_and":
+            return float(sum(not self._val(a, x) for x in c.bool_and.literals))
+        if k == "at_most_one":
+            return float(
+                max(0, sum(self._val(a, x) for x in c.at_most_one.literals) - 1)
+            )
+        if k == "exactly_one":
+            return float(abs(sum(self._val(a, x) for x in c.exactly_one.literals) - 1))
+        return 0.0 if self._check(a, ci) else 1.0
+
+    def _bad_degree(self, d, x) -> float:
+        """A defined var's degree: 0 inside its domain, else 1 plus its scaled
+        distance from it."""
+        dom = self.domains[d]
+        gap = min(
+            lo - x if x < lo else x - hi if x > hi else 0
+            for lo, hi in zip(dom[::2], dom[1::2])
+        )
+        return (
+            0.0 if gap == 0 else 1.0 + gap / (gap + max(1, abs(dom[0]), abs(dom[-1])))
+        )
+
+    def _feasible(self, a) -> bool:
+        """Every constraint and every domain holds for ``a``, from scratch."""
+        return all(self._check(a, ci) for ci in range(len(self.cons))) and all(
+            self._in_domain(v, a[v]) for v in range(self.n)
+        )
 
     def _define(self, a, d):
         x = self._compute(a, d)
@@ -1405,6 +1643,33 @@ class _AnnealSearch(_BruteForceSearch):
         self._pack(a, order)
         for d in self._topo:
             a[d] = self._define(a, d)
+
+    def _fresh(self, assign):
+        """The state from scratch: the searched vars at their least value
+        unless assigned, the rest computed, with its degrees and score. First
+        fit in offset order never places a box above its assigned offset, so
+        an assigned plan still packs."""
+        a = [None] * self.n
+        for v in (*self._free_list, *self._packed):
+            a[v] = self._doms[v][0]
+        for v, x in assign.items():
+            a[v] = x
+        order = sorted(
+            (i for i, b in enumerate(self._boxes) if b[0] in self._packed),
+            key=lambda i: a[self._boxes[i][0]],
+        )
+        self._evaluate(a, order)
+        self._deg = [self._degree(a, ci) for ci in range(len(self.cons))]
+        self._bdeg = {d: self._bad_degree(d, a[d]) for d in self._topo}
+        self._unsat = {ci for ci, g in enumerate(self._deg) if g}
+        self._bad = {d for d, g in self._bdeg.items() if g}
+        self._nviol = len(self._unsat) + len(self._bad)
+        self._pen = sum(w * g for w, g in zip(self._w, self._deg)) + sum(
+            self._wb[d] * g for d, g in self._bdeg.items()
+        )
+        self._objv = self._obj(a)
+        self._broken = set()
+        return a, order
 
     def _forward(self, a, seeds, journal):
         """Recompute, in definition order, the defined vars downstream of
@@ -1443,13 +1708,12 @@ class _AnnealSearch(_BruteForceSearch):
 
     def _apply(self, a, order, seeds, journal, flips, j0, repacked=False):
         """Settle what ``seeds`` (changed since journal[j0]) reach and update
-        the violation count and objective."""
+        the degrees, the score and the constraints the change broke."""
         changed = self._forward(a, seeds, journal)
-        while not repacked and self._pack_inputs.intersection(changed):
+        if not repacked and self._pack_inputs.intersection(changed):
             moved = self._repack(a, order, journal)
-            changed += self._forward(a, moved, journal)
             # An offset never feeds the packer back, so one pass settles it.
-            repacked = True
+            changed += self._forward(a, moved, journal)
         first: dict = {}
         for u, old in journal[j0:]:
             first.setdefault(u, old)
@@ -1458,107 +1722,126 @@ class _AnnealSearch(_BruteForceSearch):
             if a[u] == old:
                 continue
             for ref, c in self._obj_terms.get(u, ()):
-                if ref >= 0:
-                    self._objv += c * (a[u] - old)
-                else:
-                    self._objv -= c * (a[u] - old)
+                self._objv += (c if ref >= 0 else -c) * (a[u] - old)
             if u in self._pos:
-                bad = not self._in_domain(u, a[u])
-                if bad != (u in self._bad):
-                    flips.append(("bad", u, u in self._bad))
-                    (self._bad.add if bad else self._bad.discard)(u)
-                    self._nviol += 1 if bad else -1
+                deg = self._bad_degree(u, a[u])
+                if deg != self._bdeg[u]:
+                    flips.append(("bad", u, self._bdeg[u]))
+                    self._set_bad(u, deg)
             touched.update(self.watch[u])
         for ci in touched:
-            ok = self._check(a, ci)
-            if ok != self._sat[ci]:
-                flips.append(("sat", ci, self._sat[ci]))
-                self._sat[ci] = ok
-                (self._unsat.discard if ok else self._unsat.add)(ci)
-                self._nviol += -1 if ok else 1
+            deg = self._degree(a, ci)
+            old = self._deg[ci]
+            if deg != old:
+                flips.append(("deg", ci, old))
+                self._set_degree(ci, deg)
+                if not old:
+                    self._broken.add(ci)
+
+    def _set_degree(self, ci, deg):
+        old = self._deg[ci]
+        self._pen += self._w[ci] * (deg - old)
+        self._deg[ci] = deg
+        if deg and not old:
+            self._unsat.add(ci)
+            self._nviol += 1
+        elif old and not deg:
+            self._unsat.discard(ci)
+            self._nviol -= 1
+
+    def _set_bad(self, d, deg):
+        old = self._bdeg[d]
+        self._pen += self._wb[d] * (deg - old)
+        self._bdeg[d] = deg
+        if deg and not old:
+            self._bad.add(d)
+            self._nviol += 1
+        elif old and not deg:
+            self._bad.discard(d)
+            self._nviol -= 1
 
     def _verify(self, a, order):
-        """The running state equals a from-scratch evaluation."""
+        """The running state equals a from-scratch evaluation, and every
+        no-overlap the packer decides holds."""
         ref = list(a)
         self._evaluate(ref, order)
-        nviol = self._violations(ref) + sum(
-            not self._in_domain(d, ref[d]) for d in self._topo
-        )
         assert ref == a, [
             (self.p.variables[v].name, a[v], ref[v])
             for v in range(self.n)
             if a[v] != ref[v]
         ][:10]
-        assert nviol == self._nviol, (nviol, self._nviol)
-        assert self._unsat == {
-            ci for ci in range(len(self.cons)) if not self._check(ref, ci)
-        }
+        assert self._deg == [self._degree(ref, ci) for ci in range(len(self.cons))]
+        assert self._bdeg == {d: self._bad_degree(d, ref[d]) for d in self._topo}
+        pen = sum(w * g for w, g in zip(self._w, self._deg)) + sum(
+            self._wb[d] * g for d, g in self._bdeg.items()
+        )
+        assert abs(pen - self._pen) <= 1e-6 * max(1.0, abs(pen)), (pen, self._pen)
         assert abs(self._obj(ref) - self._objv) < 1e-6, (self._obj(ref), self._objv)
-
-    def _placement(self):
-        """The no-overlap boxes as (offset var, presence lit, x start, x end,
-        y size), and each offset's merge ties: (lit, other offset) for a
-        ``lit => off == other``."""
-        boxes = []
-        for c in self.cons:
-            if c.WhichOneof("constraint") != "no_overlap_2d":
-                continue
-            no = c.no_overlap_2d
-            for xi, yi in zip(no.x_intervals, no.y_intervals):
-                x, y = self.cons[xi], self.cons[yi]
-                s = y.interval.start
-                if len(s.vars) != 1 or s.coeffs[0] != 1 or s.offset or s.vars[0] < 0:
-                    continue
-                lit = y.enforcement_literal[0] if len(y.enforcement_literal) else None
-                boxes.append(
-                    (s.vars[0], lit, x.interval.start, x.interval.end, y.interval.size)
-                )
-        offsets = {b[0] for b in boxes}
-        ties: dict = {}
-        for c in self.cons:
-            if (
-                c.WhichOneof("constraint") != "linear"
-                or len(c.enforcement_literal) != 1
-            ):
-                continue
-            lin = c.linear
-            if (
-                len(lin.vars) == 2
-                and sorted(lin.coeffs) == [-1, 1]
-                and list(lin.domain) == [0, 0]
-                and all(v >= 0 and v in offsets for v in lin.vars)
-            ):
-                p, q = lin.vars
-                lit = c.enforcement_literal[0]
-                ties.setdefault(p, []).append((lit, q))
-                ties.setdefault(q, []).append((lit, p))
-        return boxes, ties
+        assert all(self._check(ref, ci) for ci in self._decoded)
 
     def _pack(self, a, order):
-        """Offsets for the boxes in ``order`` (``_C.pack_boxes``); a present
-        box outside it keeps its offset as an obstacle."""
+        """Offsets for the boxes in ``order`` (``_C.pack_boxes``). An in-place
+        group packs as one box over its members' lifetimes at their largest
+        size (members are adjacent in time and equal in size), so no packing
+        overlaps; a present box outside ``order`` keeps its offset as an
+        obstacle."""
         from torch_spyre import _C
 
-        packed = set(order)
+        n = len(self._boxes)
         index = {b[0]: i for i, b in enumerate(self._boxes)}
-        x0, x1, size, present, pinned, ties = [], [], [], [], [], []
-        for i, (off, lit, xs, xe, ys) in enumerate(self._boxes):
-            dims = (self._lin(a, xs), self._lin(a, xe), self._lin(a, ys))
-            on = None not in dims and (lit is None or bool(self._val(a, lit)))
-            x0.append(dims[0] if on else 0)
-            x1.append(dims[1] if on else 0)
-            size.append(dims[2] if on else 0)
+        packed = set(order)
+        x0, x1, size, present, pinned = [], [], [], [], []
+        for i, (off, lit, *_exprs) in enumerate(self._boxes):
+            on = lit is None or bool(self._val(a, lit))
+            xs, xe, ys = self._box_exprs[i]
+            x0.append(self._value(a, xs) if on else 0)
+            x1.append(self._value(a, xe) if on else 0)
+            size.append(self._value(a, ys) if on else 0)
             present.append(on)
             pinned.append(a[off] if i not in packed and a[off] is not None else -1)
-            ties.append(
-                [index[q] for lit, q in self._ties.get(off, ()) if self._val(a, lit)]
-            )
-        offsets = _C.pack_boxes(order, x0, x1, size, present, pinned, ties)
-        for i in order:
-            a[self._boxes[i][0]] = offsets[i]
+        group = list(range(n))
 
-    def _violations(self, a):
-        return sum(0 if self._check(a, ci) else 1 for ci in range(len(self.cons)))
+        def root(i):
+            while group[i] != i:
+                group[i] = group[group[i]]
+                i = group[i]
+            return i
+
+        for i, (off, *_rest) in enumerate(self._boxes):
+            if present[i]:
+                for lit, q in self._ties.get(off, ()):
+                    j = index[q]
+                    if present[j] and self._val(a, lit):
+                        group[root(i)] = root(j)
+        gx0, gx1, gsize, gpinned = list(x0), list(x1), list(size), list(pinned)
+        gpresent = [False] * n
+        for i in range(n):
+            if present[i]:
+                g = root(i)
+                if gpresent[g]:
+                    gx0[g] = min(gx0[g], x0[i])
+                    gx1[g] = max(gx1[g], x1[i])
+                    gsize[g] = max(gsize[g], size[i])
+                    gpinned[g] = max(gpinned[g], pinned[i])
+                else:
+                    gpresent[g] = True
+                    gx0[g], gx1[g], gsize[g], gpinned[g] = (
+                        x0[i],
+                        x1[i],
+                        size[i],
+                        pinned[i],
+                    )
+        gorder, seen = [], set()
+        for i in order:
+            g = root(i)
+            if present[i] and gpinned[g] < 0 and g not in seen:
+                seen.add(g)
+                gorder.append(g)
+        offsets = _C.pack_boxes(
+            gorder, gx0, gx1, gsize, gpresent, gpinned, [[] for _ in range(n)]
+        )
+        for i in order:
+            a[self._boxes[i][0]] = offsets[root(i)] if present[i] else 0
 
 
 class Annealing(_SolvedRecording):
@@ -1579,7 +1862,7 @@ class Annealing(_SolvedRecording):
             return self._status
         self._values = search.best_a
         self._objective_value = search.objective_value()
-        self._status = cp_model.FEASIBLE
+        self._status = cp_model.OPTIMAL if search.proved else cp_model.FEASIBLE
         return self._status
 
 
