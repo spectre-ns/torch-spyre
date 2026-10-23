@@ -615,11 +615,29 @@ class _Linearizer:
             self.report = 1.0
 
 
-def _domain_values(dom):
-    vals = []
-    for lo, hi in zip(dom[::2], dom[1::2]):
-        vals.extend(range(lo, hi + 1))
-    return vals
+class _DomainValues:
+    """A domain's values in order, never listed: offset and cost domains span
+    billions of values, and listing them exhausts memory."""
+
+    def __init__(self, dom):
+        self.spans = list(zip(dom[::2], dom[1::2]))
+        self.size = sum(hi - lo + 1 for lo, hi in self.spans)
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, i):
+        if i < 0:
+            i += self.size
+        for lo, hi in self.spans:
+            if i <= hi - lo:
+                return lo + i
+            i -= hi - lo + 1
+        raise IndexError(i)
+
+    def __iter__(self):
+        for lo, hi in self.spans:
+            yield from range(lo, hi + 1)
 
 
 class TooBig(Exception):
@@ -903,8 +921,8 @@ class _BruteForceSearch:
         # after everything, branched only if their definition never resolved.
         order.sort(
             key=lambda v: (
-                len(_domain_values(self.domains[v])) > 2,
-                len(_domain_values(self.domains[v])),
+                len(_DomainValues(self.domains[v])) > 2,
+                len(_DomainValues(self.domains[v])),
             )
         )
         order += [v for v in range(self.n) if v in self.defs]
@@ -968,7 +986,7 @@ class _BruteForceSearch:
         if a[v] is not None:
             self._dfs(a, order, i + 1)
             return
-        for x in _domain_values(self.domains[v]):
+        for x in _DomainValues(self.domains[v]):
             a[v] = x
             assigned = [v]
             ok = self._propagate(a, assigned) and self._consistent(a, assigned)
@@ -991,7 +1009,7 @@ class _AnnealSearch(_BruteForceSearch):
 
         rng = random.Random(seed)
         free = [v for v in range(self.n) if v not in self.defs]
-        doms = [_domain_values(self.domains[v]) for v in range(self.n)]
+        doms = [_DomainValues(self.domains[v]) for v in range(self.n)]
         # Definitions that cannot resolve (a row "defining" several of its own
         # vars) leave those vars free: the search moves them.
         probe = [None] * self.n
