@@ -49,7 +49,6 @@
 #include "logging.h"
 #include "logging_bindings.h"
 #include "logging_config.h"
-#include "perm_layout_native.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
@@ -274,9 +273,6 @@ PYBIND11_MODULE(_C, m) {
 
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
-
-  // Register the native scratchpad layout packer accelerator.
-  torch_spyre::scratchpad::register_perm_layout_native(m);
 
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)

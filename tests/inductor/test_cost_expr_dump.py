@@ -31,8 +31,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     cost_expr_record,
     solved_bindings,
 )
-from torch_spyre._inductor.work_division import OpSplitSpace
-from torch_spyre._inductor.wsr.enumerate_tilings import TilingSpace
 
 
 def _buffers():
@@ -65,21 +63,18 @@ def test_solved_bindings_read_the_plan_like_the_annealer():
 
 
 def test_solved_bindings_bind_the_chosen_tiling_per_axis():
-    d0, d1 = sympy.symbols("d0 d1")
-    space = OpSplitSpace(
-        op=None,
-        context=None,
-        output_axes=frozenset({d0, d1}),
-        factor_domains={},
-        tiling=TilingSpace(max_dims=2, output_counts={0: [4], 1: [2]}),
-    )
-    tiling = TileSpec((TileAxis(host_dim=0, count=4),))
+    d1 = sympy.Symbol("d1")
     t = CoreDivisionBuffer(
         "T",
         64,
         [0, 1],
-        core_divisions=[CoreDivision(splits={d1: 2}, tiling=tiling)],
-        division_space=space,
+        core_divisions=[
+            CoreDivision(
+                splits={d1: 2}, tiling=TileSpec((TileAxis(host_dim=0, count=4),))
+            ),
+            # The alternative tiles axis 1, so axis 1 has a symbol to bind.
+            CoreDivision(tiling=TileSpec((TileAxis(host_dim=1, count=2),))),
+        ],
     )
     t.address, t.chosen_division = 0, 0
     tiles = t.sym_tile_counts
@@ -165,7 +160,7 @@ def test_the_record_carries_the_context_the_buffers_cannot_show():
     context = {
         "op_names": {"C": "amax_1"},
         "op_ids": {"C": "op1"},
-        "env": {"sencores": 8, "lx_capacity": 1234, "solver": "ModelSolver"},
+        "env": {"sencores": 8, "lx_capacity": 1234},
         "solve": {"status": "OPTIMAL", "solve_s": 0.4},
     }
     rec = cost_expr_record(sympy.Integer(0), [], [p, c], CostParams(), context=context)

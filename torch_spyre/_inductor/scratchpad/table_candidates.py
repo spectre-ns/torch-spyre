@@ -30,7 +30,7 @@ from __future__ import annotations
 import itertools
 import math
 from collections.abc import Collection, Sequence
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import sympy
 from torch._inductor.ir import (
@@ -47,9 +47,7 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
-    OpSplitSpace,
     ResidencyEdge,
-    build_op_split_space,
     build_residency_edge,
     enumerate_work_division_candidates,
     has_resolved_work_div_hint,
@@ -124,10 +122,6 @@ from torch_spyre._inductor.scratchpad.drain_plans import (
 from torch_spyre._inductor.scratchpad import residency_rules
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.scratchpad.pricing import _COST_PARAMS
-
-if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.encoding_strategy import EnumerationFactory
-    from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
 
 logger = get_inductor_logger("scratchpad.table_candidates")
 
@@ -393,19 +387,17 @@ def _has_legal_division(context) -> bool:
 
 
 class TableCandidates:
-    """The table strategy's candidate generation for solves over ``capacity``
+    """The candidate generation for solves over ``capacity``
     bytes of LX: the graph from the IR, each node's menu, the pair tables,
     relations and relayout candidates. ``committed``: every op keeps the
     division work division committed, a menu of one."""
 
     def __init__(
         self,
-        factory: EnumerationFactory,
         capacity: int,
         prune: bool = False,
         committed: bool = False,
     ) -> None:
-        self.factory = factory
         self.capacity = capacity  # bytes
         self.prune = prune
         self.committed = committed
@@ -480,7 +472,7 @@ class TableCandidates:
     def _direct_read_candidates_priced(op, divisions, graph, tables) -> bool:
         from torch_spyre._inductor.cost_model import transport_dma_cost_available
         from torch_spyre._inductor.dump_cost_model import extract_op_features
-        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+        from torch_spyre._inductor.scratchpad.division_menus import _work_slices
 
         if op is None or op.get_name() not in graph.nodes:
             return False
@@ -540,7 +532,7 @@ class TableCandidates:
         # graph-level facts.
         self._prescribed_ops: frozenset[str] = frozenset()
         self._readers_by_name: dict[str, list[Operation]] = {}
-        if self.factory.tiled_menus:
+        if config.auto_coarse_tiling:
             from torch_spyre._inductor.scratchpad.coarse_tiling import (
                 prescribed_regions,
             )
@@ -664,10 +656,9 @@ class TableCandidates:
             op.data, (Pointwise, Reduction)
         ):
             return fixed, False
-        if self.factory.constraints:
-            points = self._point_menu(op, max_cores)
-            if points is not None:
-                return points, True
+        points = self._point_menu(op, max_cores)
+        if points is not None:
+            return points, True
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
@@ -711,15 +702,14 @@ class TableCandidates:
                         exc,
                     )
                     continue
-            if self.factory.constraints:
-                from torch_spyre._inductor.scratchpad.lazy_division import LazyOption
-                from torch_spyre._inductor.work_division import (
-                    work_division_context_for_op,
-                )
+            from torch_spyre._inductor.scratchpad.lazy_division import LazyOption
+            from torch_spyre._inductor.work_division import (
+                work_division_context_for_op,
+            )
 
-                context = work_division_context_for_op(op, max_cores, tiling)
-                if context is not None and tiled_candidates:
-                    options.append(LazyOption(tiling, tile_splits, context))
+            context = work_division_context_for_op(op, max_cores, tiling)
+            if context is not None and tiled_candidates:
+                options.append(LazyOption(tiling, tile_splits, context))
             for candidate in tiled_candidates:
                 division = _core_division(op, candidate, tiling, tile_splits)
                 key = (
@@ -806,8 +796,7 @@ class TableCandidates:
     def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
         """Coarse-tiling options to pair with ``op``'s divisions.
 
-        Unless ``auto_coarse_tiling`` is on and the solver takes its tilings off
-        this menu (``EnumerationFactory.tiled_menus``) the only option is the untiled
+        Unless ``auto_coarse_tiling`` is on the only option is the untiled
         ``TileSpec``, so enumeration and every downstream plan stay
         bit-identical to today. When it does, the op is offered the
         output-axis tilings it could take, minus any whose per-core read span
@@ -847,7 +836,7 @@ class TableCandidates:
         untiled = [TileSpec()]
         if self.suppress_tiling:
             return untiled
-        if not self.factory.tiled_menus:
+        if not config.auto_coarse_tiling:
             return untiled
         if getattr(op, "loop_info", None) is not None:
             return untiled
@@ -984,12 +973,8 @@ class TableCandidates:
         ``output_partition``. Counted-loop lifetimes still filter unsafe
         in-place handoffs before the solver compares those total footprints.
 
-        The tables hold each node's candidate divisions and each edge's pair
-        table and relayout candidates, and the same relations *per candidate*
-        for a solver that generates divisions rather than indexing the list:
-        the residency edge to each divided producer, and -- where
-        :class:`_DivisionMap` allows one and the solver is one that generates
-        (``EnumerationFactory.generates_divisions``) -- the op's split space.
+        The tables hold each node's candidate divisions, each edge's pair
+        table or residency relation, and its relayout candidates.
         """
         divisions = division_map.divisions
         lifetimes = calculate_liveness(graph)
@@ -1013,12 +998,6 @@ class TableCandidates:
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
         graph_output_names = set(graph.get_output_names())
-        readers_by_name: dict[str, list[ComputedBuffer]] = {}
-        if self.factory.applies_tilings:
-            for reader in graph.operations:
-                if isinstance(reader, ComputedBuffer):
-                    for name in {read.name for read in reader.get_read_writes().reads}:
-                        readers_by_name.setdefault(name, []).append(reader)
 
         prep_cache: dict = {}
         g = empty_graph(self.capacity)
@@ -1065,7 +1044,6 @@ class TableCandidates:
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         input_clone_reads: dict[str, dict[str, CloneRead]] = {}
-        derived = self.factory.constraints
         # Consumer op name -> input clones for which it is the last reader, and so
         # may reuse the clone's LX slot in place (reverse-parent, #3212). Stays
         # empty unless cloning is on, making the reverse-parent block in the output
@@ -1075,10 +1053,6 @@ class TableCandidates:
             buffer_users = get_buffer_users(graph)
             for input_name in self._eligible_clone_inputs(graph, lifetimes):
                 consumers = [op for op in buffer_users.get(input_name, [])]
-                if not derived:
-                    # A clone edge is a pair table over menu indices.
-                    for consumer in consumers:
-                        self._materialize(divisions, consumer.get_name())
                 divs, matches, reads = self._clone_divisions_and_matches(
                     input_name, consumers, divisions, prep_cache
                 )
@@ -1109,7 +1083,7 @@ class TableCandidates:
                     start_override=lifetime_start_overrides.get(input_name),
                     end_override=lifetime_end_overrides.get(input_name),
                     sym_core_divs=sym_core_divs_for(input_name, divs),
-                    sym_tile_counts=sym_tile_counts_for(input_name, divs, None),
+                    sym_tile_counts=sym_tile_counts_for(input_name, divs),
                     open_split=True,
                 )
                 tables.menus[input_name] = tuple(divs)
@@ -1142,20 +1116,17 @@ class TableCandidates:
             residency_edges = self._parent_residency_edges(
                 op, parent_proj, op_by_name, prep_cache, residency_by_buf
             )
-            if derived:
-                # The strategy derives these edges' relation from their
-                # ResidencyEdge (an input clone's from its CloneRead); only
-                # loop-carry edges, whose table is overridden below, are
-                # materialized here.
-                carry_edge = carry_update_edges.get(output_name)
-                special = set(
-                    self._loop_carry_read_edges(op, carry_update_edges, prep_cache)
-                )
-                if carry_edge is not None:
-                    special.add(carry_edge.buf_name)
-                tabled = {p: e for p, e in residency_edges.items() if p in special}
-            else:
-                tabled = residency_edges
+            # The strategy derives these edges' relation from their
+            # ResidencyEdge (an input clone's from its CloneRead); only
+            # loop-carry edges, whose table is overridden below, are
+            # materialized here.
+            carry_edge = carry_update_edges.get(output_name)
+            special = set(
+                self._loop_carry_read_edges(op, carry_update_edges, prep_cache)
+            )
+            if carry_edge is not None:
+                special.add(carry_edge.buf_name)
+            tabled = {p: e for p, e in residency_edges.items() if p in special}
             cd_parent_matches = self._cd_parent_matches(
                 tabled, buf_divisions, divisions
             )
@@ -1245,7 +1216,7 @@ class TableCandidates:
                 if input_name not in input_clone_matches:
                     continue
                 read = input_clone_reads[input_name].get(output_name)
-                if derived and read is not None:
+                if read is not None:
                     clone_reads[input_name] = read
                 else:
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
@@ -1253,7 +1224,7 @@ class TableCandidates:
                     ]
             relayout_edges: dict[str, RelayoutEdge] = {}
             if (
-                self.factory.offers_relayouts
+                config.lx_planner_relayout
                 and not config.ktir_emitter
                 and op is not None
             ):
@@ -1306,15 +1277,6 @@ class TableCandidates:
                 ):
                     parents.append(clone_name)
 
-            division_space = None
-            if (
-                op is not None
-                and output_name in division_map.enumerated
-                and self.factory.generates_divisions
-            ):
-                division_space = self._division_space(
-                    op, readers_by_name.get(output_name, ())
-                )
             g.add_ir_node(
                 output_name,
                 nbytes=size,
@@ -1329,11 +1291,8 @@ class TableCandidates:
                 start_override=lifetime_start_overrides.get(output_name),
                 end_override=lifetime_end_overrides.get(output_name),
                 op=op,
-                space=division_space,
                 sym_core_divs=sym_core_divs_for(output_name, buf_divisions),
-                sym_tile_counts=sym_tile_counts_for(
-                    output_name, buf_divisions, division_space
-                ),
+                sym_tile_counts=sym_tile_counts_for(output_name, buf_divisions),
                 open_split=bool(buf_divisions),
             )
             if buf_divisions:
@@ -1353,10 +1312,6 @@ class TableCandidates:
                     tables.lazy_spaces[output_name] = space
                 if output_name in self.point_menus:
                     tables.point_menus.add(output_name)
-            if self.factory.applies_tilings and isinstance(op, ComputedBuffer):
-                tile_reads = self._tile_reads(graph, op, op_by_name)
-                if tile_reads:
-                    tables.tile_reads[output_name] = tile_reads
         for name, parent_proj, in_place_parents in node_reads:
             g.add_reads(g.nodes[name], parent_proj, in_place_parents)
             tables.parents[name] = [
@@ -1366,21 +1321,6 @@ class TableCandidates:
             ]
         g.link_execution_order()
         return g, tables
-
-    @staticmethod
-    def _tile_reads(
-        graph: GraphLowering, op: ComputedBuffer, op_by_name: dict[str, Operation]
-    ) -> dict[str, "TileReads"]:
-        """``CoreDivisionBuffer.tile_reads`` for ``op``: one per computed
-        buffer it reads."""
-        # Local import: ``coarse_tiling`` imports this module.
-        from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
-
-        return {
-            name: TileReads(graph, producer, op)
-            for name in sorted({read.name for read in op.get_read_writes().reads})
-            if isinstance(producer := op_by_name.get(name), ComputedBuffer)
-        }
 
     @staticmethod
     def _loop_carry_update_edge(
@@ -1472,27 +1412,6 @@ class TableCandidates:
                 prep_cache=prep_cache,
             )
         return edges
-
-    def _division_space(
-        self, op: Operation, readers: Sequence[ComputedBuffer] = ()
-    ) -> Optional[OpSplitSpace]:
-        """The op's split space; ``readers`` are the ops reading its output.
-
-        The tiling half is attached only for the solver that can use it (see
-        ``EnumerationFactory.applies_tilings``): deriving it costs a stick-alignment
-        analysis per output dim, so an engine that would ignore the answer does
-        not pay for it.
-        """
-        # Local: enumerate_tilings imports scratchpad.coarse_tiling, which
-        # imports this module.
-        from torch_spyre._inductor.wsr.enumerate_tilings import build_tiling_space
-
-        tiling = (
-            build_tiling_space(op, readers=readers)
-            if self.factory.applies_tilings
-            else None
-        )
-        return build_op_split_space(op, config.sencores, tiling=tiling)
 
     def _eligible_clone_inputs(
         self, graph: GraphLowering, lifetimes: dict[str, list[int]]

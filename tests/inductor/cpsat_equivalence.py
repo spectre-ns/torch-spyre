@@ -14,7 +14,7 @@
 
 """Equivalence harness for refactors of the CP-SAT layout solver.
 
-Records, for every ``ModelSolver`` solve, the model proto and outcome of
+Records, for every ``SpyreOptimizationGraph.solve``, the model proto and outcome of
 each ladder stage plus the decisions read off the solved graph, then diffs
 two recordings. A refactor that claims "identical CP model" must produce an
 empty diff.
@@ -45,6 +45,7 @@ Three ways to record:
 from __future__ import annotations
 
 import copy
+import dataclasses
 import difflib
 import gzip
 import hashlib
@@ -147,45 +148,53 @@ class _Recorder:
 _RECORDER: Optional[_Recorder] = None
 
 
+def _record_stage(solver, model, *, objective: bool = False) -> int:
+    """``SolveSettings.record``: solve one ladder stage deterministically and
+    record it."""
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = 0
+    solver.parameters.max_time_in_seconds = 1e9
+    solver.parameters.max_deterministic_time = _DTIME
+    status = solver.Solve(model)
+    if _RECORDER is not None:
+        _RECORDER.stage(solver, model, status, objective)
+    return status
+
+
 def install(out: str | Path) -> _Recorder:
-    """Patch ``ModelSolver`` so every solve is recorded under ``out``."""
+    """Patch ``SpyreOptimizationGraph.solve`` so every solve is recorded under
+    ``out``, each ladder stage through ``SolveSettings.record``."""
     global _RECORDER
-    from torch_spyre._inductor.scratchpad import ilp_solver_ortools as mod
+    from torch_spyre._inductor.scratchpad.buffer_graph import SpyreOptimizationGraph
 
     _RECORDER = _Recorder(Path(out))
-    engine = mod.ModelSolver
-    if getattr(engine, "_cpsat_equiv_installed", False):
+    if getattr(SpyreOptimizationGraph, "_cpsat_equiv_installed", False):
         return _RECORDER
-    orig_record = engine._solve_and_record
+    orig_solve = SpyreOptimizationGraph.solve
 
-    def _solve_and_record(self, solver, model, *, objective=False):
-        solver.parameters.num_search_workers = 1
-        solver.parameters.random_seed = 0
-        solver.parameters.max_time_in_seconds = 1e9
-        solver.parameters.max_deterministic_time = _DTIME
-        status = orig_record(self, solver, model, objective=objective)
-        if _RECORDER is not None:
-            _RECORDER.stage(solver, model, status, objective)
-        return status
+    def solve(self, model=None, cost_expr=None, strategy=None):
+        from torch_spyre._inductor.scratchpad.encoding_strategy import (
+            CandidateTables,
+        )
+        from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
-    orig_solve = engine.solve
-
-    def solve(self, graph, strategy, cost_expr=None):
+        if strategy is None:
+            strategy = LazyStrategy.from_tables(CandidateTables())
+        self.settings = dataclasses.replace(self.settings, record=_record_stage)
         rec = _RECORDER
         if rec is None or rec.stages is not None:
-            return orig_solve(self, graph, strategy, cost_expr)
+            return orig_solve(self, model, cost_expr, strategy)
         rec.stages = []
         try:
-            plan = orig_solve(self, graph, strategy, cost_expr)
+            plan = orig_solve(self, model, cost_expr, strategy)
         except Exception as exc:
-            rec.finish_graph(graph, strategy, f"{type(exc).__name__}: {exc}")
+            rec.finish_graph(self, strategy, f"{type(exc).__name__}: {exc}")
             raise
-        rec.finish_graph(graph, strategy, None)
+        rec.finish_graph(self, strategy, None)
         return plan
 
-    engine._solve_and_record = _solve_and_record
-    engine.solve = solve
-    engine._cpsat_equiv_installed = True
+    SpyreOptimizationGraph.solve = solve
+    SpyreOptimizationGraph._cpsat_equiv_installed = True
     return _RECORDER
 
 
@@ -291,12 +300,12 @@ def pytest_runtest_setup(item) -> None:
 def _solve(case: str, buffers, limit: int, alignment: int, cost_expr) -> None:
     """Solve the graph of ``buffers``; a buffer with no candidate divisions is
     committed, so its node is placement-only."""
-    from torch_spyre._inductor.scratchpad.buffer_graph import build_graph, empty_graph
-    from torch_spyre._inductor.scratchpad.encoding_strategy import (
-        CandidateTables,
-        EnumerationFactory,
+    from torch_spyre._inductor.scratchpad.buffer_graph import (
+        SolveSettings,
+        build_graph,
     )
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
+    from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
+    from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 
     assert _RECORDER is not None
     _RECORDER.begin_case(case)
@@ -305,13 +314,12 @@ def _solve(case: str, buffers, limit: int, alignment: int, cost_expr) -> None:
         buffers,
         alignment,
         limit // alignment,
-        empty_graph(limit, alignment).settings,
+        SolveSettings(time_limit_seconds=0, record=_record_stage),
         {b.name: b.residency_reason for b in buffers if b.residency_reason},
     )
-    tables = CandidateTables.of_buffers(buffers)
-    strategy = EnumerationFactory().strategy_from_tables(tables)
+    strategy = LazyStrategy.from_tables(CandidateTables.of_buffers(buffers))
     try:
-        ModelSolver(limit, time_limit_seconds=0).solve(graph, strategy, cost_expr)
+        graph.solve(cost_expr=cost_expr, strategy=strategy)
     except Exception as exc:  # recorded by the patch; keep replaying
         print(f"  {case}: {type(exc).__name__}: {exc}", flush=True)
 

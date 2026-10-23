@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What ``SpyreOptimizationGraph.solve`` runs on: the ``Decomposed`` backend
-and the graph solvers. Device-free."""
+"""The ``Decomposed`` backend ``SpyreOptimizationGraph.solve`` can run on.
+Device-free."""
 
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ from torch_spyre._inductor.scratchpad.encoding_strategy import (  # noqa: E402
 from torch_spyre._inductor.scratchpad.plan_solver import (  # noqa: E402
     CoreDivision,
     CoreDivisionBuffer,
-    LifetimeBoundBuffer,
 )
 
 
@@ -75,8 +74,7 @@ def test_decomposed_reaches_the_cpsat_optimum():
     for backend in (CpSat, Decomposed):
         buffers = _menu_buffers()
         graph = build_graph(buffers, 128, 48, _settings())
-        graph.set_solver(backend)
-        graph.solve(None, None, TableStrategy.from_buffers(buffers))
+        graph.solve(model=backend(), strategy=TableStrategy.from_buffers(buffers))
         results[backend.__name__] = _spilled_bytes(graph)
     assert results["Decomposed"] == results["CpSat"]
 
@@ -88,17 +86,3 @@ def test_decomposed_refuses_too_many_leaves():
     graph = build_graph(buffers, 128, 48, _settings())
     with pytest.raises(TooBig):
         graph.solve(Decomposed(max_leaves=2), None, TableStrategy.from_buffers(buffers))
-
-
-def test_a_graph_solver_that_refuses_the_strategy_is_not_run():
-    class Refuses:
-        def accepts(self, strategy):
-            return False
-
-        def solve(self, graph, strategy, cost_expr):
-            raise AssertionError("not reached")
-
-    graph = build_graph([LifetimeBoundBuffer("x", 128, [0, 1])], 128, 16, _settings())
-    graph.set_solver(Refuses())
-    with pytest.raises(ValueError, match="cannot solve"):
-        graph.solve()

@@ -15,14 +15,9 @@
 """Tests for layout solvers"""
 
 import itertools
-import json
 import math
-import os
-import subprocess
-import sys
 import types
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Optional
@@ -42,13 +37,12 @@ from torch_spyre._inductor.scratchpad.drain_plans import (
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.scratchpad.buffer_graph import (
     SOLVER_CHOSE_SPILL,
+    SpyreOptimizationGraph,
     build_graph,
     empty_graph,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import (
-    CandidateTables,
-    EnumerationFactory,
-)
+from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
+from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
@@ -56,6 +50,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     TileAxis,
     TileSpec,
+    _check_in_place_relationships,
     solved_bindings,
 )
 
@@ -68,7 +63,6 @@ try:
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
     )
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
     _HAS_ORTOOLS = True
 except ImportError:
@@ -77,12 +71,6 @@ except ImportError:
     _SympyExprToCpSat = None  # type: ignore[assignment,misc]
     _HAS_ORTOOLS = False
 
-from torch_spyre._inductor.scratchpad.first_fit import (
-    FirstFitLayoutSolver,
-    _check_in_place_relationships,
-    _topological_sort,
-)
-
 LARGE_SIZE = 512
 SMALL_SIZE = 10
 ALIGNMENT = 128
@@ -90,9 +78,9 @@ ALIGNMENT = 128
 
 def _cpsat_solved(
     buffers, size, alignment=1, cost_expr=None
-) -> tuple[SolvedPlan, ModelSolver]:
+) -> tuple[SolvedPlan, SpyreOptimizationGraph]:
     """CP-SAT's plan for ``buffers`` over ``size`` bytes of LX, and the
-    solver that made it."""
+    graph that was solved."""
     graph = build_graph(
         buffers,
         alignment,
@@ -101,10 +89,8 @@ def _cpsat_solved(
         {b.name: b.residency_reason for b in buffers if b.residency_reason},
     )
     tables = CandidateTables.of_buffers(buffers)
-    strategy = EnumerationFactory().strategy_from_tables(tables)
-    solver = ModelSolver(size)
-    nodes = solver.solve(graph, strategy, cost_expr)
-    return SolvedPlan(nodes, tables, alignment), solver
+    nodes = graph.solve(cost_expr=cost_expr, strategy=LazyStrategy.from_tables(tables))
+    return SolvedPlan(nodes, tables, alignment), graph
 
 
 def _cpsat_plan(buffers, size, alignment=1, cost_expr=None) -> SolvedPlan:
@@ -187,9 +173,7 @@ class TestAllocatorSpillReasons(TestCase):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
         spilled = {n.name for n in allocation.nodes if not n.resident}
         self.assertEqual(len(spilled - {"barred"}), 1)
-        reasons = ScratchpadAllocator(ModelSolver(128), 128)._get_spill_reasons(
-            allocation
-        )
+        reasons = ScratchpadAllocator(128)._get_spill_reasons(allocation)
         self.assertEqual(set(reasons), spilled)
         self.assertEqual(reasons["barred"], "op not allowed")
         (capacity_spill,) = spilled - {"barred"}
@@ -197,10 +181,10 @@ class TestAllocatorSpillReasons(TestCase):
 
     def test_open_allocator_reports_as_committed_does(self):
         allocation = self._solve(LifetimeBoundBuffer("late", 128, [1, 2]))
-        joint = ScratchpadAllocator(ModelSolver(128), 128, division_mode="open")
+        joint = ScratchpadAllocator(128, division_mode="open")
         self.assertEqual(
             joint._get_spill_reasons(allocation),
-            ScratchpadAllocator(ModelSolver(128), 128)._get_spill_reasons(allocation),
+            ScratchpadAllocator(128)._get_spill_reasons(allocation),
         )
 
 
@@ -312,28 +296,6 @@ class TestDrainLifetimeBoundary(TestCase):
             LifetimeBoundBuffer("bad", 100, [0, 9], lifetime_end_override=9)
 
 
-def _two_gap_buffers():
-    """Buffers that leave two free gaps for x in a 120-byte scratchpad.
-
-    Processing order by ascending lifetime: b_mid(2), b_left(4), b_right(5), x(5).
-    b_right and x tie on lifetime; stable sort keeps b_right first.
-
-    Placements: b_mid@0, b_left@40, b_right@70.
-    b_mid lives [2,4) and x lives [4,9) — they do not overlap, so b_mid's
-    address range (0,40) is not subtracted from x's gaps. After removing
-    b_left(40,70) and b_right(70,100), x sees two gaps:
-      (0,40)   waste = 30
-      (100,120) waste = 10
-    FirstFit picks (0,40) → addr=0, not the tighter (100,120).
-    """
-    return [
-        LifetimeBoundBuffer("b_mid", 40, [2, 3]),
-        LifetimeBoundBuffer("b_left", 30, [1, 4]),
-        LifetimeBoundBuffer("b_right", 30, [3, 7]),
-        LifetimeBoundBuffer("x", 10, [4, 8]),
-    ]
-
-
 def _divs():
     # Two valid loop divisions: split output stride-256 axis four ways
     # (per-core footprint = total / 4), or keep the buffer whole.
@@ -429,12 +391,10 @@ def _assert_legal_layout(test, result, size, alignment):
 
 
 class BaseLayoutSolverTests:
-    solver_class: type[FirstFitLayoutSolver] = None  # type: ignore[assignment]
-
     def make_buffer(self, name, size, uses, **kwargs):
         """Build the buffer flavour the solver under test consumes.
 
-        The placement-only solves (first-fit, CP-SAT on undivided buffers) read
+        The placement-only solve (CP-SAT on undivided buffers) reads
         only the fields on :class:`LifetimeBoundBuffer`, so the base suite constructs
         those. :class:`JointDivisionSolverTests` overrides this to emit
         :class:`CoreDivisionBuffer`s carrying whole-buffer divisions, since the
@@ -443,29 +403,12 @@ class BaseLayoutSolverTests:
         return LifetimeBoundBuffer(name, size, uses, **kwargs)
 
     def solve(self, buffers, size=LARGE_SIZE, alignment=1):
-        self.last_solver = self.solver_class(buffers, size, alignment)
-        result = self.last_solver.plan_layout()
-        # Checked here, not in check_result: several tests call solve() directly
-        # and assert addresses themselves, and legality holds for those too.
-        _assert_legal_layout(self, result, size, alignment)
-        return result
+        """Solve ``buffers`` and check the layout is legal (every subclass
+        checks legality here, since several tests assert addresses directly)."""
+        raise NotImplementedError
 
     def check_result(self, result, expected_addresses, size, alignment):
-        """Assert the solved layout matches the heuristic-solver expectation.
-
-        :class:`JointDivisionSolverTests` overrides this: the joint solver is a
-        satisfiability search, so it returns a *valid* packing rather than the
-        specific addresses a gap heuristic picks, and it may evict a different
-        buffer when capacity forces a spill. There the check is an invariant
-        (no live overlap, within capacity, aligned) plus "places at least as
-        many buffers as the heuristic", which holds because the solver minimises
-        HBM transfers.
-        """
-        result_addresses = [p.address for p in result]
-        if isinstance(expected_addresses, set):
-            self.assertIn(tuple(result_addresses), expected_addresses)
-        else:
-            self.assertEqual(result_addresses, expected_addresses)
+        _assert_legal_packing(self, result, expected_addresses, size, alignment)
 
     def verify_layout(
         self,
@@ -527,11 +470,7 @@ class BaseLayoutSolverTests:
         # hand over, so every solver must reject it rather than place the child
         # over data nothing consumes.
         #
-        # The two solver families check this at different points -- the gap-based
-        # and ILP solvers in ``_check_in_place_relationships``, the
-        # permutation-based ones (which simulated annealing drives) in
-        # ``_compute_inplace_partners`` -- and they share no base class, so
-        # running one case against all of them is what pins the coverage.
+        # ``build_graph`` checks this in ``_check_in_place_relationships``.
         # Matched on the message: ``solve`` also checks layout legality, and a
         # bare ``assertRaises`` would accept that unrelated failure as a pass.
         parent = self.make_buffer("parent", 40, [0])
@@ -910,169 +849,16 @@ class BaseLayoutSolverTests:
             _check_in_place_relationships([p, c])
 
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-_DETERMINISM_SNIPPET_TEMPLATE = """
-import json
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from {solver_module} import {solver_class}
-def b(n, s, st, en, ipp=None):
-    uses = [st] if en - 1 == st else [st, en - 1]
-    return LifetimeBoundBuffer(name=n, size=s, uses=uses, in_place_parents=ipp or [])
-# c has two in-place parents at distinct addresses, both in-place candidates for
-# its gap -> _build_gaps' iteration order decides in_place_parents[0].
-bufs = [b("pA", 100, 0, 3), b("pB", 80, 1, 3), b("c", 50, 2, 5, ["pA", "pB"])]
-{solver_class}(bufs, 10_000, 1).plan_layout()
-print("RESULT " + json.dumps({{x.name: x.address for x in bufs}}))
-"""
-
-
-_DETERMINISM_HASHSEEDS = range(5)
-
-
-def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
-    env = dict(
-        os.environ,
-        PYTHONHASHSEED=str(hashseed),
-        TORCH_DEVICE_BACKEND_AUTOLOAD="0",
-    )
-    snippet = _DETERMINISM_SNIPPET_TEMPLATE.format(
-        solver_class=solver_class_name, solver_module=solver_module
-    )
-    p = subprocess.run(
-        [sys.executable, "-c", snippet],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=_REPO_ROOT,
-        timeout=120,
-    )
-    assert p.returncode == 0, p.stderr
-    line = next(ln for ln in p.stdout.splitlines() if ln.startswith("RESULT "))
-    return json.loads(line[len("RESULT ") :])
-
-
-def _run_determinism_snippets(solver_class_name, solver_module):
-    """Run the snippet once per hash seed, all subprocesses concurrently.
-
-    Each subprocess pays ~6s importing torch and the Inductor stack (the
-    snippet imports ``torch_spyre._inductor``, whose ``__init__`` pulls in
-    ``torch._inductor.graph``), so running them sequentially costs that import
-    once per seed. The work is entirely inside ``subprocess.run``, so threads
-    release the GIL and wall time collapses to roughly a single import.
-    Returns the results in seed order.
-    """
-    with ThreadPoolExecutor(max_workers=len(_DETERMINISM_HASHSEEDS)) as pool:
-        return list(
-            pool.map(
-                lambda seed: _run_determinism_snippet(
-                    seed, solver_class_name, solver_module
-                ),
-                _DETERMINISM_HASHSEEDS,
-            )
-        )
-
-
-class ScoreOrderingTests:
-    """Tests for the priority-score ordering in FirstFit, plus a
-    cross-process determinism check for in-place parent selection.
-
-    Buffers are placed in ascending order of ``(span - discount) / len(uses)``
-    (lower = placed first), where ``discount`` is 0.25 per in-place
-    relationship. These tests isolate the two terms the old
-    shortest-lifetime-first heuristic ignored: ``len(uses)`` and the in-place
-    discount, plus a regression check that in-place parent selection does not
-    depend on ``PYTHONHASHSEED`` (the SA co-optimizer seeds its permutation
-    from this layout, so the seed would vary with it).
-    """
-
-    def test_higher_use_count_placed_first(self):
-        # Two buffers with the same span (5) fully overlap and contend for the
-        # single slot that fits one of them. Score is span / len(uses), so the
-        # buffer with more uses scores lower and is placed first, winning the
-        # slot — regardless of input order. The old span-only tiebreak would
-        # tie (both span 5) and keep input order, pinning `few` instead.
-        many = LifetimeBoundBuffer("many", 10, [0, 1, 2, 3, 4])  # 5 / 5 = 1.0
-        few = LifetimeBoundBuffer("few", 10, [0, 4])  # 5 / 2 = 2.5
-        # `few` first in input order, to prove ordering is by score not input.
-        result = self.solve([few, many], size=10)
-        by_name = {b.name: b.address for b in result}
-        self.assertEqual(by_name["many"], 0)
-        self.assertIsNone(by_name["few"])
-
-    def test_inplace_discount_raises_priority(self):
-        # `plain` and `parent` have identical span (5) and use count (2), so
-        # their base scores tie at 2.5. `parent` is an in-place parent of
-        # `child`, earning a 0.25 discount → score (5 - 0.25) / 2 = 2.375 <
-        # 2.5, so it is placed first and wins the single contested slot. The
-        # old heuristic would tie and keep input order, pinning `plain`.
-        plain = LifetimeBoundBuffer("plain", 10, [0, 4])  # 5 / 2 = 2.5
-        parent = LifetimeBoundBuffer("parent", 10, [0, 4])  # (5 - 0.25) / 2
-        child = LifetimeBoundBuffer("child", 10, [4, 8], in_place_parents=["parent"])
-        # `plain` first in input order; without the discount the tie would
-        # keep input order and pin `plain`.
-        result = self.solve([plain, parent, child], size=10)
-        by_name = {b.name: b.address for b in result}
-        self.assertEqual(by_name["parent"], 0)
-        self.assertEqual(by_name["child"], 0)  # child reuses parent's slot
-        self.assertIsNone(by_name["plain"])
-
-    def test_failed_inplace_reuse_does_not_overlap_live_parent(self):
-        parent = LifetimeBoundBuffer("parent", 20, [0, 4])
-        blocker = LifetimeBoundBuffer("blocker", 5, [5, 8])
-        child = LifetimeBoundBuffer("child", 10, [4, 8], in_place_parents=["parent"])
-
-        result = self.solve([parent, blocker, child], size=30)
-        by_name = {buffer.name: buffer.address for buffer in result}
-
-        self.assertEqual(by_name["parent"], 0)
-        self.assertEqual(by_name["blocker"], 0)
-        self.assertEqual(by_name["child"], 20)
-
-    def test_write_first_buffer_placed_before_read_only(self):
-        # Identical span (5) and use count (2). `writer`'s first use is a write
-        # (first_use_is_read=False), so pinning it also saves the more expensive
-        # first write to HBM; its use count is inflated by 0.5, giving score
-        # 5 / 2.5 = 2.0 vs `reader`'s 5 / 2.0 = 2.5. `writer` is placed first and
-        # wins the single contested slot. Without the write bonus the scores tie
-        # and input order would pin `reader`.
-        reader = LifetimeBoundBuffer("reader", 10, [0, 4], first_use_is_read=True)
-        writer = LifetimeBoundBuffer("writer", 10, [0, 4], first_use_is_read=False)
-        # `reader` first in input order, to prove ordering is by score not input.
-        result = self.solve([reader, writer], size=10)
-        by_name = {b.name: b.address for b in result}
-        self.assertEqual(by_name["writer"], 0)
-        self.assertIsNone(by_name["reader"])
-
-    def test_inplace_parent_choice_is_hashseed_independent(self):
-        """Placement must not depend on PYTHONHASHSEED (set-iteration order)."""
-        results = _run_determinism_snippets(
-            self.solver_class.__name__, self.solver_class.__module__
-        )
-        base = results[0]
-        for hashseed, result in zip(_DETERMINISM_HASHSEEDS, results):
-            self.assertEqual(result, base, f"PYTHONHASHSEED={hashseed}")
-
-
-class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
-    solver_class = FirstFitLayoutSolver
-
-    def test_picks_first_gap_not_tightest(self):
-        result = self.solver_class(_two_gap_buffers(), 120, 1).plan_layout()
-        x_addr = next(b.address for b in result if b.name == "x")
-        self.assertEqual(x_addr, 0)
-
-
 def _assert_legal_packing(test, result, expected_addresses, size, alignment):
     """Assert a CP-SAT layout is *valid* rather than address-for-address equal to
-    the gap heuristics' answer.
+    the gap-heuristic answer the test lists.
 
     The solver is a satisfiability search, so it returns some legal packing, not
-    the specific addresses first-fit picks. Shared by both CP-SAT entry
-    points: the joint suite and the placement-only suite check the same
-    invariants (aligned, within capacity, no overlap between live buffers) plus
-    "places at least as many buffers as the heuristic", which holds because the
-    solver minimises HBM traffic.
+    those specific addresses. Shared by both CP-SAT entry points: the joint
+    suite and the placement-only suite check the same invariants (aligned,
+    within capacity, no overlap between live buffers) plus "places at least as
+    many buffers as the listed answer", which holds because the solver
+    minimises HBM traffic.
     """
     placed = [b for b in result if b.address is not None]
     # Aligned, within capacity, and no address shared between buffers live at a
@@ -1104,7 +890,7 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
     from scratchpad, and the solver returns *a* valid packing rather than the
     specific addresses a gap heuristic picks. The overrides below bridge the
     gap -- ``make_buffer`` emits division-carrying buffers, ``solve`` attaches a
-    synthetic sink so the base buffers are residency-eligible, and
+    synthetic sink so the base buffers are residency-eligible, and the base
     ``check_result`` validates the packing is legal and at least as full as the
     heuristic rather than asserting exact addresses.
     """
@@ -1153,9 +939,6 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         result = _cpsat_solve(buffers + [sink], size, alignment)[:-1]
         _assert_legal_layout(self, result, size, alignment)
         return result
-
-    def check_result(self, result, expected_addresses, size, alignment):
-        _assert_legal_packing(self, result, expected_addresses, size, alignment)
 
     def test_layout_with_inplace(self):
         # A producer->consumer chain (A->B->...->TERMINAL) gives every buffer a
@@ -1670,7 +1453,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 @unittest.skipUnless(_HAS_ORTOOLS, "division gate tests need ortools")
 class TestCpSatDivisionGate(TestCase):
     def test_gate_preserves_exact_allowed_assignments(self):
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import _gate_divisions
+        from torch_spyre._inductor.scratchpad.encoding_strategy import _gate_divisions
 
         class Solutions(cp_model.CpSolverSolutionCallback):
             def __init__(self, variables):
@@ -2389,8 +2172,8 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
     need no synthetic sink; the allocator's ``residency_reason`` bars still
     apply on both paths. ``make_buffer`` is inherited from
     :class:`BaseLayoutSolverTests`, so every shared test below runs against
-    plain buffers; only ``check_result`` is relaxed, because CP-SAT returns a
-    valid packing rather than the gap heuristics' exact addresses.
+    plain buffers, and the base ``check_result`` accepts any valid packing
+    rather than the gap heuristics' exact addresses.
     """
 
     def solve(self, buffers, size=LARGE_SIZE, alignment=1):
@@ -2403,9 +2186,6 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
         result = _cpsat_solve(buffers, size, alignment)
         _assert_legal_layout(self, result, size, alignment)
         return result
-
-    def check_result(self, result, expected_addresses, size, alignment):
-        _assert_legal_packing(self, result, expected_addresses, size, alignment)
 
     def test_consumerless_buffer_still_resides(self):
         # The joint path force-spills a buffer no one reads from LX (the slicing
@@ -2466,7 +2246,7 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
 class SolveStatsTest(TestCase):
-    """``ModelSolver.last_solve_stats``: what the solve cost and returned.
+    """``SpyreOptimizationGraph.solve_stats``: what the solve cost and returned.
 
     Nothing else in the pipeline records this, and the cost-expression dump
     reports it as the provenance of the plan it describes -- so a reader can
@@ -2483,14 +2263,14 @@ class SolveStatsTest(TestCase):
 
     def test_nothing_is_recorded_before_a_solve(self):
         """Empty, so a reader distinguishes "not recorded" from "no solve"."""
-        self.assertEqual(ModelSolver(1 << 20).last_solve_stats, {})
+        self.assertEqual(empty_graph(1 << 20).solve_stats, {})
 
     def test_an_objective_solve_is_recorded_as_one(self):
         bufs = self._bufs()
-        _, solver = _cpsat_solved(
+        _, graph = _cpsat_solved(
             bufs, 1 << 20, ALIGNMENT, cost_expr=4000 * (1 - bufs[0].sym_is_lx)
         )
-        stats = solver.last_solve_stats
+        stats = graph.solve_stats
         self.assertEqual(stats["status"], "OPTIMAL")
         self.assertTrue(stats["objective_used"])
         self.assertGreater(stats["variables"], 0)
@@ -2500,8 +2280,8 @@ class SolveStatsTest(TestCase):
         """``_run`` solves in its own occupancy passes when no objective status
         comes back. Recording only the objective solve would leave those plans
         described by an earlier call's numbers."""
-        _, solver = _cpsat_solved(self._bufs(), 1 << 20, ALIGNMENT)
-        stats = solver.last_solve_stats
+        _, graph = _cpsat_solved(self._bufs(), 1 << 20, ALIGNMENT)
+        stats = graph.solve_stats
         self.assertEqual(stats["status"], "OPTIMAL")
         self.assertFalse(stats["objective_used"], "no objective was minimized")
 
@@ -2512,8 +2292,8 @@ class SolveStatsTest(TestCase):
         bufs = self._bufs()
         unlowerable = sympy.Function("NoSuchNode")(bufs[0].sym_is_lx)
         with config.patch({"_cpsat_warn_on_cost_expr": True}):
-            _, solver = _cpsat_solved(bufs, 1 << 20, ALIGNMENT, cost_expr=unlowerable)
-        self.assertFalse(solver.last_solve_stats["objective_used"])
+            _, graph = _cpsat_solved(bufs, 1 << 20, ALIGNMENT, cost_expr=unlowerable)
+        self.assertFalse(graph.solve_stats["objective_used"])
 
 
 class TestCpSatUnallocatedReads(TestCase):
@@ -2586,64 +2366,6 @@ class TestCpSatUnallocatedReads(TestCase):
             ]
         )
         self.assertNotIn("b0", pinned)
-
-
-class TestTopologicalSort(TestCase):
-    """Tests for the Kahn's-algorithm sort that orders in-place chains.
-
-    These call the module-level helper directly with arbitrary lifetimes/sizes;
-    the in-place invariants enforced elsewhere (parent.end_time ==
-    child.start_time + 1, child.size <= parent.size) are not required here,
-    since _topological_sort only consumes in_place_parents for edges.
-    """
-
-    @staticmethod
-    def _names(buffers, f):
-        return [b.name for b in _topological_sort(buffers, f)]
-
-    def test_multi_level_chain_orders_parents_before_children(self):
-        # A 3-level in-place chain gp -> p -> c. Each level has exactly one
-        # ready node at a time, so topology alone fixes the order regardless of
-        # the tie-break key or input order.
-        gp = LifetimeBoundBuffer("gp", 100, [0, 1])
-        p = LifetimeBoundBuffer("p", 100, [2, 3], in_place_parents=["gp"])
-        c = LifetimeBoundBuffer("c", 100, [4, 5], in_place_parents=["p"])
-        # Pass the inputs out of order to prove the result is driven by the
-        # in-place edges, not the input order.
-        self.assertEqual(self._names([c, p, gp], lambda b: 0), ["gp", "p", "c"])
-
-    def test_tie_break_key_applied_below_the_root_frontier(self):
-        # Regression test for the bug where the `f` tie-break was applied only
-        # to the initial (root) frontier; nodes unlocked deeper in the sort
-        # fell back to a hardcoded lifetime key.
-        #
-        # Chain root -> mid -> {a, b}. After root and mid are popped, a and b
-        # become ready at the SAME step (third level), so their relative order
-        # is decided purely by the tie-break key.
-        #
-        # f sorts ascending by size, so the smaller buffer `a` must come first.
-        # `a` deliberately has the LONGER lifetime, so the old lifetime-keyed
-        # tie-break would (incorrectly) emit `b` before `a`.
-        root = LifetimeBoundBuffer("root", 100, [0])
-        mid = LifetimeBoundBuffer("mid", 100, [1], in_place_parents=["root"])
-        a = LifetimeBoundBuffer(
-            "a", 1, [2, 101], in_place_parents=["mid"]
-        )  # size 1, lifetime 100
-        b = LifetimeBoundBuffer(
-            "b", 100, [2], in_place_parents=["mid"]
-        )  # size 100, lifetime 1
-
-        self.assertEqual(
-            self._names([root, mid, a, b], lambda buf: buf.size),
-            ["root", "mid", "a", "b"],
-        )
-
-        # Reversing the key flips a and b, confirming the key — not lifetime or
-        # input order — drives the deep tie-break.
-        self.assertEqual(
-            self._names([root, mid, a, b], lambda buf: -buf.size),
-            ["root", "mid", "b", "a"],
-        )
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat inv-scale tests need ortools")

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 import itertools
@@ -25,9 +25,7 @@ from enum import Enum
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.pass_utils import PerCoreView
-    from torch_spyre._inductor.scratchpad.coarse_tiling import TileReads
     from torch_spyre._inductor.work_division import (
-        OpSplitSpace,
         ResidencyEdge,
     )
     from torch_spyre._inductor.scratchpad.lx_relayout import (
@@ -335,23 +333,6 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # constructs the division on the other end of an edge by inverting the view.
     # Empty where the allocator has not built them (they need the live ops).
     residency_edges: dict[str, "ResidencyEdge"] = field(default_factory=dict)
-    # This buffer's producing op's legal divisions as a space to move in --
-    # ``core_divisions`` without materializing it. ``None`` where the allocator
-    # built none (see ``allocator._DivisionMap``).
-    division_space: Optional["OpSplitSpace"] = None
-    # Index of this buffer's producing operation in ``graph.operations``, which
-    # is what a coarse-tiling *run* is measured over: a group has to occupy one
-    # contiguous stretch of that list, and buffer order is not operation order
-    # (input clones are prepended, and an operation producing no solver buffer
-    # has no index at all). ``None`` where there is no producing operation -- an
-    # input clone -- or where the caller does not supply one, which is what a
-    # solver reads as "operation order is unknown here, so no tiling may span
-    # more than nothing".
-    op_position: Optional[int] = None
-    # Parent name -> whether this buffer's op reads that computed parent tile
-    # by tile under a pair of specs; a pair it does not breaks a run there
-    # (``derive_tiling_groups``). Filled only where the solver chooses tilings.
-    tile_reads: dict[str, "TileReads"] = field(default_factory=dict)
     chosen_division: Optional[int] = None
     # Solver-chosen relayouts feeding this consumer: parent_buf_name -> the
     # fired candidate with the destination address (bytes) of the group's copy.
@@ -402,7 +383,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     @property
     def sym_tile_counts(self) -> dict[tuple[int, bool], sympy.Symbol]:
         """See :func:`sym_tile_counts_for`."""
-        return sym_tile_counts_for(self.name, self.core_divisions, self.division_space)
+        return sym_tile_counts_for(self.name, self.core_divisions)
 
 
 def sym_core_divs_for(
@@ -420,7 +401,7 @@ def sym_core_divs_for(
 
 
 def sym_tile_counts_for(
-    name: str, divisions: Sequence[CoreDivision], space: Optional["OpSplitSpace"]
+    name: str, divisions: Sequence[CoreDivision]
 ) -> dict[tuple[int, bool], sympy.Symbol]:
     """Symbolic stand-in for a chosen ``tiling``, the coarse-tiling sibling
     of :func:`sym_core_divs_for`: one symbol per tiled axis (a ``(host_dim,
@@ -428,18 +409,12 @@ def sym_tile_counts_for(
     candidate's count on the axis, 1 where it leaves the axis untiled. Keyed on
     the axis rather than the nesting level, so the symbols do not depend on how
     a candidate orders its levels -- the cost of a nest (a product of per-level
-    trip counts) does not either. Empty while no candidate is tiled.
-
-    The SA co-optimizer generates its tilings from the op's split ``space``
-    instead of listing them as candidates, so every output dim that space may
-    tile is declared too."""
+    trip counts) does not either. Empty while no candidate is tiled."""
     keys = dict.fromkeys(
         (axis.host_dim, axis.is_reduction)
         for cd in divisions
         for axis in cd.tiling.axes
     )
-    if space is not None and space.tiling is not None:
-        keys.update(dict.fromkeys((dim, False) for dim in space.tiling.output_dims))
     return {
         (dim, is_red): sympy.Symbol(
             f"tile_{name}_{'r' if is_red else 'o'}{dim}",
@@ -495,8 +470,6 @@ def cost_expr_record(
     bundle_terms: Sequence[tuple[list[str], sympy.Expr]],
     buffers: Sequence["LifetimeBoundBuffer"],
     params: object = None,
-    off_expression_ns: Mapping[str, float] | None = None,
-    score_ns: float | None = None,
     *,
     context: dict | None = None,
 ) -> dict:
@@ -505,12 +478,6 @@ def cost_expr_record(
     ``parse_expr`` restores them), the solved symbol bindings, and every term
     evaluated under them. ``buffers`` are the solver's returned buffers;
     ``buffers`` names (the graph's stores) are what a reader joins on.
-
-    ``objective_ns`` is ``cost_expr`` alone. ``off_expression_ns`` is what the
-    engine adds outside it for this plan
-    (:meth:`GraphSolver.off_expression_ns`), and ``score_ns`` the total the
-    engine minimized (:meth:`GraphSolver.score_ns`),
-    ``objective_ns`` for an engine that minimizes ``cost_expr`` itself.
 
     ``divisions`` carries each buffer's candidate core counts, the one chosen,
     its producers, its residency ``reason`` when one kept it out of LX, and the
@@ -579,8 +546,6 @@ def cost_expr_record(
         },
         "bindings": {str(k): v for k, v in bindings.items()},
         "objective_ns": objective_ns,
-        "off_expression_ns": dict(off_expression_ns or {}),
-        "score_ns": objective_ns if score_ns is None else score_ns,
     }
     # Additive only: context describes the record, it does not get to redefine
     # it. Without this a caller key named `bundles` would replace the terms.

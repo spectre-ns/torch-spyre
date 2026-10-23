@@ -1156,3 +1156,18 @@ class Annealing(_SolvedRecording):
         self._objective_value = search.objective_value()
         self._status = cp_model.FEASIBLE
         return self._status
+
+
+def from_env() -> CpSat:
+    """The backend ``SPYRE_LX_BACKEND`` names: ``cpsat`` (default),
+    ``mip:<SCIP|HIGHS|CBC>``, ``bruteforce`` or ``anneal[:<budget s>]``."""
+    import os
+
+    choice = os.environ.get("SPYRE_LX_BACKEND", "cpsat")
+    if choice.startswith("mip"):
+        return Mip(choice.partition(":")[2] or "SCIP")
+    if choice == "bruteforce":
+        return BruteForce()
+    if choice.startswith("anneal"):
+        return Annealing(budget_s=float(choice.partition(":")[2] or 10))
+    return CpSat()

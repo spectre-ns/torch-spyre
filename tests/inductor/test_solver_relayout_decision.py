@@ -35,11 +35,8 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad import buffer_graph
 from torch_spyre._inductor.scratchpad.allocator import SolvedPlan
-from torch_spyre._inductor.scratchpad.encoding_strategy import (
-    CandidateTables,
-    EnumerationFactory,
-)
-from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
+from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
+from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     ChosenRelayout,
     FiredRelayoutGroup,
@@ -112,8 +109,7 @@ def _solve(buffers, expr, size=64) -> SolvedPlan:
         buffers, 1, size, buffer_graph.empty_graph(size, 1).settings
     )
     tables = CandidateTables.of_buffers(buffers)
-    strategy = EnumerationFactory().strategy_from_tables(tables)
-    nodes = ModelSolver(size).solve(graph, strategy, expr)
+    nodes = graph.solve(cost_expr=expr, strategy=LazyStrategy.from_tables(tables))
     return SolvedPlan(nodes, tables, graph.alignment)
 
 

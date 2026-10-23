@@ -45,16 +45,11 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     ResourceNode,
     SpyreOptimizationGraph,
 )
-from torch_spyre._inductor.scratchpad.encoding_strategy import (
-    CandidateTables,
-    EnumerationFactory,
-)
+from torch_spyre._inductor.scratchpad.encoding_strategy import CandidateTables
 
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.allocator import SolvedPlan
-    from torch_spyre._inductor.scratchpad.graph_solvers import GraphSolver
-    from torch_spyre._inductor.scratchpad.encoding_strategy import EnumerationFactory
 
 logger = get_inductor_logger("scratchpad.pricing")
 
@@ -102,7 +97,6 @@ def cost_expr(
     graph: GraphLowering,
     solve_graph: SpyreOptimizationGraph,
     tables: CandidateTables,
-    factory: EnumerationFactory,
 ) -> tuple[Optional[sympy.Expr], list]:
     """The priced objective of the open-mode solve over the graph's nodes
     and the strategy's candidates, and its per-bundle terms; ``None`` when
@@ -148,11 +142,7 @@ def cost_expr(
             len(unscored),
             sorted(unscored),
         )
-    if (
-        config.auto_coarse_tiling
-        and factory.capabilities.chooses_tilings
-        and factory.capabilities.linear_cost_only
-    ):
+    if config.auto_coarse_tiling:
         # The cost model is flat in both axes the tiling search moves along:
         # it has no term for tile size and none for cut count, so every
         # candidate tiling scores identically and the choice falls to
@@ -204,7 +194,7 @@ def cost_expr(
 def dump_cost_expr(
     graph: GraphLowering,
     plan: SolvedPlan,
-    solver: GraphSolver,
+    solve_stats: dict,
     cost_expr,
     bundle_terms,
     capacity: int,
@@ -232,10 +222,9 @@ def dump_cost_expr(
             # for its own compile and leaves the rest at 32.
             "sencores": config.sencores,
             "lx_capacity": capacity,
-            "solver": solver.name,
             "allocator": "ScratchpadAllocator",
         },
-        "solve": dict(solver.last_solve_stats),
+        "solve": dict(solve_stats),
     }
     emit_json_line(
         config.dump_cost_expr_file,
@@ -244,8 +233,6 @@ def dump_cost_expr(
             bundle_terms,
             plan.report(),
             _COST_PARAMS,
-            solver.off_expression_ns(),
-            solver.score_ns(),
             context=context,
         ),
     )
@@ -271,7 +258,7 @@ def extract_op_features(graph, output_name, buffers, is_lx, *, op=None):
     from torch_spyre._inductor.scratchpad.coarse_tiling import (
         try_resolve_tile_axis_loop_vars,
     )
-    from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+    from torch_spyre._inductor.scratchpad.division_menus import _work_slices
 
     op = graph.get_buffer(output_name) if op is None else op
     buffer = buffers[output_name]

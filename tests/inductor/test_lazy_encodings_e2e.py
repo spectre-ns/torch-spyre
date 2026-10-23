@@ -25,11 +25,7 @@ import torch  # noqa: E402
 import torch_spyre  # noqa: E402,F401
 from torch_spyre._inductor import config  # noqa: E402
 
-_BASE = {
-    "lx_planning": True,
-    "co_optimizing_lx_planning": True,
-    "layout_solver": "cpsat",
-}
+_BASE = {"lx_planning": True, "co_optimizing_lx_planning": True}
 
 
 def _mlp(x, g, u, d):

@@ -21,9 +21,10 @@ work split is enumerated (a pinned value, a table of candidates), the
 relations over each edge's two ends, the candidate transforms, and every
 CP variable (:class:`NodeVars`). Nodes and edges stay pure data.
 
-:class:`TableStrategy` is the default: each open work split is a ``Table``
-over a candidate menu and every relation a table over menu indices.
-:class:`EnumerationFactory` builds a strategy from configuration alone.
+:class:`TableStrategy` encodes each open work split as a ``Table`` over a
+candidate menu, and each edge's relation from its clone read, its residency
+edge or its pair table; ``LazyStrategy`` (``lazy_strategy.py``), the one the
+allocator uses, adds the ``Lazy`` work split.
 """
 
 from __future__ import annotations
@@ -43,7 +44,6 @@ from torch_spyre._inductor.scratchpad.buffer_graph import (
     Transform,
     WorkSplit,
 )
-from torch_spyre._inductor.scratchpad.graph_solvers import Capabilities
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivision,
@@ -55,7 +55,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 
 if TYPE_CHECKING:
     from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
-    from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 Var = Any  # a backend variable or literal
 Model = Any  # cp_model.CpModel until 3a, a Backend after
@@ -334,7 +333,6 @@ class CandidateTables:
     relayout_edges: dict[tuple[str, str], Any] = field(default_factory=dict)
     lazy_spaces: dict[str, Any] = field(default_factory=dict)
     point_menus: set[str] = field(default_factory=set)
-    tile_reads: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def of_buffers(cls, buffers: Sequence[LifetimeBoundBuffer]) -> CandidateTables:
@@ -359,8 +357,6 @@ class CandidateTables:
                     tables.matches[key] = b.cd_parent_matches[p]
                 if p in b.residency_edges:
                     tables.residency[key] = b.residency_edges[p]
-            if getattr(b, "tile_reads", None):
-                tables.tile_reads[b.name] = b.tile_reads
         return tables
 
 
@@ -396,19 +392,18 @@ class TableStrategy(EncodingStrategy):
         self.solved: dict[Item, int] = {}
 
     @classmethod
-    def from_tables(
-        cls, tables: CandidateTables, *, derived: bool = False, **kwargs
-    ) -> TableStrategy:
-        """The strategy over ``tables``: per edge a pair table, or with
-        ``derived`` the clone or residency relation where there is one."""
+    def from_tables(cls, tables: CandidateTables, **kwargs) -> TableStrategy:
+        """The strategy over ``tables``: per edge its clone relation, else
+        its residency relation when it has no pair table, else its pair
+        table."""
         matches, residency, clone_reads = {}, {}, {}
         for child, parents in tables.parents.items():
             for parent in parents:
                 key = (parent, child)
                 clone = tables.clone_reads.get(key)
-                if derived and clone is not None:
+                if clone is not None:
                     clone_reads[key] = clone
-                elif derived and key not in tables.matches and key in tables.residency:
+                elif key not in tables.matches and key in tables.residency:
                     residency[key] = tables.residency[key]
                 else:
                     matches[key] = tables.matches.get(key, [])
@@ -1089,73 +1084,3 @@ class TableStrategy(EncodingStrategy):
         """The relayout candidate the read on ``edge`` fired through."""
         assert edge.transform is not None
         return self._relayouts.fired(edge, solver)
-
-
-@dataclass(frozen=True)
-class EnumerationFactory:
-    """Built from the solver's capabilities only: how the solve encodes each
-    axis and relation, and which candidates the solver can use. A solver
-    that posts a model gets the constraint encodings (``LazyStrategy``: a
-    Lazy work split wherever a node can take one, derived view relations,
-    relayouts over view ids); one that reads menus and pair tables (the
-    annealing co-optimizer) gets the table model (``TableStrategy``). It
-    never sees a graph."""
-
-    capabilities: Capabilities = Capabilities(posts_model=True)
-
-    @property
-    def constraints(self) -> bool:
-        """The constraint encodings, rather than the table model."""
-        return self.capabilities.posts_model
-
-    @property
-    def offers_relayouts(self) -> bool:
-        """Relayout candidates are generated for the solve
-        (``lx_planner_relayout``, for a solver that decides relayouts)."""
-        return self.capabilities.decides_lx_relayouts and config.lx_planner_relayout
-
-    @property
-    def generates_divisions(self) -> bool:
-        """Each open node carries its op's split space for the solver to
-        generate divisions from."""
-        return self.capabilities.generates_divisions
-
-    @property
-    def tiled_menus(self) -> bool:
-        """The menus carry tiled candidates."""
-        return config.auto_coarse_tiling and self.capabilities.tilings_from_menu
-
-    @property
-    def applies_tilings(self) -> bool:
-        """The split spaces carry tilings, and the allocator applies the ones
-        the solver generated."""
-        caps = self.capabilities
-        return (
-            config.auto_coarse_tiling
-            and caps.chooses_tilings
-            and caps.generates_divisions
-        )
-
-    def candidates(
-        self, capacity: int, prune: bool = False, committed: bool = False
-    ) -> TableCandidates:
-        """What generates the table candidates for solves over ``capacity``
-        bytes of LX (``prune``: heuristically pruned division menus;
-        ``committed``: every op keeps its committed division)."""
-        from torch_spyre._inductor.scratchpad.table_candidates import (
-            TableCandidates,
-        )
-
-        return TableCandidates(self, capacity, prune, committed)
-
-    def strategy(self, buffers: Sequence[LifetimeBoundBuffer] = ()) -> TableStrategy:
-        """The strategy over candidates given as buffers (tests, replay)."""
-        return self.strategy_from_tables(CandidateTables.of_buffers(buffers))
-
-    def strategy_from_tables(self, tables: CandidateTables) -> TableStrategy:
-        """The strategy over ``tables``."""
-        if not self.constraints:
-            return TableStrategy.from_tables(tables)
-        from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
-
-        return LazyStrategy.from_tables(tables)

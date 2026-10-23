@@ -62,7 +62,6 @@ if TYPE_CHECKING:
 
     from torch_spyre._inductor.scratchpad.encoding_strategy import EncodingStrategy
     from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
-    from torch_spyre._inductor.work_division import OpSplitSpace
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +150,6 @@ class ResourceNode:
     # start_time, which a start override can move earlier.
     produced_at: Optional[int]
     op: Optional[Operation] = None
-    space: Optional[OpSplitSpace] = None  # None: committed upstream
     residency_reason: Optional[str] = None  # applied by encode_op_constraints
     # The access ticks, the size in bytes, and the committed per-core view.
     uses: tuple[int, ...] = ()
@@ -247,17 +245,13 @@ def _integer_objective(cp: Any) -> Any:
     return expr
 
 
-def _unposted(*args, **kwargs) -> int:
-    raise AssertionError("the solver sets the solve settings")
-
-
 def empty_graph(capacity_bytes: int, alignment: int = 128) -> SpyreOptimizationGraph:
-    """A graph to build from the IR: ``alignment`` bytes per unit (one stick,
-    what every solver aligns to); the solver sets the solve settings."""
+    """A graph to build from the IR: ``alignment`` bytes per unit (one
+    stick), solved under the configured time limit."""
     return SpyreOptimizationGraph(
         alignment=alignment,
         capacity=capacity_bytes // alignment,
-        settings=SolveSettings(None, False, _unposted),
+        settings=SolveSettings(config.cpsat_time_limit_seconds),
     )
 
 
@@ -325,15 +319,13 @@ class Transform:
 
 @dataclass(frozen=True)
 class SolveSettings:
-    """How ``solve`` runs CP-SAT: the time limit, whether to bottom-justify
-    offsets, the hook that solves one ladder stage and records its stats
-    (``ModelSolver._solve_and_record``), and where a stats entry goes
-    when the objective cannot be lowered."""
+    """How ``solve`` runs CP-SAT: the time limit and whether to bottom-justify
+    offsets. ``record``, when set, solves each ladder stage in place of the
+    backend's solver (the equivalence harness captures the model there)."""
 
-    time_limit_seconds: Optional[float]  # None or 0: no limit
-    bottom_justify: bool
-    record: Callable[..., int]
-    note_stats: Callable[[dict], None] = lambda stats: None
+    time_limit_seconds: Optional[float] = None  # None or 0: no limit
+    bottom_justify: bool = True
+    record: Optional[Callable[..., int]] = None
 
 
 @dataclass
@@ -400,7 +392,8 @@ class SpyreOptimizationGraph:
     settings: SolveSettings
     nodes: dict[str, ResourceNode] = field(default_factory=dict)
     first: Optional[ResourceNode] = None
-    solver: Any = None  # a Backend class or a GraphSolver; None: CpSat
+    # What the last solve stage cost and returned, for the cost dump.
+    solve_stats: dict = field(default_factory=dict)
 
     def add_ir_node(
         self,
@@ -414,7 +407,6 @@ class SpyreOptimizationGraph:
         start_override: Optional[int] = None,
         end_override: Optional[int] = None,
         op: Optional[Operation] = None,
-        space: Optional[OpSplitSpace] = None,
         sym_core_divs: Mapping[SplitKey, sympy.Symbol] = {},
         sym_tile_counts: Mapping[TileKey, sympy.Symbol] = {},
         lx_view: Any = None,
@@ -450,7 +442,6 @@ class SpyreOptimizationGraph:
             sym_tile_counts=sym_tile_counts,
             produced_at=uses[0] if uses and not first_use_is_read else None,
             op=op,
-            space=space,
             residency_reason=residency_reason,
             uses=tuple(uses),
             nbytes=nbytes,
@@ -495,7 +486,6 @@ class SpyreOptimizationGraph:
             residency_reason=residency_reason,
             start_override=b.lifetime_start_override,
             end_override=b.lifetime_end_override,
-            space=divided.division_space if divided else None,
             sym_core_divs=divided.sym_core_divs if divided else {},
             sym_tile_counts=divided.sym_tile_counts if divided else {},
             lx_view=b.lx_view,
@@ -521,11 +511,6 @@ class SpyreOptimizationGraph:
         for before, after in zip(ops, ops[1:]):
             before.add_successor(after)
 
-    def set_solver(self, solver: Any) -> None:
-        """What ``solve`` runs on: a backend class (the posted model's solver)
-        or a graph solver, which solves the graph itself."""
-        self.solver = solver
-
     # ---- the solve ----
 
     def solve(
@@ -537,34 +522,27 @@ class SpyreOptimizationGraph:
         """Encode, run the objective ladder, and fill every open decision on
         the nodes, transforms and edges. ``model`` is the backend to post
         to and solve with (a bare ``CpModel`` is wrapped in ``CpSat``; none:
-        an instance of :meth:`set_solver`'s backend class). A graph solver set
-        with :meth:`set_solver` solves the graph itself instead. Returns every
-        node, its decisions filled. Raises :class:`SolveError`, writing
-        nothing."""
-        if strategy is None:
-            from torch_spyre._inductor.scratchpad.encoding_strategy import (
-                EnumerationFactory,
-            )
-
-            strategy = EnumerationFactory().strategy()
-        if self.solver is not None and not isinstance(self.solver, type):
-            if not self.solver.accepts(strategy):
-                raise ValueError(
-                    f"{type(self.solver).__name__} cannot solve a "
-                    f"{type(strategy).__name__}"
-                )
-            return self.solver.solve(self, strategy, cost_expr)
-
+        the one ``SPYRE_LX_BACKEND`` names). A node whose smallest per-core
+        footprint exceeds LX is barred first. Returns every node, its
+        decisions filled. Raises :class:`SolveError`, writing nothing."""
         from ortools.sat.python import cp_model
 
-        from torch_spyre._inductor.scratchpad.backend import CpSat
+        from torch_spyre._inductor.scratchpad.backend import CpSat, from_env
 
+        if strategy is None:
+            from torch_spyre._inductor.scratchpad.encoding_strategy import (
+                CandidateTables,
+            )
+            from torch_spyre._inductor.scratchpad.lazy_strategy import LazyStrategy
+
+            strategy = LazyStrategy.from_tables(CandidateTables())
+        self._bar_oversized(strategy)
         if model is None:
-            model = (self.solver or CpSat)()
+            model = from_env()
         backend = CpSat(model) if isinstance(model, cp_model.CpModel) else model
         self._finalize(backend, strategy)
         solver = backend.solver
-        backend.record = self.settings.record
+        backend.record = self._solve_stage
         settings = self.settings
         if settings.time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(settings.time_limit_seconds)
@@ -597,6 +575,45 @@ class SpyreOptimizationGraph:
         self._ladder(backend, strategy, cost_expr)
         self._extract(backend, strategy, justify_offsets)
         return list(self.get_nodes())
+
+    def _bar_oversized(self, strategy: EncodingStrategy) -> None:
+        """Bar each node whose smallest per-core footprint exceeds LX."""
+        capacity = self.capacity * self.alignment
+        for node in self.get_nodes():
+            if node.residency_reason is not None:
+                continue
+            footprint = min(
+                (
+                    ceil_div(
+                        node.nbytes, cd.output_partition * cd.tiling.output_tile_count
+                    )
+                    for cd in strategy.menus.get(node.name, ())
+                ),
+                default=node.nbytes,
+            )
+            if footprint > capacity:
+                node.residency_reason = (
+                    f"min footprint {footprint} B > LX capacity {capacity} B"
+                )
+
+    def _solve_stage(self, solver: Any, model: Any, *, objective: bool = False) -> int:
+        """Solve one ladder stage and keep what it cost and returned: the
+        last record describes the solve that produced the plan."""
+        record = self.settings.record
+        status = (
+            record(solver, model, objective=objective)
+            if record is not None
+            else solver.Solve(model)
+        )
+        self.solve_stats = {
+            "status": solver.StatusName(status),
+            "solve_s": round(solver.WallTime(), 3),
+            "variables": len(model.proto.variables),
+            "constraints": len(model.proto.constraints),
+            "limit_s": solver.parameters.max_time_in_seconds or None,
+            "objective_used": objective,
+        }
+        return status
 
     def _finalize(self, model: Any, strategy: EncodingStrategy) -> None:
         """Walk the graph in emission order, calling the strategy once per
@@ -855,13 +872,11 @@ class SpyreOptimizationGraph:
                 raise
             # A fallback solve follows and records over this; it stands only
             # if no fallback runs, and says why.
-            self.settings.note_stats(
-                {
-                    "status": "NOT_LINEARIZABLE",
-                    "error": str(exc),
-                    "objective_used": False,
-                }
-            )
+            self.solve_stats = {
+                "status": "NOT_LINEARIZABLE",
+                "error": str(exc),
+                "objective_used": False,
+            }
             return None
 
     def _extract(

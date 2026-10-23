@@ -12,18 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The SA co-optimizer against the *real* substrate types.
-
-During development of the SA co-optimizer, the buffer types were in flux. The
-branch was developed on top of an artificial substrate isolated from this
-churn. There was a test suite asserting that this substrate conformed to the
-protocols that defined it. When ``CoreDivisionBuffer`` landed, the test suite
-turned into this file, which pins the engine to the real classes:
+"""The captured co-optimization graphs against the *real* substrate types.
 
 * the captured graphs rehydrate into real :class:`CoreDivisionBuffer` objects
   that are well-formed, self-consistent, and a valid seed state (every op at
   division index 0);
-* the engine accepts those objects;
 * the two capture-derived assumptions the loader and the objective rest on hold:
   the ``boundary_cost`` -> ``BufferType`` mapping is exact, and ``read_count``
   equals the consumer count the old objective scaled by.
@@ -37,7 +30,6 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionBuffer,
 )
-from torch_spyre._inductor.scratchpad.sa_cooptimizer import SaCoOptimizingSolver
 
 from cooptimization_capture_loader import (
     DEFAULT_CAPTURE_PATH,
@@ -188,13 +180,12 @@ class CaptureAssumptionsTest(TestCase):
         buffers (``len(children)``); the landed formula scales by the buffer's own
         reads-served count. They agree on all 308 captured buffers, which is what
         makes adopting the landed formula score-preserving. If a future capture
-        breaks this, the two engines' objectives diverge and this fires.
+        breaks this, the objective stops matching the old one and this fires.
 
         Reads-served is ``read_count`` minus an input's clone-in, not
         ``read_count`` itself: ``read_count`` counts every read, and for a graph
-        input the first one is the clone-in that pinning cannot avoid. Both
-        engines discount it -- ``SACoOptimizer.spill_cost`` and
-        ``buffer_graph.spill_cost`` -- so the equivalence this test
+        input the first one is the clone-in that pinning cannot avoid.
+        ``buffer_graph.spill_cost`` discounts it, so the equivalence this test
         protects is against the discounted count.
         """
         for tag, g in _all_captures():
@@ -214,51 +205,8 @@ class CaptureAssumptionsTest(TestCase):
                 )
 
 
-class EngineBindingTest(TestCase):
-    """The engine consumes real buffers."""
-
-    def test_engine_accepts_real_core_division_buffers(self):
-        """The check whose absence let the protocol drift from the real class.
-
-        A solve over unmodified rehydrated ``CoreDivisionBuffer`` objects must
-        write both solver outputs back without touching any field the real class
-        does not have.
-        """
-        _, graph = next(_all_captures())
-        footprint = sum(max(0, b.size) for b in graph.buffers)
-        solver = SaCoOptimizingSolver(graph.buffers, max(1024, footprint // 2), 128)
-        out = solver.plan_layout_and_core_divisions()
-        self.assertEqual(len(out), len(graph.buffers))
-        for b in out:
-            self.assertIsInstance(b, CoreDivisionBuffer)
-            self.assertIsNotNone(b.chosen_division)
-            self.assertTrue(0 <= b.chosen_division < len(b.core_divisions))
-            if b.address is None:
-                self.assertIsNotNone(b.spill_reason)
-
-    def test_pinned_buffers_are_never_resident(self):
-        """The fixed pin gate, asserted on the returned layout.
-
-        Mutation-testing showed a ``_eligible`` that always returned True left the
-        suite green; this is the assertion that catches it.
-        """
-        for tag, g in _all_captures():
-            pinned = [b.name for b in g.buffers if b.residency_reason is not None]
-            if not pinned:
-                continue
-            footprint = sum(max(0, b.size) for b in g.buffers)
-            solver = SaCoOptimizingSolver(g.buffers, max(1024, footprint // 2), 128)
-            out = solver.plan_layout_and_core_divisions()
-            by_name = {b.name: b for b in out}
-            for name in pinned:
-                self.assertIsNone(
-                    by_name[name].address,
-                    f"{tag} {name}: pinned out of LX but given an address",
-                )
-
-
 class SpillCostTest(TestCase):
-    """The spill cost both engines charge (``buffer_graph.spill_cost``)."""
+    """The spill cost the solver charges (``buffer_graph.spill_cost``)."""
 
     @staticmethod
     def _buf(size, uses, boundary):

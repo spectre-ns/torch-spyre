@@ -14,7 +14,6 @@
 
 import os
 import sys
-from typing import Literal
 
 from torch.utils._config_module import install_config_module
 
@@ -282,16 +281,6 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # Set SPYRE_INDUCTOR_SDSC_CACHE=0 to disable.
 sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 
-# The LX layout solver:
-#  "cpsat":    OR-Tools CP-SAT over the solve's graph (default).
-#  "simulated_annealing":  SaCoOptimizingSolver, the joint work-division +
-#              LX-placement annealer.
-# Either chooses core divisions and coarse tilings jointly with placement under
-# ``co_optimizing_lx_planning``, and otherwise keeps the committed divisions.
-layout_solver: Literal["cpsat", "simulated_annealing"] = os.environ.get(
-    "LAYOUT_SOLVER", "cpsat"
-)  # type: ignore[assignment]
-
 # Wall-clock budget for one CP-SAT solve, in seconds. This applies to the cost
 # objective or to each phase of the fallback lexicographic objective, not the
 # whole compilation. A timeout can return a feasible plan without proving
@@ -357,16 +346,8 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 
 # Solver-driven coarse tiling: let the co-optimizing solve choose a coarse
 # tiling for each op alongside its core division, and apply the tilings it
-# selects. Off by default, and inert unless a joint co-opt path is active
-# (co_optimizing_lx_planning, with layout_solver "cpsat" or
-# "simulated_annealing"). Ops a spyre_hint or for_each_tile loop already tiles
-# keep that tiling.
-#
-# Under the SA co-optimizer, anything the apply refuses raises rather than
-# falling back, so any gap between what the search believes it may tile and
-# what ``coarse_tile`` accepts is a compile failure. And the loop cost the
-# search sees is only part of what ``predict_ops`` charges a real tiling, so it
-# is not yet a calibrated brake on the tiling axis.
+# selects. Off by default, and inert unless co_optimizing_lx_planning is on.
+# Ops a spyre_hint or for_each_tile loop already tiles keep that tiling.
 auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out

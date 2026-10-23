@@ -46,7 +46,7 @@ from torch_spyre._inductor.cost_model import (
 )
 from torch_spyre._inductor.scratchpad import pricing
 from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
-from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+from torch_spyre._inductor.scratchpad.division_menus import _work_slices
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "cooptimization_op_features.json")
 
@@ -65,13 +65,13 @@ def _entries():
 
 class CandidateDivisionTest(TestCase):
     def test_candidate_is_restored_as_complete_symbol_keyed_map(self):
-        """SA feature extraction neither encodes nor mutates Scheduler transport."""
+        """Feature extraction neither encodes nor mutates Scheduler transport."""
         m, n, kk = sympy.symbols("m n kk")
         op = object()
         division = CoreDivision(splits={m: 8, kk: 2}, reduction_syms=frozenset({kk}))
         expected = {m: 8, n: 1, kk: 2}
         with patch(
-            "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
+            "torch_spyre._inductor.scratchpad.division_menus.iteration_space_from_op",
             return_value={m: 1024, n: 1024, kk: 2048},
         ):
             self.assertEqual(_work_slices(op, division), expected)
@@ -86,7 +86,7 @@ class CandidateDivisionTest(TestCase):
         }
         with (
             patch(
-                "torch_spyre._inductor.scratchpad.sa_cooptimizer.iteration_space_from_op",
+                "torch_spyre._inductor.scratchpad.division_menus.iteration_space_from_op",
                 return_value={m: 32, n: 128, k: 64},
             ),
             patch(

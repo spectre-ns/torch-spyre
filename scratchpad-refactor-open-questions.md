@@ -33,6 +33,8 @@ it CP-SAT time (Q12). The report has the full tables and an implementation guide
 | Placement-only solvers replaced by fixed divisions (Q16) | done 2026-10-23 (de1bd4f2) |
 | Solver classes deleted: `CpSatLayoutSolver`, `MemoryPlanSolver`, `CoreDivisionLayoutSolver`, `graph_solver_for`; the annealer and first-fit are plain engines (Q18) | done 2026-10-23 |
 | Final cleanup: delete redundant code | done with the steps above |
+| The solver returns its nodes; `SolvedPlan` reads decisions off them (Q18) | done 2026-10-23 (f6f973db) |
+| One path: the annealer, graph solvers, `ModelSolver`, `layout_solver` and the factory deleted (Q19) | done 2026-10-23 |
 
 ## Q1. Stage 9: extraction or generation from the op?
 
@@ -264,3 +266,25 @@ Done: the allocator is configured with a graph solver (`ModelSolver` for CP-SAT,
 `MemoryPlanSolver` / `CoreDivisionLayoutSolver` bases and `graph_solver_for` are
 deleted. Tests solve buffers with `build_graph` + `ModelSolver.solve` and read the
 decisions through `SolvedPlan`. `build_graph` checks the buffer form's in-place pairs.
+
+Later (2026-10-23): "Shouldn't we be returning the resource nodes from the solver?" A
+solver returns every node with its decisions; `SolvedPlan(nodes, tables, alignment)` is
+built after the solve and reads the chosen division from `node.work_split` and the fired
+relayout from `edge.relayout`.
+
+## Q19. Only the main code path (answered)
+
+Answer (2026-10-23): "Prune and keep only the main code path", choosing to retire the
+annealing co-optimizer and keep `Annealing` as a graph backend.
+
+Done: `sa_cooptimizer.py`, `first_fit.py`, the C++ permutation packer,
+`graph_solvers.py` (`GraphSolver`, `Capabilities`, `BufferSolver`, `buffers_of`) and
+`ilp_solver_ortools.py` (`ModelSolver`) are deleted, with `config.layout_solver`,
+`EnumerationFactory` and `TableStrategy`'s `derived` flag. `SpyreOptimizationGraph.solve`
+bars oversized nodes, records the solve stats and picks its backend from
+`SPYRE_LX_BACKEND`. Code only the annealer reached went too: split spaces on nodes and
+buffers (`OpSplitSpace`, `build_op_split_space`, the generated-division relations on
+`ResidencyEdge`), `TileReads`, and the allocator's apply-in-place tiling path
+(`_apply_chosen_tilings` and its checks, `JOINT_TILING_AND_DIVISION_ATTR`). CP-SAT applies
+its tilings in `_materialize_selection` and re-solves, so the committed plan never
+carries a tiling. The cost dump drops `off_expression_ns`, `score_ns` and `env.solver`.

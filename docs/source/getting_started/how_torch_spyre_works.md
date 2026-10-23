@@ -712,9 +712,8 @@ remaining work is the backend lowering path that lets KTIR replace SuperDSC in t
 flow.
 
 **Scratchpad optimization.** The scratchpad planner is in-tree under
-`torch_spyre/_inductor/scratchpad/`. It plans LX with one OR-Tools CP-SAT solve (a
-simulated-annealing solver is the alternative) that covers in-place reuse, input and output
-cloning, and multi-core layouts, and by default chooses each op's work-division split jointly
+`torch_spyre/_inductor/scratchpad/`. It plans LX with one OR-Tools CP-SAT solve that
+covers in-place reuse, input and output cloning, and multi-core layouts, and by default chooses each op's work-division split jointly
 with LX placement. See [Scratchpad planning](../compiler/scratchpad_planning.md).
 
 **Distributed inference.** The `spyreccl` torch.distributed backend is implemented under

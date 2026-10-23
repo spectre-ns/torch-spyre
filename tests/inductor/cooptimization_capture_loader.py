@@ -116,8 +116,7 @@ def load_captures(
 
 
 # The capture pins the committed/legacy division at ``core_divisions[0]`` (the
-# allocator's fixed-division seed), so the SA seed is ``chosen_division = 0`` for
-# every buffer, with pi from a FirstFit pass over the sizes.
+# allocator's fixed-division seed).
 SEED_DIVISION_INDEX = 0
 
 
@@ -138,4 +137,4 @@ if __name__ == "__main__":
             print(
                 f"{tag:8} {len(graphs):>6} {len(g.buffers):>7} {pinned:>6} {resident:>9}"
             )
-    print("(*resident = solved reference; the SA engine must re-derive it)")
+    print("(*resident = solved reference; a solve must re-derive it)")

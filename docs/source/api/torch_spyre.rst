@@ -753,9 +753,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``LAYOUT_SOLVER``
-     - LX scratchpad layout solver: ``cpsat`` (default) or
-       ``simulated_annealing``. See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default
        ``1``)

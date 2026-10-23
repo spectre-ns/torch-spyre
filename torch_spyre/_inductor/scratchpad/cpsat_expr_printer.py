@@ -13,8 +13,8 @@
 # limitations under the License.
 
 """Lowering of a sympy cost expression (``cost_model``) into an OR-Tools CP-SAT
-objective, kept apart from the layout model in ``ilp_solver_ortools`` that
-calls it.
+objective, kept apart from the layout model (``buffer_graph``) that calls
+it.
 
 :func:`cost_expr_to_cpsat` reads the solver only through the two maps it is
 given: ``sym_map`` (symbol name -> CP-SAT var, plus ``_division_of_<sym>`` ->

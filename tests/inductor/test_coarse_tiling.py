@@ -2656,9 +2656,8 @@ class TestCoarseTile(unittest.TestCase):
         """A value born before an automatically-tiled counted loop and read
         inside it must stay live through the loop (issue #4035).
 
-        Same clobber the ``persistent``/``later`` repro in
-        test_perm_layout_solver.py guards at the solver level, but here the
-        ``lifetime_end_override`` is *computed* by
+        The solver honours a hand-passed ``lifetime_end_override``; here the
+        override is *computed* by
         ``counted_loop_lifetime_end_overrides`` for a loop built by the
         automatic span-overflow entry point, ``coarse_tile_post_stickify``
         -- not hand-passed, and not hint-driven.  The liveness gap comes
@@ -9695,11 +9694,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.graph_solvers import buffers_of
-        from torch_spyre._inductor.scratchpad.plan_solver import (
-            CoreDivision,
-            _check_in_place_relationships,
-        )
+        from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
         ops = [
             _LoopOp("carry"),
@@ -9731,13 +9726,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 writes={dep(op.name)},
             )
 
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            ModelSolver,
-        )
-
-        allocator = ScratchpadAllocator(
-            ModelSolver(4096), size=4096, division_mode="open"
-        )
+        allocator = ScratchpadAllocator(size=4096, division_mode="open")
         allocator.candidates.drain_plans = {
             "carry": SimpleNamespace(storage_name="carry", collective=None)
         }
@@ -9792,13 +9781,17 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 graph
             )
             self.assertEqual(in_place["reader"], ["carry"])
-            solve_graph, tables = allocator.candidates._build_graph(
+            solve_graph, _ = allocator.candidates._build_graph(
                 graph, in_place, division_menus._DivisionMap(divisions, set())
             )
 
-        # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
-        _check_in_place_relationships(buffers_of(solve_graph.get_nodes(), tables))
         nodes = solve_graph.nodes
+        # Before the fix an in-place pair broke abutment here:
+        # carry.end_time=4 != reader.start_time+1=3.
+        for node in nodes.values():
+            for e in node.inputs:
+                if e.in_place:
+                    self.assertEqual(e.src.end_time, node.start_time + 1, node.name)
         self.assertEqual(nodes["carry"].end_time, len(ops))
 
         def in_place_parents(name):
@@ -9845,11 +9838,8 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            ModelSolver,
-        )
 
-        allocator = ScratchpadAllocator(ModelSolver(2**20), 2**20)
+        allocator = ScratchpadAllocator(2**20)
         storage_op = _SentinelOp("buf2")
         update_op = _SentinelOp("buf2_update")
         plan = self._isolation_plan()
@@ -9942,11 +9932,8 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            ModelSolver,
-        )
 
-        allocator = ScratchpadAllocator(ModelSolver(2**20), 2**20)
+        allocator = ScratchpadAllocator(2**20)
         plan = self._isolation_plan()
         allocator._validated_drain_plans = {"buf2": plan}
         storage_op = _SentinelOp("buf2")
@@ -10305,11 +10292,8 @@ class TestHoistedInputClone(unittest.TestCase):
         from torch_spyre._inductor.scratchpad.allocator import (
             ScratchpadAllocator,
         )
-        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-            ModelSolver,
-        )
 
-        allocator = ScratchpadAllocator(ModelSolver(2**20), 2**20)
+        allocator = ScratchpadAllocator(2**20)
         graph = MagicMock()
         graph.operations = list(ops)
         graph.get_output_names.return_value = []

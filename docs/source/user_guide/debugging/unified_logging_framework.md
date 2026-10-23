@@ -381,7 +381,6 @@ The full list of dynamic loggers in the codebase:
 | `"scratchpad.division_menus"` | `spyre.inductor.scratchpad.division_menus` | `_inductor/scratchpad/division_menus.py` |
 | `"scratchpad.plan_solver"` | `spyre.inductor.scratchpad.plan_solver` | `_inductor/scratchpad/plan_solver.py` |
 | `"scratchpad.pricing"` | `spyre.inductor.scratchpad.pricing` | `_inductor/scratchpad/pricing.py` |
-| `"scratchpad.sa_cooptimizer"` | `spyre.inductor.scratchpad.sa_cooptimizer` | `_inductor/scratchpad/sa_cooptimizer.py` |
 | `"scratchpad.table_candidates"` | `spyre.inductor.scratchpad.table_candidates` | `_inductor/scratchpad/table_candidates.py` |
 | `"lx_context_switching"` | `spyre.inductor.lx_context_switching` | `_inductor/scratchpad/lx_context_switching.py` |
 | `"lx_relayout"` | `spyre.inductor.lx_relayout` | `_inductor/scratchpad/lx_relayout.py` |

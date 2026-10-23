@@ -1291,10 +1291,10 @@ def _allocator_features(
 ):
     """The allocator's extraction with its legal ``menu``. ``chosen`` is a menu
     index, or a ``{dim: split symbol}`` map that keeps the splits symbolic."""
-    from torch_spyre._inductor.scratchpad import sa_cooptimizer
+    from torch_spyre._inductor.scratchpad import division_menus
     from torch_spyre._inductor.scratchpad.plan_solver import CoreDivision
 
-    monkeypatch.setattr(sa_cooptimizer, "iteration_space_from_op", lambda _: it_space)
+    monkeypatch.setattr(division_menus, "iteration_space_from_op", lambda _: it_space)
     monkeypatch.setattr(dcm, "iteration_space_from_op", lambda _: it_space)
     monkeypatch.setattr(dcm, "_indirect_write_elems", lambda *_: None)
     buffers = {

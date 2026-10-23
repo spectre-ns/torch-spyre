@@ -566,7 +566,6 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     from torch_spyre._inductor.scratchpad.allocator import (
         ScratchpadAllocator,
     )
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
@@ -574,9 +573,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     commit_iteration_space_ownership(consumer, committed)
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
-    allocator = ScratchpadAllocator(
-        ModelSolver(2**20), size=2**20, division_mode="open"
-    )
+    allocator = ScratchpadAllocator(size=2**20, division_mode="open")
     ordinary, _ = allocator.candidates._enumerate_core_divisions(
         consumer, config.sencores
     )
@@ -586,7 +583,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     solve_graph, tables = allocator._build_graph(graph)
     assert list(tables.menus[consumer.name]) == ordinary
     result = allocator._solve(graph)
-    chosen = result.division(result.graph.nodes[consumer.name])
+    chosen = result.division(result.by_name[consumer.name])
     direct = allocator.candidates._pricing_operations(graph, solve_graph, tables)[0]
     costs = [
         cm._transport_dma_excess_ns(
@@ -627,7 +624,6 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
     )
     from torch_spyre._inductor.scratchpad import allocator as am
     from torch_spyre._inductor.scratchpad import table_candidates as tcm
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
@@ -677,9 +673,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         monkeypatch.setattr(
             tcm, "has_resolved_work_div_hint", lambda op: op is consumer
         )
-    allocator = am.ScratchpadAllocator(
-        ModelSolver(2**20), size=2**20, division_mode="open"
-    )
+    allocator = am.ScratchpadAllocator(size=2**20, division_mode="open")
     if failure in ("source_clone", "relayout"):
         from torch_spyre._inductor.scratchpad.plan_solver import (
             BufferType,

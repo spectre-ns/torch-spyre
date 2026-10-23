@@ -79,6 +79,13 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+def _work_slices(op, division: CoreDivision) -> dict:
+    """Restore a complete symbol-keyed split map from a sparse candidate."""
+    return {
+        symbol: division.splits.get(symbol, 1) for symbol in iteration_space_from_op(op)
+    }
+
+
 def _is_cpu_host_buffer(op: Operation) -> bool:
     """True for a ComputedBuffer that is not on the Spyre device.
 

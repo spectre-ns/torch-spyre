@@ -40,7 +40,7 @@ from torch_spyre._inductor.scratchpad import allocator as alloc_mod
 from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
 
 
-_COOPT = {"co_optimizing_lx_planning": True, "layout_solver": "cpsat"}
+_COOPT = {"co_optimizing_lx_planning": True}
 
 
 def _no_relation(self, edge, lit, model):
@@ -199,12 +199,7 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
     torch.manual_seed(0)
     host = torch.randn(8, 256, 512, dtype=torch.float16)
     x = host.to("spyre")
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(_COOPT):
         out = torch.compile(fn, dynamic=False)(x)
 
     # The solver fired the neg -> relu edge, the commit path handed
@@ -223,20 +218,10 @@ def test_solver_relayout_materializes_and_runs(monkeypatch):
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
 
 
-def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
-    """The solver's ``capabilities.decides_lx_relayouts`` says whether it
-    decides relayouts; when it does not, no candidate is enumerated and the
-    co-optimizing solve is exactly what it was before this feature."""
-    import dataclasses
-
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import ModelSolver
-
+def test_relayouts_off_materializes_nothing(monkeypatch):
+    """With ``lx_planner_relayout`` off no candidate is enumerated, and the
+    co-optimizing solve is exactly what it was before relayouts."""
     observed = _arm_forced(monkeypatch)
-    monkeypatch.setattr(
-        ModelSolver,
-        "capabilities",
-        dataclasses.replace(ModelSolver.capabilities, decides_lx_relayouts=False),
-    )
 
     def fn(t):
         return torch.relu(torch.neg(t)) + 1.0
@@ -244,7 +229,7 @@ def test_an_unsupporting_solver_materializes_nothing(monkeypatch):
     torch.manual_seed(0)
     host = torch.randn(8, 256, 512, dtype=torch.float16)
     x = host.to("spyre")
-    with config.patch(_COOPT):
+    with config.patch({**_COOPT, "lx_planner_relayout": False}):
         out = torch.compile(fn, dynamic=False)(x)
 
     observed.assert_nothing_emitted()
@@ -281,12 +266,7 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     for name, size in (("B", 8), ("M", 256), ("K", 512)):
         _pnd.declare_tensor_dim(name, size)
     x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(_COOPT):
         out = torch.compile(fn, dynamic=False)(x)
 
     observed.assert_emitted_in_lx(expected_plans=1)
@@ -649,12 +629,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     hb = torch.randn(512, 256, dtype=torch.float16)
     a = ha.to("spyre")
     b = hb.to("spyre")
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
-        }
-    ):
+    with config.patch(_COOPT):
         out = torch.compile(fn, dynamic=False, fullgraph=True)(a, b)
 
     # Graph-global, same as the test this replaces: also covers each body's
@@ -730,7 +705,6 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     with config.patch(
         {
             "co_optimizing_lx_planning": True,
-            "layout_solver": "cpsat",
             "lx_same_tile_group_relayout": True,
         }
     ):
@@ -765,63 +739,3 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
         assert cost == base * loop_trip_count, (edge.parent, cost, base)
     ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
-
-
-def test_sa_cooptimizer_keeps_its_objective_and_decides_no_relayout(monkeypatch):
-    """The simulated-annealing engine does not decide relayouts yet, so the
-    allocator must hand it neither candidates nor copies, and its objective
-    must carry no relayout term: with one it cannot bind, the annealer would
-    silently drop the WHOLE cost objective and fall back to memory-only
-    scoring (the regression this guards). Same hinted graph as the natural
-    firing test above, under the annealer: it compiles, computes the right
-    numbers, fires nothing, and scores with the real cost expression."""
-    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
-    from torch_spyre._inductor import spyre_hint
-    from torch_spyre._inductor.scratchpad import sa_cooptimizer as sa_mod
-
-    observed = _Observed(monkeypatch, force=False)
-    score_fns: list = []
-    real_build = sa_mod.SaCoOptimizingSolver._build_score_fn
-
-    def spy_build(self, cost_expr):
-        fn = real_build(self, cost_expr)
-        score_fns.append((cost_expr, fn))
-        return fn
-
-    monkeypatch.setattr(sa_mod.SaCoOptimizingSolver, "_build_score_fn", spy_build)
-
-    def fn(t):
-        with spyre_hint(work_div={"B": 4, "M": 2}):
-            hidden = torch.neg(t)
-        with spyre_hint(work_div={"B": 2, "M": 4}):
-            return torch.relu(hidden)
-
-    torch.manual_seed(0)
-    host = torch.randn(8, 256, 512, dtype=torch.float16)
-    for name, size in (("B", 8), ("M", 256), ("K", 512)):
-        _pnd.declare_tensor_dim(name, size)
-    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
-    with config.patch(
-        {
-            "co_optimizing_lx_planning": True,
-            "layout_solver": "simulated_annealing",
-        }
-    ):
-        out = torch.compile(fn, dynamic=False)(x)
-
-    observed.assert_nothing_emitted()
-    assert score_fns, "the annealer never built a score function"
-    for cost_expr, score_fn in score_fns:
-        assert cost_expr is not None, "the allocator produced no cost expression"
-        assert not any(
-            str(sym).startswith(("is_lx___spyre_lx_relayout__", "relayout"))
-            for sym in cost_expr.free_symbols
-        ), (
-            f"relayout term handed to an engine that cannot decide relayouts: {cost_expr}"
-        )
-        assert score_fn is not None, (
-            "the annealer fell back to the memory-only objective: a symbol in the "
-            "cost expression could not be bound"
-        )
-    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
-    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)

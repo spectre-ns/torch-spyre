@@ -280,7 +280,7 @@ class LazyStrategy(TableStrategy):
 
     @classmethod
     def from_tables(cls, tables, **kwargs) -> LazyStrategy:
-        strategy = super().from_tables(tables, derived=True, **kwargs)
+        strategy = super().from_tables(tables, **kwargs)
         assert isinstance(strategy, LazyStrategy)
         strategy.spaces = dict(tables.lazy_spaces)
         strategy.point_menus = set(tables.point_menus)
