@@ -430,7 +430,7 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
     @config.patch({"co_optimizing_lx_planning": True})
     def test_cpu_pointwise_chain_compiles_co_optimizing(self):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
-        `TableCandidates._build_graph` / `_determine_in_place_division_invariant`,
+        `GraphBuilder._build_graph` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
         self._run_and_check(self)
 

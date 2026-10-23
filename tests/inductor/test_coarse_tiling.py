@@ -129,7 +129,7 @@ from torch_spyre._inductor.wsr.tile import (
     compute_tile_index,
     compute_tile_stride,
 )
-import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_module
+import torch_spyre._inductor.scratchpad.graph_builder as graph_builder_module
 from utils_inductor import ir_computed_buffer, ir_input_loader
 from torch_spyre._inductor.scratchpad import division_menus
 from torch_spyre._inductor.scratchpad import residency_rules
@@ -9724,7 +9724,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             )
 
         allocator = ScratchpadAllocator(size=4096, division_mode="open")
-        allocator.candidates.drain_plans = {
+        allocator.builder.drain_plans = {
             "carry": SimpleNamespace(storage_name="carry", collective=None)
         }
         divisions = {op.name: [CoreDivision(splits={})] for op in ops}
@@ -9733,14 +9733,14 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             patch.object(residency_rules, "op_read_writes", side_effect=read_writes),
             patch.object(drain_plans, "op_read_writes", side_effect=read_writes),
             patch.object(
-                table_candidates_module, "op_read_writes", side_effect=read_writes
+                graph_builder_module, "op_read_writes", side_effect=read_writes
             ),
             patch.object(
                 residency_rules, "clone_at_graph_boundaries", return_value=False
             ),
             patch.object(drain_plans, "clone_at_graph_boundaries", return_value=False),
             patch.object(
-                table_candidates_module, "clone_at_graph_boundaries", return_value=False
+                graph_builder_module, "clone_at_graph_boundaries", return_value=False
             ),
             patch.object(
                 pricing,
@@ -9751,7 +9751,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 },
             ),
             patch.object(
-                table_candidates_module,
+                graph_builder_module,
                 "mem_usage_by_buf",
                 return_value={
                     name: {"size": 128, "op_inputs": reads}
@@ -9764,21 +9764,17 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
                 side_effect=lambda op: inputs[op.name],
             ),
             patch.object(
-                allocator.candidates,
+                allocator.builder,
                 "_residency_by_buf",
                 return_value=dict.fromkeys(by_name),
             ),
-            patch.object(
-                allocator.candidates, "_parent_residency_edges", return_value={}
-            ),
-            patch.object(allocator.candidates, "_cd_parent_matches", return_value={}),
-            patch.object(allocator.candidates, "_relayout_edges", return_value={}),
+            patch.object(allocator.builder, "_parent_residency_edges", return_value={}),
+            patch.object(allocator.builder, "_cd_parent_matches", return_value={}),
+            patch.object(allocator.builder, "_relayout_edges", return_value={}),
         ):
-            in_place = allocator.candidates._determine_in_place_division_invariant(
-                graph
-            )
+            in_place = allocator.builder._determine_in_place_division_invariant(graph)
             self.assertEqual(in_place["reader"], ["carry"])
-            solve_graph = allocator.candidates._build_graph(
+            solve_graph = allocator.builder._build_graph(
                 graph, in_place, division_menus._DivisionMap(divisions, set())
             )
 

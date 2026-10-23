@@ -116,7 +116,7 @@ class TileSpec:
         finished slice of the output rather than a partial accumulation.
 
         Landed with stage 1 and removed again by #4519 as unused; the
-        solver-driven tiling path in ``TableCandidates._tiling_candidates``
+        solver-driven tiling path in ``GraphBuilder._tiling_candidates``
         is the caller that makes it live, and it is the single filter that keeps
         reduction tilings (numerically fragile on e.g. softmax's max/sum) out of
         the candidate menu."""

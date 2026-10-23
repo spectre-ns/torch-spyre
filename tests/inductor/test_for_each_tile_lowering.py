@@ -2306,7 +2306,7 @@ class TestDrainMaterialization(unittest.TestCase):
     def _validate(graph):
         # The validator reads op read/writes, which need an active graph
         # handler (op.get_read_writes -> V.graph.sizevars), exactly as in the
-        # production call site inside TableCandidates.prepare_graph.
+        # production call site inside GraphBuilder.prepare_graph.
         with V.set_graph_handler(graph):
             return drain_plans.validated_drain_plans(graph)
 

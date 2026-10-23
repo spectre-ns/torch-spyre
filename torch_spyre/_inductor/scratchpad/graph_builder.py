@@ -15,7 +15,7 @@
 """The LX layout solve's graph, built from the IR, the same for every
 encoding strategy.
 
-:class:`TableCandidates` puts on each node its candidate core divisions and
+:class:`GraphBuilder` puts on each node its candidate core divisions and
 coarse tilings (a menu, and the space it is drawn from where the op has one)
 and on each edge the relations a strategy encodes it by (``ResidencyEdge``,
 ``CloneRead``, ``RelayoutEdge``), with a pair table only where the builder
@@ -119,7 +119,7 @@ from torch_spyre._inductor.scratchpad import residency_rules
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.scratchpad.pricing import _COST_PARAMS
 
-logger = get_inductor_logger("scratchpad.table_candidates")
+logger = get_inductor_logger("scratchpad.graph_builder")
 
 
 def residency_symbols(graph: SpyreOptimizationGraph) -> dict:
@@ -185,7 +185,7 @@ class RelayoutEdge:
             view if repr_ok and not partial and not _candidate_tiled(cd) else None
             for cd, (view, partial, repr_ok) in zip(
                 divs,
-                TableCandidates._views_for_divs(
+                GraphBuilder._views_for_divs(
                     self.parent_op, self.write_dep, self.parent, list(divs), prep_cache
                 ),
             )
@@ -200,7 +200,7 @@ class RelayoutEdge:
             view if repr_ok and not _candidate_tiled(cd) else None
             for cd, (view, _partial, repr_ok) in zip(
                 divs,
-                TableCandidates._views_for_divs(
+                GraphBuilder._views_for_divs(
                     self.consumer_op,
                     self.read_dep,
                     self.parent,
@@ -351,7 +351,7 @@ class CloneRead:
 
     def clone_index(self, divs: Sequence[CoreDivision]) -> list[int]:
         """Per consumer division, the clone view index its read has."""
-        views = TableCandidates._views_for_divs(
+        views = GraphBuilder._views_for_divs(
             self.consumer, self.read_dep, self.input_name, list(divs), self.prep_cache
         )
         out = []
@@ -382,7 +382,7 @@ def _has_legal_division(context) -> bool:
     )
 
 
-class TableCandidates:
+class GraphBuilder:
     """The solve's graph from the IR, for solves over ``capacity`` bytes of
     LX, with each node's candidates and each edge's relations, the same for
     every encoding strategy. An op whose divisions form a small space gets the

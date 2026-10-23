@@ -15,7 +15,7 @@
 
 """LX residency rules read from the IR: why an op output or a graph input may
 not reside in LX, and which reads may take over a producer's storage in place.
-The graph builder (``table_candidates``) sets each node's ``residency_reason``
+The graph builder (``graph_builder``) sets each node's ``residency_reason``
 and in-place parents from these."""
 
 from __future__ import annotations
@@ -420,8 +420,8 @@ def _inplace_edge_ok(
     preconditions are checked.
 
     This is the sole definition of a legal in-place edge, shared by
-    ``TableCandidates._determine_in_place_division_invariant`` and
-    ``TableCandidates._build_graph``, so they cannot drift.
+    ``GraphBuilder._determine_in_place_division_invariant`` and
+    ``GraphBuilder._build_graph``, so they cannot drift.
     """
     base_ok = (
         parent_name in child_pointwise_inputs

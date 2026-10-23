@@ -116,7 +116,7 @@ def _clear_loop_membership_metadata(op: Operation) -> None:
     surviving ``loop_info`` would re-group the clone into the counted loop at
     scheduling time (``_loop_group_id``) and give it another op's per-read tile
     advance in codegen (``_general_tile_advance``), and the records would
-    misclassify it in ``TableCandidates._build_graph``.  Only the two drain branches
+    misclassify it in ``GraphBuilder._build_graph``.  Only the two drain branches
     and the hoisted-input branch of ``_push_allocation`` call this; every other
     clone keeps today's metadata-copy behavior.
     """
@@ -247,9 +247,9 @@ def _assert_drain_plan_committed(
             f"drain plan for {plan.storage_name}: solver left the storage or "
             "update division unchosen"
         )
-    from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
+    from torch_spyre._inductor.scratchpad.graph_builder import GraphBuilder
 
-    edge = TableCandidates._loop_carry_update_edge(update_op, op_by_name, {})
+    edge = GraphBuilder._loop_carry_update_edge(update_op, op_by_name, {})
     pairs = (
         edge.match_pairs(list(storage_menu), list(update_menu))
         if edge is not None
@@ -383,8 +383,8 @@ class ScratchpadAllocator:
                 legal divisions (``TableStrategy``); ``"table"`` also relates
                 every edge by a pair table (``PairTableStrategy``).
         """
-        from torch_spyre._inductor.scratchpad.table_candidates import (
-            TableCandidates,
+        from torch_spyre._inductor.scratchpad.graph_builder import (
+            GraphBuilder,
         )
 
         self.pre_optimization_passes = pre_optimization_passes or []
@@ -401,7 +401,7 @@ class ScratchpadAllocator:
             "enumerated": TableStrategy,
             "table": PairTableStrategy,
         }[division_strategy]
-        self.candidates = TableCandidates(size, prune, committed=not self.joint)
+        self.builder = GraphBuilder(size, prune, committed=not self.joint)
 
     @property
     def joint(self) -> bool:
@@ -442,8 +442,8 @@ class ScratchpadAllocator:
     def _build_graph(self, graph: GraphLowering) -> SpyreOptimizationGraph:
         """The solve's graph, built from the IR, its candidates on it: the
         same for every strategy."""
-        built = self.candidates.prepare_graph(graph)
-        self._validated_drain_plans = self.candidates.drain_plans
+        built = self.builder.prepare_graph(graph)
+        self._validated_drain_plans = self.builder.drain_plans
         return built
 
     def _solve(self, graph: GraphLowering) -> SolvedPlan:
@@ -470,7 +470,7 @@ class ScratchpadAllocator:
         would), and the graph is built and solved again over the materialized
         IR, so new boundary buffers get placed and the applied ops get their
         final divisions. The second solve enumerates no further tilings
-        (``TableCandidates.suppress_tiling``), so it terminates.
+        (``GraphBuilder.suppress_tiling``), so it terminates.
 
         Ordering is solve-before-apply: a ``SolveError`` from the first solve
         propagates over the *unmutated* graph, so ``scratchpad_planning``'s
@@ -496,11 +496,11 @@ class ScratchpadAllocator:
         )
         # Re-plan over the materialized tiling; no further tiling, so the second
         # solve only places.
-        self.candidates.suppress_tiling = True
+        self.builder.suppress_tiling = True
         try:
             return self._solve(graph)
         finally:
-            self.candidates.suppress_tiling = False
+            self.builder.suppress_tiling = False
 
     def _finalize_lx_relayout_allocation(
         self, plan: SolvedPlan, graph: GraphLowering

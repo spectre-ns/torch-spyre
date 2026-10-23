@@ -16,7 +16,7 @@
 """The candidate work divisions of an op, read from the IR: the split options
 it may take, the legality and stick-fit checks, matmul and reduction axis
 parsing, and the read-distance filter. The table strategy's candidate
-generation (``table_candidates``) builds each node's menu from these."""
+generation (``graph_builder``) builds each node's menu from these."""
 
 from __future__ import annotations
 

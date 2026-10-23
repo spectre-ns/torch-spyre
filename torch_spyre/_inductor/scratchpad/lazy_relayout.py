@@ -46,7 +46,7 @@ if TYPE_CHECKING:
         TableStrategy,
     )
     from torch_spyre._inductor.scratchpad.lx_relayout import RelayoutCandidate
-    from torch_spyre._inductor.scratchpad.table_candidates import RelayoutEdge
+    from torch_spyre._inductor.scratchpad.graph_builder import RelayoutEdge
 
 Var = Any
 

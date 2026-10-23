@@ -43,7 +43,7 @@ from torch_spyre._inductor.pass_utils import op_read_writes
 from torch_spyre._inductor.patches import enable_spyre_context
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
-from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
+from torch_spyre._inductor.scratchpad.graph_builder import GraphBuilder
 from torch_spyre._inductor.scratchpad import residency_rules
 
 try:
@@ -1346,7 +1346,7 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
         )
         expected = fn(*(t.cpu() for t in args))
         captured = []
-        original = TableCandidates._division_map
+        original = GraphBuilder._division_map
 
         def capture(allocator, graph, **kwargs):
             division_map = original(allocator, graph, **kwargs)
@@ -1369,7 +1369,7 @@ class TestOffsetMutationCoOptimizing(BaseTestScratchpadUsage):
             return division_map
 
         with (
-            patch.object(TableCandidates, "_division_map", capture),
+            patch.object(GraphBuilder, "_division_map", capture),
             ts_inductor_config.patch(
                 lx_planning=True,
                 co_optimizing_lx_planning=True,
@@ -1401,14 +1401,14 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
     def _capture_solve_graphs(self):
         """The allocator's solve graphs, in either division mode."""
         captured: list = []
-        orig = TableCandidates._build_graph
+        orig = GraphBuilder._build_graph
 
         def spy(inner_self, *a, **k):
             result = orig(inner_self, *a, **k)
             captured.append(result)
             return result
 
-        with patch.object(TableCandidates, "_build_graph", spy):
+        with patch.object(GraphBuilder, "_build_graph", spy):
             yield captured
 
     @unittest.skipUnless(_HAS_ORTOOLS, "co-optimizing path needs ortools")
@@ -1436,7 +1436,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         violations: list[str] = []
         edge_count = [0]
         called = [False]
-        orig = TableCandidates._determine_in_place_division_invariant
+        orig = GraphBuilder._determine_in_place_division_invariant
 
         def spy(self, graph):
             result = orig(self, graph)
@@ -1454,7 +1454,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             return result
 
         with patch.object(
-            TableCandidates,
+            GraphBuilder,
             "_determine_in_place_division_invariant",
             spy,
         ):
@@ -1481,7 +1481,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         The clone (buffer named after the graph input) is pinned to LX and dies at
         its last read; when that last reader is pointwise and writes a same-shape
         buffer that is itself read again (a realized candidate), the solve's graph
-        (``TableCandidates._build_graph``) marks the clone as that consumer's
+        (``GraphBuilder._build_graph``) marks the clone as that consumer's
         in-place parent. We capture the graph the allocator builds and assert the
         reverse-parent edge is present. Values must be unchanged.
 
@@ -1505,7 +1505,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 compiled = torch.compile(fn, fullgraph=True)
                 result = compiled(x).to("cpu")
 
-        self.assertTrue(captured, "TableCandidates._build_graph was not called")
+        self.assertTrue(captured, "GraphBuilder._build_graph was not called")
         edge_found = False
         for solve_graph in captured:
             # Input clones are exactly the nodes whose first access is a read.
@@ -1546,7 +1546,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             ):
                 result = torch.compile(fn, fullgraph=True)(x).to("cpu")
 
-        self.assertTrue(captured, "TableCandidates._build_graph was not called")
+        self.assertTrue(captured, "GraphBuilder._build_graph was not called")
         edge_found = False
         for solve_graph in captured:
             input_clones = {
@@ -1618,7 +1618,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     ry, rq = compiled(x)
                     ry, rq = ry.to("cpu"), rq.to("cpu")
 
-        self.assertTrue(captured, "TableCandidates._build_graph was not called")
+        self.assertTrue(captured, "GraphBuilder._build_graph was not called")
         merged = False
         for solve_graph in captured:
             for parents in self._in_place_parents(solve_graph).values():

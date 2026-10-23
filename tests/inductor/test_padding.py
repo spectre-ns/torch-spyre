@@ -52,7 +52,7 @@ from torch_spyre._inductor.padding import (
 from torch_spyre._inductor.scratchpad import (
     drain_plans,
     residency_rules,
-    table_candidates,
+    graph_builder,
 )
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 
@@ -229,7 +229,7 @@ class TestInsertPaddingIR(unittest.TestCase):
             for mod in (
                 residency_rules,
                 drain_plans,
-                table_candidates,
+                graph_builder,
                 scratchpad_utils,
             )
         )

@@ -574,9 +574,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     original_body = consumer.data
     original_ownership = consumer.iteration_space_ownership
     allocator = ScratchpadAllocator(size=2**20, division_mode="open")
-    ordinary, _ = allocator.candidates._enumerate_core_divisions(
-        consumer, config.sencores
-    )
+    ordinary, _ = allocator.builder._enumerate_core_divisions(consumer, config.sencores)
     assert len(ordinary) > 1
     # No hand-built menu: go through the same candidate, clone and relayout
     # construction as the real joint solve.
@@ -584,7 +582,7 @@ def test_real_allocator_keeps_proven_priced_direct_read_candidates(
     assert list(solve_graph.nodes[consumer.name].menu) == ordinary
     result = allocator._solve(graph)
     chosen = result.division(result.by_name[consumer.name])
-    direct = allocator.candidates._pricing_operations(graph, solve_graph)[0]
+    direct = allocator.builder._pricing_operations(graph, solve_graph)[0]
     costs = [
         cm._transport_dma_excess_ns(
             [dcm.extract_op_features(direct, splits)], cm.CostParams()
@@ -623,7 +621,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
         iteration_space_from_op,
     )
     from torch_spyre._inductor.scratchpad import allocator as am
-    from torch_spyre._inductor.scratchpad import table_candidates as tcm
+    from torch_spyre._inductor.scratchpad import graph_builder as tcm
 
     graph, stage, consumer = staged_transport_graph
     b, x, n = iteration_space_from_op(consumer)
@@ -680,7 +678,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
             CoreDivision,
         )
 
-        build = allocator.candidates._build_graph
+        build = allocator.builder._build_graph
 
         def with_allocation_choice(*args):
             solve_graph = build(*args)
@@ -706,9 +704,7 @@ def test_real_allocator_pins_unproved_or_unpriced_direct_reads(
                 edge.relayout_edge = object()
             return solve_graph
 
-        monkeypatch.setattr(
-            allocator.candidates, "_build_graph", with_allocation_choice
-        )
+        monkeypatch.setattr(allocator.builder, "_build_graph", with_allocation_choice)
     if failure == "core_budget":
         with pytest.raises(AssertionError, match="fixed direct-read division over"):
             allocator._build_graph(graph)

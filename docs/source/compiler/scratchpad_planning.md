@@ -202,7 +202,7 @@ the graph input and graph output, for `3MN` bytes total, a 62% reduction.
 
 **Stage 4, clone the input to LX.** The graph input is read by several
 ops. Without a clone each reader would re-fetch from HBM.
-`TableCandidates._eligible_clone_inputs` offers the solve every multi-use
+`GraphBuilder._eligible_clone_inputs` offers the solve every multi-use
 input that may reside, gated by `clone_at_graph_boundaries()`; for each one
 the solve places in LX, `_push_allocation` inserts a `clone` op before its
 first reader. The clone reads HBM once and
@@ -268,7 +268,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | File | Responsibility |
 |---|---|
 | `allocator.py` | `ScratchpadAllocator` (open and committed division modes), `ScratchpadOptimizationPass`, `select_allocator`, `scratchpad_planning`, and the commit back to the IR (`commit_divisions`, `commit_lx_views`, `_push_allocation`) |
-| `table_candidates.py` | `TableCandidates`: builds the solve's graph from the IR (`prepare_graph`) and the strategies' candidates (division menus or Lazy spaces, view tables and relations, input clones, relayout edges) |
+| `graph_builder.py` | `GraphBuilder`: builds the solve's graph from the IR (`prepare_graph`) and the strategies' candidates (division menus or Lazy spaces, view tables and relations, input clones, relayout edges) |
 | `residency_rules.py` | Why an op output or graph input may not reside in LX (`_residency_reasons`, one reason per buffer), and which reads may take over a producer's storage in place |
 | `division_menus.py` | An op's candidate work divisions read from the IR: split options, legality and stick-fit checks, matmul and reduction axis parsing, the read-distance filter, and the pruned menu (`_enum_split_options`, `prune=True`) |
 | `drain_plans.py` | Lifetimes around coarse-tile loops: the in-place handoff tick, loop trip counts, and post-loop drain plans (`validated_drain_plans`) |
@@ -296,7 +296,7 @@ scratchpad_planning(graph)  # allocator=select_allocator()
 
 1. **Pre-passes.** `pre_optimization_passes`; `select_allocator` configures
    none.
-2. **The solve's graph.** `TableCandidates.prepare_graph` builds one
+2. **The solve's graph.** `GraphBuilder.prepare_graph` builds one
    `ResourceNode` per IR buffer, *including* the ones that may not reside,
    with its lifetime, footprint and in-place edges, its candidates (a menu,
    and the division space it is drawn from where the op has one) and each
@@ -305,7 +305,7 @@ scratchpad_planning(graph)  # allocator=select_allocator()
    committed division.
    When `clone_at_graph_boundaries()` is set, every graph input that clears
    `residency_rules._input_residency_reason` is a node too
-   (`TableCandidates._eligible_clone_inputs`), so the solve decides whether
+   (`GraphBuilder._eligible_clone_inputs`), so the solve decides whether
    to clone it into LX. Nothing is filtered out; `residency_rules._residency_reasons`
    decides eligibility and the verdict rides along as the node's
    `residency_reason` (see

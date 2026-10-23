@@ -37,7 +37,7 @@ import torch
 import torch_spyre  # noqa: F401
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad import allocator as alloc_mod
-from torch_spyre._inductor.scratchpad.table_candidates import TableCandidates
+from torch_spyre._inductor.scratchpad.graph_builder import GraphBuilder
 
 
 _COOPT = {"co_optimizing_lx_planning": True}
@@ -594,7 +594,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tables = []
-    orig_edges = TableCandidates._relayout_edges
+    orig_edges = GraphBuilder._relayout_edges
 
     def spy_edges(self, *args, **kwargs):
         out = orig_edges(self, *args, **kwargs)
@@ -602,7 +602,7 @@ def test_cross_group_coarse_tiled_edges_are_never_offered(monkeypatch):
             tables.append(out)
         return out
 
-    monkeypatch.setattr(TableCandidates, "_relayout_edges", spy_edges)
+    monkeypatch.setattr(GraphBuilder, "_relayout_edges", spy_edges)
 
     recorded = []
     real_materialize = alloc_mod.materialize_lx_relayouts
@@ -666,7 +666,7 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     from torch_spyre._inductor.scratchpad.lx_relayout import (
         solver_relayout_pair_cost,
     )
-    from torch_spyre._inductor.scratchpad.table_candidates import RelayoutEdge
+    from torch_spyre._inductor.scratchpad.graph_builder import RelayoutEdge
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
     tile_size = 128
@@ -686,7 +686,7 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
     loop_trip_count = ha.shape[0] // tile_size
 
     edges = []
-    orig_edges = TableCandidates._relayout_edges
+    orig_edges = GraphBuilder._relayout_edges
 
     def spy_edges(self, *args, **kwargs):
         out = orig_edges(self, *args, **kwargs)
@@ -702,7 +702,7 @@ def test_same_group_coarse_tiled_edge_is_offered_and_priced_per_trip(monkeypatch
             priced.append((self, (pv, cv, ncores, dst_cores), out[0]))
         return out
 
-    monkeypatch.setattr(TableCandidates, "_relayout_edges", spy_edges)
+    monkeypatch.setattr(GraphBuilder, "_relayout_edges", spy_edges)
     monkeypatch.setattr(RelayoutEdge, "price", spy_price)
     torch._inductor.codecache.FxGraphCache.clear()
     torch._dynamo.reset()

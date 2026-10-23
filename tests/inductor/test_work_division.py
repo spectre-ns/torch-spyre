@@ -116,7 +116,7 @@ from torch_spyre._inductor.work_division_constraints import (
     restickify_padding_blocked_vars,
     topk_split_domains,
 )
-import torch_spyre._inductor.scratchpad.table_candidates as table_candidates_module
+import torch_spyre._inductor.scratchpad.graph_builder as graph_builder_module
 from torch_spyre._inductor.scratchpad import division_menus
 from torch_spyre._inductor.scratchpad import drain_plans
 from torch_spyre._inductor.scratchpad import residency_rules
@@ -2246,7 +2246,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             for module in (
                 allocator_module,
                 drain_plans,
-                table_candidates_module,
+                graph_builder_module,
                 work_division_module,
             ):
                 if hasattr(module, target):
@@ -2254,10 +2254,10 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         return stack
 
     def _table(self, allocator):
-        edges = allocator.candidates._parent_residency_edges(
+        edges = allocator.builder._parent_residency_edges(
             self.consumer_op, self.parent_names, self.op_by_name, {}, self.residency
         )
-        return allocator.candidates._cd_parent_matches(
+        return allocator.builder._cd_parent_matches(
             edges, self.consumer_divs, self.divisions
         )
 
@@ -2334,7 +2334,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         self.consumer_op._loop_carry_record = record
 
         with self._patches():
-            edge = allocator.candidates._loop_carry_update_edge(
+            edge = allocator.builder._loop_carry_update_edge(
                 self.consumer_op,
                 self.op_by_name,
                 {},
@@ -2376,11 +2376,11 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
         with self._patches():
             carry_edges = {
-                "update": allocator.candidates._loop_carry_update_edge(
+                "update": allocator.builder._loop_carry_update_edge(
                     update_op, self.op_by_name, {}
                 )
             }
-            edges = allocator.candidates._loop_carry_read_edges(
+            edges = allocator.builder._loop_carry_read_edges(
                 self.consumer_op, carry_edges, {}
             )
             self.assertEqual(set(edges), {"plain"})
@@ -2393,7 +2393,7 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
             # The update's own write is the carry edge, not a read edge.
             self.assertEqual(
-                allocator.candidates._loop_carry_read_edges(update_op, carry_edges, {}),
+                allocator.builder._loop_carry_read_edges(update_op, carry_edges, {}),
                 {},
             )
 
@@ -2469,8 +2469,8 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             stack.enter_context(self._patches())
             for target, kwargs in (
                 ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
-                ("table_candidates.clone_at_graph_boundaries", {"return_value": True}),
-                ("table_candidates.mem_usage_by_buf", {"return_value": mem_usage}),
+                ("graph_builder.clone_at_graph_boundaries", {"return_value": True}),
+                ("graph_builder.mem_usage_by_buf", {"return_value": mem_usage}),
                 ("allocator.materialize_lx_relayouts", {}),
             ):
                 stack.enter_context(
@@ -2478,14 +2478,14 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 )
             stack.enter_context(
                 patch.object(
-                    allocator.candidates,
+                    allocator.builder,
                     "_residency_by_buf",
                     side_effect=lambda *a, **k: residency,
                 )
             )
             stack.enter_context(
                 patch.object(
-                    allocator.candidates,
+                    allocator.builder,
                     "_relayout_edges",
                     side_effect=lambda *a: {},
                 )
@@ -2500,9 +2500,9 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             )
 
             plans = drain_plans.validated_drain_plans(graph)
-            allocator.candidates.drain_plans = plans
+            allocator.builder.drain_plans = plans
             allocator._validated_drain_plans = plans
-            solve_graph = allocator.candidates._build_graph(
+            solve_graph = allocator.builder._build_graph(
                 graph, {}, division_menus._DivisionMap(divisions, set())
             )
             nodes = solve_graph.solve(strategy=LazyStrategy())
@@ -2791,10 +2791,10 @@ class TestResidencyEdgeMatching(unittest.TestCase):
     def test_no_consumer_op_matches_nothing(self):
         allocator = ScratchpadAllocator(size=1, division_mode="open")
         with self._patches():
-            edges = allocator.candidates._parent_residency_edges(
+            edges = allocator.builder._parent_residency_edges(
                 None, [], {}, {}, self.residency
             )
-            self.assertEqual(allocator.candidates._cd_parent_matches(edges, [], {}), {})
+            self.assertEqual(allocator.builder._cd_parent_matches(edges, [], {}), {})
 
 
 class TestCloneDivisionMatching(unittest.TestCase):
@@ -2842,11 +2842,11 @@ class TestCloneDivisionMatching(unittest.TestCase):
             ]:
                 stack.enter_context(
                     patch(
-                        f"torch_spyre._inductor.scratchpad.table_candidates.{target}",
+                        f"torch_spyre._inductor.scratchpad.graph_builder.{target}",
                         **kwargs,
                     )
                 )
-            return allocator.candidates._clone_divisions_and_matches(
+            return allocator.builder._clone_divisions_and_matches(
                 "inp", [self.consumer], {"consumer": self.consumer_divs}, {}
             )
 
@@ -2869,23 +2869,23 @@ class TestJointAllocator(unittest.TestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.ops_in_offset_mutation_component",
+                "torch_spyre._inductor.scratchpad.graph_builder.ops_in_offset_mutation_component",
                 return_value=set(),
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._fused_layout_group_ops",
+                "torch_spyre._inductor.scratchpad.graph_builder._fused_layout_group_ops",
                 return_value={},
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._find_distinct_matmul_splits",
+                "torch_spyre._inductor.scratchpad.graph_builder._find_distinct_matmul_splits",
                 return_value=((), ()),
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.is_restickify_op",
+                "torch_spyre._inductor.scratchpad.graph_builder.is_restickify_op",
                 return_value=True,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._fixed_core_division",
+                "torch_spyre._inductor.scratchpad.graph_builder._fixed_core_division",
                 return_value=fixed,
             ),
             patch(
@@ -2893,10 +2893,10 @@ class TestJointAllocator(unittest.TestCase):
                 return_value=True,
             ),
             patch.object(
-                allocator.candidates, "_enumerate_core_divisions"
+                allocator.builder, "_enumerate_core_divisions"
             ) as enumerate_divs,
         ):
-            divisions = allocator.candidates._division_map(graph).divisions
+            divisions = allocator.builder._division_map(graph).divisions
 
         self.assertEqual(divisions[op.name], [fixed])
         enumerate_divs.assert_not_called()
@@ -2911,15 +2911,15 @@ class TestJointAllocator(unittest.TestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.ops_in_offset_mutation_component",
+                "torch_spyre._inductor.scratchpad.graph_builder.ops_in_offset_mutation_component",
                 return_value={op.name},
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._find_distinct_matmul_splits",
+                "torch_spyre._inductor.scratchpad.graph_builder._find_distinct_matmul_splits",
                 return_value=((), ()),
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._fixed_core_division",
+                "torch_spyre._inductor.scratchpad.graph_builder._fixed_core_division",
                 return_value=fixed,
             ),
             patch(
@@ -2930,7 +2930,7 @@ class TestJointAllocator(unittest.TestCase):
             with self.assertRaisesRegex(
                 Unsupported, "fixed split violates hard domain"
             ):
-                allocator.candidates._division_map(graph)
+                allocator.builder._division_map(graph)
 
     def test_pruned_candidates_and_commit_reject_illegal_division(self):
         batch, m = _isym("batch"), _isym("m")
@@ -2946,19 +2946,19 @@ class TestJointAllocator(unittest.TestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.ops_in_offset_mutation_component",
+                "torch_spyre._inductor.scratchpad.graph_builder.ops_in_offset_mutation_component",
                 return_value=set(),
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._find_distinct_matmul_splits",
+                "torch_spyre._inductor.scratchpad.graph_builder._find_distinct_matmul_splits",
                 return_value=((), ()),
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._enum_split_options",
+                "torch_spyre._inductor.scratchpad.graph_builder._enum_split_options",
                 return_value=[safe, unsafe],
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.op_read_writes",
+                "torch_spyre._inductor.scratchpad.graph_builder.op_read_writes",
                 return_value=rw,
             ),
             # ``_core_division`` reads the write dep from ``work_division``.
@@ -2972,7 +2972,7 @@ class TestJointAllocator(unittest.TestCase):
                 side_effect=lambda _op, splits: splits == safe,
             ) as is_legal,
         ):
-            division_map = allocator.candidates._division_map(graph)
+            division_map = allocator.builder._division_map(graph)
             divisions = division_map.divisions[op.name]
 
         self.assertEqual(divisions, [CoreDivision(splits={m: 8})])
@@ -3013,20 +3013,20 @@ class TestJointAllocator(unittest.TestCase):
         with (
             # No point menu and no split space: the op goes to the ordinary
             # enumeration.
-            patch.object(allocator.candidates, "_point_menu", return_value=None),
+            patch.object(allocator.builder, "_point_menu", return_value=None),
             patch.object(
                 work_division_module, "work_division_context_for_op", return_value=None
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.op_read_writes",
+                "torch_spyre._inductor.scratchpad.graph_builder.op_read_writes",
                 return_value=rw,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._fixed_core_division",
+                "torch_spyre._inductor.scratchpad.graph_builder._fixed_core_division",
                 return_value=fixed,
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.enumerate_work_division_candidates",
+                "torch_spyre._inductor.scratchpad.graph_builder.enumerate_work_division_candidates",
                 return_value=[],
             ),
             patch(
@@ -3037,7 +3037,7 @@ class TestJointAllocator(unittest.TestCase):
             # Not an enumeration, so a solver may not generate divisions for
             # this op: the committed one is all it is allowed.
             self.assertEqual(
-                allocator.candidates._enumerate_core_divisions(op, max_cores=32),
+                allocator.builder._enumerate_core_divisions(op, max_cores=32),
                 ([fixed], False),
             )
 
@@ -3063,19 +3063,19 @@ class TestJointAllocator(unittest.TestCase):
         with (
             patch.object(allocator_module.config, "sencores", 32),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.ops_in_offset_mutation_component",
+                "torch_spyre._inductor.scratchpad.graph_builder.ops_in_offset_mutation_component",
                 return_value=set(),
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._find_distinct_matmul_splits",
+                "torch_spyre._inductor.scratchpad.graph_builder._find_distinct_matmul_splits",
                 return_value=((), ()),
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates._enum_split_options",
+                "torch_spyre._inductor.scratchpad.graph_builder._enum_split_options",
                 return_value=[over_budget],
             ),
             patch(
-                "torch_spyre._inductor.scratchpad.table_candidates.op_read_writes",
+                "torch_spyre._inductor.scratchpad.graph_builder.op_read_writes",
                 return_value=rw,
             ),
             # ``_core_division`` reads the write dep from ``work_division``.
@@ -3092,7 +3092,7 @@ class TestJointAllocator(unittest.TestCase):
                 AssertionError, r"over_budget_out: .*over the 32-core budget"
             ),
         ):
-            allocator.candidates._division_map(graph)
+            allocator.builder._division_map(graph)
 
 
 class TestTopKConstraints(unittest.TestCase):

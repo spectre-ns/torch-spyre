@@ -98,8 +98,8 @@ def cost_expr(
     and their candidates, and its per-bundle terms; ``None`` when
     it is withheld or cannot be built (the solver then runs its own
     lexicographic ladder)."""
-    from torch_spyre._inductor.scratchpad.table_candidates import (
-        TableCandidates,
+    from torch_spyre._inductor.scratchpad.graph_builder import (
+        GraphBuilder,
         residency_symbols,
     )
 
@@ -107,7 +107,7 @@ def cost_expr(
     # Built once here, not per op inside the loop below: every op's residency
     # lookup is against this same whole-graph map.
     default_is_lx = residency_symbols(solve_graph)
-    pricing_ops = TableCandidates._pricing_operations(graph, solve_graph)
+    pricing_ops = GraphBuilder._pricing_operations(graph, solve_graph)
     pricing_by_name = {op.get_name(): op for op in pricing_ops}
 
     # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match

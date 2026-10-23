@@ -108,7 +108,7 @@ in LX.
 
 ### The CP-SAT solve
 
-The allocator builds the solve's graph from the IR (`TableCandidates.prepare_graph`), the same
+The allocator builds the solve's graph from the IR (`GraphBuilder.prepare_graph`), the same
 graph for every encoding strategy, prices it (`pricing.cost_expr`), and calls
 `SpyreOptimizationGraph.solve` (`scratchpad/buffer_graph.py`) with the configured strategy
 (`LX_DIVISION_STRATEGY`), which derives its encoding from the graph. That posts the problem
@@ -126,7 +126,7 @@ solutions.
 ### Co-optimizer will honor `spyre_hint` for work divisions
 
 A resolved `spyre_hint(work_div=...)` is still honored under the co-optimizer, not overridden
-by the joint search. `table_candidates.py` collapses that op's candidate-division list to the single
+by the joint search. `graph_builder.py` collapses that op's candidate-division list to the single
 division the hint requested *before* the solve runs — the hint acts upstream of the search,
 not as a rule the search itself has to learn or respect. Everything else in the graph stays
 co-optimized as usual; only that one op loses its freedom.
@@ -247,7 +247,7 @@ one must be compatible. The solve ranks plans with the lexicographic ladder desc
 `cost_expr`. Once it picks a tiling, `ScratchpadAllocator._materialize_selection` has
 `scratchpad/coarse_tiling.py`'s `CoarseTilingPass` — taking a `TileSpec` and lowering it to
 `DimHint`s — apply it to the graph, and the allocation is solved again over the now-tiled graph
-with tiling suppressed (`TableCandidates.suppress_tiling`), so no further tilings are offered —
+with tiling suppressed (`GraphBuilder.suppress_tiling`), so no further tilings are offered —
 that second plan is the one committed.
 
 `scratchpad_planning.md`'s "Current limitations"/"Future work" coarse-tiling items now point

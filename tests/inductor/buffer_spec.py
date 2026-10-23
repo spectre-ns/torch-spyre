@@ -15,7 +15,7 @@
 """The buffer form: hand-written buffers for solver tests and capture replay.
 
 The compiler builds the solve's graph straight from the IR
-(``TableCandidates.prepare_graph``). Tests describe a graph as buffers
+(``GraphBuilder.prepare_graph``). Tests describe a graph as buffers
 instead; this module turns them into the same graph, candidates on its nodes
 and relations on its edges, and a solved plan back into the buffers' terms."""
 
