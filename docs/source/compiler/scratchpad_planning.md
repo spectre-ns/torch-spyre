@@ -274,7 +274,8 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `drain_plans.py` | Lifetimes around coarse-tile loops: the in-place handoff tick, loop trip counts, and post-loop drain plans (`validated_drain_plans`) |
 | `buffer_graph.py` | `SpyreOptimizationGraph`: resource nodes, dependency and execution edges, and `solve` (encoding walk, objective ladder, extraction) |
 | `encoding_strategy.py` | `EncodingStrategy` / `EnumeratedStrategy`: how the graph becomes a CP model (candidate tables, relations, CP variables) |
-| `lazy_division.py`, `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
+| `division_space.py` | An op's divisions as a space (`DivisionSpace`): tiling options, per-axis factor domains, its points |
+| `lazy_strategy.py` | The `Lazy` work split: legality as constraints, per-axis tables, digit-form views |
 | `relayout_copies.py` | Relayouts as constraints over view ids (shared copies, variable lifetimes) |
 | `backend.py` | The solver protocol the strategy posts to (`Backend`), `CpSat` (default), `Mip`, `BruteForce`, `Annealing`; `from_env` picks one from `SPYRE_LX_BACKEND` |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |

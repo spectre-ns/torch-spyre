@@ -15,7 +15,7 @@
 """The ``Lazy`` work-split encoding (Phase 2f + 2a, experimental).
 
 A Lazy node has no candidate index. Its work split is one var per loop axis
-plus a tiling choice, constrained by :func:`lazy_division.post_division`, and
+plus a tiling choice, constrained by :func:`post_division`, and
 every per-division quantity (footprint, core cost, tile counts, view ids, cost
 terms) is a table over only the axes it varies with, tabulated over the
 space's points rather than the menu. Nodes that cannot be Lazy stay ``Table``:
@@ -32,7 +32,10 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+import sympy
+
 from torch_spyre._inductor import config
+from torch_spyre._inductor import work_division as wd
 
 from torch_spyre._inductor.scratchpad.buffer_graph import (
     DependencyEdge,
@@ -49,12 +52,7 @@ from torch_spyre._inductor.scratchpad.encoding_strategy import (
     _Fixed,
     _Table,
 )
-from torch_spyre._inductor.scratchpad.lazy_division import (
-    LazySpace,
-    legal_points,
-    menu_points,
-    post_division,
-)
+from torch_spyre._inductor.scratchpad.division_space import DivisionSpace
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     ceil_div,
@@ -66,6 +64,205 @@ logger = logging.getLogger(__name__)
 # Spaces with more points than this stay Table: every quantity of a Lazy node
 # is tabulated over its points.
 MAX_POINTS = 4096
+
+Var = Any
+
+
+def _span_terms(ctx: wd.WorkDivisionContext, td, domain: dict) -> tuple[list, int]:
+    """Per outer device dim with a loop symbol: ``(stride_bytes, {axis: {split:
+    term}})``; that dim's per-core extent is ``1 + sum(terms)``. ``domain`` is
+    each axis's posted domain, so every term table is total."""
+    device_size = td.layout.device_layout.device_size
+    itemsize = td.layout.dtype.itemsize
+    dims = []
+    for d, coord in enumerate(td.device_coords[:-1]):
+        if not coord.free_symbols:
+            continue
+        per_axis = {}
+        for v in coord.free_symbols:
+            term = coord.subs(dict.fromkeys(coord.free_symbols - {v}, 0))
+            base = int(term.subs(v, 0))
+            size = wd._effective_size(v, ctx.it_space, ctx.symbol_meta)
+            values = domain.get(v, [1]) if v in ctx.it_space_adjusted else [1]
+            per_axis[v] = {s: int(term.subs(v, size // s - 1)) - base for s in values}
+        stride = math.prod(device_size[d + 1 :]) * itemsize
+        dims.append((stride, per_axis))
+    return dims, itemsize
+
+
+def post_division(
+    model, space: DivisionSpace, name: str
+) -> tuple[Var | int, dict[sympy.Symbol, Var], list[Var | int], Var | int]:
+    """Post ``space``'s legal divisions: ``(option, splits, option literals,
+    cores)``. ``option`` and ``cores`` are constants when nothing is left to
+    choose."""
+    axes = space.axes
+    domain = {a: space.domain(a) for a in axes}
+    splits: dict[sympy.Symbol, Var] = {}
+    for a in axes:
+        var = model.IntVar(min(domain[a]), max(domain[a]), f"split_{name}_{a}")
+        if len(domain[a]) < max(domain[a]) - min(domain[a]) + 1:
+            model.AddAllowedAssignments([var], [(d,) for d in domain[a]])
+        splits[a] = var
+    k = len(space.options)
+    option: Var | int
+    if k == 1:
+        option, lits = 0, [1]
+    else:
+        option = model.IntVar(0, k - 1, f"tiling_{name}")
+        lits = []
+        for i in range(k):
+            lit = model.BoolVar(f"tiling_{name}_is_{i}")
+            model.Add(option == i).OnlyEnforceIf(lit)
+            model.Add(option != i).OnlyEnforceIf(lit.Not())
+            lits.append(lit)
+    cores: Var | int = 1
+    for a in axes:
+        if isinstance(cores, int):
+            cores = splits[a]
+            continue
+        product = model.IntVar(1, space.max_cores, f"cores_{name}_{a}")
+        model.AddMultiplicationEquality(product, [cores, splits[a]])
+        cores = product
+    if not isinstance(cores, int):
+        model.Add(cores <= space.max_cores)
+    for i, o in enumerate(space.options):
+        _post_option(model, o.context, splits, domain, lits[i], f"{name}_{i}")
+    return option, splits, lits, cores
+
+
+def _enforce(constraint, lit) -> None:
+    if lit is not True:
+        constraint.OnlyEnforceIf(lit)
+
+
+def _post_option(model, ctx, splits, domain, lit, name: str) -> None:
+    """Under ``lit``, :meth:`WorkDivisionContext.is_legal` for ``ctx``."""
+    if isinstance(lit, int):
+        lit = True
+
+    def infeasible() -> None:
+        if lit is True:
+            raise ValueError(f"{name}: the only tiling option has no legal division")
+        model.Add(lit == 0)
+
+    for a, var in splits.items():
+        allowed = set(ctx.factor_domain(a)) if a in ctx.axes else {1}
+        if not allowed:
+            infeasible()
+            return
+        for value in domain[a]:
+            if value not in allowed:
+                _enforce(model.Add(var != value), lit)
+    split_reductions = [v for v in ctx.reduction_vars if v in splits]
+    if len(split_reductions) > 1:
+        reductions = []
+        for v in split_reductions:
+            b = model.BoolVar(f"red_{name}_{v}")
+            model.Add(splits[v] > 1).OnlyEnforceIf(b)
+            model.Add(splits[v] == 1).OnlyEnforceIf(b.Not())
+            reductions.append(b)
+        _enforce(model.Add(sum(reductions) <= 1), lit)
+    for v in ctx.constraints.blocked:
+        if v in splits:
+            _enforce(model.Add(splits[v] == 1), lit)
+    for v, allowed in ctx.constraints.allowed_splits.items():
+        if v in splits:
+            for value in domain[v]:
+                if value not in allowed:
+                    _enforce(model.Add(splits[v] != value), lit)
+    for v, minimum in ctx.span_min_splits.items():
+        if v in splits:
+            _enforce(model.Add(splits[v] >= minimum), lit)
+        elif minimum > 1:
+            infeasible()
+            return
+    for ti, td in enumerate(ctx.tensor_deps):
+        dims, itemsize = _span_terms(ctx, td, domain)
+        if itemsize > wd.MAX_SPAN_BYTES:
+            infeasible()
+            return
+        earlier: list = []
+        for di, (stride, per_axis) in enumerate(dims):
+            parts: list = []
+            for v, table in per_axis.items():
+                # A split this frame does not adjust leaves the term at its
+                # value for split 1.
+                if v in splits and v in ctx.axes and len(table) > 1:
+                    lo, hi = min(table.values()), max(table.values())
+                    if lo == hi:
+                        parts.append(lo)
+                        continue
+                    t = model.IntVar(lo, hi, f"span_{name}_{ti}_{di}_{v}")
+                    model.AddAllowedAssignments([splits[v], t], list(table.items()))
+                    parts.append(t)
+                else:
+                    parts.append(table.get(1, 0))
+            cap = wd.MAX_SPAN_BYTES // stride
+            if all(isinstance(p, int) for p in parts):
+                size = 1 + sum(parts)
+                if size == 1:
+                    continue
+                # A fixed extent above one decides the span unless an earlier
+                # dim already did.
+                if size > cap:
+                    if not earlier:
+                        infeasible()
+                        return
+                    _enforce(model.AddBoolOr(earlier), lit)
+                break
+            # Unbounded below: the term tables are posted for every option, and
+            # a split legal elsewhere can make this frame's extent negative.
+            size_var = model.IntVar(-(1 << 40), 1 << 40, f"extent_{name}_{ti}_{di}")
+            model.Add(size_var == 1 + sum(parts))
+            gt1 = model.BoolVar(f"gt1_{name}_{ti}_{di}")
+            model.Add(size_var > 1).OnlyEnforceIf(gt1)
+            model.Add(size_var <= 1).OnlyEnforceIf(gt1.Not())
+            model.Add(size_var <= cap).OnlyEnforceIf(
+                [gt1, *[e.Not() for e in earlier], *_lits(lit)]
+            )
+            earlier.append(gt1)
+
+
+def _lits(lit) -> list:
+    return [] if lit is True else [lit]
+
+
+def legal_points(space: DivisionSpace) -> set[tuple[int, tuple]]:
+    """Every ``(option, splits over space.axes)`` the posted constraints admit,
+    by enumerating the solutions of the division model alone: the agreement
+    check against the menu."""
+    from ortools.sat.python import cp_model
+
+    from torch_spyre._inductor.scratchpad.backend import CpSat
+
+    backend = CpSat()
+    option, splits, _, _ = post_division(backend, space, "check")
+    axes = space.axes
+    solver = cp_model.CpSolver()
+    solver.parameters.enumerate_all_solutions = True
+    solver.parameters.num_search_workers = 1
+    found: set = set()
+
+    class Collect(cp_model.CpSolverSolutionCallback):
+        def on_solution_callback(self) -> None:
+            k = option if isinstance(option, int) else self.Value(option)
+            found.add((k, tuple(self.Value(splits[a]) for a in axes)))
+
+    solver.Solve(backend.model, Collect())
+    return found
+
+
+def menu_points(
+    space: DivisionSpace, menu: Sequence[CoreDivision]
+) -> set[tuple[int, tuple]]:
+    """The menu in :func:`legal_points`' terms."""
+    by_tiling = {o.tiling: k for k, o in enumerate(space.options)}
+    axes = space.axes
+    return {
+        (by_tiling.get(cd.tiling, -1), tuple(cd.splits.get(a, 1) for a in axes))
+        for cd in menu
+    }
 
 
 @dataclass(frozen=True)
@@ -189,7 +386,7 @@ def _digits(prep, domain: dict) -> Optional[_Digits]:
     )
 
 
-def _why_illegal(space: LazySpace, k: int, splits: tuple) -> list[str]:
+def _why_illegal(space: DivisionSpace, k: int, splits: tuple) -> list[str]:
     """Which ``is_legal`` checks a point fails (agreement-check diagnostics)."""
     ctx = space.options[k].context
     s = dict(zip(space.axes, splits))
@@ -222,7 +419,7 @@ class _LazyVars:
     """A Lazy node's split encoding and its points, which ``tie`` tabulates
     over."""
 
-    def __init__(self, model: Model, space: LazySpace, option, splits) -> None:
+    def __init__(self, model: Model, space: DivisionSpace, option, splits) -> None:
         self.model = model
         self.space = space
         self.option = option
@@ -274,7 +471,7 @@ class LazyStrategy(EncodingStrategy):
 
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
-        self._lazy: dict[Item, LazySpace] = {}
+        self._lazy: dict[Item, DivisionSpace] = {}
         self._grid: dict[Item, tuple[CoreDivision, ...]] = {}
         self._digit_cache: dict = {}
 

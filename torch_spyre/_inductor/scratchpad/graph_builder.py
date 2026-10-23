@@ -408,7 +408,7 @@ class GraphBuilder:
         self.suppress_tiling = False
         self._relayout_pair_costs: dict[tuple, Optional[float]] = {}
         # Per enumerated op, its divisions as a space (a Lazy split's).
-        self.lazy_spaces: dict[str, Any] = {}
+        self.spaces: dict[str, Any] = {}
         # Ops whose menu is their space's points, not the legal divisions.
         self.point_menus: set[str] = set()
 
@@ -701,14 +701,14 @@ class GraphBuilder:
                         exc,
                     )
                     continue
-            from torch_spyre._inductor.scratchpad.lazy_division import LazyOption
+            from torch_spyre._inductor.scratchpad.division_space import DivisionOption
             from torch_spyre._inductor.work_division import (
                 work_division_context_for_op,
             )
 
             context = work_division_context_for_op(op, max_cores, tiling)
             if context is not None and tiled_candidates:
-                options.append(LazyOption(tiling, tile_splits, context))
+                options.append(DivisionOption(tiling, tile_splits, context))
             for candidate in tiled_candidates:
                 division = _core_division(op, candidate, tiling, tile_splits)
                 key = (
@@ -726,9 +726,11 @@ class GraphBuilder:
                     cds.append(division)
         if cds:
             if options:
-                from torch_spyre._inductor.scratchpad.lazy_division import LazySpace
+                from torch_spyre._inductor.scratchpad.division_space import (
+                    DivisionSpace,
+                )
 
-                self.lazy_spaces[op.get_name()] = LazySpace(op, options, max_cores)
+                self.spaces[op.get_name()] = DivisionSpace(op, options, max_cores)
             return cds, True
         return _legal_fixed_division(op, fixed, "no enumerable candidate"), False
 
@@ -741,9 +743,9 @@ class GraphBuilder:
         from torch_spyre._inductor.scratchpad.coarse_tiling import (
             try_resolve_tile_axis_loop_vars,
         )
-        from torch_spyre._inductor.scratchpad.lazy_division import (
-            LazyOption,
-            LazySpace,
+        from torch_spyre._inductor.scratchpad.division_space import (
+            DivisionOption,
+            DivisionSpace,
         )
         from torch_spyre._inductor.scratchpad.lazy_strategy import MAX_POINTS
         from torch_spyre._inductor.work_division import work_division_context_for_op
@@ -769,13 +771,13 @@ class GraphBuilder:
                     continue
             # Only an option with some legal division: the menu has no other.
             if context is not None and _has_legal_division(context):
-                options.append(LazyOption(tiling, tile_splits, context))
+                options.append(DivisionOption(tiling, tile_splits, context))
         if not options:
             return None
-        space = LazySpace(op, options, max_cores)
+        space = DivisionSpace(op, options, max_cores)
         if len(space.points()) > MAX_POINTS:
             return None
-        self.lazy_spaces[op.get_name()] = space
+        self.spaces[op.get_name()] = space
         self.point_menus.add(op.get_name())
         return [space.division(k, s) for k, s in space.points()]
 
@@ -784,7 +786,7 @@ class GraphBuilder:
         it (a pair table, read-copy pricing). Same order as the enumeration."""
         if name not in self.point_menus:
             return
-        space = self.lazy_spaces[name]
+        space = self.spaces[name]
         divisions[name] = [
             space.division(k, s)
             for k, s in space.points()
@@ -1286,7 +1288,7 @@ class GraphBuilder:
                 end_override=lifetime_end_overrides.get(output_name),
                 op=op,
                 menu=buf_divisions,
-                space=self.lazy_spaces.get(output_name)
+                space=self.spaces.get(output_name)
                 if output_name in division_map.enumerated
                 else None,
                 point_menu=output_name in division_map.enumerated
