@@ -37,6 +37,7 @@
 #include <utility>
 #include <vector>
 
+#include "box_packer.h"
 #include "job_plan.h"
 #include "kernel_provenance_registry.h"
 
@@ -273,6 +274,9 @@ PYBIND11_MODULE(_C, m) {
 
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
+
+  // Register the annealing backend's native packer.
+  torch_spyre::scratchpad::register_box_packer(m);
 
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)

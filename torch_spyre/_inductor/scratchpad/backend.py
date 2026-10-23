@@ -640,6 +640,17 @@ class _DomainValues:
             yield from range(lo, hi + 1)
 
 
+def _complementary(d1, d2) -> bool:
+    """Whether two domains (flat [lo, hi, ...] lists) partition the int64 range."""
+    spans = sorted([*zip(d1[::2], d1[1::2]), *zip(d2[::2], d2[1::2])])
+    nxt = -(2**63)
+    for lo, hi in spans:
+        if lo != nxt:
+            return False
+        nxt = hi + 1
+    return nxt == 2**63
+
+
 class TooBig(Exception):
     pass
 
@@ -713,8 +724,11 @@ class _BruteForceSearch:
         return vs
 
     def _definitions(self):
-        """var -> constraint index that computes it from other vars."""
+        """var -> constraint index that computes it from other vars. One
+        constraint defines one var: an equality defining all its vars leaves
+        each waiting on the others, and none ever resolves."""
         defs = {}
+        self._lookups: dict[int, dict] = {}
         for ci, c in enumerate(self.cons):
             if len(c.enforcement_literal):
                 continue
@@ -730,10 +744,98 @@ class _BruteForceSearch:
             elif k == "linear":
                 lin = c.linear
                 if list(lin.domain) == [lin.domain[0], lin.domain[0]]:
-                    for v, co in zip(lin.vars, lin.coeffs):
-                        if abs(co) == 1:
-                            defs.setdefault(self._ref(v), ci)
+                    # The newest var: an auxiliary is made after its inputs.
+                    unit = [
+                        self._ref(v)
+                        for v, co in zip(lin.vars, lin.coeffs)
+                        if abs(co) == 1 and self._ref(v) not in defs
+                    ]
+                    if unit:
+                        defs[max(unit)] = ci
+            elif k == "table":
+                lookup = self._functional_table(c.table)
+                if lookup is not None and lookup[0] not in defs:
+                    defs[lookup[0]] = ci
+                    self._lookups[ci] = lookup[1]
+        self._reified = self._reifications(defs)
+        for v, ci in self._reified.items():
+            defs[v] = ci
         return defs
+
+    def _functional_table(self, t):
+        """(last var, row -> value) when a table's last column is a var that
+        is a function of the other columns, as a lazy ``tie`` posts it (a
+        constant column pins it outright)."""
+        if t.negated:
+            return None
+        if len(t.exprs):
+            last = t.exprs[-1]
+            if (
+                len(last.vars) != 1
+                or last.coeffs[0] != 1
+                or last.offset
+                or last.vars[0] < 0
+            ):
+                return None
+            var, w = last.vars[0], len(t.exprs)
+        else:
+            var, w = t.vars[-1], len(t.vars)
+        if w < 2:
+            return None
+        vals = list(t.values)
+        lookup: dict = {}
+        for j in range(0, len(vals), w):
+            key, out = tuple(vals[j : j + w - 1]), vals[j + w - 1]
+            if lookup.setdefault(key, out) != out:
+                return None
+        return var, lookup
+
+    def _reifications(self, defs):
+        """bool var -> the constraint it enforces, for a ``b => lin in D``,
+        ``not b => lin in complement(D)`` pair (b is whether lin lies in D),
+        or a ``b => and(L)``, ``not b => or(not L)`` pair (b is and(L))."""
+        out = {}
+        ors = {
+            (c.enforcement_literal[0], frozenset(c.bool_or.literals))
+            for c in self.cons
+            if c.WhichOneof("constraint") == "bool_or"
+            and len(c.enforcement_literal) == 1
+        }
+        for ci, c in enumerate(self.cons):
+            if (
+                c.WhichOneof("constraint") != "bool_and"
+                or len(c.enforcement_literal) != 1
+            ):
+                continue
+            lit = c.enforcement_literal[0]
+            if lit < 0 or lit in defs or lit in out:
+                continue
+            negated = frozenset(-x - 1 for x in c.bool_and.literals)
+            if (-lit - 1, negated) in ors:
+                out[lit] = ci
+        by_expr: dict = {}
+        for ci, c in enumerate(self.cons):
+            if (
+                c.WhichOneof("constraint") != "linear"
+                or len(c.enforcement_literal) != 1
+            ):
+                continue
+            key = (tuple(c.linear.vars), tuple(c.linear.coeffs))
+            by_expr.setdefault(key, []).append(ci)
+        for group in by_expr.values():
+            for ci in group:
+                lit = self.cons[ci].enforcement_literal[0]
+                if lit < 0 or lit in defs or lit in out:
+                    continue
+                for cj in group:
+                    if self.cons[cj].enforcement_literal[0] == -lit - 1 and (
+                        _complementary(
+                            self.cons[ci].linear.domain, self.cons[cj].linear.domain
+                        )
+                    ):
+                        out[lit] = ci
+                        break
+        return out
 
     def _objective(self):
         """(vars, coeffs, offset, report): minimize offset + sum(c * x); the
@@ -864,6 +966,29 @@ class _BruteForceSearch:
         ci = self.defs[v]
         c = self.cons[ci]
         k = c.WhichOneof("constraint")
+        if v in self._reified and k == "bool_and":
+            xs = [self._val(a, x) for x in c.bool_and.literals]
+            return None if None in xs else int(all(xs))
+        if v in self._reified:
+            lin = c.linear
+            s = 0
+            for r, co in zip(lin.vars, lin.coeffs):
+                x = self._val(a, r)
+                if x is None:
+                    return None
+                s += co * x
+            return int(
+                any(lo <= s <= hi for lo, hi in zip(lin.domain[::2], lin.domain[1::2]))
+            )
+        if k == "table":
+            t = c.table
+            cols = (
+                [self._lin(a, x) for x in t.exprs]
+                if len(t.exprs)
+                else [a[x] for x in t.vars]
+            )
+            row = tuple(cols[:-1])
+            return None if None in row else self._lookups[ci].get(row)
         if k == "element":
             e = c.element
             i = self._lin(a, e.linear_index)
@@ -999,83 +1124,438 @@ class _BruteForceSearch:
 class _AnnealSearch(_BruteForceSearch):
     """Simulated annealing over the recorded model, no linearization: every
     constraint kind is evaluated natively (the same checks as the exhaustive
-    search), violations are penalized, and a move reassigns one variable that
-    no constraint defines; defined ones are recomputed."""
+    search). Offsets are never searched: each resident box goes, in placement
+    order, to the lowest offset clear of the boxes placed before it that
+    share its time.
 
-    def anneal(
-        self, seed: int, budget_s: float, penalty: Optional[float] = None, start=None
-    ):
+    A move reassigns one free var, or moves one box in the placement order,
+    then repairs: while a constraint is violated, it rewrites the free vars
+    behind one violated constraint (a whole table row at once), keeping the
+    candidate that leaves the fewest violations. Valid plans are not one
+    connected region under these moves, so the search may leave them: an
+    excursion through plans with at most ``EXCURSION_VIOLATIONS`` violations
+    (each costing ``EXCURSION_PENALTY`` times the objective's full scale, so
+    leaving the valid plans is rare and short) that finds no valid plan
+    within ``EXCURSION_MOVES`` moves is undone back to the last valid one.
+    Only valid plans are kept as the best. From an invalid start it first
+    descends to a valid plan.
+
+    Moves are differential: only the defined vars downstream of a change are
+    recomputed, the packer reruns only when a packing input changed, only the
+    constraints watching a changed var are re-checked, and a rejected move is
+    undone from a journal. ``SPYRE_ANNEAL_VERIFY=N`` checks the running state
+    against a from-scratch evaluation every N moves."""
+
+    REPAIR_ROUNDS = 6
+    REPAIR_CANDIDATES = 6
+    EXCURSION_VIOLATIONS = 2
+    EXCURSION_MOVES = 30
+    EXCURSION_PENALTY = 10.0
+
+    def anneal(self, seed: int, budget_s: float, start=None):
+        import os
         import random
 
         rng = random.Random(seed)
-        free = [v for v in range(self.n) if v not in self.defs]
-        doms = [_DomainValues(self.domains[v]) for v in range(self.n)]
-        # Definitions that cannot resolve (a row "defining" several of its own
-        # vars) leave those vars free: the search moves them.
-        probe = [None] * self.n
-        for v in free:
-            probe[v] = doms[v][0]
-        self._propagate(probe, [])
-        self._floating: set = {v for v in self.defs if probe[v] is None}
-        free += sorted(self._floating)
+        verify = int(os.environ.get("SPYRE_ANNEAL_VERIFY", "0"))
+        self._boxes, self._ties = self._placement()
+        self._doms = doms = [_DomainValues(self.domains[v]) for v in range(self.n)]
+        packed = {b[0] for b in self._boxes if b[0] not in self.defs}
+        self._order_definitions()
+        free = [
+            v
+            for v in range(self.n)
+            if (v not in self.defs or v in self._floating) and v not in packed
+        ]
+        self._free = set(free)
+        self._sources_of: dict = {}
+        self._pack_inputs = self._packing_inputs()
+        self._obj_terms: dict = {}
+        if self.objective:
+            for ref, c in zip(self.objective[0], self.objective[1]):
+                self._obj_terms.setdefault(self._ref(ref), []).append((ref, c))
         a = [None] * self.n
-        for v in free:
+        for v in (*free, *packed):
             a[v] = doms[v][0]
         if start is not None:  # the previous ladder stage's plan (a hint)
-            for v in free:
+            for v in (*free, *packed):
                 if v < len(start) and start[v] is not None:
                     a[v] = start[v]
-        self._settle(a, doms)
-        scale = (
+        # First fit in the hint's offset order never places a box above its
+        # hinted offset, so the hint's plan still packs.
+        order = sorted(
+            (i for i, b in enumerate(self._boxes) if b[0] in packed),
+            key=lambda i: a[self._boxes[i][0]],
+        )
+        self._evaluate(a, order)
+        self._sat = [self._check(a, ci) for ci in range(len(self.cons))]
+        self._unsat = {ci for ci, ok in enumerate(self._sat) if not ok}
+        self._bad = {d for d in self._topo if not self._in_domain(d, a[d])}
+        self._nviol = len(self._unsat) + len(self._bad)
+        self._violations(a)  # the start's count, for whoever is watching
+        self._objv = self._obj(a)
+        temp = (
             max(1.0, sum(abs(c) for c in self.objective[1])) if self.objective else 1.0
         )
-        penalty = penalty or scale
-        cur_v = self._violations(a)
-        cur = self._obj(a) + penalty * cur_v
-        best = None
-        if cur_v == 0:
-            best = (self._obj(a), list(a))
+        penalty = self.EXCURSION_PENALTY * temp
+        best = (self._objv, list(a)) if self._nviol == 0 else None
+        excursion: list = []  # the accepted moves since the last valid plan
         t0 = time.perf_counter()
-        temp = scale
         moves = 0
-        while time.perf_counter() - t0 < budget_s and free:
+        while time.perf_counter() - t0 < budget_s and (free or len(order) > 1):
             moves += 1
-            v = rng.choice(free)
-            old = a[v]
-            choices = doms[v]
-            if len(choices) < 2:
-                continue
-            a[v] = rng.choice(choices)
-            if a[v] == old:
-                continue
-            saved = list(a)
-            saved[v] = old
-            self._settle(a, doms)
-            new_v = self._violations(a)
-            new = self._obj(a) + penalty * new_v
-            if new <= cur or rng.random() < math.exp(-(new - cur) / max(temp, 1e-9)):
-                cur, cur_v = new, new_v
-                if cur_v == 0 and (best is None or self._obj(a) < best[0] - 1e-9):
-                    best = (self._obj(a), list(a))
+            journal: list = []
+            flips: list = []
+            state = (self._nviol, self._objv)
+            saved_order = None
+            if len(order) > 1 and (not free or rng.random() < 0.2):
+                saved_order = list(order)
+                i, j = rng.sample(range(len(order)), 2)
+                order.insert(j, order.pop(i))
+                moved = self._repack(a, order, journal)
+                self._apply(a, order, moved, journal, flips, 0, repacked=True)
             else:
-                a[:] = saved
+                v = rng.choice(free)
+                if not self._try(a, order, [(v, rng.choice(doms[v]))], journal, flips):
+                    continue
+            self._repair(a, order, journal, flips, rng)
+            if best is None:  # descending to a first valid plan
+                accept = self._nviol <= state[0]
+            elif self._nviol > self.EXCURSION_VIOLATIONS:
+                accept = False
+            else:
+                delta = self._objv - state[1] + penalty * (self._nviol - state[0])
+                accept = delta <= 0 or rng.random() < math.exp(-delta / max(temp, 1e-9))
+            if not accept:
+                self._undo_move(a, order, (journal, flips, state, saved_order))
+            elif self._nviol == 0:
+                excursion.clear()
+                if best is None or self._objv < best[0] - 1e-9:
+                    best = (self._objv, list(a))
+            elif best is not None:
+                excursion.append((journal, flips, state, saved_order))
+                if len(excursion) > self.EXCURSION_MOVES:
+                    for move in reversed(excursion):
+                        self._undo_move(a, order, move)
+                    excursion.clear()
+            if verify and moves % verify == 0:
+                self._verify(a, order)
             temp = max(temp * 0.9995, 1e-3)
-            if moves % 2000 == 0:
-                penalty *= 1.2
-                cur = self._obj(a) + penalty * cur_v
         self.moves = moves
         if best is not None:
             self.best, self.best_a = best
         return best is not None
 
-    def _settle(self, a, doms):
-        for v in self.defs:
-            if v not in self._floating:
-                a[v] = None
-        self._propagate(a, [])
-        for v in self.defs:  # a definition that does not resolve here
-            if a[v] is None:
-                a[v] = doms[v][0]
+    # ---- moves ----
+
+    def _try(self, a, order, assigns, journal, flips) -> bool:
+        """Apply ``assigns`` (var, value); False when nothing changes."""
+        j0 = len(journal)
+        seeds = []
+        for v, x in assigns:
+            if a[v] != x:
+                journal.append((v, a[v]))
+                a[v] = x
+                seeds.append(v)
+        if seeds:
+            self._apply(a, order, seeds, journal, flips, j0)
+        return bool(seeds)
+
+    def _undo_move(self, a, order, move):
+        journal, flips, state, saved_order = move
+        self._rollback(a, journal, flips, 0, 0, state)
+        if saved_order is not None:
+            order[:] = saved_order
+
+    def _rollback(self, a, journal, flips, j0, f0, state):
+        for u, old in reversed(journal[j0:]):
+            a[u] = old
+        for kind, key, old in reversed(flips[f0:]):
+            if kind == "sat":
+                self._sat[key] = old
+                (self._unsat.discard if old else self._unsat.add)(key)
+            else:
+                (self._bad.add if old else self._bad.discard)(key)
+        del journal[j0:], flips[f0:]
+        self._nviol, self._objv = state
+
+    def _repair(self, a, order, journal, flips, rng):
+        """Greedily rewrite the free vars behind violated constraints."""
+        for _ in range(self.REPAIR_ROUNDS):
+            if not self._nviol:
+                return
+            violated = sorted(self._unsat) + [self.defs[d] for d in sorted(self._bad)]
+            ci = rng.choice(violated)
+            pick = None
+            for cand in self._candidates(a, ci, rng):
+                j0, f0, state = len(journal), len(flips), (self._nviol, self._objv)
+                if self._try(a, order, cand, journal, flips):
+                    if pick is None or self._nviol < pick[0]:
+                        pick = (self._nviol, cand)
+                    self._rollback(a, journal, flips, j0, f0, state)
+            if pick is None or pick[0] >= self._nviol:
+                return
+            self._try(a, order, pick[1], journal, flips)
+
+    def _candidates(self, a, ci, rng):
+        """Assignments that might satisfy constraint ci: a row for a table's
+        free columns, else one free var behind ci at a new value."""
+        c = self.cons[ci]
+        k = self.REPAIR_CANDIDATES
+        if c.WhichOneof("constraint") == "table" and not c.table.negated:
+            t = c.table
+            cols = (
+                [
+                    x.vars[0]
+                    if len(x.vars) == 1
+                    and x.coeffs[0] == 1
+                    and not x.offset
+                    and x.vars[0] >= 0
+                    else None
+                    for x in t.exprs
+                ]
+                if len(t.exprs)
+                else list(t.vars)
+            )
+            free = [
+                (j, v) for j, v in enumerate(cols) if v is not None and v in self._free
+            ]
+            if free:
+                w = len(cols)
+                rows = len(t.values) // w
+                for r in rng.sample(range(rows), min(k, rows)):
+                    yield [(v, t.values[r * w + j]) for j, v in free]
+                return
+        sources = self._sources(ci)
+        for v in rng.sample(sources, min(k, len(sources))):
+            yield [(v, rng.choice(self._doms[v]))]
+
+    def _sources(self, ci):
+        """The free vars constraint ci depends on, through definitions."""
+        if ci not in self._sources_of:
+            seen, todo, out = set(), list(self.vars_of[ci]), []
+            while todo:
+                u = todo.pop()
+                if u in seen:
+                    continue
+                seen.add(u)
+                if u in self._free:
+                    out.append(u)
+                elif u in self._pos:
+                    todo.extend(self._deps[u])
+            self._sources_of[ci] = sorted(out)
+        return self._sources_of[ci]
+
+    # ---- structure ----
+
+    def _order_definitions(self):
+        """Each defined var after the vars its definition reads (Kahn). A var
+        left in a cycle floats: the search moves it like a free one."""
+        deps = {
+            d: {u for u in self.vars_of[ci] if u != d} for d, ci in self.defs.items()
+        }
+        waiting = {d: sum(u in self.defs for u in ds) for d, ds in deps.items()}
+        readers: dict = {}
+        for d, ds in deps.items():
+            for u in ds:
+                readers.setdefault(u, []).append(d)
+        ready = sorted(d for d, k in waiting.items() if k == 0)
+        topo = []
+        while ready:
+            d = ready.pop()
+            topo.append(d)
+            for w in readers.get(d, ()):
+                waiting[w] -= 1
+                if waiting[w] == 0:
+                    ready.append(w)
+        self._topo = topo
+        self._deps = deps
+        self._pos = {d: i for i, d in enumerate(topo)}
+        self._floating = set(self.defs) - set(topo)
+        self._readers = {
+            u: [d for d in ds if d in self._pos] for u, ds in readers.items()
+        }
+
+    def _packing_inputs(self):
+        """Vars the packer reads: presences, lifetimes, sizes, merge
+        literals, and offsets it does not choose."""
+        out = set()
+        packed = {b[0] for b in self._boxes if b[0] not in self.defs}
+        for off, lit, xs, xe, ys in self._boxes:
+            if lit is not None:
+                out.add(self._ref(lit))
+            for e in (xs, xe, ys):
+                out |= self._expr_vars(e)
+            if off not in packed:
+                out.add(off)
+        for ties in self._ties.values():
+            out |= {self._ref(lit) for lit, _ in ties}
+        return out
+
+    # ---- evaluation ----
+
+    def _define(self, a, d):
+        x = self._compute(a, d)
+        return self._doms[d][0] if x is None else x
+
+    def _evaluate(self, a, order):
+        """Every defined var and offset, from scratch."""
+        for d in self._topo:
+            a[d] = self._define(a, d)
+        self._pack(a, order)
+        for d in self._topo:
+            a[d] = self._define(a, d)
+
+    def _forward(self, a, seeds, journal):
+        """Recompute, in definition order, the defined vars downstream of
+        ``seeds``; return every var that changed."""
+        import heapq
+
+        heap: list = []
+        queued: set = set()
+        for u in seeds:
+            for d in self._readers.get(u, ()):
+                if d not in queued:
+                    queued.add(d)
+                    heapq.heappush(heap, (self._pos[d], d))
+        changed = list(seeds)
+        while heap:
+            _, d = heapq.heappop(heap)
+            x = self._define(a, d)
+            if x == a[d]:
+                continue
+            journal.append((d, a[d]))
+            a[d] = x
+            changed.append(d)
+            for w in self._readers.get(d, ()):
+                if w not in queued:
+                    queued.add(w)
+                    heapq.heappush(heap, (self._pos[w], w))
+        return changed
+
+    def _repack(self, a, order, journal):
+        offs = [self._boxes[i][0] for i in order]
+        old = [a[o] for o in offs]
+        self._pack(a, order)
+        moved = [(o, x) for o, x in zip(offs, old) if a[o] != x]
+        journal.extend(moved)
+        return [o for o, _ in moved]
+
+    def _apply(self, a, order, seeds, journal, flips, j0, repacked=False):
+        """Settle what ``seeds`` (changed since journal[j0]) reach and update
+        the violation count and objective."""
+        changed = self._forward(a, seeds, journal)
+        while not repacked and self._pack_inputs.intersection(changed):
+            moved = self._repack(a, order, journal)
+            changed += self._forward(a, moved, journal)
+            # An offset never feeds the packer back, so one pass settles it.
+            repacked = True
+        first: dict = {}
+        for u, old in journal[j0:]:
+            first.setdefault(u, old)
+        touched: set = set()
+        for u, old in first.items():
+            if a[u] == old:
+                continue
+            for ref, c in self._obj_terms.get(u, ()):
+                if ref >= 0:
+                    self._objv += c * (a[u] - old)
+                else:
+                    self._objv -= c * (a[u] - old)
+            if u in self._pos:
+                bad = not self._in_domain(u, a[u])
+                if bad != (u in self._bad):
+                    flips.append(("bad", u, u in self._bad))
+                    (self._bad.add if bad else self._bad.discard)(u)
+                    self._nviol += 1 if bad else -1
+            touched.update(self.watch[u])
+        for ci in touched:
+            ok = self._check(a, ci)
+            if ok != self._sat[ci]:
+                flips.append(("sat", ci, self._sat[ci]))
+                self._sat[ci] = ok
+                (self._unsat.discard if ok else self._unsat.add)(ci)
+                self._nviol += -1 if ok else 1
+
+    def _verify(self, a, order):
+        """The running state equals a from-scratch evaluation."""
+        ref = list(a)
+        self._evaluate(ref, order)
+        nviol = self._violations(ref) + sum(
+            not self._in_domain(d, ref[d]) for d in self._topo
+        )
+        assert ref == a, [
+            (self.p.variables[v].name, a[v], ref[v])
+            for v in range(self.n)
+            if a[v] != ref[v]
+        ][:10]
+        assert nviol == self._nviol, (nviol, self._nviol)
+        assert self._unsat == {
+            ci for ci in range(len(self.cons)) if not self._check(ref, ci)
+        }
+        assert abs(self._obj(ref) - self._objv) < 1e-6, (self._obj(ref), self._objv)
+
+    def _placement(self):
+        """The no-overlap boxes as (offset var, presence lit, x start, x end,
+        y size), and each offset's merge ties: (lit, other offset) for a
+        ``lit => off == other``."""
+        boxes = []
+        for c in self.cons:
+            if c.WhichOneof("constraint") != "no_overlap_2d":
+                continue
+            no = c.no_overlap_2d
+            for xi, yi in zip(no.x_intervals, no.y_intervals):
+                x, y = self.cons[xi], self.cons[yi]
+                s = y.interval.start
+                if len(s.vars) != 1 or s.coeffs[0] != 1 or s.offset or s.vars[0] < 0:
+                    continue
+                lit = y.enforcement_literal[0] if len(y.enforcement_literal) else None
+                boxes.append(
+                    (s.vars[0], lit, x.interval.start, x.interval.end, y.interval.size)
+                )
+        offsets = {b[0] for b in boxes}
+        ties: dict = {}
+        for c in self.cons:
+            if (
+                c.WhichOneof("constraint") != "linear"
+                or len(c.enforcement_literal) != 1
+            ):
+                continue
+            lin = c.linear
+            if (
+                len(lin.vars) == 2
+                and sorted(lin.coeffs) == [-1, 1]
+                and list(lin.domain) == [0, 0]
+                and all(v >= 0 and v in offsets for v in lin.vars)
+            ):
+                p, q = lin.vars
+                lit = c.enforcement_literal[0]
+                ties.setdefault(p, []).append((lit, q))
+                ties.setdefault(q, []).append((lit, p))
+        return boxes, ties
+
+    def _pack(self, a, order):
+        """Offsets for the boxes in ``order`` (``_C.pack_boxes``); a present
+        box outside it keeps its offset as an obstacle."""
+        from torch_spyre import _C
+
+        packed = set(order)
+        index = {b[0]: i for i, b in enumerate(self._boxes)}
+        x0, x1, size, present, pinned, ties = [], [], [], [], [], []
+        for i, (off, lit, xs, xe, ys) in enumerate(self._boxes):
+            dims = (self._lin(a, xs), self._lin(a, xe), self._lin(a, ys))
+            on = None not in dims and (lit is None or bool(self._val(a, lit)))
+            x0.append(dims[0] if on else 0)
+            x1.append(dims[1] if on else 0)
+            size.append(dims[2] if on else 0)
+            present.append(on)
+            pinned.append(a[off] if i not in packed and a[off] is not None else -1)
+            ties.append(
+                [index[q] for lit, q in self._ties.get(off, ()) if self._val(a, lit)]
+            )
+        offsets = _C.pack_boxes(order, x0, x1, size, present, pinned, ties)
+        for i in order:
+            a[self._boxes[i][0]] = offsets[i]
 
     def _violations(self, a):
         return sum(0 if self._check(a, ci) else 1 for ci in range(len(self.cons)))
