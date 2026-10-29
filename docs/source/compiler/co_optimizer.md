@@ -302,14 +302,19 @@ Even when the expression survives, parts of the model go quiet. Both engines pri
 expression, built once by the allocator, so both inherit the same limitation: a term cannot
 branch on a decision the solver has not made yet (issue `#4233`). Terms that would branch on a
 still-symbolic shape or residency guard themselves (`_is_sym`, or an
-`isinstance(..., sympy.Basic)` check) and return their neutral value instead — the two
-underfill derates (`coarse_underfill_eff`, `coarse_underfill_eff_matmul`),
-`_lx_spill_bw_derate`, `_matmul_mac_peak`, `_reduction_bw_cores_factor`, the bundled model's
-split-reread term, and `_eff_bw`'s per-op access-pattern overrides, which a symbolic `is_lx`
-drops back to the default turnaround. Nothing raises, and nothing reports it: the plan is just
-ranked by a model short those derates. A branch that cannot guard itself costs more — reading
-`ArgTraffic.mem` raises on a symbolic `is_lx`, which the allocator catches and turns into the
-memory-only fallback for the whole graph; see the warning under [The
+`isinstance(..., sympy.Basic)` check) and return their neutral value instead — the coarse
+underfill derate (`coarse_underfill_eff`), `_lx_spill_bw_derate` (in its
+`_lx_spill_working_set` helper, not the derate itself), `_matmul_mac_peak`,
+`_reduction_bw_cores_factor`, the bundled model's split-reread term, and `_eff_bw`'s per-op
+access-pattern overrides, which a symbolic `is_lx` drops back to the default turnaround.
+Nothing raises, and nothing reports it: the plan is just ranked by a model short those
+derates. The bundled matmul's array-fill derate is a different case and not a symbolic one:
+it goes through `underfill_eff`, which a coarse-tiled matmul bypasses outright for want of
+data to fit (`_select(tiles_output_dim, ...)` takes the un-derated branch), while the
+matmul-calibrated `coarse_underfill_eff_matmul` curve reaches only the `SPYRE_DUMP_COST`
+report text, never the minimized expression. A branch that cannot guard itself costs more —
+reading `ArgTraffic.mem` raises on a symbolic `is_lx`, which the allocator catches and turns
+into the memory-only fallback for the whole graph; see the warning under [The
 objective](sa_co_optimization.md#the-objective) for the paths that still read it.
 :::
 
