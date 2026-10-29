@@ -85,7 +85,7 @@ class _NoOpSolver(CoreDivisionLayoutSolver):
         return False
 
     @classmethod
-    def replans_after_tiling(cls) -> bool:
+    def linear_cost_only(cls) -> bool:
         return False
 
     def plan_layout(self, log_lx_usage=False):

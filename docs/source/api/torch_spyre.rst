@@ -687,12 +687,6 @@ Environment Variables
        edge, overlapping the two stages. Off by default, which keeps the
        single-stream FIFO ordering. On values match flex's grammar exactly:
        ``1``, ``true``, ``t``, ``yes``, ``y``
-   * - ``SPYRE_INDUCTOR_LOG=1``
-     - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
-       Inductor logging (INFO level)
-   * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - *Deprecated*. Use ``TORCH_LOGS='+torch_spyre.inductor'`` (DEBUG level).
-       Sets Spyre Inductor log verbosity
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file
@@ -773,8 +767,8 @@ Environment Variables
        op-spec IR at pipeline stage boundaries (default empty)
    * - ``TORCH_SPYRE_TIMING``
      - Record structured per-compile frontend timings: one JSON event per
-       pass pipeline and per pass, with input/output graph sizes
-       (default ``0``)
+       pass pipeline and per pass, with input/output graph sizes and
+       analysis-call counts (default ``0``)
    * - ``TORCH_SPYRE_TIMING_OUT``
      - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
        inserted before the suffix, so ``rec.json`` is written as
