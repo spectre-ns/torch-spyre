@@ -60,6 +60,14 @@ _CORE_INV_SCALE = 1024
 _CORE_INV_SCALE_MAX_VALUE = 32
 # constant limit on product terms to avoid int32 overflow in CP-SAT
 _MAX_PRODUCT_BOUND = 2**30
+# Fixed-point scale _truncate_floats_min rounds a Min/Max operand's
+# coefficients to.
+_MINMAX_FLOAT_SCALE = 10000
+# Width of a tabled sub-expression's levels, and of a named Min/Max over tables
+# (see _SympyExprToCpSat._tabulate). A bundle's memory term multiplies both of
+# its derates by up to two split inverses, and that product of four factors has
+# to stay under _MAX_PRODUCT_BOUND.
+_TABLE_LEVEL_BITS = 10
 
 
 _operator_map = {
@@ -107,6 +115,12 @@ def _simplify_eq_conjunction(expr):
                 continue  # implied by Eq(lhs, eqs[lhs])
         kept.append(arg)
     return sympy.And(*kept)
+
+
+# One-operand functions _evaluate_candidates applies entry by entry. The
+# rewrite drops floors and replaces split logs, but a tabled sub-expression is
+# evaluated before it does (see _SympyExprToCpSat._tabulate).
+_ELEMENTWISE = {sympy.floor: math.floor, sympy.ceiling: math.ceil, sympy.log: math.log}
 
 
 _inv_rel_op = {
@@ -206,6 +220,12 @@ class _SympyExprToCpSat(Printer):
         self._conjunction_cache: dict = {}
         self._candidate_cache: dict = {}
         self._division_table_cache: dict = {}
+        # tab_<n> symbol name -> (owning buffer wrapper, integer levels), and
+        # (owner, levels) -> name so equal tables share one variable.
+        self._tables: dict = {}
+        self._table_names: dict = {}
+        # minmax_<n> symbol name -> the Min/Max it names, over integer tables.
+        self._minmax: dict = {}
         super().__init__()
 
     def _print(self, expr, **kwargs):
@@ -239,6 +259,9 @@ class _SympyExprToCpSat(Printer):
             if isinstance(mapped, (int, float)):
                 return None, mapped
             name = expr.name
+            if name in self._tables:
+                wrapper, levels = self._tables[name]
+                return wrapper, np.asarray(levels, dtype=object)
             prefix = next((p for p in ("inv_", "log2_") if name.startswith(p)), "")
             raw_name = name[len(prefix) :]
             entry = self._buffer_map.get(raw_name)
@@ -302,6 +325,8 @@ class _SympyExprToCpSat(Printer):
                 result = np.where(cond, value, result)
         elif expr.func is sympy.KroneckerDelta:
             result = np.equal(*values)
+        elif expr.func in _ELEMENTWISE:
+            result = np.vectorize(_ELEMENTWISE[expr.func], otypes=[object])(values[0])
         else:
             return None
         return owner, result
@@ -354,14 +379,18 @@ class _SympyExprToCpSat(Printer):
 
     def _rewrite(self, cost_expr: sympy.Expr) -> sympy.Expr:
         """The symbolic rewrites that bring ``cost_expr`` into the form the
-        printer lowers: floors dropped, logs of Min/Max pushed inside, split
-        logs and inverses replaced by table symbols, scalars pushed into
+        printer lowers: fractional and negative powers pushed into Min/Max and
+        Piecewise and what is left of them tabled (see :meth:`_tabulate`),
+        floors dropped, ``1 - is_lx`` named, logs of Min/Max pushed inside,
+        split logs and inverses replaced by table symbols, scalars pushed into
         Min/Max/Piecewise, floats truncated. Min/Max are rebuilt lazily first
         (see :class:`_LazyMin`)."""
         cost_expr = _lazy_minmax(cost_expr)
+        cost_expr = cost_expr.replace(lambda e: e.is_Pow, self._pow_inward)
+        cost_expr = self._tabulate(cost_expr)
         cost_expr = cost_expr.replace(
-            lambda e: e.func == sympy.floor,
-            lambda e: e.args[0],
+            lambda e: e.func in [sympy.floor, sympy.Add],
+            self._pre_expand,
         )
         cost_expr = sympy.expand(cost_expr)
         cost_expr = cost_expr.replace(
@@ -379,6 +408,225 @@ class _SympyExprToCpSat(Printer):
         )
         cost_expr = self._integerize_minmax(cost_expr)
         return cost_expr
+
+    @staticmethod
+    def _pow_inward(expr):
+        """Push a fractional or negative power into a Min/Max, a Piecewise or a
+        positive coefficient, where the rewrite has no lowering for it, so that
+        each operand can be tabled (see :meth:`_tabulate`): the coarse underfill
+        derate divides a bundle's memory term by a Min over its ops. Exact for
+        the nonnegative values a cost takes; a negative power swaps Min and
+        Max."""
+        base, exp = expr.args
+        if not exp.is_Number or (exp.is_Integer and exp > 0):
+            return expr
+
+        def power(arg):
+            result = arg**exp
+            return _SympyExprToCpSat._pow_inward(result) if result.is_Pow else result
+
+        if isinstance(base, (sympy.Min, sympy.Max)):
+            keeps = isinstance(base, sympy.Min) == (exp > 0)
+            return (_LazyMin if keeps else _LazyMax)(*map(power, base.args))
+        if base.is_Piecewise:
+            return sympy.Piecewise(*((power(v), c) for v, c in base.args))
+        if base.is_Mul and base.args[0].is_Number and base.args[0] > 0:
+            return base.args[0] ** exp * power(sympy.Mul(*base.args[1:]))
+        return expr
+
+    def _tabulate(self, expr):
+        """Replace each sub-expression the rewrite has no lowering for -- a
+        fractional or negative power of anything but a split, as the coarse
+        underfill and LX-spill derates take of a tile height -- by a table over
+        the decisions it reads, when that is one buffer's division and at most
+        one residency literal. The largest such sub-expression is tabled whole,
+        so every candidate division is priced as the cost model writes it; one
+        that reads more is rebuilt from its operands."""
+        if not expr.args or not self._has_unlowerable(expr):
+            return expr
+        decision = self._decision(expr)
+        if decision is not None:
+            table = self._table(expr, *decision)
+            if table is not None:
+                return table
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            named = self._named_minmax(expr)
+            if named is not None:
+                return named
+        return expr.func(*(self._tabulate(arg) for arg in expr.args))
+
+    def _named_minmax(self, expr):
+        """``expr``, a Min/Max whose operands each read one buffer's division
+        and at most one residency literal, as ``unit * minmax_<n>``: the
+        operands tabled in integers of one ``unit``, sized so the Min/Max spans
+        ``_TABLE_LEVEL_BITS``. Under a name, ``expand`` and
+        _min_piecewise_expand cannot push a term's coefficient into it, so its
+        variable keeps that width where a bundle's memory term multiplies it by
+        a split's inverse and by its other derate. None when an operand reads
+        more."""
+        kind = sympy.Min if isinstance(expr, sympy.Min) else sympy.Max
+
+        def flatten(node):
+            # Max(Max(a, b), c) is Max(a, b, c): a lazy Max is not flattened.
+            if isinstance(node, kind):
+                return [leaf for arg in node.args for leaf in flatten(arg)]
+            return [node]
+
+        operands = flatten(expr)
+        tables = []
+        for arg in operands:
+            decision = self._decision(arg)
+            if decision is None:
+                return None
+            values = self._branch_values(arg, decision[1])
+            if values is None:
+                return None
+            tables.append((decision, values))
+        largest = max(float(np.abs(v).max()) for _, values in tables for v in values)
+        if largest == 0:
+            return sympy.Integer(0)
+        unit = largest / 2**_TABLE_LEVEL_BITS
+        scaled = []
+        for (owner, literal), values in tables:
+            ints = [np.rint(v / unit).astype(int) for v in values]
+            operand = self._levels(owner, ints[0])
+            if literal is not None:
+                operand += literal * self._levels(owner, ints[1] - ints[0])
+            scaled.append(operand)
+        name = f"minmax_{len(self._minmax)}"
+        self._minmax[name] = expr.func(*scaled)
+        return sympy.Float(unit) * sympy.Symbol(name, integer=True)
+
+    @memoize_method
+    def _has_unlowerable(self, expr):
+        """Whether ``expr`` holds a power or log the rewrite cannot lower."""
+        if expr.is_Pow:
+            base, exp = expr.args
+            if not (
+                (exp.is_Integer and exp > 0)
+                or (self._is_split_sym(base) and exp == -1)
+                or (
+                    base.is_Symbol
+                    and base.name.startswith("split_")
+                    and exp.is_Number
+                    and math.isclose(exp, 0.25)
+                )
+            ):
+                return True
+        if expr.func is sympy.log:
+            arg = expr.args[0]
+            if not (arg.is_Number or self._is_split_sym(arg)):
+                return True
+        return any(self._has_unlowerable(arg) for arg in expr.args)
+
+    def _owner(self, symbol):
+        """The division-choosing buffer whose menu ``symbol`` is a column of, as
+        :meth:`_evaluate_candidates` reads it, or None."""
+        wrapper, _ = self._buffer_map.get(symbol.name, (None, None))
+        return wrapper or self._sym_map.get(f"_division_of_{symbol.name}")
+
+    @memoize_method
+    def _decision(self, expr):
+        """``(owner, literal)`` when ``expr`` reads at most one buffer's
+        division and at most one residency literal, else None."""
+        owner = literal = None
+        for symbol in expr.free_symbols:
+            mapped = self._sym_map.get(symbol.name)
+            wrapper = self._owner(symbol)
+            if wrapper is not None:
+                if owner is not None and wrapper is not owner:
+                    return None
+                owner = wrapper
+            elif getattr(mapped, "is_boolean", False):
+                if literal is not None:
+                    return None
+                literal = symbol
+            elif not isinstance(mapped, (int, float)):
+                return None
+        return owner, literal
+
+    def _branch_values(self, expr, literal):
+        """``expr`` at each candidate division of the one buffer it reads: one
+        array, or two, at ``literal = 0`` and ``1``. None when it does not
+        evaluate to finite values."""
+        branches = [expr]
+        if literal is not None:
+            branches = [expr.xreplace({literal: v}) for v in (0, 1)]
+        try:
+            evaluated = [self._candidate_values(branch) for branch in branches]
+        except (ArithmeticError, ValueError):
+            return None
+        if any(e is None for e in evaluated):
+            return None
+        values = np.broadcast_arrays(
+            *(np.asarray(v, dtype=float) for _, v in evaluated)
+        )
+        if not all(np.isfinite(v).all() for v in values):
+            return None
+        return values
+
+    def _table(self, expr, owner, literal):
+        """``expr`` as ``base + step * tab_<n>`` over ``owner``'s division; with
+        a ``literal``, its value at ``literal = 0`` plus ``literal`` times the
+        difference. None when it does not evaluate to a finite table."""
+        values = self._branch_values(expr, literal)
+        if values is None:
+            return None
+        result = self._table_symbol(owner, values[0])
+        if literal is not None:
+            result += literal * self._table_symbol(owner, values[1] - values[0])
+        return result
+
+    def _table_symbol(self, owner, values):
+        """``values``, one per candidate division of ``owner``, as ``base + step
+        * levels`` with the levels spanning at most ``_TABLE_LEVEL_BITS``.
+        ``base`` and ``step`` are multiples of ``1 / _MINMAX_FLOAT_SCALE``, so
+        _truncate_floats_min keeps them exactly inside a Min/Max."""
+        flat = np.ravel(values)
+        lo, hi = float(flat.min()), float(flat.max())
+        if lo == hi:
+            return sympy.Integer(int(lo)) if lo.is_integer() else sympy.Float(lo)
+        scale = _MINMAX_FLOAT_SCALE
+        units = max(1, round((hi - lo) * scale / 2**_TABLE_LEVEL_BITS))
+        base, step = (
+            sympy.Rational(round(lo * scale), scale),
+            sympy.Rational(units, scale),
+        )
+        levels = np.rint((flat - float(base)) / float(step)).astype(int)
+        return base + step * self._levels(owner, levels)
+
+    def _levels(self, owner, ints):
+        """Integer values, one per candidate division of ``owner``, as ``lowest
+        + tab_<n>``: one ``element`` lookup when printed (see _print_Symbol),
+        shared by every table with the same levels."""
+        flat = np.ravel(ints)
+        lowest = int(flat.min())
+        levels = tuple(int(v) - lowest for v in flat)
+        if not any(levels):
+            return sympy.Integer(lowest)
+        key = id(owner), levels
+        if key not in self._table_names:
+            self._table_names[key] = f"tab_{len(self._tables)}"
+            self._tables[self._table_names[key]] = owner, levels
+        symbol = sympy.Symbol(self._table_names[key], integer=True, nonnegative=True)
+        return lowest + symbol
+
+    @staticmethod
+    def _pre_expand(expr):
+        """Drop a floor, and name ``1 - is_lx_<buf>`` ``is_hbm_<buf>`` so that
+        ``expand`` does not multiply out a product of them: a bundle term has
+        one per operand, and n of them expand to 2**n terms."""
+        if expr.func == sympy.floor:
+            return expr.args[0]
+        if len(expr.args) == 2 and expr.args[0] == 1:
+            arg = expr.args[1]
+            if arg.is_Mul and len(arg.args) == 2 and arg.args[0] == -1:
+                sym = arg.args[1]
+                if sym.is_Symbol and sym.name.startswith("is_lx_"):
+                    return sympy.Symbol(
+                        f"is_hbm_{sym.name[6:]}", integer=True, nonnegative=True
+                    )
+        return expr
 
     @classmethod
     def _log_min(cls, expr):
@@ -621,7 +869,7 @@ class _SympyExprToCpSat(Printer):
     @staticmethod
     def _truncate_floats_min(expr):
         # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
-        m = 10000
+        m = _MINMAX_FLOAT_SCALE
         func = expr.func
 
         def _process_inner(expr):
@@ -786,6 +1034,26 @@ class _SympyExprToCpSat(Printer):
     def _print_Symbol(self, expr):
         if expr.name in self._sym_map:
             return self._sym_map[expr.name]
+        if expr.name in self._tables:
+            owner, levels = self._tables[expr.name]
+            domain = cp_model.Domain.FromValues(list(levels))
+            cp_var = self._model.new_int_var_from_domain(domain, expr.name)
+            self._model.add_element(owner.division, levels, cp_var)
+            self._sym_map[expr.name] = cp_var
+            return cp_var
+        if expr.name in self._minmax:
+            cp_var = self._print(self._minmax[expr.name])
+            self._sym_map[expr.name] = cp_var
+            return cp_var
+        if expr.name.startswith("is_hbm_"):
+            # A literal of its own rather than ``1 - is_lx``, so a product of
+            # several stays a gated product of booleans (_print_multiply takes
+            # at most one linear factor).
+            lx = self._print_Symbol(sympy.Symbol(f"is_lx_{expr.name[7:]}"))
+            cp_var = self._model.new_bool_var(expr.name)
+            self._model.add(cp_var + lx == 1)
+            self._sym_map[expr.name] = cp_var
+            return cp_var
         if not expr.name.startswith(("log2_", "inv_")):
             raise NotImplementedError(f"not implemented. expr: {expr}")
         name = expr.name[5:] if expr.name.startswith("log2_") else expr.name[4:]

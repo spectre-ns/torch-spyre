@@ -3222,6 +3222,119 @@ class TestInvScale(TestCase):
                 self.assertLessEqual(self._max_error(raw, scale), self.MAX_ERROR)
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat table tests need ortools")
+class TestTabledDerates(TestCase):
+    """The rewrite tables what it has no lowering for -- the coarse underfill
+    and LX-spill derates, fractional powers of a tile height -- over the one
+    division and residency literal each reads, and names ``1 - is_lx`` so
+    ``expand`` keeps a product of complements whole."""
+
+    MENUS = {"buf0": [1, 2, 4, 8, 16, 32], "buf1": [1, 2, 4, 8]}
+
+    def setUp(self):
+        self.model = cp_model.CpModel()
+        self.sym_map, self.buffer_map, self.divisions = {}, {}, {}
+        self.splits, self.lits = {}, {}
+        for buf, raw in self.MENUS.items():
+            division = self.model.new_int_var(0, len(raw) - 1, f"division_{buf}")
+            name = f"split_{buf}_d0"
+            var = self.model.new_int_var(min(raw), max(raw), name)
+            self.model.add_element(division, raw, var)
+            wrapper = types.SimpleNamespace(
+                division=division, buffer=types.SimpleNamespace(core_divisions=raw)
+            )
+            self.sym_map[name], self.buffer_map[name] = var, (wrapper, raw)
+            self.divisions[buf] = division
+            self.splits[buf] = sympy.Symbol(name, integer=True, positive=True)
+            lit = f"is_lx_{buf}"
+            self.sym_map[lit] = self.model.new_bool_var(lit)
+            self.lits[buf] = sympy.Symbol(lit, integer=True, nonnegative=True)
+
+    def _converter(self):
+        return _SympyExprToCpSat(self.model, self.sym_map, self.buffer_map)
+
+    def _rows_per_core(self, buf, rows, trips):
+        # cost_features' tile height: an HBM output is divided by the trip count.
+        lit = self.lits[buf]
+        return (rows / trips * (1 - lit) + rows * lit) / self.splits[buf]
+
+    def _assert_lowers_to(self, expr, rel):
+        """``expr`` lowered, against its exact value at every pinned division and
+        residency, within ``rel`` of it."""
+        lowered = self._converter().convert(expr)
+        names = list(self.MENUS)
+        choices = [range(len(self.MENUS[b])) for b in names] + [(0, 1)] * len(names)
+        for chosen in itertools.product(*choices):
+            case = self.model.clone()
+            point = {}
+            for buf, index, flag in zip(names, chosen, chosen[len(names) :]):
+                division = case.get_int_var_from_proto_index(self.divisions[buf].index)
+                lit = case.get_bool_var_from_proto_index(
+                    self.sym_map[f"is_lx_{buf}"].index
+                )
+                case.add(division == index)
+                case.add(lit == flag)
+                point[self.splits[buf]] = self.MENUS[buf][index]
+                point[self.lits[buf]] = flag
+            case.minimize(lowered)
+            solver = cp_model.CpSolver()
+            solver.parameters.num_search_workers = 1
+            self.assertEqual(solver.solve(case), cp_model.OPTIMAL, point)
+            want = float(expr.subs(point))
+            self.assertAlmostEqual(
+                solver.objective_value, want, delta=rel * abs(want), msg=point
+            )
+
+    def _derates(self):
+        from torch_spyre._inductor.cost_model import CostParams, coarse_underfill_eff
+
+        params = CostParams()
+        heights = {b: self._rows_per_core(b, 4096, 4) for b in self.MENUS}
+        eff = sympy.Min(
+            1, *(coarse_underfill_eff(h, 512, params) for h in heights.values())
+        )
+        # _lx_spill_bw_derate's formula over the same tile heights.
+        ws = sympy.Max(*(2.0 * h * 512 * 2 for h in heights.values()))
+        cap, exp = params.lx_spill_cap_bytes, params.lx_spill_exp
+        spill = cap**exp / sympy.Max(ws**exp, cap**exp)
+        return eff, spill
+
+    def _memory(self):
+        return sum(2e5 / self.splits[b] * (1 - self.lits[b]) + 3e4 for b in self.MENUS)
+
+    # Each derate is a Min/Max of tables in one unit spanning _TABLE_LEVEL_BITS,
+    # so it rounds by at most 2**-11 of its largest value; the ratio of the
+    # largest to the smallest value here is under 8, so 1% bounds the product.
+    def test_a_memory_term_divided_by_its_underfill_derate(self):
+        eff, _ = self._derates()
+        self.assertFalse(eff.is_number)
+        self._assert_lowers_to(self._memory() / eff, rel=0.01)
+
+    def test_a_memory_term_divided_by_both_derates(self):
+        eff, spill = self._derates()
+        self.assertFalse(spill.is_number)
+        self._assert_lowers_to(self._memory() / eff / spill, rel=0.01)
+
+    def test_a_product_of_complements_lowers_exactly(self):
+        a, b = self.lits["buf0"], self.lits["buf1"]
+        expr = 1000 * (1 - a) * (1 - b) / self.splits["buf0"] + 7
+        self._assert_lowers_to(expr, rel=1e-9)
+
+    def test_complements_stay_one_term_through_expand(self):
+        lits = [
+            sympy.Symbol(f"is_lx_b{i}", integer=True, nonnegative=True)
+            for i in range(4)
+        ]
+        size = sympy.Symbol("bytes", positive=True)
+        rewritten = self._converter()._rewrite(size * sympy.Mul(*(1 - x for x in lits)))
+        self.assertEqual(len(sympy.Add.make_args(rewritten)), 1, rewritten)
+
+    def test_an_expression_the_rewrite_lowers_is_not_tabled(self):
+        split = self.splits["buf0"]
+        expr = 3 * self._memory() + sympy.log(split) + 5 / split + split**0.25
+        self.assertIs(self._converter()._tabulate(expr), expr)
+
+
 class TestObjectiveCostParams(TestCase):
     """Every solver's objective drops the tile-height derates."""
 
