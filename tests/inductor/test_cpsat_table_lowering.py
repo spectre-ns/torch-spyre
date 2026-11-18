@@ -285,9 +285,7 @@ def test_a_form_is_abstract_and_a_table_is_a_form():
         CpForm()  # type: ignore[abstract]
 
     class Partial(CpForm):
-        @property
-        def entries(self) -> int:
-            return 0
+        """A form with no cp_expr."""
 
     with pytest.raises(TypeError):
         Partial()  # type: ignore[abstract]

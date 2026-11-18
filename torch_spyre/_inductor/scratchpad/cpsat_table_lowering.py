@@ -297,17 +297,8 @@ def _read_only(values: Any, index: CpIndex) -> np.ndarray:
 class CpForm(ABC):
     """What a node is realized as: the one thing a reader and the objective take of
     it. A value, with no model in it, that builds its own CP-SAT side. Each kind of
-    form is a subclass: here a CpTable, and from Stage 3 a CpLinear too."""
-
-    @property
-    @abstractmethod
-    def entries(self) -> int:
-        """The table entries the form puts in the model: what the cap bounds."""
-
-    @property
-    @abstractmethod
-    def finite(self) -> bool:
-        """Whether every value the form can take is a finite number."""
+    form is a subclass: here a CpTable, and from Stage 3 a CpLinear too, the form a
+    sum is realized as."""
 
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -465,19 +456,16 @@ class CpNode:
 
     @cached_property
     def form(self) -> CpForm:
-        """The node's form, realized the first time it is read. Raises
-        TableLoweringError naming the node when it has none, and when a value of it
-        is not finite."""
-        form = self.realize()
-        if not form.finite:
-            raise TableLoweringError(self.expr, "a value that is not finite")
-        return form
+        """The node's form, realized the first time it is read; realize raises
+        TableLoweringError naming the node when it has none."""
+        return self.realize()
 
     def realize(self) -> CpForm:
         """Realizes the node: one table over its inputs, their positions combined in
         the order of their symbols sorted by sympy.default_sort_key, the last
         fastest. Raises TableLoweringError naming the node when that table would pass
-        the cap; one past the cap is never evaluated."""
+        the cap, one past the cap never evaluated, and when a value of it is not
+        finite."""
         symbols = sorted(self.columns, key=sympy.default_sort_key)
         positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
         under = {i: None for p in positions for i in p.under()}
@@ -494,7 +482,13 @@ class CpNode:
         for position in positions[1:]:
             index = CpIndex(Combine(), (index, position))
         values = values_on_grid(self.expr, self.columns, positions)
-        return CpTable(values=values, index=index)
+        return self._finite(CpTable(values=values, index=index))
+
+    def _finite(self, table: CpTable) -> CpTable:
+        """table, refused naming the node when a value of it is not finite."""
+        if not table.finite:
+            raise TableLoweringError(self.expr, "a value that is not finite")
+        return table
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The node in model, in COST_SCALE units: its form built
@@ -522,7 +516,7 @@ class CpSymbol(CpNode):
     def realize(self) -> CpTable:
         """Its column."""
         (column,) = self.columns.values()
-        return column
+        return self._finite(column)
 
 
 @dataclass(eq=False)
@@ -532,7 +526,8 @@ class CpConstant(CpNode):
 
     def realize(self) -> CpTable:
         """Its value, one entry on the Unit position."""
-        return CpTable(values=np.array([_constant(self.expr)]), index=UNIT)
+        value = np.array([_constant(self.expr)])
+        return self._finite(CpTable(values=value, index=UNIT))
 
 
 class TableLowering:
