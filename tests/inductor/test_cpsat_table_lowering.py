@@ -31,7 +31,6 @@ from sympy.functions.elementary.piecewise import ExprCondPair
 from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     COST_SCALE,
     UNIT,
-    Candidate,
     Combine,
     CpConstant,
     CpIndex,
@@ -217,61 +216,49 @@ def test_a_node_tabulates_itself_when_it_is_read():
     assert root.table.index == position
     assert list(root.table.values) == pytest.approx([1.0, 2**0.5, 2.0])
     small = CpNode(a**0.5, (leaf, half), 2)
-    assert small.table is None
-    assert (
-        small.refusal()
-        == "one table over its inputs would hold 3 entries, past the cap of 2"
-    )
-    with pytest.raises(TableLoweringError, match="past the cap of 2"):
-        small.read()
+    with pytest.raises(
+        TableLoweringError,
+        match="one table over its inputs would hold 3 entries, past the cap of 2",
+    ):
+        small.table
     with pytest.raises(TableLoweringError, match="no input"):
-        CpSymbol(a, (), CAP).read()
+        CpSymbol(a, (), CAP).table
 
 
-def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
+def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
     case = Case()
-    position = case.add_input("a", a=[1.0, 2.0, 4.0])
-    built: list[str] = []
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    calls: list[sympy.Basic] = []
+    lambdify = sympy.lambdify
 
-    def candidate(name: str, entries: int) -> Candidate:
-        def build() -> CpTable:
-            built.append(name)
-            return CpTable(values=[float(entries)] * 3, index=position)
+    def counting(args, expr, **kwargs):
+        calls.append(expr)
+        return lambdify(args, expr, **kwargs)
 
-        return Candidate(name, entries, build)
-
-    class Choices(CpNode):
-        def candidates(self) -> list[Candidate]:
-            return [candidate("wide", 100), candidate("mid", 10), candidate("small", 5)]
-
-    table = Choices(case.symbol("a"), (), 50).tabulate()
-    assert table is not None and list(table.values) == [5.0] * 3
-    assert built == ["small"]
-    narrow = Choices(case.symbol("a"), (), 4)
-    assert narrow.tabulate() is None
-    assert built == ["small"]  # nothing past the cap is built
-    assert narrow.refusal() == "small would hold 5 entries, past the cap of 4"
+    monkeypatch.setattr(sympy, "lambdify", counting)
+    root = TableLowering(case.inputs, cap=5).lower(a * b)
+    with pytest.raises(TableLoweringError, match="6 entries, past the cap of 5"):
+        root.table
+    assert calls == []
 
 
 def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
     case = Case()
     position = case.integer("y", [1, 4, 9, 16])  # gaps: a Locate, built as a variable
-    built: dict = {}
     before = len(case.model.proto.variables), len(case.model.proto.constraints)
     constant = CpTable(values=[2.0, 2.0, 2.0, 2.0], index=position)
-    assert constant.cp_expr(case.model, built) == 2 * COST_SCALE
-    assert position not in built  # its position, a Locate, was never built
+    assert constant.cp_expr(case.model) == 2 * COST_SCALE
     after = len(case.model.proto.variables), len(case.model.proto.constraints)
-    assert after == before
+    assert after == before  # its position, a Locate, was never built
     table = CpTable(values=[1.0, 2.0, 4.0, 8.0], index=position)
-    target = table.cp_expr(case.model, built)
-    assert position in built
-    assert table.cp_expr(case.model, built) is target  # built once
+    target = table.cp_expr(case.model)
     rows = dict(case.solutions([case.variables[0], target]))
     assert rows == {1: 1024, 4: 2048, 9: 4096, 16: 8192}
 
 
-def test_lower_tabulates_nothing_and_cp_expr_builds_a_node_once():
+def test_lower_tabulates_nothing_and_a_refusal_leaves_the_model_as_it_was():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -279,14 +266,11 @@ def test_lower_tabulates_nothing_and_cp_expr_builds_a_node_once():
     root = TableLowering(case.inputs, cap=CAP).lower(a**0.5 * b)
     assert type(root) is CpNode and root.expr == a**0.5 * b
     assert "table" not in vars(root)
-    built: dict = {}
-    first = root.cp_expr(case.model, built)
+    root.cp_expr(case.model)
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
-    assert root.cp_expr(case.model, built) is first
-    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
     wide = TableLowering(case.inputs, cap=4).lower(a**0.5 * b)
     with pytest.raises(TableLoweringError, match="past the cap of 4"):
-        wide.cp_expr(case.model, built)
+        wide.cp_expr(case.model)
     assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
 
 
@@ -337,21 +321,10 @@ def test_positions_agree_with_cp_sat_at_every_assignment():
     x = case.integer("x", [2, 3, 4, 5])
     y = case.integer("y", [1, 4, 9])
     joint = CpIndex(Combine(), (x, y))
-    rows = case.solutions(case.variables + [joint.cp_expr(case.model, {})])
+    rows = case.solutions(case.variables + [joint.cp_expr(case.model)])
     values = {v: np.array([r[k] for r in rows]) for k, v in enumerate(case.variables)}
     assert list(joint.positions(values)) == [r[-1] for r in rows]
     assert sorted(r[-1] for r in rows) == list(range(12))
-
-
-def test_equal_indexes_made_apart_are_built_once():
-    case = Case()
-    case.integer("y", [1, 4, 9])
-    var = case.variables[0]
-    built: dict = {}
-    CpIndex(Locate(var, (1, 4, 9))).cp_expr(case.model, built)
-    before = len(case.model.proto.constraints)
-    CpIndex(Locate(var, (1, 4, 9))).cp_expr(case.model, built)
-    assert len(case.model.proto.constraints) == before
 
 
 # --------------------------------------------------------------- values_on_grid
@@ -428,7 +401,7 @@ def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     case.add_input("b", b=[1.0, 3.0, 5.0, 7.0])
     a, b = case.symbol("a"), case.symbol("b")
     plan = case.assert_exact(a**2 * b + b**0.5 / a)
-    index = plan.read().index
+    index = plan.table.index
     assert index.size == 12
 
 
@@ -477,7 +450,7 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     case.values[lit], case.values[division] = [0, 1], [0, 1, 2]
     expr = RelayoutCharge(is_lx, div, 0, 65, 147)
     plan = case.assert_exact(expr)
-    index = plan.read().index
+    index = plan.table.index
     assert index.size == 6
 
 
@@ -545,5 +518,5 @@ def test_the_naive_lowering_explodes_past_the_cap():
         case.lower(expr, cap=4096)
     assert caught.value.node == expr
     plan, _ = case.lower(expr, cap=8192)
-    index = plan.read().index
+    index = plan.table.index
     assert index.size == 4620

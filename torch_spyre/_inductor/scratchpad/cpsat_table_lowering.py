@@ -26,8 +26,7 @@ works out which entry of a table applies. A node's value is a *table*: a float l
   never tabulated. The plan, the root's ``CpNode``, holds no model either;
 - the build: the root's ``cp_expr`` reads its table, which builds itself into the
   model (``CpTable.cp_expr``), rounded onto ``COST_SCALE``, its position built by
-  ``CpIndex.cp_expr``. A ``Built`` memo, passed along with the model, builds each
-  table and position once. Only ``cp_expr`` methods touch the model.
+  ``CpIndex.cp_expr``. Only ``cp_expr`` methods touch the model.
 
 This is the base: one table per node, every value computed by ``sympy.lambdify`` over
 the node's inputs, and the root read as one lookup. It lowers an expression whose
@@ -233,7 +232,7 @@ class CpIndex:
     mapping applied to its parts.
 
     A value, with no model in it. Two nodes that make the same position make equal
-    CpIndexes, which hash alike, so cp_expr builds the position once. Made from
+    CpIndexes, which hash alike. Made from
     the leaf steps by IndexMap steps alone, so the final index of a term is a function
     of every input it was made from.
     """
@@ -256,14 +255,14 @@ class CpIndex:
         parts = [part.positions(values) for part in self.parts]
         return self.mapping.positions(values, self, parts)
 
-    def cp_expr(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The CP-SAT side: this position as an expression in model, its mapping's
-        cp_expr on its parts' expressions, parts first. Each step is built once per
-        equal CpIndex in built, what has already been built in model."""
+        cp_expr on its parts' expressions, parts first, a part it reaches twice built
+        once. Each call builds anew."""
+        built: dict[CpIndex, CpExpr] = {}
         for step in self.under():
-            if step not in built:
-                parts = [built[part] for part in step.parts]
-                built[step] = step.mapping.cp_expr(model, step, parts)
+            parts = [built[part] for part in step.parts]
+            built[step] = step.mapping.cp_expr(model, step, parts)
         return built[self]
 
     def under(self) -> list[CpIndex]:
@@ -313,21 +312,14 @@ class CpTable:
         turns out constant still counts in full."""
         return len(self.values) + sum(i.mapping.entries for i in self.index.under())
 
-    def cp_expr(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The table in model, values[index] in COST_SCALE units: the list rounded
         once, within half a unit of its float value, then a number when it is
         constant, and otherwise one add_element on its index's position into a new
         variable whose domain is the rounded values. The position is built only when
         the table is not constant, so a constant table adds nothing to the model.
-        built is what has already been built in model: a table, and a position, is
-        built once. Raises TableLoweringError for an entry that is not finite or past
+        Raises TableLoweringError for an entry that is not finite or past
         MAX_ENTRY."""
-        if self in built:
-            return built[self]
-        built[self] = self._build(model, built)
-        return built[self]
-
-    def _build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
         if not np.all(np.isfinite(self.values)):
             raise TableLoweringError(None, "a table entry that is not finite")
         scaled = np.rint(COST_SCALE * self.values)
@@ -342,12 +334,8 @@ class CpTable:
         target = model.new_int_var_from_domain(
             cp_model.Domain.from_values(sorted(set(entries))), "table"
         )
-        model.add_element(self.index.cp_expr(model, built), entries, target)
+        model.add_element(self.index.cp_expr(model), entries, target)
         return target
-
-
-# What has been built in one model: a position by its CpIndex, a table by itself.
-Built: TypeAlias = dict["CpIndex | CpTable", CpExpr]
 
 
 # Each symbol's column, the symbol's value at each row of its input, on that input.
@@ -418,17 +406,6 @@ def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]:
     return expr.args
 
 
-@dataclass(frozen=True)
-class Candidate:
-    """One way to tabulate a node: what it is, the entries it would hold, known
-    before its list is computed, and how to build it. A candidate past the cap is
-    never built."""
-
-    name: str
-    entries: int
-    build: Callable[[], CpTable]
-
-
 @dataclass(eq=False)
 class CpNode:
     """The CP-SAT counterpart of one sympy node, which tabulates itself.
@@ -438,12 +415,11 @@ class CpNode:
     as the sympy nodes: children holds the CpNodes of children_of(expr), made before
     it, and a subexpression shared by two parents is one CpNode that both hold. A
     node reads only its children: the columns of its inputs are gathered from them.
-    cap bounds its table. No model is involved.
+    cap bounds its table. No model is involved until cp_expr.
 
-    Everything a node knows is computed the first time it is read and kept: its
-    columns, its positions and its table. This class is an operation over free
-    symbols; CpSymbol and CpConstant are the leaves. A subclass changes how a node is
-    tabulated by overriding candidates, and nothing else changes for it.
+    A node's columns and its table are computed the first time they are read, and
+    kept. This class is an operation over free symbols; CpSymbol and CpConstant are
+    the leaves. A subclass changes how a node is tabulated by overriding tabulate.
     """
 
     expr: sympy.Basic
@@ -459,72 +435,44 @@ class CpNode:
         return columns
 
     @cached_property
-    def positions(self) -> list[CpIndex]:
-        """The distinct positions of the node's columns, in the order of their symbols
-        sorted by sympy.default_sort_key."""
-        symbols = sorted(self.columns, key=sympy.default_sort_key)
-        return list(dict.fromkeys(self.columns[s].index for s in symbols))
-
-    @cached_property
-    def table(self) -> CpTable | None:
-        """The node's table, tabulated the first time it is read; None when no
-        candidate fits the cap."""
-        return self.tabulate()
-
-    def tabulate(self) -> CpTable | None:
-        """Realizes the node: of the candidates under the cap, the one with the fewest
-        entries (rule 3), built; None when none fits. A candidate past the cap is
-        never built."""
-        fits = [c for c in self.candidates() if c.entries <= self.cap]
-        if not fits:
-            return None
-        return min(fits, key=lambda c: c.entries).build()
-
-    def candidates(self) -> list[Candidate]:
-        """The ways to tabulate the node. Here one: one table over its inputs, their
-        positions combined in the order of positions, the last fastest."""
-        under = {i: None for p in self.positions for i in p.under()}
-        entries = math.prod(p.size for p in self.positions) + sum(
-            i.mapping.entries for i in under
-        )
-        return [Candidate("one table over its inputs", entries, self._one_table)]
-
-    def _one_table(self) -> CpTable:
-        index = self.positions[0]
-        for position in self.positions[1:]:
-            index = CpIndex(Combine(), (index, position))
-        values = values_on_grid(self.expr, self.columns, self.positions)
-        return CpTable(values=values, index=index)
-
-    def refusal(self) -> str:
-        """Why the node has no table under its cap."""
-        smallest = min(self.candidates(), key=lambda c: c.entries, default=None)
-        if smallest is None:
-            return "no way to tabulate it"
-        return (
-            f"{smallest.name} would hold {smallest.entries} entries, past the cap "
-            f"of {self.cap}"
-        )
-
-    def read(self) -> CpTable:
-        """The node's table, for a reader that needs one. Raises TableLoweringError
-        naming the node when it has no table, and when a value of it is not finite:
-        an infinite or NaN entry may sit in a list that a parent discards, but not in
-        one read into the objective."""
-        table = self.table
-        if table is None:
-            raise TableLoweringError(self.expr, self.refusal())
+    def table(self) -> CpTable:
+        """The node's table, tabulated the first time it is read. Raises
+        TableLoweringError naming the node when it has none, and when a value of it
+        is not finite."""
+        table = self.tabulate()
         if not np.all(np.isfinite(table.values)):
             raise TableLoweringError(self.expr, "a value that is not finite")
         return table
 
-    def cp_expr(self, model: cp_model.CpModel, built: Built | None = None) -> CpExpr:
-        """The node in model, in COST_SCALE units: its table read, which tabulates
-        it and raises TableLoweringError naming it when it has none, before anything
-        is added to the model, then built (CpTable.cp_expr). built is what has already
-        been built in model, so a node, or a position, read twice is built once; a
-        fresh one when None."""
-        return self.read().cp_expr(model, {} if built is None else built)
+    def tabulate(self) -> CpTable:
+        """Realizes the node: one table over its inputs, their positions combined in
+        the order of their symbols sorted by sympy.default_sort_key, the last
+        fastest. Raises TableLoweringError naming the node when that table would pass
+        the cap; one past the cap is never evaluated."""
+        symbols = sorted(self.columns, key=sympy.default_sort_key)
+        positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
+        under = {i: None for p in positions for i in p.under()}
+        entries = math.prod(p.size for p in positions) + sum(
+            i.mapping.entries for i in under
+        )
+        if entries > self.cap:
+            raise TableLoweringError(
+                self.expr,
+                f"one table over its inputs would hold {entries} entries, past the "
+                f"cap of {self.cap}",
+            )
+        index = positions[0]
+        for position in positions[1:]:
+            index = CpIndex(Combine(), (index, position))
+        values = values_on_grid(self.expr, self.columns, positions)
+        return CpTable(values=values, index=index)
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """The node in model, in COST_SCALE units: its table built
+        (CpTable.cp_expr), one lookup or a number. Reading the table tabulates the
+        node, so a refusal comes before anything is added to the model. Each call
+        builds anew."""
+        return self.table.cp_expr(model)
 
 
 @dataclass(eq=False)
@@ -542,17 +490,10 @@ class CpSymbol(CpNode):
             raise TableLoweringError(self.expr, "a symbol with no input")
         return {self.expr: self.column}
 
-    def candidates(self) -> list[Candidate]:
-        """Its column, the one way to tabulate it; none without an input."""
-        column = self.column
-        if column is None:
-            return []
-        return [Candidate("its column", column.entries, lambda: column)]
-
-    def refusal(self) -> str:
-        if self.column is None:
-            return "a symbol with no input"
-        return super().refusal()
+    def tabulate(self) -> CpTable:
+        """Its column."""
+        (column,) = self.columns.values()
+        return column
 
 
 @dataclass(eq=False)
@@ -560,11 +501,8 @@ class CpConstant(CpNode):
     """A node with no free symbol: a number, true or false, or an operation on
     numbers. Its table is its value on the Unit position."""
 
-    def candidates(self) -> list[Candidate]:
+    def tabulate(self) -> CpTable:
         """Its value, one entry on the Unit position."""
-        return [Candidate("its value", 1, self._value)]
-
-    def _value(self) -> CpTable:
         return CpTable(values=np.array([_constant(self.expr)]), index=UNIT)
 
 
