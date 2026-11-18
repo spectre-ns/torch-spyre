@@ -148,7 +148,7 @@ class Case:
 # ----------------------------------------------------------------------- the walk
 
 
-def test_walk_visits_children_first_and_shares_a_subexpression():
+def test_the_factory_makes_children_first_and_shares_a_subexpression():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -205,23 +205,29 @@ def test_a_node_gathers_its_columns_from_its_children():
     assert dict(nodes[sympy.Integer(2)].columns) == {}
 
 
-def test_a_node_tabulates_itself_with_the_cap_alone():
-    """No lowering is passed in: a node reads its children and the cap."""
+def test_a_node_tabulates_itself_when_it_is_read():
+    """No lowering is passed in, and nothing visits: a node reads its children and
+    its cap, the first time its table is read."""
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
-    leaf = CpSymbol(a, (), column=case.inputs[a])
-    half = CpConstant(sympy.Float(0.5), ())
-    root = CpNode(a**0.5, (leaf, half))
-    for node in (leaf, half, root):
-        node.visit_op(CAP)
+    leaf = CpSymbol(a, (), CAP, column=case.inputs[a])
+    half = CpConstant(sympy.Float(0.5), (), CAP)
+    root = CpNode(a**0.5, (leaf, half), CAP)
+    assert "table" not in vars(root)
     assert root.table is not None
     assert root.table.index == position
     assert list(root.table.values) == pytest.approx([1.0, 2**0.5, 2.0])
-    assert root.tabulate(2) is None
-    assert "past the cap of 2" in root.refusal(2)
+    small = CpNode(a**0.5, (leaf, half), 2)
+    assert small.table is None
+    assert (
+        small.refusal()
+        == "one table over its inputs would hold 3 entries, past the cap of 2"
+    )
+    with pytest.raises(TableLoweringError, match="past the cap of 2"):
+        small.as_linear()
     with pytest.raises(TableLoweringError, match="no input"):
-        CpSymbol(a, ()).visit_op(CAP)
+        CpSymbol(a, (), CAP).as_linear()
 
 
 def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
@@ -240,13 +246,13 @@ def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
         def candidates(self) -> list[Candidate]:
             return [candidate("wide", 100), candidate("mid", 10), candidate("small", 5)]
 
-    node = Choices(case.symbol("a"), ())
-    table = node.tabulate(50)
+    table = Choices(case.symbol("a"), (), 50).tabulate()
     assert table is not None and list(table.values) == [5.0] * 3
     assert built == ["small"]
-    assert node.tabulate(4) is None
+    narrow = Choices(case.symbol("a"), (), 4)
+    assert narrow.tabulate() is None
     assert built == ["small"]  # nothing past the cap is built
-    assert node.refusal(4) == "small would hold 5 entries, past the cap of 4"
+    assert narrow.refusal() == "small would hold 5 entries, past the cap of 4"
 
 
 # ------------------------------------------------------------------------- values
@@ -352,7 +358,7 @@ def test_a_value_that_is_not_finite_is_refused():
         case.lower(1 / (a - 2))
 
 
-def test_each_node_is_lambdified_once(monkeypatch):
+def test_a_node_is_lambdified_once_and_only_when_its_table_is_read(monkeypatch):
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -368,8 +374,15 @@ def test_each_node_is_lambdified_once(monkeypatch):
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    assert calls == []  # making the nodes tabulates nothing
     computed = [e for e in nodes if e.free_symbols and not isinstance(e, sympy.Symbol)]
+    for _ in range(2):
+        for e in computed:
+            assert nodes[e].table is not None
     assert len(calls) == len(computed) == len(set(calls))
+    calls.clear()
+    TableLowering(case.inputs, cap=CAP).lower(expr)
+    assert calls == [expr]  # one table per node: only the root is read
 
 
 # ---------------------------------------------------------------- exact lowering

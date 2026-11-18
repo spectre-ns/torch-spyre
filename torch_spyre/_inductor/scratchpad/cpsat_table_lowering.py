@@ -20,9 +20,11 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 ``value == values[index]``. The lowering has three layers:
 
 - values: ``CpIndex``, ``CpLinear`` and ``CpTable`` are frozen and hold no model;
-- the walk: ``TableLowering`` makes one ``CpNode`` per node of the expression, and
-  each node tabulates itself from its children. The plan it returns, a ``CpLinear``,
-  holds no model either, so a refusal cannot touch one;
+- the nodes: ``TableLowering`` is a factory that makes one ``CpNode`` per node of the
+  expression, of a class chosen by the node's sympy class. Each node computes its
+  own table from its children the first time it is read, so a node nobody reads is
+  never tabulated. The plan the root returns, a ``CpLinear``, holds no model
+  either, so a refusal cannot touch one;
 - the build: ``CpEmitter`` rounds the plan onto ``COST_SCALE`` and is the only code
   that calls CP-SAT.
 
@@ -417,18 +419,20 @@ class CpNode:
 
     expr is the sympy node, injected and only read: it says which operation the node
     is, and gives its arguments and its free symbols. The CpNodes form the same graph
-    as the sympy nodes: children holds the CpNodes of children_of(expr), made and
-    visited before it, and a subexpression shared by two parents is one CpNode that
-    both hold. A node reads only its children: the columns of its inputs are
-    gathered from them. visit_op sets what a parent reads. No model is involved.
+    as the sympy nodes: children holds the CpNodes of children_of(expr), made before
+    it, and a subexpression shared by two parents is one CpNode that both hold. A
+    node reads only its children: the columns of its inputs are gathered from them.
+    cap bounds its table. No model is involved.
 
-    This class is an operation over free symbols; CpSymbol and CpConstant are the
-    leaves. A subclass changes how a node is tabulated by overriding candidates.
+    Everything a node knows is computed the first time it is read and kept: its
+    columns, its positions and its table. This class is an operation over free
+    symbols; CpSymbol and CpConstant are the leaves. A subclass changes how a node is
+    tabulated by overriding candidates, and nothing else changes for it.
     """
 
     expr: sympy.Basic
     children: tuple[CpNode, ...]
-    table: CpTable | None = field(default=None, init=False)
+    cap: int
 
     @cached_property
     def columns(self) -> Mapping[sympy.Symbol, CpTable]:
@@ -445,18 +449,17 @@ class CpNode:
         symbols = sorted(self.columns, key=sympy.default_sort_key)
         return list(dict.fromkeys(self.columns[s].index for s in symbols))
 
-    def visit_op(self, cap: int) -> None:
-        """The walk on this node, once, after its children: sets table. Raises
-        TableLoweringError naming the node when it ends with no table."""
-        self.table = self.tabulate(cap)
-        if self.table is None:
-            raise TableLoweringError(self.expr, self.refusal(cap))
+    @cached_property
+    def table(self) -> CpTable | None:
+        """The node's table, tabulated the first time it is read; None when no
+        candidate fits the cap."""
+        return self.tabulate()
 
-    def tabulate(self, cap: int) -> CpTable | None:
-        """The node's table: of the candidates under cap, the one with the fewest
-        entries (rule 3), built; None when none fits. A candidate past cap is never
-        built."""
-        fits = [c for c in self.candidates() if c.entries <= cap]
+    def tabulate(self) -> CpTable | None:
+        """Realizes the node: of the candidates under the cap, the one with the fewest
+        entries (rule 3), built; None when none fits. A candidate past the cap is
+        never built."""
+        fits = [c for c in self.candidates() if c.entries <= self.cap]
         if not fits:
             return None
         return min(fits, key=lambda c: c.entries).build()
@@ -477,39 +480,43 @@ class CpNode:
         values = values_on_grid(self.expr, self.columns, self.positions)
         return CpTable(values=values, index=index)
 
-    def refusal(self, cap: int) -> str:
-        """Why the node has no table under cap."""
+    def refusal(self) -> str:
+        """Why the node has no table under its cap."""
         smallest = min(self.candidates(), key=lambda c: c.entries, default=None)
         if smallest is None:
             return "no way to tabulate it"
         return (
             f"{smallest.name} would hold {smallest.entries} entries, past the cap "
-            f"of {cap}"
+            f"of {self.cap}"
         )
 
     def as_linear(self) -> CpLinear:
         """The node read linearly: its table, a CpTable being a CpLinear. Raises
-        TableLoweringError naming the node when a value of it is not finite: an
-        infinite or NaN entry may sit in a list that a parent discards, but not in one
-        read into the objective."""
-        if self.table is None:
-            raise TableLoweringError(self.expr, "read before it was visited")
-        if not np.all(np.isfinite(self.table.values)):
+        TableLoweringError naming the node when it has no table, and when a value of
+        it is not finite: an infinite or NaN entry may sit in a list that a parent
+        discards, but not in one read into the objective."""
+        table = self.table
+        if table is None:
+            raise TableLoweringError(self.expr, self.refusal())
+        if not np.all(np.isfinite(table.values)):
             raise TableLoweringError(self.expr, "a value that is not finite")
-        return self.table
+        return table
 
 
 @dataclass(eq=False)
 class CpSymbol(CpNode):
-    """A symbol: its column on its input, injected by the rewrite from the inputs,
-    or None for a symbol with no input."""
+    """A symbol: its column on its input, injected by the factory from the inputs,
+    or None for a symbol with no input, which raises when it is read."""
 
     column: CpTable | None = None
 
     @cached_property
     def columns(self) -> Mapping[sympy.Symbol, CpTable]:
-        """Its own column, or none."""
-        return {} if self.column is None else {self.expr: self.column}
+        """Its own column. Raises TableLoweringError naming the symbol when it has no
+        input, so a parent that reads it is refused by the symbol's name."""
+        if self.column is None:
+            raise TableLoweringError(self.expr, "a symbol with no input")
+        return {self.expr: self.column}
 
     def candidates(self) -> list[Candidate]:
         """Its column, the one way to tabulate it; none without an input."""
@@ -518,10 +525,10 @@ class CpSymbol(CpNode):
             return []
         return [Candidate("its column", column.entries, lambda: column)]
 
-    def refusal(self, cap: int) -> str:
+    def refusal(self) -> str:
         if self.column is None:
             return "a symbol with no input"
-        return super().refusal(cap)
+        return super().refusal()
 
 
 @dataclass(eq=False)
@@ -538,13 +545,14 @@ class CpConstant(CpNode):
 
 
 class TableLowering:
-    """Plans cost expressions as tables: the walk that makes and visits one CpNode
-    per node, each of which tabulates itself. It holds no model, so the walk cannot
-    write to one, and it keeps nothing between calls of lower.
+    """Plans cost expressions as tables: a factory for CpNodes. It makes one CpNode
+    per node, of the class the node's sympy class calls for, and hands it what it
+    reads; the nodes do the rest. It holds no model, so planning cannot write to one,
+    and it keeps nothing between calls of lower.
 
-    inputs gives each symbol's column on its input, which the rewrite hands to the
+    inputs gives each symbol's column on its input, which the factory hands to the
     symbol's CpSymbol; cap bounds the entries of one table, its list and the remaps
-    under its index, and is handed to each node's visit_op.
+    under its index, and is handed to every node.
     """
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
@@ -552,31 +560,30 @@ class TableLowering:
         self.cap = cap
 
     def lower(self, root: sympy.Basic) -> CpLinear:
-        """root as a plan: the form the objective reads, the root's table."""
+        """root as a plan: the form the objective reads, the root's table. Reading it
+        tabulates the root, and through it every node it reads."""
         return self.rewrite(root)[root].as_linear()
 
     def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:
         """Each node under root, once, as a CpNode holding its children's CpNodes,
-        visited after them, in the order of sympy.postorder_traversal with its repeats
-        dropped. An arm's ExprCondPair gets no CpNode. Recursion-free; root is not
-        changed."""
+        made after them, in the order of sympy.postorder_traversal with its repeats
+        dropped. An arm's ExprCondPair gets no CpNode. Nothing is tabulated here;
+        root is not changed."""
         nodes: dict[sympy.Basic, CpNode] = {}
         for expr in dict.fromkeys(sympy.postorder_traversal(root)):
             if isinstance(expr, ExprCondPair):
                 continue
-            node = self._node(expr, tuple(nodes[c] for c in children_of(expr)))
-            node.visit_op(self.cap)
-            nodes[expr] = node
+            nodes[expr] = self._node(expr, tuple(nodes[c] for c in children_of(expr)))
         return nodes
 
     def _node(self, expr: sympy.Basic, children: tuple[CpNode, ...]) -> CpNode:
         """expr's CpNode: a CpSymbol holding its input's column, a CpConstant for a
         node with no free symbol, and a CpNode for every other node."""
         if isinstance(expr, sympy.Symbol):
-            return CpSymbol(expr, children, column=self.inputs.get(expr))
+            return CpSymbol(expr, children, self.cap, column=self.inputs.get(expr))
         if not expr.free_symbols:
-            return CpConstant(expr, children)
-        return CpNode(expr, children)
+            return CpConstant(expr, children, self.cap)
+        return CpNode(expr, children, self.cap)
 
 
 def _constant(expr: sympy.Basic) -> float:
