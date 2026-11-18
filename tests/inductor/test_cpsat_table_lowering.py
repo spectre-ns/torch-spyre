@@ -36,7 +36,6 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     CpConstant,
     CpEmitter,
     CpIndex,
-    CpLinear,
     CpNode,
     CpSymbol,
     CpTable,
@@ -101,9 +100,9 @@ class Case:
 
     def lower(
         self, expr: sympy.Basic, cap: int = CAP
-    ) -> tuple[CpLinear, cp_model.LinearExprT]:
+    ) -> tuple[CpTable, cp_model.LinearExprT]:
         plan = TableLowering(self.inputs, cap=cap).lower(expr)
-        return plan, CpEmitter(self.model).linear(plan)
+        return plan, CpEmitter(self.model).table(plan)
 
     def solutions(self, exprs: list) -> list[tuple[int, ...]]:
         solver = cp_model.CpSolver()
@@ -130,7 +129,7 @@ class Case:
             )
         return float(expr.xreplace(point))
 
-    def assert_exact(self, expr: sympy.Basic, cap: int = CAP) -> CpLinear:
+    def assert_exact(self, expr: sympy.Basic, cap: int = CAP) -> CpTable:
         plan, objective = self.lower(expr, cap)
         cost = self.model.new_int_var(-(2**60), 2**60, "cost")
         self.model.add(cost == objective)
@@ -138,7 +137,7 @@ class Case:
         assignments = list(itertools.product(*(self.values[v] for v in self.variables)))
         assert len(rows) == len(assignments)
         assert sorted(row[:-1] for row in rows) == sorted(assignments)
-        bound = (len(plan.lists) + 1) / 2
+        bound = 0.5  # one table, rounded once
         for row in rows:
             exact = COST_SCALE * self.sympy_value(expr, row[:-1])
             assert abs(row[-1] - exact) <= bound, (row, exact)
@@ -225,9 +224,9 @@ def test_a_node_tabulates_itself_when_it_is_read():
         == "one table over its inputs would hold 3 entries, past the cap of 2"
     )
     with pytest.raises(TableLoweringError, match="past the cap of 2"):
-        small.as_linear()
+        small.read()
     with pytest.raises(TableLoweringError, match="no input"):
-        CpSymbol(a, (), CAP).as_linear()
+        CpSymbol(a, (), CAP).read()
 
 
 def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
@@ -280,7 +279,7 @@ def test_an_index_refuses_parts_its_step_does_not_take():
     assert CpIndex(Combine(), (a, b)).size == 6
 
 
-def test_a_table_takes_values_and_index_only_and_its_lists_are_read_only():
+def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     with pytest.raises(TypeError):
@@ -291,10 +290,10 @@ def test_a_table_takes_values_and_index_only_and_its_lists_are_read_only():
     assert table.values[0] == 1.0
     with pytest.raises(ValueError):
         table.values[0] = 5.0
-    with pytest.raises(TypeError):
-        table.lists[UNIT] = np.array([1.0])  # type: ignore[index]
     with pytest.raises(AttributeError):
-        table.constant = 2.0  # type: ignore[misc]
+        table.values = np.zeros(3)  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        table.index = UNIT  # type: ignore[misc]
 
 
 def test_positions_agree_with_cp_sat_at_every_assignment():
@@ -394,7 +393,7 @@ def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     case.add_input("b", b=[1.0, 3.0, 5.0, 7.0])
     a, b = case.symbol("a"), case.symbol("b")
     plan = case.assert_exact(a**2 * b + b**0.5 / a)
-    (index,) = plan.lists
+    index = plan.index
     assert index.size == 12
 
 
@@ -443,7 +442,7 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     case.values[lit], case.values[division] = [0, 1], [0, 1, 2]
     expr = RelayoutCharge(is_lx, div, 0, 65, 147)
     plan = case.assert_exact(expr)
-    (index,) = plan.lists
+    index = plan.index
     assert index.size == 6
 
 
@@ -511,5 +510,5 @@ def test_the_naive_lowering_explodes_past_the_cap():
         case.lower(expr, cap=4096)
     assert caught.value.node == expr
     plan, _ = case.lower(expr, cap=8192)
-    (index,) = plan.lists
+    index = plan.index
     assert index.size == 4620

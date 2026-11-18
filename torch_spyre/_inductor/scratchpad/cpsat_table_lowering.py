@@ -19,12 +19,12 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 ``values`` and a ``CpIndex``, the position in it that the decision variables fix,
 ``value == values[index]``. The lowering has three layers:
 
-- values: ``CpIndex``, ``CpLinear`` and ``CpTable`` are frozen and hold no model;
+- values: ``CpIndex`` and ``CpTable`` are frozen and hold no model;
 - the nodes: ``TableLowering`` is a factory that makes one ``CpNode`` per node of the
   expression, of a class chosen by the node's sympy class. Each node computes its
   own table from its children the first time it is read, so a node nobody reads is
-  never tabulated. The plan the root returns, a ``CpLinear``, holds no model
-  either, so a refusal cannot touch one;
+  never tabulated. The plan, the root's ``CpTable``, holds no model either, so a
+  refusal cannot touch one;
 - the build: ``CpEmitter`` rounds the plan onto ``COST_SCALE`` and is the only code
   that calls CP-SAT.
 
@@ -38,9 +38,8 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
-from types import MappingProxyType
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -284,54 +283,24 @@ def _read_only(values: Any, index: CpIndex) -> np.ndarray:
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
-class CpLinear:
-    """A node read linearly: the float form an emitter collapses into a CP-SAT
-    expression, a constant plus one list per index. Nothing in it is rounded, and
-    nothing in it changes once it is made: its lists are read-only copies. Compared by
-    identity, its lists being arrays."""
+class CpTable:
+    """A node's table: values[index], made together and never apart. values is the
+    value at each position, float until the emitter rounds it, stored as a read-only
+    copy; a list whose length is not the index's size is refused. Frozen, with no
+    model in it, and compared by identity, its list being an array."""
 
-    constant: float = 0.0
-    lists: Mapping[CpIndex, np.ndarray] = field(default_factory=dict)
+    values: np.ndarray
+    index: CpIndex
 
     def __post_init__(self) -> None:
-        """Refuses a list whose length is not its index's size, and stores read-only
-        copies."""
-        lists = {
-            index: _read_only(values, index) for index, values in self.lists.items()
-        }
-        object.__setattr__(self, "lists", MappingProxyType(lists))
+        object.__setattr__(self, "values", _read_only(self.values, self.index))
 
     @property
     def entries(self) -> int:
-        """The entries the form puts in the model: its lists, and the remaps under
-        their indexes, each once. Counted before any rounding, so a list that turns
-        out constant still counts in full."""
-        under = {index: None for key in self.lists for index in key.under()}
-        return sum(len(v) for v in self.lists.values()) + sum(
-            index.mapping.entries for index in under
-        )
-
-
-class CpTable(CpLinear):
-    """A node read as a table: values[index], made together and never apart. It is a
-    CpLinear with one list on one index and nothing else, so a table is read linearly
-    as it is. Its entries, the list plus the remaps under its index, are what the cap
-    bounds."""
-
-    def __init__(self, *, values: Any, index: CpIndex) -> None:
-        super().__init__(lists={index: values})
-
-    @property
-    def values(self) -> np.ndarray:
-        """Its one list: the value at each position, float until collapsed."""
-        (values,) = self.lists.values()
-        return values
-
-    @property
-    def index(self) -> CpIndex:
-        """The index of its one list."""
-        (index,) = self.lists
-        return index
+        """The entries the table puts in the model, what the cap bounds: its list,
+        and the remaps under its index. Counted before any rounding, so a list that
+        turns out constant still counts in full."""
+        return len(self.values) + sum(i.mapping.entries for i in self.index.under())
 
 
 # Each symbol's column, the symbol's value at each row of its input, on that input.
@@ -363,7 +332,7 @@ def values_on_grid(
 
     A value need not be finite: a Piecewise arm is infinite where it is not taken,
     and a Piecewise with no arm true is NaN. A list is refused for that only when it
-    is read into the objective (CpNode.as_linear).
+    is read into the objective (CpNode.read).
     """
     shape = tuple(p.size for p in positions)
     grid = np.indices(shape).reshape(len(shape), -1) if shape else np.zeros((0, 1), int)
@@ -490,11 +459,11 @@ class CpNode:
             f"of {self.cap}"
         )
 
-    def as_linear(self) -> CpLinear:
-        """The node read linearly: its table, a CpTable being a CpLinear. Raises
-        TableLoweringError naming the node when it has no table, and when a value of
-        it is not finite: an infinite or NaN entry may sit in a list that a parent
-        discards, but not in one read into the objective."""
+    def read(self) -> CpTable:
+        """The node's table, for a reader that needs one. Raises TableLoweringError
+        naming the node when it has no table, and when a value of it is not finite:
+        an infinite or NaN entry may sit in a list that a parent discards, but not in
+        one read into the objective."""
         table = self.table
         if table is None:
             raise TableLoweringError(self.expr, self.refusal())
@@ -541,7 +510,7 @@ class CpConstant(CpNode):
         return [Candidate("its value", 1, self._value)]
 
     def _value(self) -> CpTable:
-        return CpTable(values=[_constant(self.expr)], index=UNIT)
+        return CpTable(values=np.array([_constant(self.expr)]), index=UNIT)
 
 
 class TableLowering:
@@ -559,10 +528,10 @@ class TableLowering:
         self.inputs = inputs
         self.cap = cap
 
-    def lower(self, root: sympy.Basic) -> CpLinear:
-        """root as a plan: the form the objective reads, the root's table. Reading it
-        tabulates the root, and through it every node it reads."""
-        return self.rewrite(root)[root].as_linear()
+    def lower(self, root: sympy.Basic) -> CpTable:
+        """root as a plan: the root's table, which the objective reads as one lookup.
+        Reading it tabulates the root, and through it every node it reads."""
+        return self.rewrite(root)[root].read()
 
     def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:
         """Each node under root, once, as a CpNode holding its children's CpNodes,
@@ -600,13 +569,12 @@ def _constant(expr: sympy.Basic) -> float:
 
 class CpEmitter:
     """Builds a plan into one CP-SAT model: the only code that calls CP-SAT. It owns
-    the model and the memo of what it built, so a position, and a form, is built
-    once per emitter."""
+    the model and the memo of what it built, so a position is built once per
+    emitter."""
 
     def __init__(self, model: cp_model.CpModel) -> None:
         self.model = model
         self._indexes: dict[CpIndex, CpExpr] = {}
-        self._forms: dict[CpLinear, CpExpr] = {}
 
     def index(self, index: CpIndex) -> CpExpr:
         """index's position as a CP-SAT expression: its mapping's cp_expr on its
@@ -617,13 +585,13 @@ class CpEmitter:
                 self._indexes[step] = step.mapping.cp_expr(self.model, step, parts)
         return self._indexes[index]
 
-    def table(self, values: np.ndarray, index: CpIndex) -> CpExpr:
-        """values[index] as a CP-SAT expression: the list rounded once onto
-        COST_SCALE, then a number when it is constant, and otherwise one add_element
-        on self.index(index) into a new variable whose domain is the rounded values.
-        Raises TableLoweringError for an entry that is not finite or past
-        MAX_ENTRY."""
-        values = np.asarray(values, dtype=float)
+    def table(self, table: CpTable) -> CpExpr:
+        """table.values[table.index] as a CP-SAT expression in COST_SCALE units: the
+        list rounded once, within half a unit of its float value, then a number when
+        it is constant, and otherwise one add_element on self.index(table.index) into
+        a new variable whose domain is the rounded values. Raises TableLoweringError
+        for an entry that is not finite or past MAX_ENTRY."""
+        values, index = table.values, table.index
         if not np.all(np.isfinite(values)):
             raise TableLoweringError(None, "a table entry that is not finite")
         scaled = np.rint(COST_SCALE * values)
@@ -640,13 +608,3 @@ class CpEmitter:
         )
         self.model.add_element(self.index(index), entries, target)
         return target
-
-    def linear(self, form: CpLinear) -> CpExpr:
-        """form as a CP-SAT expression in COST_SCALE units, built once per form: its
-        constant, plus self.table of each list. A sum of T lists and a constant is
-        within (T + 1) / 2 units of its float value."""
-        if form not in self._forms:
-            constant = self.table(np.array([form.constant]), UNIT)
-            terms = [self.table(v, index) for index, v in form.lists.items()]
-            self._forms[form] = sum(terms, start=constant)
-        return self._forms[form]
