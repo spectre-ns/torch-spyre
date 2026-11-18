@@ -24,8 +24,9 @@ works out which entry of a table applies. A node's value is a *table*: a float l
   expression, of a class chosen by the node's sympy class. Each node computes its
   own table from its children the first time it is read, so a node nobody reads is
   never tabulated. The plan, the root's ``CpNode``, holds no model either;
-- the build: ``CpEmitter.emit`` reads the root and rounds its table onto
-  ``COST_SCALE``, and is the only code that calls CP-SAT.
+- the build: ``CpEmitter.emit`` reads the root, and the root's table builds itself
+  into the model (``CpTable.cp_expr``), rounded onto ``COST_SCALE``. Nothing reaches
+  the model but through the emitter.
 
 This is the base: one table per node, every value computed by ``sympy.lambdify`` over
 the node's inputs, and the root read as one lookup. It lowers an expression whose
@@ -284,7 +285,7 @@ def _read_only(values: Any, index: CpIndex) -> np.ndarray:
 @dataclass(frozen=True, eq=False, kw_only=True)
 class CpTable:
     """A node's table: values[index], made together and never apart. values is the
-    value at each position, float until the emitter rounds it, stored as a read-only
+    value at each position, float until cp_expr rounds it, stored as a read-only
     copy; a list whose length is not the index's size is refused. Frozen, with no
     model in it, and compared by identity, its list being an array."""
 
@@ -300,6 +301,33 @@ class CpTable:
         and the remaps under its index. Counted before any rounding, so a list that
         turns out constant still counts in full."""
         return len(self.values) + sum(i.mapping.entries for i in self.index.under())
+
+    def cp_expr(
+        self, model: cp_model.CpModel, position: Callable[[CpIndex], CpExpr]
+    ) -> CpExpr:
+        """The table in model, values[index] in COST_SCALE units: the list rounded
+        once, within half a unit of its float value, then a number when it is
+        constant, and otherwise one add_element on position(index) into a new
+        variable whose domain is the rounded values. position builds an index's
+        CP-SAT expression, and is called only when the table is not constant, so a
+        constant table adds nothing to the model. Raises TableLoweringError for an
+        entry that is not finite or past MAX_ENTRY."""
+        if not np.all(np.isfinite(self.values)):
+            raise TableLoweringError(None, "a table entry that is not finite")
+        scaled = np.rint(COST_SCALE * self.values)
+        largest = float(np.max(np.abs(scaled)))
+        if largest > MAX_ENTRY:
+            raise TableLoweringError(
+                None, f"a table entry of {largest:.3g}, past 2^50 = {MAX_ENTRY}"
+            )
+        entries = [int(v) for v in scaled]
+        if len(set(entries)) == 1:
+            return entries[0]
+        target = model.new_int_var_from_domain(
+            cp_model.Domain.from_values(sorted(set(entries))), "table"
+        )
+        model.add_element(position(self.index), entries, target)
+        return target
 
 
 # Each symbol's column, the symbol's value at each row of its input, on that input.
@@ -568,9 +596,10 @@ def _constant(expr: sympy.Basic) -> float:
 
 
 class CpEmitter:
-    """Builds a plan into one CP-SAT model: the only code that calls CP-SAT. It owns
-    the model and the memo of what it built, so a node, and a position, is built
-    once per emitter."""
+    """Builds a plan into one CP-SAT model. It owns the model and the memo of what
+    it built, so a node, and a position, is built once per emitter; each value
+    builds its own CP-SAT side (CpTable.cp_expr, IndexMap.cp_expr) when the emitter
+    asks it to."""
 
     def __init__(self, model: cp_model.CpModel) -> None:
         self.model = model
@@ -579,11 +608,11 @@ class CpEmitter:
 
     def emit(self, node: CpNode) -> CpExpr:
         """node as a CP-SAT expression in COST_SCALE units, built once per node: its
-        table read as one lookup. Reading the table tabulates the node, and raises
-        TableLoweringError naming it when it has none, before anything is added to
-        the model for it."""
+        table's cp_expr, with self.index building its position. Reading the table
+        tabulates the node, and raises TableLoweringError naming it when it has
+        none, before anything is added to the model for it."""
         if node not in self._nodes:
-            self._nodes[node] = self.table(node.read())
+            self._nodes[node] = node.read().cp_expr(self.model, self.index)
         return self._nodes[node]
 
     def index(self, index: CpIndex) -> CpExpr:
@@ -594,27 +623,3 @@ class CpEmitter:
                 parts = [self._indexes[part] for part in step.parts]
                 self._indexes[step] = step.mapping.cp_expr(self.model, step, parts)
         return self._indexes[index]
-
-    def table(self, table: CpTable) -> CpExpr:
-        """table.values[table.index] as a CP-SAT expression in COST_SCALE units: the
-        list rounded once, within half a unit of its float value, then a number when
-        it is constant, and otherwise one add_element on self.index(table.index) into
-        a new variable whose domain is the rounded values. Raises TableLoweringError
-        for an entry that is not finite or past MAX_ENTRY."""
-        values, index = table.values, table.index
-        if not np.all(np.isfinite(values)):
-            raise TableLoweringError(None, "a table entry that is not finite")
-        scaled = np.rint(COST_SCALE * values)
-        largest = float(np.max(np.abs(scaled)))
-        if largest > MAX_ENTRY:
-            raise TableLoweringError(
-                None, f"a table entry of {largest:.3g}, past 2^50 = {MAX_ENTRY}"
-            )
-        entries = [int(v) for v in scaled]
-        if len(set(entries)) == 1:
-            return entries[0]
-        target = self.model.new_int_var_from_domain(
-            cp_model.Domain.from_values(sorted(set(entries))), "table"
-        )
-        self.model.add_element(self.index(index), entries, target)
-        return target

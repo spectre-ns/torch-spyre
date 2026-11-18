@@ -254,6 +254,29 @@ def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
     assert narrow.refusal() == "small would hold 5 entries, past the cap of 4"
 
 
+def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
+    case = Case()
+    position = case.add_input("a", a=[1.0, 2.0, 4.0])
+    asked: list[CpIndex] = []
+    emitter = CpEmitter(case.model)
+
+    def position_of(index: CpIndex) -> cp_model.LinearExprT:
+        asked.append(index)
+        return emitter.index(index)
+
+    before = len(case.model.proto.variables), len(case.model.proto.constraints)
+    constant = CpTable(values=[2.0, 2.0, 2.0], index=position)
+    assert constant.cp_expr(case.model, position_of) == 2 * COST_SCALE
+    assert asked == []
+    after = len(case.model.proto.variables), len(case.model.proto.constraints)
+    assert after == before
+    table = CpTable(values=[1.0, 2.0, 4.0], index=position)
+    target = table.cp_expr(case.model, position_of)
+    assert asked == [position]
+    rows = dict(case.solutions([case.variables[0], target]))
+    assert rows == {0: 1024, 1: 2048, 2: 4096}
+
+
 def test_lower_tabulates_nothing_and_emit_builds_a_node_once():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
