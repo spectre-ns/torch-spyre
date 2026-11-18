@@ -19,7 +19,8 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 ``values`` and a ``CpIndex``, the position in it that the decision variables fix,
 ``value == values[index]``. The lowering has three layers:
 
-- values: ``CpIndex`` and ``CpTable`` are frozen and hold no model;
+- values: ``CpIndex`` and the forms, ``CpForm`` and its one kind here, ``CpTable``,
+  hold no model;
 - the nodes: ``TableLowering`` is a factory that makes one ``CpNode`` per node of the
   expression, of a class chosen by the node's sympy class. Each node realizes its
   own form, here a table, from its children the first time it is read, so a node
@@ -293,8 +294,28 @@ def _read_only(values: Any, index: CpIndex) -> np.ndarray:
     return array
 
 
+class CpForm(ABC):
+    """What a node is realized as: the one thing a reader and the objective take of
+    it. A value, with no model in it, that builds its own CP-SAT side. Each kind of
+    form is a subclass: here a CpTable, and from Stage 3 a CpLinear too."""
+
+    @property
+    @abstractmethod
+    def entries(self) -> int:
+        """The table entries the form puts in the model: what the cap bounds."""
+
+    @property
+    @abstractmethod
+    def finite(self) -> bool:
+        """Whether every value the form can take is a finite number."""
+
+    @abstractmethod
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """The form in model, as a CP-SAT expression in COST_SCALE units."""
+
+
 @dataclass(frozen=True, eq=False, kw_only=True)
-class CpTable:
+class CpTable(CpForm):
     """A node's table: values[index], made together and never apart. values is the
     value at each position, float until cp_expr rounds it, stored as a read-only
     copy; a list whose length is not the index's size is refused. Frozen, with no
@@ -313,6 +334,11 @@ class CpTable:
         turns out constant still counts in full."""
         return len(self.values) + sum(i.mapping.entries for i in self.index.under())
 
+    @property
+    def finite(self) -> bool:
+        """Whether every value in its list is a finite number."""
+        return bool(np.all(np.isfinite(self.values)))
+
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The table in model, values[index] in COST_SCALE units: the list rounded
         once, within half a unit of its float value, then a number when it is
@@ -321,7 +347,7 @@ class CpTable:
         the table is not constant, so a constant table adds nothing to the model.
         Raises TableLoweringError for an entry that is not finite or past
         MAX_ENTRY."""
-        if not np.all(np.isfinite(self.values)):
+        if not self.finite:
             raise TableLoweringError(None, "a table entry that is not finite")
         scaled = np.rint(COST_SCALE * self.values)
         largest = float(np.max(np.abs(scaled)))
@@ -418,8 +444,8 @@ class CpNode:
     node reads only its children: the columns of its inputs are gathered from them.
     cap bounds its table. No model is involved until cp_expr.
 
-    A node's form is what a reader and the objective take of it: in this stage
-    always its table, one CpTable. Its columns and its form are computed the first
+    A node's form, a CpForm, is what a reader and the objective take of it: in this
+    stage always its table, one CpTable. Its columns and its form are computed the first
     time they are read, and kept. This class is an operation over free symbols;
     CpSymbol and CpConstant are the leaves. A subclass changes how a node is
     realized by overriding realize.
@@ -438,16 +464,16 @@ class CpNode:
         return columns
 
     @cached_property
-    def form(self) -> CpTable:
+    def form(self) -> CpForm:
         """The node's form, realized the first time it is read. Raises
         TableLoweringError naming the node when it has none, and when a value of it
         is not finite."""
         form = self.realize()
-        if not np.all(np.isfinite(form.values)):
+        if not form.finite:
             raise TableLoweringError(self.expr, "a value that is not finite")
         return form
 
-    def realize(self) -> CpTable:
+    def realize(self) -> CpForm:
         """Realizes the node: one table over its inputs, their positions combined in
         the order of their symbols sorted by sympy.default_sort_key, the last
         fastest. Raises TableLoweringError naming the node when that table would pass

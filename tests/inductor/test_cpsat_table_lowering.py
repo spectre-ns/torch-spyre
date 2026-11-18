@@ -33,6 +33,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     UNIT,
     Combine,
     CpConstant,
+    CpForm,
     CpIndex,
     CpNode,
     CpSymbol,
@@ -275,6 +276,27 @@ def test_lower_realizes_nothing_and_a_refusal_leaves_the_model_as_it_was():
 
 
 # ------------------------------------------------------------------------- values
+
+
+def test_a_form_is_abstract_and_a_table_is_a_form():
+    case = Case()
+    position = case.add_input("a", a=[1.0, 2.0, 4.0])
+    with pytest.raises(TypeError):
+        CpForm()  # type: ignore[abstract]
+
+    class Partial(CpForm):
+        @property
+        def entries(self) -> int:
+            return 0
+
+    with pytest.raises(TypeError):
+        Partial()  # type: ignore[abstract]
+    table = CpTable(values=[1.0, 2.0, 4.0], index=position)
+    assert isinstance(table, CpForm)
+    assert table.finite and table.entries == 3
+    assert not CpTable(values=[1.0, np.inf, 4.0], index=position).finite
+    a = case.symbol("a")
+    assert isinstance(TableLowering(case.inputs, cap=CAP).lower(a**0.5).form, CpForm)
 
 
 def test_a_list_must_have_its_index_size():
