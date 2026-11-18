@@ -100,9 +100,9 @@ class Case:
 
     def lower(
         self, expr: sympy.Basic, cap: int = CAP
-    ) -> tuple[CpTable, cp_model.LinearExprT]:
-        plan = TableLowering(self.inputs, cap=cap).lower(expr)
-        return plan, CpEmitter(self.model).table(plan)
+    ) -> tuple[CpNode, cp_model.LinearExprT]:
+        root = TableLowering(self.inputs, cap=cap).lower(expr)
+        return root, CpEmitter(self.model).emit(root)
 
     def solutions(self, exprs: list) -> list[tuple[int, ...]]:
         solver = cp_model.CpSolver()
@@ -129,7 +129,7 @@ class Case:
             )
         return float(expr.xreplace(point))
 
-    def assert_exact(self, expr: sympy.Basic, cap: int = CAP) -> CpTable:
+    def assert_exact(self, expr: sympy.Basic, cap: int = CAP) -> CpNode:
         plan, objective = self.lower(expr, cap)
         cost = self.model.new_int_var(-(2**60), 2**60, "cost")
         self.model.add(cost == objective)
@@ -252,6 +252,25 @@ def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
     assert narrow.tabulate() is None
     assert built == ["small"]  # nothing past the cap is built
     assert narrow.refusal() == "small would hold 5 entries, past the cap of 4"
+
+
+def test_lower_tabulates_nothing_and_emit_builds_a_node_once():
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    root = TableLowering(case.inputs, cap=CAP).lower(a**0.5 * b)
+    assert type(root) is CpNode and root.expr == a**0.5 * b
+    assert "table" not in vars(root)
+    emitter = CpEmitter(case.model)
+    first = emitter.emit(root)
+    built = len(case.model.proto.constraints), len(case.model.proto.variables)
+    assert emitter.emit(root) is first
+    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == built
+    wide = TableLowering(case.inputs, cap=4).lower(a**0.5 * b)
+    with pytest.raises(TableLoweringError, match="past the cap of 4"):
+        emitter.emit(wide)
+    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == built
 
 
 # ------------------------------------------------------------------------- values
@@ -380,7 +399,7 @@ def test_a_node_is_lambdified_once_and_only_when_its_table_is_read(monkeypatch):
             assert nodes[e].table is not None
     assert len(calls) == len(computed) == len(set(calls))
     calls.clear()
-    TableLowering(case.inputs, cap=CAP).lower(expr)
+    CpEmitter(case.model).emit(TableLowering(case.inputs, cap=CAP).lower(expr))
     assert calls == [expr]  # one table per node: only the root is read
 
 
@@ -393,7 +412,7 @@ def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     case.add_input("b", b=[1.0, 3.0, 5.0, 7.0])
     a, b = case.symbol("a"), case.symbol("b")
     plan = case.assert_exact(a**2 * b + b**0.5 / a)
-    index = plan.index
+    index = plan.read().index
     assert index.size == 12
 
 
@@ -442,7 +461,7 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     case.values[lit], case.values[division] = [0, 1], [0, 1, 2]
     expr = RelayoutCharge(is_lx, div, 0, 65, 147)
     plan = case.assert_exact(expr)
-    index = plan.index
+    index = plan.read().index
     assert index.size == 6
 
 
@@ -510,5 +529,5 @@ def test_the_naive_lowering_explodes_past_the_cap():
         case.lower(expr, cap=4096)
     assert caught.value.node == expr
     plan, _ = case.lower(expr, cap=8192)
-    index = plan.index
+    index = plan.read().index
     assert index.size == 4620

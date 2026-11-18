@@ -23,10 +23,9 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 - the nodes: ``TableLowering`` is a factory that makes one ``CpNode`` per node of the
   expression, of a class chosen by the node's sympy class. Each node computes its
   own table from its children the first time it is read, so a node nobody reads is
-  never tabulated. The plan, the root's ``CpTable``, holds no model either, so a
-  refusal cannot touch one;
-- the build: ``CpEmitter`` rounds the plan onto ``COST_SCALE`` and is the only code
-  that calls CP-SAT.
+  never tabulated. The plan, the root's ``CpNode``, holds no model either;
+- the build: ``CpEmitter.emit`` reads the root and rounds its table onto
+  ``COST_SCALE``, and is the only code that calls CP-SAT.
 
 This is the base: one table per node, every value computed by ``sympy.lambdify`` over
 the node's inputs, and the root read as one lookup. It lowers an expression whose
@@ -528,10 +527,11 @@ class TableLowering:
         self.inputs = inputs
         self.cap = cap
 
-    def lower(self, root: sympy.Basic) -> CpTable:
-        """root as a plan: the root's table, which the objective reads as one lookup.
-        Reading it tabulates the root, and through it every node it reads."""
-        return self.rewrite(root)[root].read()
+    def lower(self, root: sympy.Basic) -> CpNode:
+        """root as a plan: root's CpNode, over the graph of nodes under it. Nothing is
+        tabulated here; CpEmitter.emit reads the root, which tabulates it, and
+        through it every node it reads."""
+        return self.rewrite(root)[root]
 
     def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:
         """Each node under root, once, as a CpNode holding its children's CpNodes,
@@ -569,12 +569,22 @@ def _constant(expr: sympy.Basic) -> float:
 
 class CpEmitter:
     """Builds a plan into one CP-SAT model: the only code that calls CP-SAT. It owns
-    the model and the memo of what it built, so a position is built once per
-    emitter."""
+    the model and the memo of what it built, so a node, and a position, is built
+    once per emitter."""
 
     def __init__(self, model: cp_model.CpModel) -> None:
         self.model = model
         self._indexes: dict[CpIndex, CpExpr] = {}
+        self._nodes: dict[CpNode, CpExpr] = {}
+
+    def emit(self, node: CpNode) -> CpExpr:
+        """node as a CP-SAT expression in COST_SCALE units, built once per node: its
+        table read as one lookup. Reading the table tabulates the node, and raises
+        TableLoweringError naming it when it has none, before anything is added to
+        the model for it."""
+        if node not in self._nodes:
+            self._nodes[node] = self.table(node.read())
+        return self._nodes[node]
 
     def index(self, index: CpIndex) -> CpExpr:
         """index's position as a CP-SAT expression: its mapping's cp_expr on its
