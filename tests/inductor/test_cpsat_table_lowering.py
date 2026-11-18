@@ -31,10 +31,14 @@ from sympy.functions.elementary.piecewise import ExprCondPair
 from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     COST_SCALE,
     UNIT,
+    Candidate,
     Combine,
+    CpConstant,
     CpEmitter,
     CpIndex,
     CpLinear,
+    CpNode,
+    CpSymbol,
     CpTable,
     Input,
     Locate,
@@ -57,7 +61,7 @@ class Case:
         self.variables: list[cp_model.IntVar] = []
         self.values: dict[cp_model.IntVar, list[int]] = {}
 
-    def menu(self, name: str, **columns: list[float]) -> CpIndex:
+    def add_input(self, name: str, **columns: list[float]) -> CpIndex:
         """A buffer's division: a variable in 0 .. n-1 picking a row of its menu, and
         one column per symbol of the buffer."""
         sizes = {len(column) for column in columns.values()}
@@ -146,8 +150,8 @@ class Case:
 
 def test_walk_visits_children_first_and_shares_a_subexpression():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
-    case.menu("b", b=[1.0, 3.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
@@ -165,7 +169,7 @@ def test_walk_visits_children_first_and_shares_a_subexpression():
 
 def test_a_piecewise_arm_gets_no_node():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     expr = sympy.Piecewise((a, a > 2), (a**2, True))
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
@@ -173,20 +177,92 @@ def test_a_piecewise_arm_gets_no_node():
     assert [c.expr for c in nodes[expr].children] == [a, a > 2, a**2, sympy.true]
 
 
+def test_each_node_is_a_symbol_a_constant_or_an_operation():
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    a = case.symbol("a")
+    root2 = sympy.sqrt(2)
+    expr = 3 * a + root2 * a**0.5
+    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    assert type(nodes[a]) is CpSymbol
+    assert nodes[a].column is case.inputs[a]
+    assert type(nodes[sympy.Integer(3)]) is CpConstant
+    assert type(nodes[root2]) is CpConstant  # an operation on numbers
+    assert type(nodes[a**0.5]) is CpNode
+    assert type(nodes[expr]) is CpNode
+
+
+def test_a_node_gathers_its_columns_from_its_children():
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    expr = a**0.5 + 2 * b
+    nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
+    assert dict(nodes[expr].columns) == {a: case.inputs[a], b: case.inputs[b]}
+    assert all(nodes[expr].columns[s] is case.inputs[s] for s in (a, b))
+    assert dict(nodes[2 * b].columns) == {b: case.inputs[b]}
+    assert dict(nodes[sympy.Integer(2)].columns) == {}
+
+
+def test_a_node_tabulates_itself_with_the_cap_alone():
+    """No lowering is passed in: a node reads its children and the cap."""
+    case = Case()
+    position = case.add_input("a", a=[1.0, 2.0, 4.0])
+    a = case.symbol("a")
+    leaf = CpSymbol(a, (), column=case.inputs[a])
+    half = CpConstant(sympy.Float(0.5), ())
+    root = CpNode(a**0.5, (leaf, half))
+    for node in (leaf, half, root):
+        node.visit_op(CAP)
+    assert root.table is not None
+    assert root.table.index == position
+    assert list(root.table.values) == pytest.approx([1.0, 2**0.5, 2.0])
+    assert root.tabulate(2) is None
+    assert "past the cap of 2" in root.refusal(2)
+    with pytest.raises(TableLoweringError, match="no input"):
+        CpSymbol(a, ()).visit_op(CAP)
+
+
+def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
+    case = Case()
+    position = case.add_input("a", a=[1.0, 2.0, 4.0])
+    built: list[str] = []
+
+    def candidate(name: str, entries: int) -> Candidate:
+        def build() -> CpTable:
+            built.append(name)
+            return CpTable(values=[float(entries)] * 3, index=position)
+
+        return Candidate(name, entries, build)
+
+    class Choices(CpNode):
+        def candidates(self) -> list[Candidate]:
+            return [candidate("wide", 100), candidate("mid", 10), candidate("small", 5)]
+
+    node = Choices(case.symbol("a"), ())
+    table = node.tabulate(50)
+    assert table is not None and list(table.values) == [5.0] * 3
+    assert built == ["small"]
+    assert node.tabulate(4) is None
+    assert built == ["small"]  # nothing past the cap is built
+    assert node.refusal(4) == "small would hold 5 entries, past the cap of 4"
+
+
 # ------------------------------------------------------------------------- values
 
 
 def test_a_list_must_have_its_index_size():
     case = Case()
-    position = case.menu("a", a=[1.0, 2.0, 4.0])
+    position = case.add_input("a", a=[1.0, 2.0, 4.0])
     with pytest.raises(ValueError):
         CpTable(values=[1.0, 2.0], index=position)
 
 
 def test_an_index_refuses_parts_its_step_does_not_take():
     case = Case()
-    a = case.menu("a", a=[1.0, 2.0, 4.0])
-    b = case.menu("b", b=[1.0, 3.0])
+    a = case.add_input("a", a=[1.0, 2.0, 4.0])
+    b = case.add_input("b", b=[1.0, 3.0])
     with pytest.raises(ValueError):
         CpIndex(Combine(), (a,))
     with pytest.raises(ValueError):
@@ -200,7 +276,7 @@ def test_an_index_refuses_parts_its_step_does_not_take():
 
 def test_a_table_takes_values_and_index_only_and_its_lists_are_read_only():
     case = Case()
-    position = case.menu("a", a=[1.0, 2.0, 4.0])
+    position = case.add_input("a", a=[1.0, 2.0, 4.0])
     with pytest.raises(TypeError):
         CpTable(values=[1.0, 2.0, 3.0], index=position, constant=1.0)  # type: ignore[call-arg]
     source = np.array([1.0, 2.0, 3.0])
@@ -243,9 +319,9 @@ def test_equal_indexes_made_apart_are_built_once():
 
 def test_values_on_grid_is_row_major_with_the_last_position_fastest():
     case = Case()
-    a = case.menu("a", a=[0.0, 1.0])
-    b = case.menu("b", b=[0.0, 1.0, 2.0])
-    c = case.menu("c", c=[0.0, 1.0, 2.0, 3.0])
+    a = case.add_input("a", a=[0.0, 1.0])
+    b = case.add_input("b", b=[0.0, 1.0, 2.0])
+    c = case.add_input("c", c=[0.0, 1.0, 2.0, 3.0])
     sa, sb, sc = case.symbol("a"), case.symbol("b"), case.symbol("c")
     values = values_on_grid(100 * sa + 10 * sb + sc, case.inputs, [a, b, c])
     expected = [
@@ -256,21 +332,21 @@ def test_values_on_grid_is_row_major_with_the_last_position_fastest():
 
 def test_values_on_grid_moves_two_symbols_of_one_position_together():
     case = Case()
-    p = case.menu("a", d0=[1.0, 2.0, 4.0], d1=[8.0, 4.0, 2.0])
+    p = case.add_input("a", d0=[1.0, 2.0, 4.0], d1=[8.0, 4.0, 2.0])
     d0, d1 = case.symbol("d0"), case.symbol("d1")
     assert list(values_on_grid(d0 * d1, case.inputs, [p])) == [8.0, 8.0, 8.0]
 
 
 def test_values_on_grid_broadcasts_a_constant():
     case = Case()
-    p = case.menu("a", a=[1.0, 2.0, 4.0])
+    p = case.add_input("a", a=[1.0, 2.0, 4.0])
     values = values_on_grid(sympy.Integer(5), case.inputs, [p])
     assert list(values) == [5.0, 5.0, 5.0]
 
 
 def test_a_value_that_is_not_finite_is_refused():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     with pytest.raises(TableLoweringError):
         case.lower(1 / (a - 2))
@@ -278,8 +354,8 @@ def test_a_value_that_is_not_finite_is_refused():
 
 def test_each_node_is_lambdified_once(monkeypatch):
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
-    case.menu("b", b=[1.0, 3.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     calls: list[sympy.Basic] = []
     lambdify = sympy.lambdify
@@ -301,8 +377,8 @@ def test_each_node_is_lambdified_once(monkeypatch):
 
 def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
-    case.menu("b", b=[1.0, 3.0, 5.0, 7.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0, 5.0, 7.0])
     a, b = case.symbol("a"), case.symbol("b")
     plan = case.assert_exact(a**2 * b + b**0.5 / a)
     (index,) = plan.lists
@@ -319,14 +395,14 @@ def test_a_variable_with_gaps_and_one_above_zero_read_their_entries():
 
 def test_a_piecewise_with_an_infinite_arm_not_taken_is_exact():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     case.assert_exact(sympy.Piecewise((1 / (a - 2), a > 2), (0.5, True)))
 
 
 def test_a_piecewise_with_no_arm_true_is_refused():
     case = Case()
-    case.menu("a", a=[1.0, 4.0])
+    case.add_input("a", a=[1.0, 4.0])
     a = case.symbol("a")
     with pytest.raises(TableLoweringError):
         case.lower(sympy.Piecewise((a, a > 3)))
@@ -334,7 +410,7 @@ def test_a_piecewise_with_no_arm_true_is_refused():
 
 def test_functions_numpy_does_not_share_give_sympys_values():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     case.assert_exact(sympy.sec(a / 4) + sympy.sinc(a))
 
@@ -360,7 +436,7 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
 
 def test_an_undefined_function_is_refused():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     with pytest.raises(TableLoweringError):
         case.lower(sympy.Function("f")(a))
@@ -368,7 +444,7 @@ def test_an_undefined_function_is_refused():
 
 def test_a_coefficient_is_applied_before_the_rounding():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     _, objective = case.lower(7 * a**0.5)
     cost = case.model.new_int_var(0, 2**40, "cost")
@@ -379,7 +455,7 @@ def test_a_coefficient_is_applied_before_the_rounding():
 
 def test_a_constant_list_adds_no_variable_and_a_constant_objective_is_an_int():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     variables = len(case.model.proto.variables)
     _, objective = case.lower(a / a + 2)
@@ -390,7 +466,7 @@ def test_a_constant_list_adds_no_variable_and_a_constant_objective_is_an_int():
 
 def test_an_entry_too_large_for_int64_sums_is_refused():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     with pytest.raises(TableLoweringError, match="2\\^50"):
         case.lower(1e14 * a)
@@ -398,7 +474,7 @@ def test_an_entry_too_large_for_int64_sums_is_refused():
 
 def test_a_symbol_with_no_input_is_refused_by_name():
     case = Case()
-    case.menu("a", a=[1.0, 2.0, 4.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0])
     a, z = case.symbol("a"), sympy.Symbol("z", positive=True)
     with pytest.raises(TableLoweringError) as caught:
         case.lower(a + z)
@@ -411,9 +487,9 @@ def test_the_naive_lowering_explodes_past_the_cap():
     20 = 4620 entries, though no term reads more than one buffer. Under a cap of 4096
     the sum is refused, by name; keeping a sum linear is the next optimization."""
     case = Case()
-    case.menu("a", a=[float(v) for v in range(1, 22)])
-    case.menu("b", b=[float(v) for v in range(1, 12)])
-    case.menu("c", c=[float(v) for v in range(1, 21)])
+    case.add_input("a", a=[float(v) for v in range(1, 22)])
+    case.add_input("b", b=[float(v) for v in range(1, 12)])
+    case.add_input("c", c=[float(v) for v in range(1, 21)])
     a, b, c = case.symbol("a"), case.symbol("b"), case.symbol("c")
     expr = a**0.5 + b**0.5 + c**0.25
     with pytest.raises(

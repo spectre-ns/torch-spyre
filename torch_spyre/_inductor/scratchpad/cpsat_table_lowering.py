@@ -20,7 +20,8 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 ``value == values[index]``. The lowering has three layers:
 
 - values: ``CpIndex``, ``CpLinear`` and ``CpTable`` are frozen and hold no model;
-- the walk: ``TableLowering`` turns an expression into a plan, a ``CpLinear``, and
+- the walk: ``TableLowering`` makes one ``CpNode`` per node of the expression, and
+  each node tabulates itself from its children. The plan it returns, a ``CpLinear``,
   holds no model either, so a refusal cannot touch one;
 - the build: ``CpEmitter`` rounds the plan onto ``COST_SCALE`` and is the only code
   that calls CP-SAT.
@@ -345,20 +346,18 @@ def _compile(expr: sympy.Basic) -> tuple[list[sympy.Symbol], Callable[..., Any]]
 
 def values_on_grid(
     expr: sympy.Basic,
-    inputs: Inputs,
+    columns: Mapping[sympy.Symbol, CpTable],
     positions: Sequence[CpIndex],
-    cache: dict[sympy.Basic, tuple[list[sympy.Symbol], Callable[..., Any]]]
-    | None = None,
 ) -> np.ndarray:
     """expr at every joint assignment of positions, row-major, the last position
     fastest: entry i1 * s1 + ... + im * sm, s_k the product of the sizes after k.
 
-    Each free symbol of expr is read from its column in inputs, at its own position,
+    Each free symbol of expr is read from its column in columns, at its own position,
     which must be one of positions; two symbols on one position move together. expr
-    is lambdified with the numpy module, once per expr when a cache is given. A
-    function that takes scalars only, as RelayoutCharge's ``_imp_`` does, is
-    evaluated point by point. Raises TableLoweringError for a function with no
-    numeric value.
+    is lambdified with the numpy module on each call: a node makes one call, when it
+    builds its table. A function that takes scalars only, as RelayoutCharge's
+    ``_imp_`` does, is evaluated point by point. Raises TableLoweringError for a
+    function with no numeric value.
 
     A value need not be finite: a Piecewise arm is infinite where it is not taken,
     and a Piecewise with no arm true is NaN. A list is refused for that only when it
@@ -368,23 +367,19 @@ def values_on_grid(
     grid = np.indices(shape).reshape(len(shape), -1) if shape else np.zeros((0, 1), int)
     count = grid.shape[1]
     axis = {p: k for k, p in enumerate(positions)}
-    if cache is not None and expr in cache:
-        symbols, func = cache[expr]
-    else:
-        symbols, func = _compile(expr)
-        if cache is not None:
-            cache[expr] = symbols, func
-    columns = []
+    symbols, func = _compile(expr)
+    arguments = []
     for symbol in symbols:
-        table = inputs[symbol]
-        columns.append(table.values[grid[axis[table.index]]])
+        table = columns[symbol]
+        arguments.append(table.values[grid[axis[table.index]]])
     with np.errstate(all="ignore"):
         try:
             try:
-                result = np.asarray(func(*columns), dtype=float)
+                result = np.asarray(func(*arguments), dtype=float)
             except TypeError:
                 result = np.array(
-                    [func(*(c[i] for c in columns)) for i in range(count)], dtype=float
+                    [func(*(a[i] for a in arguments)) for i in range(count)],
+                    dtype=float,
                 )
         except NameError as exc:
             raise TableLoweringError(expr, f"no numeric value ({exc})") from exc
@@ -405,29 +400,92 @@ def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]:
     return expr.args
 
 
+@dataclass(frozen=True)
+class Candidate:
+    """One way to tabulate a node: what it is, the entries it would hold, known
+    before its list is computed, and how to build it. A candidate past the cap is
+    never built."""
+
+    name: str
+    entries: int
+    build: Callable[[], CpTable]
+
+
 @dataclass(eq=False)
 class CpNode:
-    """The CP-SAT counterpart of one sympy node.
+    """The CP-SAT counterpart of one sympy node, which tabulates itself.
 
     expr is the sympy node, injected and only read: it says which operation the node
     is, and gives its arguments and its free symbols. The CpNodes form the same graph
     as the sympy nodes: children holds the CpNodes of children_of(expr), made and
     visited before it, and a subexpression shared by two parents is one CpNode that
-    both hold. visit_op sets what a parent reads. No model is involved.
+    both hold. A node reads only its children: the columns of its inputs are
+    gathered from them. visit_op sets what a parent reads. No model is involved.
+
+    This class is an operation over free symbols; CpSymbol and CpConstant are the
+    leaves. A subclass changes how a node is tabulated by overriding candidates.
     """
 
     expr: sympy.Basic
     children: tuple[CpNode, ...]
     table: CpTable | None = field(default=None, init=False)
 
-    def visit_op(self, lowering: TableLowering) -> None:
-        """The walk on this node, once, after its children: sets table, its input's
-        column for a symbol, its value on the Unit position for a constant, and
-        otherwise one table over the inputs of its free symbols. Raises
+    @cached_property
+    def columns(self) -> Mapping[sympy.Symbol, CpTable]:
+        """Each free symbol's column on its input, gathered from the children."""
+        columns: dict[sympy.Symbol, CpTable] = {}
+        for child in self.children:
+            columns.update(child.columns)
+        return columns
+
+    @cached_property
+    def positions(self) -> list[CpIndex]:
+        """The distinct positions of the node's columns, in the order of their symbols
+        sorted by sympy.default_sort_key."""
+        symbols = sorted(self.columns, key=sympy.default_sort_key)
+        return list(dict.fromkeys(self.columns[s].index for s in symbols))
+
+    def visit_op(self, cap: int) -> None:
+        """The walk on this node, once, after its children: sets table. Raises
         TableLoweringError naming the node when it ends with no table."""
-        self.table = lowering.tabulate(self)
+        self.table = self.tabulate(cap)
         if self.table is None:
-            raise TableLoweringError(self.expr, lowering.refusal(self.expr))
+            raise TableLoweringError(self.expr, self.refusal(cap))
+
+    def tabulate(self, cap: int) -> CpTable | None:
+        """The node's table: of the candidates under cap, the one with the fewest
+        entries (rule 3), built; None when none fits. A candidate past cap is never
+        built."""
+        fits = [c for c in self.candidates() if c.entries <= cap]
+        if not fits:
+            return None
+        return min(fits, key=lambda c: c.entries).build()
+
+    def candidates(self) -> list[Candidate]:
+        """The ways to tabulate the node. Here one: one table over its inputs, their
+        positions combined in the order of positions, the last fastest."""
+        under = {i: None for p in self.positions for i in p.under()}
+        entries = math.prod(p.size for p in self.positions) + sum(
+            i.mapping.entries for i in under
+        )
+        return [Candidate("one table over its inputs", entries, self._one_table)]
+
+    def _one_table(self) -> CpTable:
+        index = self.positions[0]
+        for position in self.positions[1:]:
+            index = CpIndex(Combine(), (index, position))
+        values = values_on_grid(self.expr, self.columns, self.positions)
+        return CpTable(values=values, index=index)
+
+    def refusal(self, cap: int) -> str:
+        """Why the node has no table under cap."""
+        smallest = min(self.candidates(), key=lambda c: c.entries, default=None)
+        if smallest is None:
+            return "no way to tabulate it"
+        return (
+            f"{smallest.name} would hold {smallest.entries} entries, past the cap "
+            f"of {cap}"
+        )
 
     def as_linear(self) -> CpLinear:
         """The node read linearly: its table, a CpTable being a CpLinear. Raises
@@ -441,20 +499,57 @@ class CpNode:
         return self.table
 
 
-class TableLowering:
-    """Plans cost expressions as tables. It holds no model, so the walk cannot write
-    to one, and it keeps nothing between calls of lower but the lambdified functions.
+@dataclass(eq=False)
+class CpSymbol(CpNode):
+    """A symbol: its column on its input, injected by the rewrite from the inputs,
+    or None for a symbol with no input."""
 
-    inputs gives each symbol's column on its input; cap bounds the entries of one
-    table, its list and the remaps under its index.
+    column: CpTable | None = None
+
+    @cached_property
+    def columns(self) -> Mapping[sympy.Symbol, CpTable]:
+        """Its own column, or none."""
+        return {} if self.column is None else {self.expr: self.column}
+
+    def candidates(self) -> list[Candidate]:
+        """Its column, the one way to tabulate it; none without an input."""
+        column = self.column
+        if column is None:
+            return []
+        return [Candidate("its column", column.entries, lambda: column)]
+
+    def refusal(self, cap: int) -> str:
+        if self.column is None:
+            return "a symbol with no input"
+        return super().refusal(cap)
+
+
+@dataclass(eq=False)
+class CpConstant(CpNode):
+    """A node with no free symbol: a number, true or false, or an operation on
+    numbers. Its table is its value on the Unit position."""
+
+    def candidates(self) -> list[Candidate]:
+        """Its value, one entry on the Unit position."""
+        return [Candidate("its value", 1, self._value)]
+
+    def _value(self) -> CpTable:
+        return CpTable(values=[_constant(self.expr)], index=UNIT)
+
+
+class TableLowering:
+    """Plans cost expressions as tables: the walk that makes and visits one CpNode
+    per node, each of which tabulates itself. It holds no model, so the walk cannot
+    write to one, and it keeps nothing between calls of lower.
+
+    inputs gives each symbol's column on its input, which the rewrite hands to the
+    symbol's CpSymbol; cap bounds the entries of one table, its list and the remaps
+    under its index, and is handed to each node's visit_op.
     """
 
     def __init__(self, inputs: Inputs, *, cap: int) -> None:
         self.inputs = inputs
         self.cap = cap
-        self.compiled: dict[
-            sympy.Basic, tuple[list[sympy.Symbol], Callable[..., Any]]
-        ] = {}
 
     def lower(self, root: sympy.Basic) -> CpLinear:
         """root as a plan: the form the objective reads, the root's table."""
@@ -469,53 +564,19 @@ class TableLowering:
         for expr in dict.fromkeys(sympy.postorder_traversal(root)):
             if isinstance(expr, ExprCondPair):
                 continue
-            node = CpNode(expr, tuple(nodes[child] for child in children_of(expr)))
-            node.visit_op(self)
+            node = self._node(expr, tuple(nodes[c] for c in children_of(expr)))
+            node.visit_op(self.cap)
             nodes[expr] = node
         return nodes
 
-    def positions_of(self, expr: sympy.Basic) -> list[CpIndex]:
-        """The distinct positions of expr's free symbols, in the order of the symbols
-        sorted by sympy.default_sort_key. Raises KeyError for a symbol with no input."""
-        symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
-        return list(dict.fromkeys(self.inputs[s].index for s in symbols))
-
-    def entries_of_one_table(self, expr: sympy.Basic) -> int:
-        """The entries one table over expr's inputs would hold: the product of their
-        sizes, plus the remaps under their positions."""
-        positions = self.positions_of(expr)
-        under = {i: None for p in positions for i in p.under()}
-        return math.prod(p.size for p in positions) + sum(
-            i.mapping.entries for i in under
-        )
-
-    def tabulate(self, node: CpNode) -> CpTable | None:
-        """node's table, or None when it has none: a symbol's column, a constant on
-        the Unit position, or one table over the inputs of node's free symbols, read
-        through their positions combined in the order of positions_of, the last
-        fastest. One past the cap is never evaluated."""
-        expr = node.expr
+    def _node(self, expr: sympy.Basic, children: tuple[CpNode, ...]) -> CpNode:
+        """expr's CpNode: a CpSymbol holding its input's column, a CpConstant for a
+        node with no free symbol, and a CpNode for every other node."""
         if isinstance(expr, sympy.Symbol):
-            return self.inputs.get(expr)
+            return CpSymbol(expr, children, column=self.inputs.get(expr))
         if not expr.free_symbols:
-            return CpTable(values=[_constant(expr)], index=UNIT)
-        if self.entries_of_one_table(expr) > self.cap:
-            return None
-        positions = self.positions_of(expr)
-        index = positions[0]
-        for position in positions[1:]:
-            index = CpIndex(Combine(), (index, position))
-        values = values_on_grid(expr, self.inputs, positions, self.compiled)
-        return CpTable(values=values, index=index)
-
-    def refusal(self, expr: sympy.Basic) -> str:
-        """Why expr has no table."""
-        if isinstance(expr, sympy.Symbol):
-            return "a symbol with no input"
-        return (
-            f"one table over its inputs would hold {self.entries_of_one_table(expr)} "
-            f"entries, past the cap of {self.cap}"
-        )
+            return CpConstant(expr, children)
+        return CpNode(expr, children)
 
 
 def _constant(expr: sympy.Basic) -> float:
