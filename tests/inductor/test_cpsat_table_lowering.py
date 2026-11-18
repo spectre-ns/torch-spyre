@@ -202,27 +202,27 @@ def test_a_node_gathers_its_columns_from_its_children():
     assert dict(nodes[sympy.Integer(2)].columns) == {}
 
 
-def test_a_node_tabulates_itself_when_it_is_read():
+def test_a_node_realizes_itself_when_it_is_read():
     """No lowering is passed in, and nothing visits: a node reads its children and
-    its cap, the first time its table is read."""
+    its cap, the first time its form is read."""
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     leaf = CpSymbol(a, (), CAP, column=case.inputs[a])
     half = CpConstant(sympy.Float(0.5), (), CAP)
     root = CpNode(a**0.5, (leaf, half), CAP)
-    assert "table" not in vars(root)
-    assert root.table is not None
-    assert root.table.index == position
-    assert list(root.table.values) == pytest.approx([1.0, 2**0.5, 2.0])
+    assert "form" not in vars(root)
+    assert root.form is not None
+    assert root.form.index == position
+    assert list(root.form.values) == pytest.approx([1.0, 2**0.5, 2.0])
     small = CpNode(a**0.5, (leaf, half), 2)
     with pytest.raises(
         TableLoweringError,
         match="one table over its inputs would hold 3 entries, past the cap of 2",
     ):
-        small.table
+        small.form
     with pytest.raises(TableLoweringError, match="no input"):
-        CpSymbol(a, (), CAP).table
+        CpSymbol(a, (), CAP).form
 
 
 def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
@@ -240,7 +240,7 @@ def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
     monkeypatch.setattr(sympy, "lambdify", counting)
     root = TableLowering(case.inputs, cap=5).lower(a * b)
     with pytest.raises(TableLoweringError, match="6 entries, past the cap of 5"):
-        root.table
+        root.form
     assert calls == []
 
 
@@ -258,14 +258,14 @@ def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
     assert rows == {1: 1024, 4: 2048, 9: 4096, 16: 8192}
 
 
-def test_lower_tabulates_nothing_and_a_refusal_leaves_the_model_as_it_was():
+def test_lower_realizes_nothing_and_a_refusal_leaves_the_model_as_it_was():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     root = TableLowering(case.inputs, cap=CAP).lower(a**0.5 * b)
     assert type(root) is CpNode and root.expr == a**0.5 * b
-    assert "table" not in vars(root)
+    assert "form" not in vars(root)
     root.cp_expr(case.model)
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
     wide = TableLowering(case.inputs, cap=4).lower(a**0.5 * b)
@@ -365,7 +365,7 @@ def test_a_value_that_is_not_finite_is_refused():
         case.lower(1 / (a - 2))
 
 
-def test_a_node_is_lambdified_once_and_only_when_its_table_is_read(monkeypatch):
+def test_a_node_is_lambdified_once_and_only_when_its_form_is_read(monkeypatch):
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -381,11 +381,11 @@ def test_a_node_is_lambdified_once_and_only_when_its_table_is_read(monkeypatch):
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
-    assert calls == []  # making the nodes tabulates nothing
+    assert calls == []  # making the nodes realizes nothing
     computed = [e for e in nodes if e.free_symbols and not isinstance(e, sympy.Symbol)]
     for _ in range(2):
         for e in computed:
-            assert nodes[e].table is not None
+            assert nodes[e].form is not None
     assert len(calls) == len(computed) == len(set(calls))
     calls.clear()
     TableLowering(case.inputs, cap=CAP).lower(expr).cp_expr(case.model)
@@ -401,7 +401,7 @@ def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     case.add_input("b", b=[1.0, 3.0, 5.0, 7.0])
     a, b = case.symbol("a"), case.symbol("b")
     plan = case.assert_exact(a**2 * b + b**0.5 / a)
-    index = plan.table.index
+    index = plan.form.index
     assert index.size == 12
 
 
@@ -450,7 +450,7 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     case.values[lit], case.values[division] = [0, 1], [0, 1, 2]
     expr = RelayoutCharge(is_lx, div, 0, 65, 147)
     plan = case.assert_exact(expr)
-    index = plan.table.index
+    index = plan.form.index
     assert index.size == 6
 
 
@@ -518,5 +518,5 @@ def test_the_naive_lowering_explodes_past_the_cap():
         case.lower(expr, cap=4096)
     assert caught.value.node == expr
     plan, _ = case.lower(expr, cap=8192)
-    index = plan.table.index
+    index = plan.form.index
     assert index.size == 4620

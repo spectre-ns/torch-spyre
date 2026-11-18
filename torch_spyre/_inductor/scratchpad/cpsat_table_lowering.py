@@ -21,10 +21,11 @@ works out which entry of a table applies. A node's value is a *table*: a float l
 
 - values: ``CpIndex`` and ``CpTable`` are frozen and hold no model;
 - the nodes: ``TableLowering`` is a factory that makes one ``CpNode`` per node of the
-  expression, of a class chosen by the node's sympy class. Each node computes its
-  own table from its children the first time it is read, so a node nobody reads is
-  never tabulated. The plan, the root's ``CpNode``, holds no model either;
-- the build: the root's ``cp_expr`` reads its table, which builds itself into the
+  expression, of a class chosen by the node's sympy class. Each node realizes its
+  own form, here a table, from its children the first time it is read, so a node
+  nobody reads is never realized. The plan, the root's ``CpNode``, holds no model
+  either;
+- the build: the root's ``cp_expr`` reads its form, which builds itself into the
   model (``CpTable.cp_expr``), rounded onto ``COST_SCALE``, its position built by
   ``CpIndex.cp_expr``. Only ``cp_expr`` methods touch the model.
 
@@ -408,7 +409,7 @@ def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]:
 
 @dataclass(eq=False)
 class CpNode:
-    """The CP-SAT counterpart of one sympy node, which tabulates itself.
+    """The CP-SAT counterpart of one sympy node, which realizes itself.
 
     expr is the sympy node, injected and only read: it says which operation the node
     is, and gives its arguments and its free symbols. The CpNodes form the same graph
@@ -417,9 +418,11 @@ class CpNode:
     node reads only its children: the columns of its inputs are gathered from them.
     cap bounds its table. No model is involved until cp_expr.
 
-    A node's columns and its table are computed the first time they are read, and
-    kept. This class is an operation over free symbols; CpSymbol and CpConstant are
-    the leaves. A subclass changes how a node is tabulated by overriding tabulate.
+    A node's form is what a reader and the objective take of it: in this stage
+    always its table, one CpTable. Its columns and its form are computed the first
+    time they are read, and kept. This class is an operation over free symbols;
+    CpSymbol and CpConstant are the leaves. A subclass changes how a node is
+    realized by overriding realize.
     """
 
     expr: sympy.Basic
@@ -435,16 +438,16 @@ class CpNode:
         return columns
 
     @cached_property
-    def table(self) -> CpTable:
-        """The node's table, tabulated the first time it is read. Raises
+    def form(self) -> CpTable:
+        """The node's form, realized the first time it is read. Raises
         TableLoweringError naming the node when it has none, and when a value of it
         is not finite."""
-        table = self.tabulate()
-        if not np.all(np.isfinite(table.values)):
+        form = self.realize()
+        if not np.all(np.isfinite(form.values)):
             raise TableLoweringError(self.expr, "a value that is not finite")
-        return table
+        return form
 
-    def tabulate(self) -> CpTable:
+    def realize(self) -> CpTable:
         """Realizes the node: one table over its inputs, their positions combined in
         the order of their symbols sorted by sympy.default_sort_key, the last
         fastest. Raises TableLoweringError naming the node when that table would pass
@@ -468,11 +471,11 @@ class CpNode:
         return CpTable(values=values, index=index)
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The node in model, in COST_SCALE units: its table built
-        (CpTable.cp_expr), one lookup or a number. Reading the table tabulates the
+        """The node in model, in COST_SCALE units: its form built
+        (CpTable.cp_expr), one lookup or a number. Reading the form realizes the
         node, so a refusal comes before anything is added to the model. Each call
         builds anew."""
-        return self.table.cp_expr(model)
+        return self.form.cp_expr(model)
 
 
 @dataclass(eq=False)
@@ -490,7 +493,7 @@ class CpSymbol(CpNode):
             raise TableLoweringError(self.expr, "a symbol with no input")
         return {self.expr: self.column}
 
-    def tabulate(self) -> CpTable:
+    def realize(self) -> CpTable:
         """Its column."""
         (column,) = self.columns.values()
         return column
@@ -499,9 +502,9 @@ class CpSymbol(CpNode):
 @dataclass(eq=False)
 class CpConstant(CpNode):
     """A node with no free symbol: a number, true or false, or an operation on
-    numbers. Its table is its value on the Unit position."""
+    numbers. Its form is its value on the Unit position."""
 
-    def tabulate(self) -> CpTable:
+    def realize(self) -> CpTable:
         """Its value, one entry on the Unit position."""
         return CpTable(values=np.array([_constant(self.expr)]), index=UNIT)
 
@@ -523,14 +526,14 @@ class TableLowering:
 
     def lower(self, root: sympy.Basic) -> CpNode:
         """root as a plan: root's CpNode, over the graph of nodes under it. Nothing is
-        tabulated here; the root's cp_expr reads it, which tabulates it, and through
+        realized here; the root's cp_expr reads it, which realizes it, and through
         it every node it reads."""
         return self.rewrite(root)[root]
 
     def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:
         """Each node under root, once, as a CpNode holding its children's CpNodes,
         made after them, in the order of sympy.postorder_traversal with its repeats
-        dropped. An arm's ExprCondPair gets no CpNode. Nothing is tabulated here;
+        dropped. An arm's ExprCondPair gets no CpNode. Nothing is realized here;
         root is not changed."""
         nodes: dict[sympy.Basic, CpNode] = {}
         for expr in dict.fromkeys(sympy.postorder_traversal(root)):
