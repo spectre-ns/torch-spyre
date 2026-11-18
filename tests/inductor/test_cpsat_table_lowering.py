@@ -41,6 +41,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     Input,
     TableLowering,
     TableLoweringError,
+    Unit,
     values_on_grid,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
@@ -65,10 +66,10 @@ class Case:
         assert len(sizes) == 1
         (size,) = sizes
         var = self.model.new_int_var(0, size - 1, f"division_{name}")
-        position = CpIndex(Input(var, size=size))
+        position = Input(var, size=size)
         for symbol_name, column in columns.items():
             self.inputs[sympy.Symbol(symbol_name, positive=True)] = CpTable(
-                values=column, index=position
+                values=np.array(column), index=position
             )
         self.variables.append(var)
         self.values[var] = list(range(size))
@@ -79,9 +80,9 @@ class Case:
         is the value offset by lo."""
         domain = list(range(lo, lo + size))
         var = self.model.new_int_var(lo, lo + size - 1, name)
-        position = CpIndex(Input(var, size=size, lo=lo))
+        position = Input(var, size=size, lo=lo)
         self.inputs[sympy.Symbol(name, integer=True)] = CpTable(
-            values=domain, index=position
+            values=np.array(domain), index=position
         )
         self.variables.append(var)
         self.values[var] = list(domain)
@@ -298,17 +299,24 @@ def test_a_list_must_have_its_index_size():
         CpTable(values=[1.0, 2.0], index=position)
 
 
-def test_an_index_refuses_parts_its_step_does_not_take():
+def test_a_step_takes_the_parts_it_names_and_equal_steps_are_one_position():
     case = Case()
     a = case.add_input("a", a=[1.0, 2.0, 4.0])
     b = case.add_input("b", b=[1.0, 3.0])
+    with pytest.raises(TypeError):
+        CpIndex()  # type: ignore[abstract]
+    with pytest.raises(TypeError):
+        Combine(a)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        Combine(a, b, a)  # type: ignore[call-arg]
     with pytest.raises(ValueError):
-        CpIndex(Combine(), (a,))
-    with pytest.raises(ValueError):
-        CpIndex(Combine(), (a, b, a))
-    with pytest.raises(ValueError):
-        CpIndex(Input(case.variables[0], size=3), (a,))
-    assert CpIndex(Combine(), (a, b)).size == 6
+        Input(case.variables[0], size=0)
+    pair = Combine(a, b)
+    assert pair.size == 6 and pair.parts == (a, b) and pair.entries == 0
+    assert pair == Combine(a, b) and hash(pair) == hash(Combine(a, b))
+    assert pair != Combine(b, a)
+    assert pair.under() == [a, b, pair]
+    assert UNIT.size == 1 and UNIT.parts == () and UNIT == Unit()
 
 
 def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
@@ -332,7 +340,7 @@ def test_positions_agree_with_cp_sat_at_every_assignment():
     case = Case()
     x = case.integer("x", 2, 4)
     y = case.integer("y", -1, 3)
-    joint = CpIndex(Combine(), (x, y))
+    joint = Combine(x, y)
     rows = case.solutions(case.variables + [joint.cp_expr(case.model)])
     values = {v: np.array([r[k] for r in rows]) for k, v in enumerate(case.variables)}
     assert list(joint.positions(values)) == [r[-1] for r in rows]
@@ -452,8 +460,8 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     model = case.model
     lit = model.new_bool_var("is_lx")
     division = model.new_int_var(0, 2, "division_src")
-    lit_index = CpIndex(Input(lit, size=2))
-    div_index = CpIndex(Input(division, size=3))
+    lit_index = Input(lit, size=2)
+    div_index = Input(division, size=3)
     is_lx = sympy.Symbol("is_lx", integer=True)
     div = sympy.Symbol("division_src", integer=True, nonnegative=True)
     case.inputs[is_lx] = CpTable(values=[0, 1], index=lit_index)

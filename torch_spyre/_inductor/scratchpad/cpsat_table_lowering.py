@@ -40,7 +40,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, TypeAlias
 
@@ -80,162 +80,42 @@ class TableLoweringError(Exception):
 # --------------------------------------------------------------------------- values
 
 
-class IndexMap(ABC):
-    """One mapping step of a CpIndex: from its parts' positions to a position
-    0 .. size - 1, in numpy and in CP-SAT. Each kind of step is a subclass; CpIndex
-    and the nodes do not change when one is added."""
+class CpIndex(ABC):
+    """A position: a map from the inputs' values to 0 .. size - 1, in numpy and in
+    CP-SAT. Each kind of step is a subclass that holds its parts, the positions it is
+    made from, as its own fields, so a step depends on CpIndex alone. A value, with no
+    model in it. Steps are frozen dataclasses: two that make the same position from
+    equal parts are equal and hash alike. CpTable and the nodes do not change when a
+    step is added."""
 
-    @abstractmethod
-    def size_from(self, parts: Sequence[CpIndex]) -> int:
-        """The number of positions the step maps onto. Raises ValueError for parts it
-        does not take: the wrong count, or sizes its own data does not fit."""
-
-    @property
-    @abstractmethod
-    def entries(self) -> int:
-        """The table entries the step puts in the model, 0 for an arithmetic step."""
-
-    @abstractmethod
-    def positions(
-        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
-    ) -> np.ndarray:
-        """The step in numpy: index's position at each assignment in values, from its
-        parts' positions there. A leaf step reads its variable's values."""
-
-    @abstractmethod
-    def cp_expr(
-        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
-    ) -> CpExpr:
-        """The step in model: the same position as a CP-SAT expression, from its
-        parts' expressions. A leaf step reads its variable."""
-
-
-def _no_parts(step: str, parts: Sequence[CpIndex]) -> None:
-    if parts:
-        raise ValueError(f"{step} is a leaf and takes no parts, got {len(parts)}")
-
-
-@dataclass(frozen=True)
-class Input(IndexMap):
-    """A leaf: a variable's own position, v -> v - lo, for a domain lo .. lo + size - 1
-    with no gaps. A division or a literal has lo 0. The variable is already in the
-    model."""
-
-    var: cp_model.IntVar
+    # The number of positions, 0 .. size - 1: a field of each step, given or
+    # computed from its parts when it is made.
     size: int
-    lo: int = 0
-
-    def size_from(self, parts: Sequence[CpIndex]) -> int:
-        _no_parts("Input", parts)
-        if self.size < 1:
-            raise ValueError(f"Input of size {self.size}")
-        return self.size
 
     @property
-    def entries(self) -> int:
-        return 0
-
-    def positions(
-        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
-    ) -> np.ndarray:
-        return np.asarray(values[self.var]) - self.lo
-
-    def cp_expr(
-        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
-    ) -> CpExpr:
-        return self.var - self.lo if self.lo else self.var
-
-
-@dataclass(frozen=True)
-class Unit(IndexMap):
-    """A leaf: the one position of a constant, on no input."""
-
-    def size_from(self, parts: Sequence[CpIndex]) -> int:
-        _no_parts("Unit", parts)
-        return 1
+    @abstractmethod
+    def parts(self) -> tuple[CpIndex, ...]:
+        """The positions it is made from, () for a leaf."""
 
     @property
+    @abstractmethod
     def entries(self) -> int:
-        return 0
+        """The table entries the step itself puts in the model, 0 for an arithmetic
+        step."""
 
-    def positions(
-        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
-    ) -> np.ndarray:
-        return np.zeros((), dtype=np.int64)
-
-    def cp_expr(
-        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
-    ) -> CpExpr:
-        return 0
-
-
-@dataclass(frozen=True)
-class Combine(IndexMap):
-    """(left, right) -> left * right.size + right. The right part's size is a
-    constant, read from index.parts, so this is linear: no two variables are
-    multiplied."""
-
-    def size_from(self, parts: Sequence[CpIndex]) -> int:
-        if len(parts) != 2:
-            raise ValueError(f"Combine takes two parts, got {len(parts)}")
-        return parts[0].size * parts[1].size
-
-    @property
-    def entries(self) -> int:
-        return 0
-
-    def positions(
-        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
-    ) -> np.ndarray:
-        return parts[0] * index.parts[1].size + parts[1]
-
-    def cp_expr(
-        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
-    ) -> CpExpr:
-        return parts[0] * index.parts[1].size + parts[1]
-
-
-@dataclass(frozen=True)
-class CpIndex:
-    """A map from the inputs' values to a position in one table, 0 .. size - 1: its
-    mapping applied to its parts.
-
-    A value, with no model in it. Two nodes that make the same position make equal
-    CpIndexes, which hash alike. Made from
-    the leaf steps by IndexMap steps alone, so the final index of a term is a function
-    of every input it was made from.
-    """
-
-    mapping: IndexMap
-    parts: tuple[CpIndex, ...] = ()
-
-    def __post_init__(self) -> None:
-        """Refuses parts its mapping does not take, by asking for size."""
-        self.size
-
-    @cached_property
-    def size(self) -> int:
-        """mapping.size_from(parts): computed, never passed in."""
-        return self.mapping.size_from(self.parts)
-
+    @abstractmethod
     def positions(self, values: Values) -> np.ndarray:
-        """The numpy side: its position at each assignment in values, its parts'
-        positions first. cp_expr is the CP-SAT side of the same map."""
-        parts = [part.positions(values) for part in self.parts]
-        return self.mapping.positions(values, self, parts)
+        """The numpy side: its position at each assignment in values, from its parts'
+        positions there. A leaf reads its variable's values."""
 
+    @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The CP-SAT side: this position as an expression in model, its mapping's
-        cp_expr on its parts' expressions, parts first, a part it reaches twice built
-        once. Each call builds anew."""
-        built: dict[CpIndex, CpExpr] = {}
-        for step in self.under():
-            parts = [built[part] for part in step.parts]
-            built[step] = step.mapping.cp_expr(model, step, parts)
-        return built[self]
+        """The CP-SAT side: the same position as an expression in model, from its
+        parts' cp_expr. A leaf reads its variable. Each call builds anew, and a part
+        reached twice is built twice: no step of this stage adds to the model."""
 
     def under(self) -> list[CpIndex]:
-        """This index and every index it is made from, each once, parts first."""
+        """This position and every position it is made from, each once, parts first."""
         seen: dict[CpIndex, None] = {}
         stack: list[tuple[CpIndex, bool]] = [(self, False)]
         while stack:
@@ -248,7 +128,86 @@ class CpIndex:
         return list(seen)
 
 
-UNIT = CpIndex(Unit())
+@dataclass(frozen=True)
+class Input(CpIndex):
+    """A leaf: a variable's own position, v -> v - lo, for a domain lo .. lo + size - 1
+    with no gaps. A division or a literal has lo 0. The variable is already in the
+    model."""
+
+    var: cp_model.IntVar
+    size: int
+    lo: int = 0
+
+    def __post_init__(self) -> None:
+        if self.size < 1:
+            raise ValueError(f"Input of size {self.size}")
+
+    @property
+    def parts(self) -> tuple[CpIndex, ...]:
+        return ()
+
+    @property
+    def entries(self) -> int:
+        return 0
+
+    def positions(self, values: Values) -> np.ndarray:
+        return np.asarray(values[self.var]) - self.lo
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        return self.var - self.lo if self.lo else self.var
+
+
+@dataclass(frozen=True)
+class Unit(CpIndex):
+    """A leaf: the one position of a constant, on no input."""
+
+    size: int = field(default=1, init=False)
+
+    @property
+    def parts(self) -> tuple[CpIndex, ...]:
+        return ()
+
+    @property
+    def entries(self) -> int:
+        return 0
+
+    def positions(self, values: Values) -> np.ndarray:
+        return np.zeros((), dtype=np.int64)
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        return 0
+
+
+@dataclass(frozen=True)
+class Combine(CpIndex):
+    """(left, right) -> left * right.size + right. right.size is a constant, so this
+    is linear: no two variables are multiplied."""
+
+    left: CpIndex
+    right: CpIndex
+    size: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "size", self.left.size * self.right.size)
+
+    @property
+    def parts(self) -> tuple[CpIndex, ...]:
+        return (self.left, self.right)
+
+    @property
+    def entries(self) -> int:
+        return 0
+
+    def positions(self, values: Values) -> np.ndarray:
+        return self.left.positions(values) * self.right.size + self.right.positions(
+            values
+        )
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        return self.left.cp_expr(model) * self.right.size + self.right.cp_expr(model)
+
+
+UNIT = Unit()
 
 
 def _read_only(values: Any, index: CpIndex) -> np.ndarray:
@@ -290,7 +249,7 @@ class CpTable(CpForm):
         """The entries the table puts in the model, what the cap bounds: its list,
         and the remaps under its index. Counted before any rounding, so a list that
         turns out constant still counts in full."""
-        return len(self.values) + sum(i.mapping.entries for i in self.index.under())
+        return len(self.values) + sum(i.entries for i in self.index.under())
 
     @property
     def finite(self) -> bool:
@@ -436,9 +395,7 @@ class CpNode:
         symbols = sorted(self.columns, key=sympy.default_sort_key)
         positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
         under = {i: None for p in positions for i in p.under()}
-        entries = math.prod(p.size for p in positions) + sum(
-            i.mapping.entries for i in under
-        )
+        entries = math.prod(p.size for p in positions) + sum(i.entries for i in under)
         if entries > self.cap:
             raise TableLoweringError(
                 self.expr,
@@ -447,7 +404,7 @@ class CpNode:
             )
         index = positions[0]
         for position in positions[1:]:
-            index = CpIndex(Combine(), (index, position))
+            index = Combine(index, position)
         values = values_on_grid(self.expr, self.columns, positions)
         return self._finite(CpTable(values=values, index=index))
 
