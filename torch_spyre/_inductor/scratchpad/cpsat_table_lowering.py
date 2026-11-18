@@ -147,39 +147,6 @@ class Input(IndexMap):
 
 
 @dataclass(frozen=True)
-class Locate(IndexMap):
-    """A leaf: the position of a variable whose domain has gaps, v -> its place in
-    domain, the domain's values ascending."""
-
-    var: cp_model.IntVar
-    domain: tuple[int, ...]
-
-    def size_from(self, parts: Sequence[CpIndex]) -> int:
-        _no_parts("Locate", parts)
-        if not self.domain or list(self.domain) != sorted(set(self.domain)):
-            raise ValueError(
-                f"Locate needs distinct ascending values, got {self.domain}"
-            )
-        return len(self.domain)
-
-    @property
-    def entries(self) -> int:
-        return len(self.domain)
-
-    def positions(
-        self, values: Values, index: CpIndex, parts: Sequence[np.ndarray]
-    ) -> np.ndarray:
-        return np.searchsorted(np.asarray(self.domain), values[self.var])
-
-    def cp_expr(
-        self, model: cp_model.CpModel, index: CpIndex, parts: Sequence[CpExpr]
-    ) -> CpExpr:
-        pos = model.new_int_var(0, index.size - 1, f"pos_{self.var.name}")
-        model.add_element(pos, list(self.domain), self.var)
-        return pos
-
-
-@dataclass(frozen=True)
 class Unit(IndexMap):
     """A leaf: the one position of a constant, on no input."""
 

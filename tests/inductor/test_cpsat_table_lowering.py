@@ -39,7 +39,6 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     CpSymbol,
     CpTable,
     Input,
-    Locate,
     TableLowering,
     TableLoweringError,
     values_on_grid,
@@ -75,17 +74,12 @@ class Case:
         self.values[var] = list(range(size))
         return position
 
-    def integer(self, name: str, domain: list[int]) -> CpIndex:
-        """An integer variable with its own values: offset when the domain has no
-        gaps, located when it has."""
-        var = self.model.new_int_var_from_domain(
-            cp_model.Domain.from_values(domain), name
-        )
-        lo = min(domain)
-        if domain == list(range(lo, lo + len(domain))):
-            position = CpIndex(Input(var, size=len(domain), lo=lo))
-        else:
-            position = CpIndex(Locate(var, tuple(domain)))
+    def integer(self, name: str, lo: int, size: int) -> CpIndex:
+        """An integer variable with its own values, lo .. lo + size - 1: its position
+        is the value offset by lo."""
+        domain = list(range(lo, lo + size))
+        var = self.model.new_int_var(lo, lo + size - 1, name)
+        position = CpIndex(Input(var, size=size, lo=lo))
         self.inputs[sympy.Symbol(name, integer=True)] = CpTable(
             values=domain, index=position
         )
@@ -247,16 +241,16 @@ def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
 
 def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
     case = Case()
-    position = case.integer("y", [1, 4, 9, 16])  # gaps: a Locate, built as a variable
+    position = case.integer("y", 1, 4)
     before = len(case.model.proto.variables), len(case.model.proto.constraints)
     constant = CpTable(values=[2.0, 2.0, 2.0, 2.0], index=position)
     assert constant.cp_expr(case.model) == 2 * COST_SCALE
     after = len(case.model.proto.variables), len(case.model.proto.constraints)
-    assert after == before  # its position, a Locate, was never built
+    assert after == before
     table = CpTable(values=[1.0, 2.0, 4.0, 8.0], index=position)
     target = table.cp_expr(case.model)
     rows = dict(case.solutions([case.variables[0], target]))
-    assert rows == {1: 1024, 4: 2048, 9: 4096, 16: 8192}
+    assert rows == {1: 1024, 2: 2048, 3: 4096, 4: 8192}
 
 
 def test_lower_realizes_nothing_and_a_refusal_leaves_the_model_as_it_was():
@@ -314,8 +308,6 @@ def test_an_index_refuses_parts_its_step_does_not_take():
         CpIndex(Combine(), (a, b, a))
     with pytest.raises(ValueError):
         CpIndex(Input(case.variables[0], size=3), (a,))
-    with pytest.raises(ValueError):
-        CpIndex(Locate(case.variables[0], (3, 1)))
     assert CpIndex(Combine(), (a, b)).size == 6
 
 
@@ -338,8 +330,8 @@ def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
 
 def test_positions_agree_with_cp_sat_at_every_assignment():
     case = Case()
-    x = case.integer("x", [2, 3, 4, 5])
-    y = case.integer("y", [1, 4, 9])
+    x = case.integer("x", 2, 4)
+    y = case.integer("y", -1, 3)
     joint = CpIndex(Combine(), (x, y))
     rows = case.solutions(case.variables + [joint.cp_expr(case.model)])
     values = {v: np.array([r[k] for r in rows]) for k, v in enumerate(case.variables)}
@@ -425,10 +417,10 @@ def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     assert index.size == 12
 
 
-def test_a_variable_with_gaps_and_one_above_zero_read_their_entries():
+def test_variables_above_and_below_zero_read_their_entries():
     case = Case()
-    case.integer("x", [2, 3, 4, 5])
-    case.integer("y", [1, 4, 9])
+    case.integer("x", 2, 4)
+    case.integer("y", -1, 3)
     x, y = case.symbol("x"), case.symbol("y")
     case.assert_exact(x**1.5 * y + 3 * x)
 
