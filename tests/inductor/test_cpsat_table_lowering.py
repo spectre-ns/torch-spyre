@@ -34,7 +34,6 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     Candidate,
     Combine,
     CpConstant,
-    CpEmitter,
     CpIndex,
     CpNode,
     CpSymbol,
@@ -102,7 +101,7 @@ class Case:
         self, expr: sympy.Basic, cap: int = CAP
     ) -> tuple[CpNode, cp_model.LinearExprT]:
         root = TableLowering(self.inputs, cap=cap).lower(expr)
-        return root, CpEmitter(self.model).emit(root)
+        return root, root.cp_expr(self.model)
 
     def solutions(self, exprs: list) -> list[tuple[int, ...]]:
         solver = cp_model.CpSolver()
@@ -256,28 +255,23 @@ def test_tabulate_builds_the_cheapest_candidate_under_the_cap_and_no_other():
 
 def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
     case = Case()
-    position = case.add_input("a", a=[1.0, 2.0, 4.0])
-    asked: list[CpIndex] = []
-    emitter = CpEmitter(case.model)
-
-    def position_of(index: CpIndex) -> cp_model.LinearExprT:
-        asked.append(index)
-        return emitter.index(index)
-
+    position = case.integer("y", [1, 4, 9, 16])  # gaps: a Locate, built as a variable
+    built: dict = {}
     before = len(case.model.proto.variables), len(case.model.proto.constraints)
-    constant = CpTable(values=[2.0, 2.0, 2.0], index=position)
-    assert constant.cp_expr(case.model, position_of) == 2 * COST_SCALE
-    assert asked == []
+    constant = CpTable(values=[2.0, 2.0, 2.0, 2.0], index=position)
+    assert constant.cp_expr(case.model, built) == 2 * COST_SCALE
+    assert position not in built  # its position, a Locate, was never built
     after = len(case.model.proto.variables), len(case.model.proto.constraints)
     assert after == before
-    table = CpTable(values=[1.0, 2.0, 4.0], index=position)
-    target = table.cp_expr(case.model, position_of)
-    assert asked == [position]
+    table = CpTable(values=[1.0, 2.0, 4.0, 8.0], index=position)
+    target = table.cp_expr(case.model, built)
+    assert position in built
+    assert table.cp_expr(case.model, built) is target  # built once
     rows = dict(case.solutions([case.variables[0], target]))
-    assert rows == {0: 1024, 1: 2048, 2: 4096}
+    assert rows == {1: 1024, 4: 2048, 9: 4096, 16: 8192}
 
 
-def test_lower_tabulates_nothing_and_emit_builds_a_node_once():
+def test_lower_tabulates_nothing_and_cp_expr_builds_a_node_once():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -285,15 +279,15 @@ def test_lower_tabulates_nothing_and_emit_builds_a_node_once():
     root = TableLowering(case.inputs, cap=CAP).lower(a**0.5 * b)
     assert type(root) is CpNode and root.expr == a**0.5 * b
     assert "table" not in vars(root)
-    emitter = CpEmitter(case.model)
-    first = emitter.emit(root)
-    built = len(case.model.proto.constraints), len(case.model.proto.variables)
-    assert emitter.emit(root) is first
-    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == built
+    built: dict = {}
+    first = root.cp_expr(case.model, built)
+    size = len(case.model.proto.constraints), len(case.model.proto.variables)
+    assert root.cp_expr(case.model, built) is first
+    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
     wide = TableLowering(case.inputs, cap=4).lower(a**0.5 * b)
     with pytest.raises(TableLoweringError, match="past the cap of 4"):
-        emitter.emit(wide)
-    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == built
+        wide.cp_expr(case.model, built)
+    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
 
 
 # ------------------------------------------------------------------------- values
@@ -343,8 +337,7 @@ def test_positions_agree_with_cp_sat_at_every_assignment():
     x = case.integer("x", [2, 3, 4, 5])
     y = case.integer("y", [1, 4, 9])
     joint = CpIndex(Combine(), (x, y))
-    emitter = CpEmitter(case.model)
-    rows = case.solutions(case.variables + [emitter.index(joint)])
+    rows = case.solutions(case.variables + [joint.cp_expr(case.model, {})])
     values = {v: np.array([r[k] for r in rows]) for k, v in enumerate(case.variables)}
     assert list(joint.positions(values)) == [r[-1] for r in rows]
     assert sorted(r[-1] for r in rows) == list(range(12))
@@ -354,10 +347,10 @@ def test_equal_indexes_made_apart_are_built_once():
     case = Case()
     case.integer("y", [1, 4, 9])
     var = case.variables[0]
-    emitter = CpEmitter(case.model)
-    emitter.index(CpIndex(Locate(var, (1, 4, 9))))
+    built: dict = {}
+    CpIndex(Locate(var, (1, 4, 9))).cp_expr(case.model, built)
     before = len(case.model.proto.constraints)
-    emitter.index(CpIndex(Locate(var, (1, 4, 9))))
+    CpIndex(Locate(var, (1, 4, 9))).cp_expr(case.model, built)
     assert len(case.model.proto.constraints) == before
 
 
@@ -422,7 +415,7 @@ def test_a_node_is_lambdified_once_and_only_when_its_table_is_read(monkeypatch):
             assert nodes[e].table is not None
     assert len(calls) == len(computed) == len(set(calls))
     calls.clear()
-    CpEmitter(case.model).emit(TableLowering(case.inputs, cap=CAP).lower(expr))
+    TableLowering(case.inputs, cap=CAP).lower(expr).cp_expr(case.model)
     assert calls == [expr]  # one table per node: only the root is read
 
 

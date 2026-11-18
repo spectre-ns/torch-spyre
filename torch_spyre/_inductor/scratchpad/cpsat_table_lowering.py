@@ -24,9 +24,10 @@ works out which entry of a table applies. A node's value is a *table*: a float l
   expression, of a class chosen by the node's sympy class. Each node computes its
   own table from its children the first time it is read, so a node nobody reads is
   never tabulated. The plan, the root's ``CpNode``, holds no model either;
-- the build: ``CpEmitter.emit`` reads the root, and the root's table builds itself
-  into the model (``CpTable.cp_expr``), rounded onto ``COST_SCALE``. Nothing reaches
-  the model but through the emitter.
+- the build: the root's ``cp_expr`` reads its table, which builds itself into the
+  model (``CpTable.cp_expr``), rounded onto ``COST_SCALE``, its position built by
+  ``CpIndex.cp_expr``. A ``Built`` memo, passed along with the model, builds each
+  table and position once. Only ``cp_expr`` methods touch the model.
 
 This is the base: one table per node, every value computed by ``sympy.lambdify`` over
 the node's inputs, and the root read as one lookup. It lowers an expression whose
@@ -80,8 +81,8 @@ class TableLoweringError(Exception):
 
 class IndexMap(ABC):
     """One mapping step of a CpIndex: from its parts' positions to a position
-    0 .. size - 1, in numpy and in CP-SAT. Each kind of step is a subclass; CpIndex,
-    the walk and the emitter do not change when one is added."""
+    0 .. size - 1, in numpy and in CP-SAT. Each kind of step is a subclass; CpIndex
+    and the nodes do not change when one is added."""
 
     @abstractmethod
     def size_from(self, parts: Sequence[CpIndex]) -> int:
@@ -232,7 +233,7 @@ class CpIndex:
     mapping applied to its parts.
 
     A value, with no model in it. Two nodes that make the same position make equal
-    CpIndexes, which hash alike, so an emitter builds the position once. Made from
+    CpIndexes, which hash alike, so cp_expr builds the position once. Made from
     the leaf steps by IndexMap steps alone, so the final index of a term is a function
     of every input it was made from.
     """
@@ -251,9 +252,19 @@ class CpIndex:
 
     def positions(self, values: Values) -> np.ndarray:
         """The numpy side: its position at each assignment in values, its parts'
-        positions first. CpEmitter.index is the CP-SAT side of the same map."""
+        positions first. cp_expr is the CP-SAT side of the same map."""
         parts = [part.positions(values) for part in self.parts]
         return self.mapping.positions(values, self, parts)
+
+    def cp_expr(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+        """The CP-SAT side: this position as an expression in model, its mapping's
+        cp_expr on its parts' expressions, parts first. Each step is built once per
+        equal CpIndex in built, what has already been built in model."""
+        for step in self.under():
+            if step not in built:
+                parts = [built[part] for part in step.parts]
+                built[step] = step.mapping.cp_expr(model, step, parts)
+        return built[self]
 
     def under(self) -> list[CpIndex]:
         """This index and every index it is made from, each once, parts first."""
@@ -302,16 +313,21 @@ class CpTable:
         turns out constant still counts in full."""
         return len(self.values) + sum(i.mapping.entries for i in self.index.under())
 
-    def cp_expr(
-        self, model: cp_model.CpModel, position: Callable[[CpIndex], CpExpr]
-    ) -> CpExpr:
+    def cp_expr(self, model: cp_model.CpModel, built: Built) -> CpExpr:
         """The table in model, values[index] in COST_SCALE units: the list rounded
         once, within half a unit of its float value, then a number when it is
-        constant, and otherwise one add_element on position(index) into a new
-        variable whose domain is the rounded values. position builds an index's
-        CP-SAT expression, and is called only when the table is not constant, so a
-        constant table adds nothing to the model. Raises TableLoweringError for an
-        entry that is not finite or past MAX_ENTRY."""
+        constant, and otherwise one add_element on its index's position into a new
+        variable whose domain is the rounded values. The position is built only when
+        the table is not constant, so a constant table adds nothing to the model.
+        built is what has already been built in model: a table, and a position, is
+        built once. Raises TableLoweringError for an entry that is not finite or past
+        MAX_ENTRY."""
+        if self in built:
+            return built[self]
+        built[self] = self._build(model, built)
+        return built[self]
+
+    def _build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
         if not np.all(np.isfinite(self.values)):
             raise TableLoweringError(None, "a table entry that is not finite")
         scaled = np.rint(COST_SCALE * self.values)
@@ -326,8 +342,12 @@ class CpTable:
         target = model.new_int_var_from_domain(
             cp_model.Domain.from_values(sorted(set(entries))), "table"
         )
-        model.add_element(position(self.index), entries, target)
+        model.add_element(self.index.cp_expr(model, built), entries, target)
         return target
+
+
+# What has been built in one model: a position by its CpIndex, a table by itself.
+Built: TypeAlias = dict["CpIndex | CpTable", CpExpr]
 
 
 # Each symbol's column, the symbol's value at each row of its input, on that input.
@@ -498,6 +518,14 @@ class CpNode:
             raise TableLoweringError(self.expr, "a value that is not finite")
         return table
 
+    def cp_expr(self, model: cp_model.CpModel, built: Built | None = None) -> CpExpr:
+        """The node in model, in COST_SCALE units: its table read, which tabulates
+        it and raises TableLoweringError naming it when it has none, before anything
+        is added to the model, then built (CpTable.cp_expr). built is what has already
+        been built in model, so a node, or a position, read twice is built once; a
+        fresh one when None."""
+        return self.read().cp_expr(model, {} if built is None else built)
+
 
 @dataclass(eq=False)
 class CpSymbol(CpNode):
@@ -557,8 +585,8 @@ class TableLowering:
 
     def lower(self, root: sympy.Basic) -> CpNode:
         """root as a plan: root's CpNode, over the graph of nodes under it. Nothing is
-        tabulated here; CpEmitter.emit reads the root, which tabulates it, and
-        through it every node it reads."""
+        tabulated here; the root's cp_expr reads it, which tabulates it, and through
+        it every node it reads."""
         return self.rewrite(root)[root]
 
     def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:
@@ -590,36 +618,3 @@ def _constant(expr: sympy.Basic) -> float:
         return float(expr)  # type: ignore[arg-type]
     except TypeError as exc:
         raise TableLoweringError(expr, "a constant with no numeric value") from exc
-
-
-# ----------------------------------------------------------------------- the build
-
-
-class CpEmitter:
-    """Builds a plan into one CP-SAT model. It owns the model and the memo of what
-    it built, so a node, and a position, is built once per emitter; each value
-    builds its own CP-SAT side (CpTable.cp_expr, IndexMap.cp_expr) when the emitter
-    asks it to."""
-
-    def __init__(self, model: cp_model.CpModel) -> None:
-        self.model = model
-        self._indexes: dict[CpIndex, CpExpr] = {}
-        self._nodes: dict[CpNode, CpExpr] = {}
-
-    def emit(self, node: CpNode) -> CpExpr:
-        """node as a CP-SAT expression in COST_SCALE units, built once per node: its
-        table's cp_expr, with self.index building its position. Reading the table
-        tabulates the node, and raises TableLoweringError naming it when it has
-        none, before anything is added to the model for it."""
-        if node not in self._nodes:
-            self._nodes[node] = node.read().cp_expr(self.model, self.index)
-        return self._nodes[node]
-
-    def index(self, index: CpIndex) -> CpExpr:
-        """index's position as a CP-SAT expression: its mapping's cp_expr on its
-        parts' expressions, parts first. Built once per equal CpIndex."""
-        for step in index.under():
-            if step not in self._indexes:
-                parts = [self._indexes[part] for part in step.parts]
-                self._indexes[step] = step.mapping.cp_expr(self.model, step, parts)
-        return self._indexes[index]
