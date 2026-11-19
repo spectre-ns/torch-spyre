@@ -42,7 +42,6 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     TableLowering,
     TableLoweringError,
     UnitIndex,
-    Values,
     values_on_grid,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
@@ -59,17 +58,6 @@ class InputIndex(Index):
     var: cp_model.IntVar
     size: int
     lo: int = 0
-
-    @property
-    def parts(self) -> tuple[Index, ...]:
-        return ()
-
-    @property
-    def entries(self) -> int:
-        return 0
-
-    def positions(self, values: Values) -> np.ndarray:
-        return np.asarray(values[self.var]) - self.lo
 
     def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
         return self.var - self.lo if self.lo else self.var
@@ -139,11 +127,12 @@ class Case:
 
     def sympy_value(self, expr: sympy.Basic, assignment: tuple[int, ...]) -> float:
         """expr evaluated by sympy where the variables take assignment."""
-        values = {v: np.array([x]) for v, x in zip(self.variables, assignment)}
+        values = dict(zip(self.variables, assignment))
         point = {}
         for symbol, table in self.inputs.items():
-            position = int(np.ravel(table.index.positions(values))[0])
-            value = float(table.values[position])
+            index = table.index
+            assert isinstance(index, InputIndex)
+            value = float(table.values[values[index.var] - index.lo])
             point[symbol] = (
                 sympy.Integer(int(value)) if value.is_integer() else sympy.Float(value)
             )
@@ -313,7 +302,7 @@ def test_a_realization_is_abstract_and_a_table_is_one():
         Partial()  # type: ignore[abstract]
     table = TableRealization(values=[1.0, 2.0, 4.0], index=position)
     assert isinstance(table, AbstractRealization)
-    assert table.finite and table.entries == 3
+    assert table.finite
     assert not TableRealization(values=[1.0, np.inf, 4.0], index=position).finite
     a = case.symbol("a")
     assert isinstance(
@@ -340,11 +329,10 @@ def test_a_step_takes_the_parts_it_names_and_equal_steps_are_one_position():
     with pytest.raises(TypeError):
         CombineIndex(a, b, a)  # type: ignore[call-arg]
     pair = CombineIndex(a, b)
-    assert pair.size == 6 and pair.parts == (a, b) and pair.entries == 0
+    assert pair.size == 6 and (pair.left, pair.right) == (a, b)
     assert pair == CombineIndex(a, b) and hash(pair) == hash(CombineIndex(a, b))
     assert pair != CombineIndex(b, a)
-    assert pair.under() == [a, b, pair]
-    assert UNIT.size == 1 and UNIT.parts == () and UNIT == UnitIndex()
+    assert UNIT.size == 1 and UNIT == UnitIndex()
 
 
 def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
@@ -366,15 +354,14 @@ def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
         table.index = UNIT  # type: ignore[misc]
 
 
-def test_positions_agree_with_cp_sat_at_every_assignment():
+def test_a_combined_position_is_row_major_at_every_assignment():
     case = Case()
     x = case.integer("x", 2, 4)
     y = case.integer("y", -1, 3)
     joint = CombineIndex(x, y)
     rows = case.solutions(case.variables + [joint.cp_expr(case.model)])
-    values = {v: np.array([r[k] for r in rows]) for k, v in enumerate(case.variables)}
-    assert list(joint.positions(values)) == [r[-1] for r in rows]
-    assert sorted(r[-1] for r in rows) == list(range(12))
+    assert all(position == (vx - 2) * 3 + (vy + 1) for vx, vy, position in rows)
+    assert sorted(position for _, _, position in rows) == list(range(12))
 
 
 # --------------------------------------------------------------- values_on_grid

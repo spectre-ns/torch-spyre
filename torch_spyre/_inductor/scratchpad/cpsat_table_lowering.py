@@ -61,8 +61,6 @@ MAX_ENTRY = 2**50
 
 # What CP-SAT takes as a linear expression: a LinearExpr, an IntVar or an int.
 CpExpr: TypeAlias = cp_model.LinearExprT
-# Each variable's values at a set of assignments, one array entry per assignment.
-Values: TypeAlias = Mapping[cp_model.IntVar, np.ndarray]
 
 
 class TableLoweringError(Exception):
@@ -83,10 +81,10 @@ class TableLoweringError(Exception):
 
 
 class Index(ABC):
-    """A position: a map from the inputs' values to 0 .. size - 1, in numpy and in
-    CP-SAT. Each kind of step is a subclass that holds its parts, the positions it is
-    made from, as its own fields, so a step depends on Index alone. A value, with no
-    model in it. Steps are frozen dataclasses: two that make the same position from
+    """A position: a map from the inputs' values to 0 .. size - 1, as a CP-SAT
+    expression. Each kind of step is a subclass that holds its parts, the positions it
+    is made from, as its own fields, so a step depends on Index alone. A value, with
+    no model in it. Steps are frozen dataclasses: two that make the same position from
     equal parts are equal and hash alike. TableRealization and the nodes do not change
     when a step is added. The steps here are UnitIndex and CombineIndex: the step over
     an input's variable is made by whoever makes the inputs."""
@@ -95,41 +93,11 @@ class Index(ABC):
     # computed from its parts when it is made.
     size: int
 
-    @property
-    @abstractmethod
-    def parts(self) -> tuple[Index, ...]:
-        """The positions it is made from, () for a leaf."""
-
-    @property
-    @abstractmethod
-    def entries(self) -> int:
-        """The table entries the step itself puts in the model, 0 for an arithmetic
-        step."""
-
-    @abstractmethod
-    def positions(self, values: Values) -> np.ndarray:
-        """The numpy side: its position at each assignment in values, from its parts'
-        positions there. A leaf over a variable reads the variable's values."""
-
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The CP-SAT side: the same position as an expression in model, from its
-        parts' cp_expr. A leaf over a variable reads the variable. Each call builds
-        anew, and a part reached twice is built twice: no step of this stage adds to
-        the model."""
-
-    def under(self) -> list[Index]:
-        """This position and every position it is made from, each once, parts first."""
-        seen: dict[Index, None] = {}
-        stack: list[tuple[Index, bool]] = [(self, False)]
-        while stack:
-            index, expanded = stack.pop()
-            if expanded:
-                seen[index] = None
-            elif index not in seen:
-                stack.append((index, True))
-                stack.extend((part, False) for part in reversed(index.parts))
-        return list(seen)
+        """The position as an expression in model, from its parts' cp_expr. A leaf over
+        a variable reads the variable. Each call builds anew, and a part reached twice
+        is built twice: no step of this stage adds to the model."""
 
 
 @dataclass(frozen=True)
@@ -137,17 +105,6 @@ class UnitIndex(Index):
     """A leaf: the one position of a constant, on no input."""
 
     size: int = field(default=1, init=False)
-
-    @property
-    def parts(self) -> tuple[Index, ...]:
-        return ()
-
-    @property
-    def entries(self) -> int:
-        return 0
-
-    def positions(self, values: Values) -> np.ndarray:
-        return np.zeros((), dtype=np.int64)
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return 0
@@ -164,19 +121,6 @@ class CombineIndex(Index):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "size", self.left.size * self.right.size)
-
-    @property
-    def parts(self) -> tuple[Index, ...]:
-        return (self.left, self.right)
-
-    @property
-    def entries(self) -> int:
-        return 0
-
-    def positions(self, values: Values) -> np.ndarray:
-        return self.left.positions(values) * self.right.size + self.right.positions(
-            values
-        )
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return self.left.cp_expr(model) * self.right.size + self.right.cp_expr(model)
@@ -218,13 +162,6 @@ class TableRealization(AbstractRealization):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", _read_only(self.values, self.index))
-
-    @property
-    def entries(self) -> int:
-        """The entries the table puts in the model, what the cap bounds: its list,
-        and the remaps under its index. Counted before any rounding, so a list that
-        turns out constant still counts in full."""
-        return len(self.values) + sum(i.entries for i in self.index.under())
 
     @property
     def finite(self) -> bool:
@@ -374,8 +311,7 @@ class Node:
         or not this node's value depends on it."""
         symbols = sorted(self.columns, key=sympy.default_sort_key)
         positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
-        under = {i: None for p in positions for i in p.under()}
-        entries = math.prod(p.size for p in positions) + sum(i.entries for i in under)
+        entries = math.prod(p.size for p in positions)
         if entries > self.cap:
             raise TableLoweringError(
                 self.expr,
@@ -444,7 +380,7 @@ class TableLowering:
     and it keeps nothing between calls of lower.
 
     inputs gives each symbol's column on its input, which the factory hands to the
-    symbol's InputNode; cap bounds the entries of one table, its list and the remaps
+    symbol's InputNode; cap bounds the entries of one table, the length of its list,
     under its index, and is handed to every node.
     """
 
