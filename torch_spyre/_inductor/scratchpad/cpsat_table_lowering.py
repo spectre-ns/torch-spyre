@@ -23,9 +23,10 @@ works out which entry of a table applies. A node's value is a *table*: a float l
   hold no model;
 - the nodes: ``TableLowering`` is a factory that makes one ``CpNode`` per node of the
   expression, of a class chosen by the node's sympy class. Each node realizes its
-  own form, here a table, from its children the first time it is read, so a node
-  nobody reads is never realized. The plan, the root's ``CpNode``, holds no model
-  either;
+  own form, here a table, the first time it is read, and reads its children's forms
+  as it does, so reading the root realizes every node under it. A node refuses a
+  value of its own that is not finite, whether or not its parent's value depends on
+  it. The plan, the root's ``CpNode``, holds no model either;
 - the build: the root's ``cp_expr`` reads its form, which builds itself into the
   model (``CpTable.cp_expr``), rounded onto ``COST_SCALE``, its position built by
   ``CpIndex.cp_expr``. Only ``cp_expr`` methods touch the model.
@@ -309,9 +310,9 @@ def values_on_grid(
     ``_imp_`` does, is evaluated point by point. Raises TableLoweringError for a
     function with no numeric value.
 
-    A value need not be finite: a Piecewise arm is infinite where it is not taken,
-    and a Piecewise with no arm true is NaN. A list is refused for that only when it
-    is read into the objective (CpNode.read).
+    A value returned here need not be finite: a division by zero is infinite, and a
+    Piecewise with no arm true is NaN. The node that makes the list refuses it
+    (CpNode.realize).
     """
     shape = tuple(p.size for p in positions)
     grid = np.indices(shape).reshape(len(shape), -1) if shape else np.zeros((0, 1), int)
@@ -358,14 +359,17 @@ class CpNode:
     is, and gives its arguments and its free symbols. The CpNodes form the same graph
     as the sympy nodes: children holds the CpNodes of children_of(expr), made before
     it, and a subexpression shared by two parents is one CpNode that both hold. A
-    node reads only its children: the columns of its inputs are gathered from them.
-    cap bounds its table. No model is involved until cp_expr.
+    node reads only its children: the columns of its inputs are gathered from them,
+    and it reads their forms when it is realized. cap bounds its table. No model is
+    involved until cp_expr.
 
     A node's form, a CpForm, is what a reader and the objective take of it: in this
     stage always its table, one CpTable. Its columns and its form are computed the first
-    time they are read, and kept. This class is an operation over free symbols;
-    CpSymbol and CpConstant are the leaves. A subclass changes how a node is
-    realized by overriding realize.
+    time they are read, and kept. A node refuses a value of its own that is not
+    finite, so one below a finite root is refused at the node that makes it: an
+    infinite Piecewise arm at the arm, taken or not. This class is an operation over
+    free symbols; CpSymbol and CpConstant are the leaves. A subclass changes how a
+    node is realized by overriding realize.
     """
 
     expr: sympy.Basic
@@ -391,7 +395,9 @@ class CpNode:
         the order of their symbols sorted by sympy.default_sort_key, the last
         fastest. Raises TableLoweringError naming the node when that table would pass
         the cap, one past the cap never evaluated, and when a value of it is not
-        finite."""
+        finite. Under the cap it reads its children's forms first, so a child with a
+        value that is not finite is refused at the child, naming it, whether or not
+        this node's value depends on it."""
         symbols = sorted(self.columns, key=sympy.default_sort_key)
         positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
         under = {i: None for p in positions for i in p.under()}
@@ -402,6 +408,8 @@ class CpNode:
                 f"one table over its inputs would hold {entries} entries, past the "
                 f"cap of {self.cap}",
             )
+        for child in self.children:
+            child.form  # realizes the child, which refuses its own non-finite value
         index = positions[0]
         for position in positions[1:]:
             index = Combine(index, position)
@@ -472,7 +480,7 @@ class TableLowering:
     def lower(self, root: sympy.Basic) -> CpNode:
         """root as a plan: root's CpNode, over the graph of nodes under it. Nothing is
         realized here; the root's cp_expr reads it, which realizes it, and through
-        it every node it reads."""
+        it every node under it."""
         return self.rewrite(root)[root]
 
     def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:

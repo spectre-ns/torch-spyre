@@ -207,8 +207,9 @@ def test_a_node_realizes_itself_when_it_is_read():
     leaf = CpSymbol(a, (), CAP, column=case.inputs[a])
     half = CpConstant(sympy.Float(0.5), (), CAP)
     root = CpNode(a**0.5, (leaf, half), CAP)
-    assert "form" not in vars(root)
+    assert not any("form" in vars(node) for node in (root, leaf, half))
     assert root.form is not None
+    assert all("form" in vars(node) for node in (leaf, half))  # read by the root
     assert root.form.index == position
     assert list(root.form.values) == pytest.approx([1.0, 2**0.5, 2.0])
     small = CpNode(a**0.5, (leaf, half), 2)
@@ -234,10 +235,10 @@ def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
         return lambdify(args, expr, **kwargs)
 
     monkeypatch.setattr(sympy, "lambdify", counting)
-    root = TableLowering(case.inputs, cap=5).lower(a * b)
+    root = TableLowering(case.inputs, cap=5).lower(a**0.5 * b)
     with pytest.raises(TableLoweringError, match="6 entries, past the cap of 5"):
         root.form
-    assert calls == []
+    assert calls == []  # not the root's table, and not a**0.5 under it
 
 
 def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
@@ -385,6 +386,27 @@ def test_a_value_that_is_not_finite_is_refused():
         case.lower(1 / (a - 2))
 
 
+def test_a_value_that_is_not_finite_is_refused_at_its_node_under_a_finite_root():
+    """Each root's own table is finite: a Min drops an infinite value, a comparison
+    reads a NaN as false, and an arm is never taken. The child that makes the value
+    refuses it, be it an operation, a constant or a symbol."""
+    case = Case()
+    position = case.add_input("a", a=[1.0, 2.0, 4.0], b=[1.0, np.inf, 4.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    infinite = 1 / (a - 2)
+    nan = sympy.sqrt(a - 3)
+    for child, expr in (
+        (infinite, sympy.Min(infinite, 5)),
+        (nan, sympy.Piecewise((1, nan > 0), (2, True))),
+        (sympy.oo, sympy.Piecewise((sympy.oo, a > 4), (a, True))),
+        (b, sympy.Min(a, b)),
+    ):
+        assert np.all(np.isfinite(values_on_grid(expr, case.inputs, [position])))
+        with pytest.raises(TableLoweringError, match="not finite") as caught:
+            case.lower(expr)
+        assert caught.value.node == child
+
+
 def test_a_node_is_lambdified_once_and_only_when_its_form_is_read(monkeypatch):
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
@@ -409,7 +431,9 @@ def test_a_node_is_lambdified_once_and_only_when_its_form_is_read(monkeypatch):
     assert len(calls) == len(computed) == len(set(calls))
     calls.clear()
     TableLowering(case.inputs, cap=CAP).lower(expr).cp_expr(case.model)
-    assert calls == [expr]  # one table per node: only the root is read
+    # reading the root reads every node under it, each once, the root last
+    assert len(calls) == len(computed) and set(calls) == set(computed)
+    assert calls[-1] == expr
 
 
 # ---------------------------------------------------------------- exact lowering
@@ -433,11 +457,15 @@ def test_variables_above_and_below_zero_read_their_entries():
     case.assert_exact(x**1.5 * y + 3 * x)
 
 
-def test_a_piecewise_with_an_infinite_arm_not_taken_is_exact():
+def test_an_infinite_piecewise_arm_is_refused_at_the_arm_taken_or_not():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
-    case.assert_exact(sympy.Piecewise((1 / (a - 2), a > 2), (0.5, True)))
+    arm = 1 / (a - 2)  # infinite at a = 2
+    for condition in (a > 2, a >= 2):  # at a = 2 the arm is not taken, then taken
+        with pytest.raises(TableLoweringError, match="not finite") as caught:
+            case.lower(sympy.Piecewise((arm, condition), (0.5, True)))
+        assert caught.value.node == arm
 
 
 def test_a_piecewise_with_no_arm_true_is_refused():
