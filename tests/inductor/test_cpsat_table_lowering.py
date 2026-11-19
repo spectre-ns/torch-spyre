@@ -31,17 +31,17 @@ from sympy.functions.elementary.piecewise import ExprCondPair
 from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     COST_SCALE,
     UNIT,
-    Combine,
-    CpConstant,
-    CpForm,
-    CpIndex,
-    CpNode,
-    CpSymbol,
-    CpTable,
-    Input,
+    CombineIndex,
+    ConstantNode,
+    AbstractRealization,
+    Index,
+    Node,
+    InputNode,
+    TableRealization,
+    InputIndex,
     TableLowering,
     TableLoweringError,
-    Unit,
+    UnitIndex,
     values_on_grid,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
@@ -55,33 +55,33 @@ class Case:
 
     def __init__(self) -> None:
         self.model = cp_model.CpModel()
-        self.inputs: dict[sympy.Symbol, CpTable] = {}
+        self.inputs: dict[sympy.Symbol, TableRealization] = {}
         self.variables: list[cp_model.IntVar] = []
         self.values: dict[cp_model.IntVar, list[int]] = {}
 
-    def add_input(self, name: str, **columns: list[float]) -> CpIndex:
+    def add_input(self, name: str, **columns: list[float]) -> Index:
         """A buffer's division: a variable in 0 .. n-1 picking a row of its menu, and
         one column per symbol of the buffer."""
         sizes = {len(column) for column in columns.values()}
         assert len(sizes) == 1
         (size,) = sizes
         var = self.model.new_int_var(0, size - 1, f"division_{name}")
-        position = Input(var, size=size)
+        position = InputIndex(var, size=size)
         for symbol_name, column in columns.items():
-            self.inputs[sympy.Symbol(symbol_name, positive=True)] = CpTable(
+            self.inputs[sympy.Symbol(symbol_name, positive=True)] = TableRealization(
                 values=np.array(column), index=position
             )
         self.variables.append(var)
         self.values[var] = list(range(size))
         return position
 
-    def integer(self, name: str, lo: int, size: int) -> CpIndex:
+    def integer(self, name: str, lo: int, size: int) -> Index:
         """An integer variable with its own values, lo .. lo + size - 1: its position
         is the value offset by lo."""
         domain = list(range(lo, lo + size))
         var = self.model.new_int_var(lo, lo + size - 1, name)
-        position = Input(var, size=size, lo=lo)
-        self.inputs[sympy.Symbol(name, integer=True)] = CpTable(
+        position = InputIndex(var, size=size, lo=lo)
+        self.inputs[sympy.Symbol(name, integer=True)] = TableRealization(
             values=np.array(domain), index=position
         )
         self.variables.append(var)
@@ -94,7 +94,7 @@ class Case:
 
     def lower(
         self, expr: sympy.Basic, cap: int = CAP
-    ) -> tuple[CpNode, cp_model.LinearExprT]:
+    ) -> tuple[Node, cp_model.LinearExprT]:
         root = TableLowering(self.inputs, cap=cap).lower(expr)
         return root, root.cp_expr(self.model)
 
@@ -123,7 +123,7 @@ class Case:
             )
         return float(expr.xreplace(point))
 
-    def assert_exact(self, expr: sympy.Basic, cap: int = CAP) -> CpNode:
+    def assert_exact(self, expr: sympy.Basic, cap: int = CAP) -> Node:
         plan, objective = self.lower(expr, cap)
         cost = self.model.new_int_var(-(2**60), 2**60, "cost")
         self.model.add(cost == objective)
@@ -170,19 +170,19 @@ def test_a_piecewise_arm_gets_no_node():
     assert [c.expr for c in nodes[expr].children] == [a, a > 2, a**2, sympy.true]
 
 
-def test_each_node_is_a_symbol_a_constant_or_an_operation():
+def test_each_node_is_an_input_a_constant_or_an_operation():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     root2 = sympy.sqrt(2)
     expr = 3 * a + root2 * a**0.5
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
-    assert type(nodes[a]) is CpSymbol
+    assert type(nodes[a]) is InputNode
     assert nodes[a].column is case.inputs[a]
-    assert type(nodes[sympy.Integer(3)]) is CpConstant
-    assert type(nodes[root2]) is CpConstant  # an operation on numbers
-    assert type(nodes[a**0.5]) is CpNode
-    assert type(nodes[expr]) is CpNode
+    assert type(nodes[sympy.Integer(3)]) is ConstantNode
+    assert type(nodes[root2]) is ConstantNode  # an operation on numbers
+    assert type(nodes[a**0.5]) is Node
+    assert type(nodes[expr]) is Node
 
 
 def test_a_node_gathers_its_columns_from_its_children():
@@ -200,26 +200,26 @@ def test_a_node_gathers_its_columns_from_its_children():
 
 def test_a_node_realizes_itself_when_it_is_read():
     """No lowering is passed in, and nothing visits: a node reads its children and
-    its cap, the first time its form is read."""
+    its cap, the first time its realization is read."""
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
-    leaf = CpSymbol(a, (), CAP, column=case.inputs[a])
-    half = CpConstant(sympy.Float(0.5), (), CAP)
-    root = CpNode(a**0.5, (leaf, half), CAP)
-    assert not any("form" in vars(node) for node in (root, leaf, half))
-    assert root.form is not None
-    assert all("form" in vars(node) for node in (leaf, half))  # read by the root
-    assert root.form.index == position
-    assert list(root.form.values) == pytest.approx([1.0, 2**0.5, 2.0])
-    small = CpNode(a**0.5, (leaf, half), 2)
+    leaf = InputNode(a, (), CAP, column=case.inputs[a])
+    half = ConstantNode(sympy.Float(0.5), (), CAP)
+    root = Node(a**0.5, (leaf, half), CAP)
+    assert not any("realization" in vars(node) for node in (root, leaf, half))
+    assert root.realization is not None
+    assert all("realization" in vars(node) for node in (leaf, half))  # read by the root
+    assert root.realization.index == position
+    assert list(root.realization.values) == pytest.approx([1.0, 2**0.5, 2.0])
+    small = Node(a**0.5, (leaf, half), 2)
     with pytest.raises(
         TableLoweringError,
         match="one table over its inputs would hold 3 entries, past the cap of 2",
     ):
-        small.form
+        small.realization
     with pytest.raises(TableLoweringError, match="no input"):
-        CpSymbol(a, (), CAP).form
+        InputNode(a, (), CAP).realization
 
 
 def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
@@ -237,7 +237,7 @@ def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
     monkeypatch.setattr(sympy, "lambdify", counting)
     root = TableLowering(case.inputs, cap=5).lower(a**0.5 * b)
     with pytest.raises(TableLoweringError, match="6 entries, past the cap of 5"):
-        root.form
+        root.realization
     assert calls == []  # not the root's table, and not a**0.5 under it
 
 
@@ -245,11 +245,11 @@ def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
     case = Case()
     position = case.integer("y", 1, 4)
     before = len(case.model.proto.variables), len(case.model.proto.constraints)
-    constant = CpTable(values=[2.0, 2.0, 2.0, 2.0], index=position)
+    constant = TableRealization(values=[2.0, 2.0, 2.0, 2.0], index=position)
     assert constant.cp_expr(case.model) == 2 * COST_SCALE
     after = len(case.model.proto.variables), len(case.model.proto.constraints)
     assert after == before
-    table = CpTable(values=[1.0, 2.0, 4.0, 8.0], index=position)
+    table = TableRealization(values=[1.0, 2.0, 4.0, 8.0], index=position)
     target = table.cp_expr(case.model)
     rows = dict(case.solutions([case.variables[0], target]))
     assert rows == {1: 1024, 2: 2048, 3: 4096, 4: 8192}
@@ -261,8 +261,8 @@ def test_lower_realizes_nothing_and_a_refusal_leaves_the_model_as_it_was():
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     root = TableLowering(case.inputs, cap=CAP).lower(a**0.5 * b)
-    assert type(root) is CpNode and root.expr == a**0.5 * b
-    assert "form" not in vars(root)
+    assert type(root) is Node and root.expr == a**0.5 * b
+    assert "realization" not in vars(root)
     root.cp_expr(case.model)
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
     wide = TableLowering(case.inputs, cap=4).lower(a**0.5 * b)
@@ -274,30 +274,33 @@ def test_lower_realizes_nothing_and_a_refusal_leaves_the_model_as_it_was():
 # ------------------------------------------------------------------------- values
 
 
-def test_a_form_is_abstract_and_a_table_is_a_form():
+def test_a_realization_is_abstract_and_a_table_is_one():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     with pytest.raises(TypeError):
-        CpForm()  # type: ignore[abstract]
+        AbstractRealization()  # type: ignore[abstract]
 
-    class Partial(CpForm):
-        """A form with no cp_expr."""
+    class Partial(AbstractRealization):
+        """A realization with no cp_expr."""
 
     with pytest.raises(TypeError):
         Partial()  # type: ignore[abstract]
-    table = CpTable(values=[1.0, 2.0, 4.0], index=position)
-    assert isinstance(table, CpForm)
+    table = TableRealization(values=[1.0, 2.0, 4.0], index=position)
+    assert isinstance(table, AbstractRealization)
     assert table.finite and table.entries == 3
-    assert not CpTable(values=[1.0, np.inf, 4.0], index=position).finite
+    assert not TableRealization(values=[1.0, np.inf, 4.0], index=position).finite
     a = case.symbol("a")
-    assert isinstance(TableLowering(case.inputs, cap=CAP).lower(a**0.5).form, CpForm)
+    assert isinstance(
+        TableLowering(case.inputs, cap=CAP).lower(a**0.5).realization,
+        AbstractRealization,
+    )
 
 
 def test_a_list_must_have_its_index_size():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     with pytest.raises(ValueError):
-        CpTable(values=[1.0, 2.0], index=position)
+        TableRealization(values=[1.0, 2.0], index=position)
 
 
 def test_a_step_takes_the_parts_it_names_and_equal_steps_are_one_position():
@@ -305,28 +308,30 @@ def test_a_step_takes_the_parts_it_names_and_equal_steps_are_one_position():
     a = case.add_input("a", a=[1.0, 2.0, 4.0])
     b = case.add_input("b", b=[1.0, 3.0])
     with pytest.raises(TypeError):
-        CpIndex()  # type: ignore[abstract]
+        Index()  # type: ignore[abstract]
     with pytest.raises(TypeError):
-        Combine(a)  # type: ignore[call-arg]
+        CombineIndex(a)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
-        Combine(a, b, a)  # type: ignore[call-arg]
+        CombineIndex(a, b, a)  # type: ignore[call-arg]
     with pytest.raises(ValueError):
-        Input(case.variables[0], size=0)
-    pair = Combine(a, b)
+        InputIndex(case.variables[0], size=0)
+    pair = CombineIndex(a, b)
     assert pair.size == 6 and pair.parts == (a, b) and pair.entries == 0
-    assert pair == Combine(a, b) and hash(pair) == hash(Combine(a, b))
-    assert pair != Combine(b, a)
+    assert pair == CombineIndex(a, b) and hash(pair) == hash(CombineIndex(a, b))
+    assert pair != CombineIndex(b, a)
     assert pair.under() == [a, b, pair]
-    assert UNIT.size == 1 and UNIT.parts == () and UNIT == Unit()
+    assert UNIT.size == 1 and UNIT.parts == () and UNIT == UnitIndex()
 
 
 def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     with pytest.raises(TypeError):
-        CpTable(values=[1.0, 2.0, 3.0], index=position, constant=1.0)  # type: ignore[call-arg]
+        TableRealization(  # type: ignore[call-arg]
+            values=[1.0, 2.0, 3.0], index=position, constant=1.0
+        )
     source = np.array([1.0, 2.0, 3.0])
-    table = CpTable(values=source, index=position)
+    table = TableRealization(values=source, index=position)
     source[0] = 9.0
     assert table.values[0] == 1.0
     with pytest.raises(ValueError):
@@ -341,7 +346,7 @@ def test_positions_agree_with_cp_sat_at_every_assignment():
     case = Case()
     x = case.integer("x", 2, 4)
     y = case.integer("y", -1, 3)
-    joint = Combine(x, y)
+    joint = CombineIndex(x, y)
     rows = case.solutions(case.variables + [joint.cp_expr(case.model)])
     values = {v: np.array([r[k] for r in rows]) for k, v in enumerate(case.variables)}
     assert list(joint.positions(values)) == [r[-1] for r in rows]
@@ -407,7 +412,9 @@ def test_a_value_that_is_not_finite_is_refused_at_its_node_under_a_finite_root()
         assert caught.value.node == child
 
 
-def test_a_node_is_lambdified_once_and_only_when_its_form_is_read(monkeypatch):
+def test_a_node_is_lambdified_once_and_only_when_its_realization_is_read(
+    monkeypatch,
+):
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -427,7 +434,7 @@ def test_a_node_is_lambdified_once_and_only_when_its_form_is_read(monkeypatch):
     computed = [e for e in nodes if e.free_symbols and not isinstance(e, sympy.Symbol)]
     for _ in range(2):
         for e in computed:
-            assert nodes[e].form is not None
+            assert nodes[e].realization is not None
     assert len(calls) == len(computed) == len(set(calls))
     calls.clear()
     TableLowering(case.inputs, cap=CAP).lower(expr).cp_expr(case.model)
@@ -445,7 +452,7 @@ def test_one_table_over_two_inputs_of_different_sizes_is_exact():
     case.add_input("b", b=[1.0, 3.0, 5.0, 7.0])
     a, b = case.symbol("a"), case.symbol("b")
     plan = case.assert_exact(a**2 * b + b**0.5 / a)
-    index = plan.form.index
+    index = plan.realization.index
     assert index.size == 12
 
 
@@ -488,17 +495,17 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     model = case.model
     lit = model.new_bool_var("is_lx")
     division = model.new_int_var(0, 2, "division_src")
-    lit_index = Input(lit, size=2)
-    div_index = Input(division, size=3)
+    lit_index = InputIndex(lit, size=2)
+    div_index = InputIndex(division, size=3)
     is_lx = sympy.Symbol("is_lx", integer=True)
     div = sympy.Symbol("division_src", integer=True, nonnegative=True)
-    case.inputs[is_lx] = CpTable(values=[0, 1], index=lit_index)
-    case.inputs[div] = CpTable(values=[0, 1, 2], index=div_index)
+    case.inputs[is_lx] = TableRealization(values=[0, 1], index=lit_index)
+    case.inputs[div] = TableRealization(values=[0, 1, 2], index=div_index)
     case.variables += [lit, division]
     case.values[lit], case.values[division] = [0, 1], [0, 1, 2]
     expr = RelayoutCharge(is_lx, div, 0, 65, 147)
     plan = case.assert_exact(expr)
-    index = plan.form.index
+    index = plan.realization.index
     assert index.size == 6
 
 
@@ -566,5 +573,5 @@ def test_the_naive_lowering_explodes_past_the_cap():
         case.lower(expr, cap=4096)
     assert caught.value.node == expr
     plan, _ = case.lower(expr, cap=8192)
-    index = plan.form.index
+    index = plan.realization.index
     assert index.size == 4620

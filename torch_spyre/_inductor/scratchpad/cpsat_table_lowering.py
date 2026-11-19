@@ -16,20 +16,21 @@
 
 Every cost value is computed before the solve, in floating point, and CP-SAT only
 works out which entry of a table applies. A node's value is a *table*: a float list
-``values`` and a ``CpIndex``, the position in it that the decision variables fix,
+``values`` and an ``Index``, the position in it that the decision variables fix,
 ``value == values[index]``. The lowering has three layers:
 
-- values: ``CpIndex`` and the forms, ``CpForm`` and its one kind here, ``CpTable``,
-  hold no model;
-- the nodes: ``TableLowering`` is a factory that makes one ``CpNode`` per node of the
-  expression, of a class chosen by the node's sympy class. Each node realizes its
-  own form, here a table, the first time it is read, and reads its children's forms
-  as it does, so reading the root realizes every node under it. A node refuses a
-  value of its own that is not finite, whether or not its parent's value depends on
-  it. The plan, the root's ``CpNode``, holds no model either;
-- the build: the root's ``cp_expr`` reads its form, which builds itself into the
-  model (``CpTable.cp_expr``), rounded onto ``COST_SCALE``, its position built by
-  ``CpIndex.cp_expr``. Only ``cp_expr`` methods touch the model.
+- values: ``Index``, a position, and ``AbstractRealization``, what a node is realized
+  as, with its one kind here, ``TableRealization``, hold no model;
+- the nodes: ``TableLowering`` is a factory that makes one ``Node`` per node of the
+  expression, of a class chosen by the node's sympy class. Each node realizes
+  itself, here as a table, the first time its realization is read, and reads its
+  children's realizations as it does, so reading the root realizes every node under
+  it. A node refuses a value of its own that is not finite, whether or not its
+  parent's value depends on it. The plan, the root's ``Node``, holds no model
+  either;
+- the build: the root's ``cp_expr`` reads its realization, which builds itself into
+  the model (``TableRealization.cp_expr``), rounded onto ``COST_SCALE``, its position
+  built by ``Index.cp_expr``. Only ``cp_expr`` methods touch the model.
 
 This is the base: one table per node, every value computed by ``sympy.lambdify`` over
 the node's inputs, and the root read as one lookup. It lowers an expression whose
@@ -66,7 +67,7 @@ Values: TypeAlias = Mapping[cp_model.IntVar, np.ndarray]
 
 class TableLoweringError(Exception):
     """An objective the tables cannot lower. ``node`` is the sympy node left with no
-    form, or None for a refusal outside the walk; ``reason`` says why.
+    realization, or None for a refusal outside the walk; ``reason`` says why.
 
     It subclasses none of RuntimeError, TypeError and ValueError, so an ``except``
     around the objective that catches those cannot turn it into a different solve.
@@ -81,13 +82,13 @@ class TableLoweringError(Exception):
 # --------------------------------------------------------------------------- values
 
 
-class CpIndex(ABC):
+class Index(ABC):
     """A position: a map from the inputs' values to 0 .. size - 1, in numpy and in
     CP-SAT. Each kind of step is a subclass that holds its parts, the positions it is
-    made from, as its own fields, so a step depends on CpIndex alone. A value, with no
+    made from, as its own fields, so a step depends on Index alone. A value, with no
     model in it. Steps are frozen dataclasses: two that make the same position from
-    equal parts are equal and hash alike. CpTable and the nodes do not change when a
-    step is added."""
+    equal parts are equal and hash alike. TableRealization and the nodes do not change
+    when a step is added."""
 
     # The number of positions, 0 .. size - 1: a field of each step, given or
     # computed from its parts when it is made.
@@ -95,7 +96,7 @@ class CpIndex(ABC):
 
     @property
     @abstractmethod
-    def parts(self) -> tuple[CpIndex, ...]:
+    def parts(self) -> tuple[Index, ...]:
         """The positions it is made from, () for a leaf."""
 
     @property
@@ -115,10 +116,10 @@ class CpIndex(ABC):
         parts' cp_expr. A leaf reads its variable. Each call builds anew, and a part
         reached twice is built twice: no step of this stage adds to the model."""
 
-    def under(self) -> list[CpIndex]:
+    def under(self) -> list[Index]:
         """This position and every position it is made from, each once, parts first."""
-        seen: dict[CpIndex, None] = {}
-        stack: list[tuple[CpIndex, bool]] = [(self, False)]
+        seen: dict[Index, None] = {}
+        stack: list[tuple[Index, bool]] = [(self, False)]
         while stack:
             index, expanded = stack.pop()
             if expanded:
@@ -130,7 +131,7 @@ class CpIndex(ABC):
 
 
 @dataclass(frozen=True)
-class Input(CpIndex):
+class InputIndex(Index):
     """A leaf: a variable's own position, v -> v - lo, for a domain lo .. lo + size - 1
     with no gaps. A division or a literal has lo 0. The variable is already in the
     model."""
@@ -141,10 +142,10 @@ class Input(CpIndex):
 
     def __post_init__(self) -> None:
         if self.size < 1:
-            raise ValueError(f"Input of size {self.size}")
+            raise ValueError(f"InputIndex of size {self.size}")
 
     @property
-    def parts(self) -> tuple[CpIndex, ...]:
+    def parts(self) -> tuple[Index, ...]:
         return ()
 
     @property
@@ -159,13 +160,13 @@ class Input(CpIndex):
 
 
 @dataclass(frozen=True)
-class Unit(CpIndex):
+class UnitIndex(Index):
     """A leaf: the one position of a constant, on no input."""
 
     size: int = field(default=1, init=False)
 
     @property
-    def parts(self) -> tuple[CpIndex, ...]:
+    def parts(self) -> tuple[Index, ...]:
         return ()
 
     @property
@@ -180,19 +181,19 @@ class Unit(CpIndex):
 
 
 @dataclass(frozen=True)
-class Combine(CpIndex):
+class CombineIndex(Index):
     """(left, right) -> left * right.size + right. right.size is a constant, so this
     is linear: no two variables are multiplied."""
 
-    left: CpIndex
-    right: CpIndex
+    left: Index
+    right: Index
     size: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "size", self.left.size * self.right.size)
 
     @property
-    def parts(self) -> tuple[CpIndex, ...]:
+    def parts(self) -> tuple[Index, ...]:
         return (self.left, self.right)
 
     @property
@@ -208,10 +209,10 @@ class Combine(CpIndex):
         return self.left.cp_expr(model) * self.right.size + self.right.cp_expr(model)
 
 
-UNIT = Unit()
+UNIT = UnitIndex()
 
 
-def _read_only(values: Any, index: CpIndex) -> np.ndarray:
+def _read_only(values: Any, index: Index) -> np.ndarray:
     array = np.array(values, dtype=float)
     if array.shape != (index.size,):
         raise ValueError(
@@ -221,26 +222,26 @@ def _read_only(values: Any, index: CpIndex) -> np.ndarray:
     return array
 
 
-class CpForm(ABC):
+class AbstractRealization(ABC):
     """What a node is realized as: the one thing a reader and the objective take of
     it. A value, with no model in it, that builds its own CP-SAT side. Each kind of
-    form is a subclass: here a CpTable, and from Stage 3 a CpLinear too, the form a
-    sum is realized as."""
+    realization is a subclass: here a TableRealization, and from Stage 3 a
+    LinearRealization too, what a sum is realized as."""
 
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The form in model, as a CP-SAT expression in COST_SCALE units."""
+        """The realization in model, as a CP-SAT expression in COST_SCALE units."""
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
-class CpTable(CpForm):
+class TableRealization(AbstractRealization):
     """A node's table: values[index], made together and never apart. values is the
     value at each position, float until cp_expr rounds it, stored as a read-only
     copy; a list whose length is not the index's size is refused. Frozen, with no
     model in it, and compared by identity, its list being an array."""
 
     values: np.ndarray
-    index: CpIndex
+    index: Index
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", _read_only(self.values, self.index))
@@ -284,7 +285,7 @@ class CpTable(CpForm):
 
 
 # Each symbol's column, the symbol's value at each row of its input, on that input.
-Inputs: TypeAlias = Mapping[sympy.Symbol, CpTable]
+Inputs: TypeAlias = Mapping[sympy.Symbol, TableRealization]
 
 
 # ----------------------------------------------------------- values by lambdify
@@ -297,8 +298,8 @@ def _compile(expr: sympy.Basic) -> tuple[list[sympy.Symbol], Callable[..., Any]]
 
 def values_on_grid(
     expr: sympy.Basic,
-    columns: Mapping[sympy.Symbol, CpTable],
-    positions: Sequence[CpIndex],
+    columns: Mapping[sympy.Symbol, TableRealization],
+    positions: Sequence[Index],
 ) -> np.ndarray:
     """expr at every joint assignment of positions, row-major, the last position
     fastest: entry i1 * s1 + ... + im * sm, s_k the product of the sizes after k.
@@ -312,7 +313,7 @@ def values_on_grid(
 
     A value returned here need not be finite: a division by zero is infinite, and a
     Piecewise with no arm true is NaN. The node that makes the list refuses it
-    (CpNode.realize).
+    (Node.realize).
     """
     shape = tuple(p.size for p in positions)
     grid = np.indices(shape).reshape(len(shape), -1) if shape else np.zeros((0, 1), int)
@@ -352,52 +353,52 @@ def children_of(expr: sympy.Basic) -> tuple[sympy.Basic, ...]:
 
 
 @dataclass(eq=False)
-class CpNode:
+class Node:
     """The CP-SAT counterpart of one sympy node, which realizes itself.
 
     expr is the sympy node, injected and only read: it says which operation the node
-    is, and gives its arguments and its free symbols. The CpNodes form the same graph
-    as the sympy nodes: children holds the CpNodes of children_of(expr), made before
-    it, and a subexpression shared by two parents is one CpNode that both hold. A
+    is, and gives its arguments and its free symbols. The Nodes make the same graph
+    as the sympy nodes: children holds the Nodes of children_of(expr), made before
+    it, and a subexpression shared by two parents is one Node that both hold. A
     node reads only its children: the columns of its inputs are gathered from them,
-    and it reads their forms when it is realized. cap bounds its table. No model is
-    involved until cp_expr.
+    and it reads their realizations when it is realized. cap bounds its table. No
+    model is involved until cp_expr.
 
-    A node's form, a CpForm, is what a reader and the objective take of it: in this
-    stage always its table, one CpTable. Its columns and its form are computed the first
-    time they are read, and kept. A node refuses a value of its own that is not
-    finite, so one below a finite root is refused at the node that makes it: an
-    infinite Piecewise arm at the arm, taken or not. This class is an operation over
-    free symbols; CpSymbol and CpConstant are the leaves. A subclass changes how a
-    node is realized by overriding realize.
+    A node's realization, an AbstractRealization, is what a reader and the objective
+    take of it: in this stage always its table, one TableRealization. Its columns and
+    its realization are computed the first time they are read, and kept. A node
+    refuses a value of its own that is not finite, so one below a finite root is
+    refused at the node that makes it: an infinite Piecewise arm at the arm, taken or
+    not. This class is an operation over free symbols; InputNode and ConstantNode are
+    the leaves. A subclass changes how a node is realized by overriding realize.
     """
 
     expr: sympy.Basic
-    children: tuple[CpNode, ...]
+    children: tuple[Node, ...]
     cap: int
 
     @cached_property
-    def columns(self) -> Mapping[sympy.Symbol, CpTable]:
+    def columns(self) -> Mapping[sympy.Symbol, TableRealization]:
         """Each free symbol's column on its input, gathered from the children."""
-        columns: dict[sympy.Symbol, CpTable] = {}
+        columns: dict[sympy.Symbol, TableRealization] = {}
         for child in self.children:
             columns.update(child.columns)
         return columns
 
     @cached_property
-    def form(self) -> CpForm:
-        """The node's form, realized the first time it is read; realize raises
-        TableLoweringError naming the node when it has none."""
+    def realization(self) -> AbstractRealization:
+        """What the node is realized as, made the first time it is read and kept;
+        realize raises TableLoweringError naming the node when it has none."""
         return self.realize()
 
-    def realize(self) -> CpForm:
+    def realize(self) -> AbstractRealization:
         """Realizes the node: one table over its inputs, their positions combined in
         the order of their symbols sorted by sympy.default_sort_key, the last
         fastest. Raises TableLoweringError naming the node when that table would pass
         the cap, one past the cap never evaluated, and when a value of it is not
-        finite. Under the cap it reads its children's forms first, so a child with a
-        value that is not finite is refused at the child, naming it, whether or not
-        this node's value depends on it."""
+        finite. Under the cap it reads its children's realizations first, so a child
+        with a value that is not finite is refused at the child, naming it, whether
+        or not this node's value depends on it."""
         symbols = sorted(self.columns, key=sympy.default_sort_key)
         positions = list(dict.fromkeys(self.columns[s].index for s in symbols))
         under = {i: None for p in positions for i in p.under()}
@@ -409,67 +410,68 @@ class CpNode:
                 f"cap of {self.cap}",
             )
         for child in self.children:
-            child.form  # realizes the child, which refuses its own non-finite value
+            # realizes the child, which refuses its own value that is not finite
+            child.realization
         index = positions[0]
         for position in positions[1:]:
-            index = Combine(index, position)
+            index = CombineIndex(index, position)
         values = values_on_grid(self.expr, self.columns, positions)
-        return self._finite(CpTable(values=values, index=index))
+        return self._finite(TableRealization(values=values, index=index))
 
-    def _finite(self, table: CpTable) -> CpTable:
+    def _finite(self, table: TableRealization) -> TableRealization:
         """table, refused naming the node when a value of it is not finite."""
         if not table.finite:
             raise TableLoweringError(self.expr, "a value that is not finite")
         return table
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """The node in model, in COST_SCALE units: its form built
-        (CpTable.cp_expr), one lookup or a number. Reading the form realizes the
-        node, so a refusal comes before anything is added to the model. Each call
-        builds anew."""
-        return self.form.cp_expr(model)
+        """The node in model, in COST_SCALE units: its realization built
+        (TableRealization.cp_expr), one lookup or a number. Reading the realization
+        realizes the node, so a refusal comes before anything is added to the model.
+        Each call builds anew."""
+        return self.realization.cp_expr(model)
 
 
 @dataclass(eq=False)
-class CpSymbol(CpNode):
+class InputNode(Node):
     """A symbol: its column on its input, injected by the factory from the inputs,
     or None for a symbol with no input, which raises when it is read."""
 
-    column: CpTable | None = None
+    column: TableRealization | None = None
 
     @cached_property
-    def columns(self) -> Mapping[sympy.Symbol, CpTable]:
+    def columns(self) -> Mapping[sympy.Symbol, TableRealization]:
         """Its own column. Raises TableLoweringError naming the symbol when it has no
         input, so a parent that reads it is refused by the symbol's name."""
         if self.column is None:
             raise TableLoweringError(self.expr, "a symbol with no input")
         return {self.expr: self.column}
 
-    def realize(self) -> CpTable:
+    def realize(self) -> TableRealization:
         """Its column."""
         (column,) = self.columns.values()
         return self._finite(column)
 
 
 @dataclass(eq=False)
-class CpConstant(CpNode):
+class ConstantNode(Node):
     """A node with no free symbol: a number, true or false, or an operation on
-    numbers. Its form is its value on the Unit position."""
+    numbers. It is realized as its value on the UnitIndex position."""
 
-    def realize(self) -> CpTable:
-        """Its value, one entry on the Unit position."""
+    def realize(self) -> TableRealization:
+        """Its value, one entry on the UnitIndex position."""
         value = np.array([_constant(self.expr)])
-        return self._finite(CpTable(values=value, index=UNIT))
+        return self._finite(TableRealization(values=value, index=UNIT))
 
 
 class TableLowering:
-    """Plans cost expressions as tables: a factory for CpNodes. It makes one CpNode
+    """Plans cost expressions as tables: a factory for Nodes. It makes one Node
     per node, of the class the node's sympy class calls for, and hands it what it
     reads; the nodes do the rest. It holds no model, so planning cannot write to one,
     and it keeps nothing between calls of lower.
 
     inputs gives each symbol's column on its input, which the factory hands to the
-    symbol's CpSymbol; cap bounds the entries of one table, its list and the remaps
+    symbol's InputNode; cap bounds the entries of one table, its list and the remaps
     under its index, and is handed to every node.
     """
 
@@ -477,32 +479,32 @@ class TableLowering:
         self.inputs = inputs
         self.cap = cap
 
-    def lower(self, root: sympy.Basic) -> CpNode:
-        """root as a plan: root's CpNode, over the graph of nodes under it. Nothing is
+    def lower(self, root: sympy.Basic) -> Node:
+        """root as a plan: root's Node, over the graph of nodes under it. Nothing is
         realized here; the root's cp_expr reads it, which realizes it, and through
         it every node under it."""
         return self.rewrite(root)[root]
 
-    def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, CpNode]:
-        """Each node under root, once, as a CpNode holding its children's CpNodes,
+    def rewrite(self, root: sympy.Basic) -> dict[sympy.Basic, Node]:
+        """Each node under root, once, as a Node holding its children's Nodes,
         made after them, in the order of sympy.postorder_traversal with its repeats
-        dropped. An arm's ExprCondPair gets no CpNode. Nothing is realized here;
+        dropped. An arm's ExprCondPair gets no Node. Nothing is realized here;
         root is not changed."""
-        nodes: dict[sympy.Basic, CpNode] = {}
+        nodes: dict[sympy.Basic, Node] = {}
         for expr in dict.fromkeys(sympy.postorder_traversal(root)):
             if isinstance(expr, ExprCondPair):
                 continue
             nodes[expr] = self._node(expr, tuple(nodes[c] for c in children_of(expr)))
         return nodes
 
-    def _node(self, expr: sympy.Basic, children: tuple[CpNode, ...]) -> CpNode:
-        """expr's CpNode: a CpSymbol holding its input's column, a CpConstant for a
-        node with no free symbol, and a CpNode for every other node."""
+    def _node(self, expr: sympy.Basic, children: tuple[Node, ...]) -> Node:
+        """expr's Node: an InputNode holding its input's column, a ConstantNode for a
+        node with no free symbol, and a Node for every other node."""
         if isinstance(expr, sympy.Symbol):
-            return CpSymbol(expr, children, self.cap, column=self.inputs.get(expr))
+            return InputNode(expr, children, self.cap, column=self.inputs.get(expr))
         if not expr.free_symbols:
-            return CpConstant(expr, children, self.cap)
-        return CpNode(expr, children, self.cap)
+            return ConstantNode(expr, children, self.cap)
+        return Node(expr, children, self.cap)
 
 
 def _constant(expr: sympy.Basic) -> float:
