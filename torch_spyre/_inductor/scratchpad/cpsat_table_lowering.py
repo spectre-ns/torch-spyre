@@ -88,7 +88,8 @@ class Index(ABC):
     made from, as its own fields, so a step depends on Index alone. A value, with no
     model in it. Steps are frozen dataclasses: two that make the same position from
     equal parts are equal and hash alike. TableRealization and the nodes do not change
-    when a step is added."""
+    when a step is added. The steps here are UnitIndex and CombineIndex: the step over
+    an input's variable is made by whoever makes the inputs."""
 
     # The number of positions, 0 .. size - 1: a field of each step, given or
     # computed from its parts when it is made.
@@ -108,13 +109,14 @@ class Index(ABC):
     @abstractmethod
     def positions(self, values: Values) -> np.ndarray:
         """The numpy side: its position at each assignment in values, from its parts'
-        positions there. A leaf reads its variable's values."""
+        positions there. A leaf over a variable reads the variable's values."""
 
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The CP-SAT side: the same position as an expression in model, from its
-        parts' cp_expr. A leaf reads its variable. Each call builds anew, and a part
-        reached twice is built twice: no step of this stage adds to the model."""
+        parts' cp_expr. A leaf over a variable reads the variable. Each call builds
+        anew, and a part reached twice is built twice: no step of this stage adds to
+        the model."""
 
     def under(self) -> list[Index]:
         """This position and every position it is made from, each once, parts first."""
@@ -128,35 +130,6 @@ class Index(ABC):
                 stack.append((index, True))
                 stack.extend((part, False) for part in reversed(index.parts))
         return list(seen)
-
-
-@dataclass(frozen=True)
-class InputIndex(Index):
-    """A leaf: a variable's own position, v -> v - lo, for a domain lo .. lo + size - 1
-    with no gaps. A division or a literal has lo 0. The variable is already in the
-    model."""
-
-    var: cp_model.IntVar
-    size: int
-    lo: int = 0
-
-    def __post_init__(self) -> None:
-        if self.size < 1:
-            raise ValueError(f"InputIndex of size {self.size}")
-
-    @property
-    def parts(self) -> tuple[Index, ...]:
-        return ()
-
-    @property
-    def entries(self) -> int:
-        return 0
-
-    def positions(self, values: Values) -> np.ndarray:
-        return np.asarray(values[self.var]) - self.lo
-
-    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        return self.var - self.lo if self.lo else self.var
 
 
 @dataclass(frozen=True)

@@ -21,6 +21,7 @@ COST_SCALE times the expression evaluated by sympy, within the rounding bound.
 """
 
 import itertools
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -38,15 +39,40 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     Node,
     InputNode,
     TableRealization,
-    InputIndex,
     TableLowering,
     TableLoweringError,
     UnitIndex,
+    Values,
     values_on_grid,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 CAP = 8192
+
+
+@dataclass(frozen=True)
+class InputIndex(Index):
+    """The tests' step over a variable: its own position, v - lo, for a domain
+    lo .. lo + size - 1. The module has no such step yet, since nothing in it makes an
+    input; this one is made on Index alone, as any step is."""
+
+    var: cp_model.IntVar
+    size: int
+    lo: int = 0
+
+    @property
+    def parts(self) -> tuple[Index, ...]:
+        return ()
+
+    @property
+    def entries(self) -> int:
+        return 0
+
+    def positions(self, values: Values) -> np.ndarray:
+        return np.asarray(values[self.var]) - self.lo
+
+    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
+        return self.var - self.lo if self.lo else self.var
 
 
 class Case:
@@ -313,8 +339,6 @@ def test_a_step_takes_the_parts_it_names_and_equal_steps_are_one_position():
         CombineIndex(a)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         CombineIndex(a, b, a)  # type: ignore[call-arg]
-    with pytest.raises(ValueError):
-        InputIndex(case.variables[0], size=0)
     pair = CombineIndex(a, b)
     assert pair.size == 6 and pair.parts == (a, b) and pair.entries == 0
     assert pair == CombineIndex(a, b) and hash(pair) == hash(CombineIndex(a, b))
