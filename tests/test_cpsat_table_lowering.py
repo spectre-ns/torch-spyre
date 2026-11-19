@@ -25,6 +25,11 @@ import itertools
 import numpy as np
 import pytest
 import sympy
+
+# ortools is not installed on s390x or ppc64le (pyproject.toml), and the table module
+# imports it at its top: skip the file there rather than fail to collect it.
+pytest.importorskip("ortools.sat.python.cp_model")
+
 from ortools.sat.python import cp_model
 from sympy.functions.elementary.piecewise import ExprCondPair
 
