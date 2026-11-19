@@ -21,7 +21,6 @@ COST_SCALE times the expression evaluated by sympy, within the rounding bound.
 """
 
 import itertools
-from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -36,6 +35,8 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     ConstantNode,
     AbstractRealization,
     Index,
+    Input,
+    InputIndex,
     Node,
     InputNode,
     TableRealization,
@@ -49,58 +50,44 @@ from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 CAP = 8192
 
 
-@dataclass(frozen=True)
-class InputIndex(Index):
-    """The tests' step over a variable: its own position, v - lo, for a domain
-    lo .. lo + size - 1. The module has no such step yet, since nothing in it makes an
-    input; this one is made on Index alone, as any step is."""
-
-    var: cp_model.IntVar
-    size: int
-    lo: int = 0
-
-    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
-        return self.var - self.lo if self.lo else self.var
-
-
 class Case:
-    """A CP-SAT model with inputs made by hand: each input is a variable and the
-    column of every symbol that reads it."""
+    """A CP-SAT model with inputs made by hand: each symbol's input is its variable
+    and its value at each of the variable's values."""
 
     def __init__(self) -> None:
         self.model = cp_model.CpModel()
-        self.inputs: dict[sympy.Symbol, TableRealization] = {}
+        self.inputs: dict[sympy.Symbol, Input] = {}
         self.variables: list[cp_model.IntVar] = []
         self.values: dict[cp_model.IntVar, list[int]] = {}
 
     def add_input(self, name: str, **columns: list[float]) -> Index:
         """A buffer's division: a variable in 0 .. n-1 picking a row of its menu, and
-        one column per symbol of the buffer."""
+        one column per symbol of the buffer. Returns the position an InputNode makes
+        on that variable."""
         sizes = {len(column) for column in columns.values()}
         assert len(sizes) == 1
         (size,) = sizes
         var = self.model.new_int_var(0, size - 1, f"division_{name}")
-        position = InputIndex(var, size=size)
         for symbol_name, column in columns.items():
-            self.inputs[sympy.Symbol(symbol_name, positive=True)] = TableRealization(
-                values=np.array(column), index=position
-            )
+            self.inputs[sympy.Symbol(symbol_name, positive=True)] = (var, column)
         self.variables.append(var)
         self.values[var] = list(range(size))
-        return position
+        return InputIndex(var, size=size)
 
     def integer(self, name: str, lo: int, size: int) -> Index:
         """An integer variable with its own values, lo .. lo + size - 1: its position
-        is the value offset by lo."""
+        is the value offset by lo. Returns the position an InputNode makes on it."""
         domain = list(range(lo, lo + size))
         var = self.model.new_int_var(lo, lo + size - 1, name)
-        position = InputIndex(var, size=size, lo=lo)
-        self.inputs[sympy.Symbol(name, integer=True)] = TableRealization(
-            values=np.array(domain), index=position
-        )
+        self.inputs[sympy.Symbol(name, integer=True)] = (var, domain)
         self.variables.append(var)
         self.values[var] = list(domain)
-        return position
+        return InputIndex(var, size=size, lo=lo)
+
+    def columns(self) -> dict[sympy.Symbol, TableRealization]:
+        """Each symbol's column, as its InputNode makes it."""
+        nodes = {s: InputNode(s, (), CAP, input=self.inputs[s]) for s in self.inputs}
+        return {s: node.columns[s] for s, node in nodes.items()}
 
     def symbol(self, name: str) -> sympy.Symbol:
         (symbol,) = (s for s in self.inputs if s.name == name)
@@ -129,10 +116,8 @@ class Case:
         """expr evaluated by sympy where the variables take assignment."""
         values = dict(zip(self.variables, assignment))
         point = {}
-        for symbol, table in self.inputs.items():
-            index = table.index
-            assert isinstance(index, InputIndex)
-            value = float(table.values[values[index.var] - index.lo])
+        for symbol, (var, column) in self.inputs.items():
+            value = float(column[values[var] - self.values[var][0]])
             point[symbol] = (
                 sympy.Integer(int(value)) if value.is_integer() else sympy.Float(value)
             )
@@ -193,11 +178,32 @@ def test_each_node_is_an_input_a_constant_or_an_operation():
     expr = 3 * a + root2 * a**0.5
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
     assert type(nodes[a]) is InputNode
-    assert nodes[a].column is case.inputs[a]
+    assert nodes[a].input is case.inputs[a]
     assert type(nodes[sympy.Integer(3)]) is ConstantNode
     assert type(nodes[root2]) is ConstantNode  # an operation on numbers
     assert type(nodes[a**0.5]) is Node
     assert type(nodes[expr]) is Node
+
+
+def test_an_input_node_makes_its_position_on_its_variable():
+    """The caller hands over a variable and values, and no position. Two symbols of
+    one variable get equal positions, so one table over both is on one axis."""
+    case = Case()
+    position = case.add_input("a", d0=[1.0, 2.0, 4.0], d1=[8.0, 4.0, 2.0])
+    offset = case.integer("y", 2, 4)
+    d0, d1, y = case.symbol("d0"), case.symbol("d1"), case.symbol("y")
+    nodes = TableLowering(case.inputs, cap=CAP).rewrite(d0 * d1 + y)
+    assert nodes[d0].realization.index == nodes[d1].realization.index == position
+    assert nodes[y].realization.index == offset and offset.lo == 2
+    assert list(nodes[d1].realization.values) == [8.0, 4.0, 2.0]
+    assert nodes[d0 * d1].realization.index == position  # one axis, 3 entries
+    case.assert_exact(d0 * d1 + y)
+    short = InputNode(d0, (), CAP, input=(case.variables[0], [1.0, 2.0]))
+    with pytest.raises(
+        TableLoweringError, match="2 values for a variable with 3"
+    ) as caught:
+        short.realization
+    assert caught.value.node == d0
 
 
 def test_a_node_gathers_its_columns_from_its_children():
@@ -207,9 +213,9 @@ def test_a_node_gathers_its_columns_from_its_children():
     a, b = case.symbol("a"), case.symbol("b")
     expr = a**0.5 + 2 * b
     nodes = TableLowering(case.inputs, cap=CAP).rewrite(expr)
-    assert dict(nodes[expr].columns) == {a: case.inputs[a], b: case.inputs[b]}
-    assert all(nodes[expr].columns[s] is case.inputs[s] for s in (a, b))
-    assert dict(nodes[2 * b].columns) == {b: case.inputs[b]}
+    assert set(nodes[expr].columns) == {a, b}
+    assert all(nodes[expr].columns[s] is nodes[s].columns[s] for s in (a, b))
+    assert dict(nodes[2 * b].columns) == {b: nodes[b].columns[b]}
     assert dict(nodes[sympy.Integer(2)].columns) == {}
 
 
@@ -219,7 +225,7 @@ def test_a_node_realizes_itself_when_it_is_read():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
-    leaf = InputNode(a, (), CAP, column=case.inputs[a])
+    leaf = InputNode(a, (), CAP, input=case.inputs[a])
     half = ConstantNode(sympy.Float(0.5), (), CAP)
     root = Node(a**0.5, (leaf, half), CAP)
     assert not any("realization" in vars(node) for node in (root, leaf, half))
@@ -373,7 +379,7 @@ def test_values_on_grid_is_row_major_with_the_last_position_fastest():
     b = case.add_input("b", b=[0.0, 1.0, 2.0])
     c = case.add_input("c", c=[0.0, 1.0, 2.0, 3.0])
     sa, sb, sc = case.symbol("a"), case.symbol("b"), case.symbol("c")
-    values = values_on_grid(100 * sa + 10 * sb + sc, case.inputs, [a, b, c])
+    values = values_on_grid(100 * sa + 10 * sb + sc, case.columns(), [a, b, c])
     expected = [
         100 * i + 10 * j + k for i in range(2) for j in range(3) for k in range(4)
     ]
@@ -384,13 +390,13 @@ def test_values_on_grid_moves_two_symbols_of_one_position_together():
     case = Case()
     p = case.add_input("a", d0=[1.0, 2.0, 4.0], d1=[8.0, 4.0, 2.0])
     d0, d1 = case.symbol("d0"), case.symbol("d1")
-    assert list(values_on_grid(d0 * d1, case.inputs, [p])) == [8.0, 8.0, 8.0]
+    assert list(values_on_grid(d0 * d1, case.columns(), [p])) == [8.0, 8.0, 8.0]
 
 
 def test_values_on_grid_broadcasts_a_constant():
     case = Case()
     p = case.add_input("a", a=[1.0, 2.0, 4.0])
-    values = values_on_grid(sympy.Integer(5), case.inputs, [p])
+    values = values_on_grid(sympy.Integer(5), case.columns(), [p])
     assert list(values) == [5.0, 5.0, 5.0]
 
 
@@ -417,7 +423,7 @@ def test_a_value_that_is_not_finite_is_refused_at_its_node_under_a_finite_root()
         (sympy.oo, sympy.Piecewise((sympy.oo, a > 4), (a, True))),
         (b, sympy.Min(a, b)),
     ):
-        assert np.all(np.isfinite(values_on_grid(expr, case.inputs, [position])))
+        assert np.all(np.isfinite(values_on_grid(expr, case.columns(), [position])))
         with pytest.raises(TableLoweringError, match="not finite") as caught:
             case.lower(expr)
         assert caught.value.node == child
@@ -506,12 +512,10 @@ def test_a_relayout_charge_is_one_table_over_its_literal_and_division():
     model = case.model
     lit = model.new_bool_var("is_lx")
     division = model.new_int_var(0, 2, "division_src")
-    lit_index = InputIndex(lit, size=2)
-    div_index = InputIndex(division, size=3)
     is_lx = sympy.Symbol("is_lx", integer=True)
     div = sympy.Symbol("division_src", integer=True, nonnegative=True)
-    case.inputs[is_lx] = TableRealization(values=[0, 1], index=lit_index)
-    case.inputs[div] = TableRealization(values=[0, 1, 2], index=div_index)
+    case.inputs[is_lx] = (lit, [0, 1])
+    case.inputs[div] = (division, [0, 1, 2])
     case.variables += [lit, division]
     case.values[lit], case.values[division] = [0, 1], [0, 1, 2]
     expr = RelayoutCharge(is_lx, div, 0, 65, 147)

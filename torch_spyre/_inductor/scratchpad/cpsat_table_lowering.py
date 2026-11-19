@@ -26,8 +26,9 @@ works out which entry of a table applies. A node's value is a *table*: a float l
   itself, here as a table, the first time its realization is read, and reads its
   children's realizations as it does, so reading the root realizes every node under
   it. A node refuses a value of its own that is not finite, whether or not its
-  parent's value depends on it. The plan, the root's ``Node``, holds no model
-  either;
+  parent's value depends on it. A symbol's ``InputNode`` is handed its variable and
+  its values, and makes its own position on that variable. The plan, the root's
+  ``Node``, holds no model either;
 - the build: the root's ``cp_expr`` reads its realization, which builds itself into
   the model (``TableRealization.cp_expr``), rounded onto ``COST_SCALE``, its position
   built by ``Index.cp_expr``. Only ``cp_expr`` methods touch the model.
@@ -86,8 +87,8 @@ class Index(ABC):
     is made from, as its own fields, so a step depends on Index alone. A value, with
     no model in it. Steps are frozen dataclasses: two that make the same position from
     equal parts are equal and hash alike. TableRealization and the nodes do not change
-    when a step is added. The steps here are UnitIndex and CombineIndex: the step over
-    an input's variable is made by whoever makes the inputs."""
+    when a step is added. The steps here are InputIndex, UnitIndex and
+    CombineIndex."""
 
     # The number of positions, 0 .. size - 1: a field of each step, given or
     # computed from its parts when it is made.
@@ -98,6 +99,20 @@ class Index(ABC):
         """The position as an expression in model, from its parts' cp_expr. A leaf over
         a variable reads the variable. Each call builds anew, and a part reached twice
         is built twice: no step of this stage adds to the model."""
+
+
+@dataclass(frozen=True)
+class InputIndex(Index):
+    """A leaf: a variable's own position, v -> v - lo, for a variable whose values run
+    from lo to lo + size - 1. An InputNode makes one on its variable, which is already
+    in the model. Two on one variable are equal: one position."""
+
+    var: cp_model.IntVar
+    size: int
+    lo: int = 0
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        return self.var - self.lo if self.lo else self.var
 
 
 @dataclass(frozen=True)
@@ -194,8 +209,10 @@ class TableRealization(AbstractRealization):
         return target
 
 
-# Each symbol's column, the symbol's value at each row of its input, on that input.
-Inputs: TypeAlias = Mapping[sympy.Symbol, TableRealization]
+# Each symbol's input: the variable that picks its value, and the symbol's value at
+# each of that variable's values, from its lowest to its highest.
+Input: TypeAlias = tuple[cp_model.IntVar, Sequence[float]]
+Inputs: TypeAlias = Mapping[sympy.Symbol, Input]
 
 
 # ----------------------------------------------------------- values by lambdify
@@ -343,18 +360,30 @@ class Node:
 
 @dataclass(eq=False)
 class InputNode(Node):
-    """A symbol: its column on its input, injected by the factory from the inputs,
-    or None for a symbol with no input, which raises when it is read."""
+    """A symbol: input data. input is its variable and its value at each of that
+    variable's values, injected by the factory from the inputs, or None for a symbol
+    with no input, which raises when it is read. The node makes its own position, an
+    InputIndex on its variable, so the caller makes none."""
 
-    column: TableRealization | None = None
+    input: Input | None = None
 
     @cached_property
     def columns(self) -> Mapping[sympy.Symbol, TableRealization]:
-        """Its own column. Raises TableLoweringError naming the symbol when it has no
-        input, so a parent that reads it is refused by the symbol's name."""
-        if self.column is None:
+        """Its own column: its values on its variable's position, made here from the
+        variable's lowest and highest values. Raises TableLoweringError naming the
+        symbol when it has no input, so a parent that reads it is refused by the
+        symbol's name, and when its values are not one per value of its variable."""
+        if self.input is None:
             raise TableLoweringError(self.expr, "a symbol with no input")
-        return {self.expr: self.column}
+        var, values = self.input
+        domain = list(var.proto.domain)  # its intervals, flattened: lowest first
+        lo, hi = domain[0], domain[-1]
+        if len(values) != hi - lo + 1:
+            raise TableLoweringError(
+                self.expr, f"{len(values)} values for a variable with {hi - lo + 1}"
+            )
+        index = InputIndex(var, size=len(values), lo=lo)
+        return {self.expr: TableRealization(values=values, index=index)}
 
     def realize(self) -> TableRealization:
         """Its column."""
@@ -379,7 +408,7 @@ class TableLowering:
     reads; the nodes do the rest. It holds no model, so planning cannot write to one,
     and it keeps nothing between calls of lower.
 
-    inputs gives each symbol's column on its input, which the factory hands to the
+    inputs gives each symbol's variable and values, which the factory hands to the
     symbol's InputNode; cap bounds the entries of one table, the length of its list,
     under its index, and is handed to every node.
     """
@@ -407,10 +436,10 @@ class TableLowering:
         return nodes
 
     def _node(self, expr: sympy.Basic, children: tuple[Node, ...]) -> Node:
-        """expr's Node: an InputNode holding its input's column, a ConstantNode for a
+        """expr's Node: an InputNode holding its symbol's input, a ConstantNode for a
         node with no free symbol, and a Node for every other node."""
         if isinstance(expr, sympy.Symbol):
-            return InputNode(expr, children, self.cap, column=self.inputs.get(expr))
+            return InputNode(expr, children, self.cap, input=self.inputs.get(expr))
         if not expr.free_symbols:
             return ConstantNode(expr, children, self.cap)
         return Node(expr, children, self.cap)
