@@ -37,6 +37,8 @@ import numpy as np
 import sympy
 from sympy.printing.printer import Printer
 
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
+
 if TYPE_CHECKING:
     from ortools.sat.python import cp_model, cp_model_helper
 else:
@@ -70,6 +72,23 @@ _operator_map = {
     "==": operator.eq,
     "!=": operator.ne,
 }
+
+
+# The classes whose value over a buffer's candidates _evaluate_candidates computes with
+# the numpy core. The core has functions for more (floor, log, ...): a node of any other
+# class is left to its print method.
+_CANDIDATE_CLASSES = (
+    sympy.Add,
+    sympy.Mul,
+    sympy.Pow,
+    sympy.Min,
+    sympy.Max,
+    sympy.core.relational.Relational,
+    sympy.And,
+    sympy.Or,
+    sympy.Piecewise,
+    sympy.KroneckerDelta,
+)
 
 
 def _eq_fact(rel):
@@ -277,34 +296,9 @@ class _SympyExprToCpSat(Printer):
         owner = owners[0] if owners else None
         if any(other is not owner for other in owners):
             return None
-        values = [value[1] for value in evaluated]
-        if expr.is_Add:
-            result = sum(values)
-        elif expr.is_Mul:
-            result = math.prod(values)
-        elif expr.is_Pow:
-            result = values[0] ** values[1]
-        elif isinstance(expr, (sympy.Min, sympy.Max)):
-            operation = np.minimum if isinstance(expr, sympy.Min) else np.maximum
-            result = values[0]
-            for value in values[1:]:
-                result = operation(result, value)
-        elif expr.is_Relational:
-            result = _operator_map[expr.rel_op](*values)
-        elif expr.func in (sympy.And, sympy.Or):
-            operation = np.logical_and if expr.func is sympy.And else np.logical_or
-            result = values[0]
-            for value in values[1:]:
-                result = operation(result, value)
-        elif expr.is_Piecewise:
-            result = values[-2]
-            for value, cond in reversed(list(zip(values[:-2:2], values[1:-2:2]))):
-                result = np.where(cond, value, result)
-        elif expr.func is sympy.KroneckerDelta:
-            result = np.equal(*values)
-        else:
+        if not isinstance(expr, _CANDIDATE_CLASSES):
             return None
-        return owner, result
+        return owner, numpy_eval(expr, [value[1] for value in evaluated])
 
     def _division_table(self, expr):
         evaluated = self._candidate_values(expr)

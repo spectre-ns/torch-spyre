@@ -775,7 +775,7 @@ def test_a_symbol_with_no_input_is_refused_by_name():
 
 
 def _count_lambdify(monkeypatch) -> list[sympy.Basic]:
-    """The expressions lambdified from here on, the lowering's functions forgotten."""
+    """The expressions lambdified from here on."""
     calls: list[sympy.Basic] = []
     lambdify = sympy.lambdify
 
@@ -784,13 +784,15 @@ def _count_lambdify(monkeypatch) -> list[sympy.Basic]:
         return lambdify(args, expr, **kwargs)
 
     monkeypatch.setattr(sympy, "lambdify", counting)
-    lowering._lambdified.cache_clear()
     return calls
 
 
-def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
-    """Forty terms of one shape make hundreds of nodes and a few functions: every node
-    of one class and form of operands shares one."""
+def test_a_node_is_lambdified_only_when_the_core_has_no_function(monkeypatch):
+    """A node's list comes from the numpy core's function of its class, with no
+    lambdify: forty terms of one shape make hundreds of nodes and none is lambdified.
+    A node of a class the core has no function for, here sinc and sec, lambdifies its
+    class over placeholders when it computes a list, and nothing is kept between
+    lowerings."""
     case = Case()
     case.add_input("a", a=[float(v) for v in range(1, 65)])
     case.add_input("b", b=[float(v) for v in range(1, 9)])
@@ -803,15 +805,16 @@ def test_a_function_is_lambdified_once_for_each_class_and_form(monkeypatch):
         + sympy.Max(a**0.5, b / (i + 1))
         for i in range(40)
     ]
-    expr = sympy.Add(*terms)
+    expr = sympy.Add(*terms) + sympy.sinc(a) * sympy.sec(b / 16)
     calls = _count_lambdify(monkeypatch)
     nodes = _nodes(case, expr)
-    np.testing.assert_allclose(
-        _on_inputs(nodes[expr]), _stage_1(nodes[expr]), rtol=1e-12
-    )
-    computed = [n for n in nodes.values() if type(n) is not InputNode]
-    assert len(computed) > 300
-    assert len(calls) == len({str(c) for c in calls}) <= 12
+    listed = _on_inputs(nodes[expr])
+    assert len([n for n in nodes.values() if type(n) is not InputNode]) > 300
+    assert {str(c) for c in calls} == {"sec(operand0)", "sinc(operand0)"}
+    first = len(calls)
+    _on_inputs(_nodes(case, expr)[expr])
+    assert len(calls) == 2 * first
+    np.testing.assert_allclose(listed, _stage_1(nodes[expr]), rtol=1e-12)
 
 
 def test_a_function_takes_its_operands_by_their_own_names():
@@ -819,7 +822,6 @@ def test_a_function_takes_its_operands_by_their_own_names():
     per argument: seconds for a Min or Max of a few dozen operands. Plain symbols
     whose names are identifiers are taken as they are, so the function's parameters
     are the placeholders' own names, and a Min of 35 is quick to lambdify."""
-    lowering._lambdified.cache_clear()
     func = lowering._lambdified(sympy.Min, (None,) * 35)
     assert list(inspect.signature(func).parameters) == [
         f"operand{i}" for i in range(35)

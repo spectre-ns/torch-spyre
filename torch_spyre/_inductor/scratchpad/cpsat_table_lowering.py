@@ -28,9 +28,10 @@ works out which entry of a table applies. The objective uses three CP-SAT forms:
   the class that sympy class calls for, over the Nodes of the node's children. A node
   has two reads, each made the first time it is read and kept: its ``table``, the
   cheapest table of it in entries, for a parent that computes its own list from it,
-  and its ``realization``, for a linear reader. A node's list is its function, its
-  sympy class lambdified once per class and form of operands, applied to its
-  operands' lists;
+  and its ``realization``, for a linear reader. A node's list is the numpy core's
+  function of its sympy class (``cost_expr_numpy.py``) applied to its operands'
+  lists; a class the core has no function for is lambdified over placeholders, by
+  the node, with nothing kept;
 - the build: the root's ``cp_expr`` reads its realization, which builds itself into
   the model, each position and realization once per build.
 
@@ -43,7 +44,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import cached_property, lru_cache
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
@@ -51,6 +52,7 @@ import sympy
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 if TYPE_CHECKING:
@@ -680,11 +682,39 @@ CONDITION = "condition"
 Form: TypeAlias = "str | sympy.Rational | None"
 
 
-@lru_cache(maxsize=1024)
+def _function_values(
+    expr: sympy.Basic, forms: tuple[Form, ...], arguments: Sequence[np.ndarray]
+) -> Any:
+    """expr's list from arguments, its operands' lists in the forms they take, by the
+    numpy core's function of its class; by its class lambdified (_lambdified) when the
+    core has none.
+
+    A condition is compared with 0, as a table holds it as 1.0 or 0.0. A Mul divides
+    its other factors' product by the bases of its factors with a negative rational
+    exponent, each raised to the exponent's size, as lambdify prints a quotient: 98/a,
+    where 98*(1/a) is 1.9999999999999998 at a = 49."""
+    plain = [
+        argument != 0 if form == CONDITION else argument
+        for argument, form in zip(arguments, forms)
+        if form is None or form == CONDITION
+    ]
+    divisors = [
+        argument ** float(-form)  # type: ignore[operator]
+        for argument, form in zip(arguments, forms)
+        if not (form is None or form == CONDITION)
+    ]
+    try:
+        value = numpy_eval(expr, plain)
+    except NotImplementedError:
+        return _apply(_lambdified(expr.func, forms), arguments)
+    return value / math.prod(divisors) if divisors else value
+
+
 def _lambdified(func: Any, forms: tuple[Form, ...]) -> Callable[..., Any]:
     """The function of a node of sympy class func whose operands take forms,
-    lambdified with the numpy module over one placeholder per operand. lambdify runs
-    once for each class and forms, and every node of them shares the function.
+    lambdified with the numpy module over one placeholder per operand: the function of
+    a class the numpy core has none for. A node calls it when it computes a list, and
+    nothing keeps the function after that.
 
     The placeholders are plain symbols, operand0, operand1, ..., whose names are
     Python identifiers, so lambdify takes them as they are. It renames every argument
@@ -1005,7 +1035,7 @@ class Node:
         operands: Sequence[Node | TableRealization | float | None],
         forms: tuple[Form, ...],
     ) -> TableRealization:
-        """Its function (_lambdified) applied to operands at every joint assignment of
+        """Its function (_function_values) applied to operands at every joint assignment of
         positions: a node's table, an operand on the table's own position as it is,
         one on other positions at its own (Index.on_grid), and a constant at every
         entry."""
@@ -1025,7 +1055,7 @@ class Node:
         values = _values(
             self.expr,
             index.size,
-            lambda: _apply(_lambdified(self.expr.func, forms), arguments),
+            lambda: _function_values(self.expr, forms, arguments),
         )
         return TableRealization(values=values, index=index)
 
