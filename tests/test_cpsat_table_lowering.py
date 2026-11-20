@@ -40,23 +40,16 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     COST_SCALE,
     UNIT,
     AbstractRealization,
-    AddNode,
     CombineIndex,
     CompactIndex,
-    ConstantNode,
     ExtremeIndex,
-    ExtremeNode,
     ExtremeRealization,
     GateRealization,
     Index,
     Input,
     InputIndex,
-    InputNode,
     LinearRealization,
     LocateIndex,
-    MulNode,
-    Node,
-    RelayoutChargeNode,
     SwitchRealization,
     TableLowering,
     TableLoweringError,
@@ -74,6 +67,76 @@ from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 CAP = 8192
+
+
+class Printed:
+    """One node as a printer prints it: the tests' handle on its realization, what the
+    printer returns for it, and on the table a parent can ask that for."""
+
+    def __init__(self, printer: TableLowering, expr: sympy.Basic) -> None:
+        self.printer = printer
+        self.expr = expr
+
+    @property
+    def realization(self) -> AbstractRealization:
+        return self.printer.print(self.expr)
+
+    @property
+    def table(self) -> TableRealization:
+        return self.realization.table(self.printer.cap)
+
+    @property
+    def tabulated(self) -> TableRealization | None:
+        return self.realization.tabulated(self.printer.cap)
+
+    @property
+    def columns(self) -> dict[sympy.Symbol, TableRealization]:
+        """Each free symbol's column, in the order of the symbols."""
+        symbols = sorted(self.expr.free_symbols, key=sympy.default_sort_key)
+        return {s: self.printer.print(s).table(self.printer.cap) for s in symbols}
+
+    @property
+    def operands(self) -> list["Printed"]:
+        """Its operands: a Piecewise's arms' values and conditions, else its args."""
+        parts = self.expr.args
+        if isinstance(self.expr, sympy.Piecewise):
+            parts = tuple(part for pair in self.expr.args for part in pair.args)
+        return [Printed(self.printer, part) for part in parts]
+
+    @property
+    def ladder(self) -> TableRealization:
+        """A Min or Max's ladder, from its operands' tables."""
+        tables = [operand.table for operand in self.operands]
+        return lowering._ladder(tables, isinstance(self.expr, sympy.Min))
+
+    def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
+        return self.realization.cp_expr(model)
+
+
+class Recording(TableLowering):
+    """A printer that keeps the nodes it prints, in the order their realizations are
+    returned: operands before their parents."""
+
+    def __init__(self, inputs: dict[sympy.Symbol, Input], cap: int = 8192) -> None:
+        super().__init__(inputs, cap=cap)
+        self.printed: dict[sympy.Basic, AbstractRealization] = {}
+
+    def print(self, expr: sympy.Basic) -> AbstractRealization:
+        realization = super().print(expr)
+        self.printed.setdefault(expr, realization)
+        return realization
+
+
+class Views(dict):
+    """The nodes a recording printer printed, each as a Printed, by its sympy node; a
+    node it did not print is printed when it is asked for."""
+
+    def __init__(self, printer: Recording) -> None:
+        super().__init__((expr, Printed(printer, expr)) for expr in printer.printed)
+        self.printer = printer
+
+    def __missing__(self, expr: sympy.Basic) -> Printed:
+        return Printed(self.printer, expr)
 
 
 class Case:
@@ -119,9 +182,9 @@ class Case:
         return InputIndex(var, size=2)
 
     def columns(self) -> dict[sympy.Symbol, TableRealization]:
-        """Each symbol's column, as its InputNode makes it."""
-        nodes = {s: InputNode(s, (), CAP, input=self.inputs[s]) for s in self.inputs}
-        return {s: node.columns[s] for s, node in nodes.items()}
+        """Each symbol's column, as the printer makes it."""
+        printer = TableLowering(self.inputs, cap=CAP)
+        return {s: printer.print(s).table(CAP) for s in self.inputs}
 
     def symbol(self, name: str) -> sympy.Symbol:
         (symbol,) = (s for s in self.inputs if s.name == name)
@@ -129,8 +192,9 @@ class Case:
 
     def lower(
         self, expr: sympy.Basic, cap: int = CAP
-    ) -> tuple[Node, cp_model.LinearExprT]:
-        root = TableLowering(self.inputs, cap=cap).lower(expr)
+    ) -> tuple[Printed, cp_model.LinearExprT]:
+        """expr normalized, printed and built into the case's model."""
+        root = _printed(self, expr, cap)
         return root, root.cp_expr(self.model)
 
     def elements(self) -> list[int]:
@@ -171,7 +235,7 @@ class Case:
 
     def assert_exact(
         self, expr: sympy.Basic, cap: int = CAP, bound: float = 0.5
-    ) -> Node:
+    ) -> Printed:
         plan, objective = self.lower(expr, cap)
         cost = self.model.new_int_var(-(2**60), 2**60, "cost")
         self.model.add(cost == objective)
@@ -185,21 +249,18 @@ class Case:
         return plan
 
 
-def _nodes(case: Case, expr: sympy.Basic, cap: int = CAP) -> dict[sympy.Basic, Node]:
-    """Each Node under expr lowered by one printer, by its sympy node, children
+def _nodes(case: Case, expr: sympy.Basic, cap: int = CAP) -> Views:
+    """Each node under expr as one printer prints it, by its sympy node, operands
     before their parents."""
-    nodes: dict[sympy.Basic, Node] = {}
+    printer = Recording(case.inputs, cap)
+    printer.print(printer.normalize(expr))
+    return Views(printer)
 
-    def gather(node: Node) -> None:
-        if node.expr in nodes:
-            assert nodes[node.expr] is node  # one Node per sympy node
-            return
-        for child in node.children:
-            gather(child)
-        nodes[node.expr] = node
 
-    gather(TableLowering(case.inputs, cap=cap).lower(expr))
-    return nodes
+def _printed(case: Case, expr: sympy.Basic, cap: int = CAP) -> Printed:
+    """expr, normalized, as a new printer prints it."""
+    printer = TableLowering(case.inputs, cap=cap)
+    return Printed(printer, printer.normalize(expr))
 
 
 def _literals(case: Case, count: int) -> list[sympy.Symbol]:
@@ -208,7 +269,7 @@ def _literals(case: Case, count: int) -> list[sympy.Symbol]:
     return [case.symbol(f"x{j}") for j in range(count)]
 
 
-def _on_inputs(node: Node) -> np.ndarray:
+def _on_inputs(node: Printed) -> np.ndarray:
     """node's table read at every entry of one table over its inputs, row-major in
     the order of its symbols sorted by sympy.default_sort_key: its values whatever
     position it took."""
@@ -224,7 +285,7 @@ def _on_inputs(node: Node) -> np.ndarray:
 # -------------------------------------------------------------------- the printer
 
 
-def test_the_printer_prints_children_first_and_shares_a_subexpression():
+def test_the_printer_prints_operands_first_and_a_shared_subexpression_once():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -234,51 +295,57 @@ def test_the_printer_prints_children_first_and_shares_a_subexpression():
     before = sympy.srepr(expr)
     nodes = _nodes(case, expr)
     order = list(nodes)
-    for expr_node, node in nodes.items():
-        for child in node.children:
-            assert order.index(child.expr) < order.index(expr_node)
-    holders = [n for n in nodes.values() if any(c is nodes[shared] for c in n.children)]
-    assert len(holders) == 2
-    assert len(order) == len(set(order))
+    assert order[-1] == expr and len(order) == len(set(order))
+    for node in order:
+        for operand in node.args:
+            if operand in nodes:
+                assert order.index(operand) < order.index(node)
+    # two parents read one realization of the shared sum
+    assert nodes.printer.print(shared) is nodes[shared].realization
     assert sympy.srepr(expr) == before
 
 
-def test_a_piecewise_arm_gets_no_node():
+def test_a_piecewise_arm_is_not_printed():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
     expr = sympy.Piecewise((a, a > 2), (a**2, True))
     nodes = _nodes(case, expr)
     assert not any(isinstance(e, ExprCondPair) for e in nodes)
-    assert [c.expr for c in nodes[expr].children] == [a, a > 2, a**2, sympy.true]
+    assert {a, a > 2, a**2, sympy.true} <= set(nodes)
+    assert [o.expr for o in nodes[expr].operands] == [a, a > 2, a**2, sympy.true]
 
 
-def test_each_node_has_the_class_its_sympy_class_calls_for():
+def test_each_node_is_realized_as_its_sympy_class_calls_for():
+    """What a print method returns for a linear reader: a column, a number, a table,
+    a scaled table, a Max kept linear or as its table, a gated charge, and a sum."""
     case = Case()
-    case.add_input("a", a=[1.0, 2.0, 4.0])
+    position = case.add_input("a", a=[1.0, 2.0, 4.0])
     case.literal("x")
     a, x = case.symbol("a"), case.symbol("x")
     root2 = sympy.sqrt(2)
     charge = RelayoutCharge(x, a, 3, 4, 5)
     expr = 3 * a + root2 * a**0.5 + sympy.Max(a, 2) + charge
     nodes = _nodes(case, expr)
-    assert type(nodes[a]) is InputNode
-    assert nodes[a].input is case.inputs[a]
-    assert type(nodes[sympy.Integer(3)]) is ConstantNode
-    assert type(nodes[root2]) is ConstantNode  # an operation on numbers
-    assert type(nodes[a**0.5]) is Node
-    assert type(nodes[3 * a]) is MulNode
-    assert type(nodes[sympy.Max(a, 2)]) is ExtremeNode
-    assert type(nodes[charge]) is RelayoutChargeNode
-    assert type(nodes[expr]) is AddNode
-    assert [c.expr for c in nodes[charge].children] == [x, a]  # its prices are data
+    column = nodes[a].realization
+    assert type(column) is TableRealization and column.index == position
+    assert list(column.values) == [1.0, 2.0, 4.0]
+    assert nodes[sympy.Integer(3)].table.index == UNIT
+    assert nodes[root2].table.index == UNIT  # an operation on numbers
+    assert type(nodes[a**0.5].realization) is TableRealization
+    assert list(nodes[3 * a].table.values) == [3.0, 6.0, 12.0]  # the column, scaled
+    assert isinstance(
+        nodes[sympy.Max(a, 2)].realization, (ExtremeRealization, TableRealization)
+    )
+    assert type(nodes[charge].realization) is GateRealization
+    assert type(nodes[expr].realization) is LinearRealization
 
 
 def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
-    """A node is printed by the print method of the nearest class along its MRO that
-    has one, so a subclass of Min is an ExtremeNode, and a class with none goes to
-    emptyPrinter, a Node. A printer keeps its Nodes: what two calls of lower share is
-    one Node."""
+    """print is the entry point. A node is printed by the print method of the nearest
+    class along its MRO that has one, so a subclass of Min is printed as a Min, and a
+    class with none goes to emptyPrinter. A printer keeps what it has printed: what
+    two calls of print share is one realization."""
 
     class Smallest(sympy.Min):
         pass
@@ -288,20 +355,25 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     printer = TableLowering(case.inputs, cap=CAP)
-    assert isinstance(printer, Printer)
+    assert isinstance(printer, Printer) and not hasattr(printer, "lower")
     smallest = Smallest(a, b)
     assert type(smallest) is Smallest
-    assert type(printer.lower(smallest)) is ExtremeNode
-    assert type(printer.lower(sympy.log(a))) is Node
-    assert type(printer.lower(sympy.log(sympy.Integer(2)) + sympy.pi)) is ConstantNode
-    root = printer.lower(sympy.log(a) + smallest)
-    assert [child.expr for child in root.children] == list(root.expr.args)
-    assert all(child is printer.lower(child.expr) for child in root.children)
-    assert root is printer.lower(root.expr)
+    by_min = printer.print(sympy.Min(a, b))
+    assert type(printer.print(smallest)) is type(by_min)
+    assert list(printer.print(smallest).table(CAP).values) == list(
+        by_min.table(CAP).values
+    )
+    assert type(printer.print(sympy.log(a))) is TableRealization
+    assert (
+        printer.print(sympy.log(sympy.Integer(2)) + sympy.pi).table(CAP).index == UNIT
+    )
+    root = printer.print(sympy.log(a) + smallest)
+    assert root is printer.print(sympy.log(a) + smallest)
+    assert type(root) is LinearRealization
     case.assert_exact(sympy.log(a) + smallest)
 
 
-def test_an_input_node_makes_its_position_on_its_variable():
+def test_the_printer_makes_a_symbols_position_on_its_variable():
     """The caller hands over a variable and values, and no position. Two symbols of
     one variable get equal positions, so one table over both is on one axis."""
     case = Case()
@@ -321,13 +393,13 @@ def test_an_input_node_makes_its_position_on_its_variable():
         ((division, [1.0, "two", 4.0]), "values that are not one number each"),
         ((~literal, [1.0, 2.0]), "a variable that is not an IntVar"),
     ):
-        node = InputNode(d0, (), CAP, input=refused)  # type: ignore[arg-type]
+        printer = TableLowering({d0: refused}, cap=CAP)  # type: ignore[dict-item]
         with pytest.raises(TableLoweringError, match=match) as caught:
-            node.realization
+            printer.print(d0)
         assert caught.value.node == d0
 
 
-def test_a_node_gathers_its_columns_from_its_children():
+def test_an_operation_is_over_its_symbols_columns():
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -335,35 +407,27 @@ def test_a_node_gathers_its_columns_from_its_children():
     expr = a**0.5 + 2 * b
     nodes = _nodes(case, expr)
     assert set(nodes[expr].columns) == {a, b}
-    assert all(nodes[expr].columns[s] is nodes[s].columns[s] for s in (a, b))
-    assert dict(nodes[2 * b].columns) == {b: nodes[b].columns[b]}
+    assert all(nodes[expr].columns[s] is nodes[s].table for s in (a, b))
+    assert dict(nodes[2 * b].columns) == {b: nodes[b].table}
     assert dict(nodes[sympy.Integer(2)].columns) == {}
 
 
-def test_a_node_makes_its_table_when_it_is_read():
-    """No lowering is passed in, and nothing visits: a node reads its children and
-    its cap, the first time its table is read."""
+def test_a_table_at_the_cap_is_made_and_one_past_it_is_refused():
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
     a = case.symbol("a")
-    leaf = InputNode(a, (), CAP, input=case.inputs[a])
-    half = ConstantNode(sympy.Float(0.5), (), CAP)
-    root = Node(a**0.5, (leaf, half), CAP)
-    assert not any("tabulated" in vars(node) for node in (root, leaf, half))
-    assert root.realization is root.table
-    assert all("tabulated" in vars(node) for node in (leaf, half))  # read by the root
-    assert root.table.index == position
-    assert list(root.table.values) == pytest.approx([1.0, 2**0.5, 2.0])
-    assert Node(a**0.5, (leaf, half), 3).table.index == position  # at the cap
-    small = Node(a**0.5, (leaf, half), 2)
-    assert small.tabulated is None
+    root = TableLowering(case.inputs, cap=3).print(a**0.5)  # at the cap
+    assert root.table(3) is root and root.table(3).index == position
+    assert list(root.table(3).values) == pytest.approx([1.0, 2**0.5, 2.0])
+    small = TableLowering(case.inputs, cap=2)
+    assert small._table(a**0.5) is None
     with pytest.raises(
         TableLoweringError,
         match="one table over its inputs would hold 3 entries, past the cap of 2",
     ):
-        small.realization
+        small.print(a**0.5)
     with pytest.raises(TableLoweringError, match="no input"):
-        InputNode(a, (), CAP).realization
+        TableLowering({}, cap=CAP).print(a**0.5)
 
 
 def _count_evaluations(monkeypatch) -> list[sympy.Basic]:
@@ -381,7 +445,7 @@ def _count_evaluations(monkeypatch) -> list[sympy.Basic]:
 
 
 def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
-    """Under a power the product is a table: one over its inputs and one from its
+    """Under a log the product is a table: one over its inputs and one from its
     parts are both 6 entries, past the cap of 5, so its own list is never computed.
     Read linearly it is a switch, which fits."""
     case = Case()
@@ -389,12 +453,18 @@ def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     calls = _count_evaluations(monkeypatch)
-    root = TableLowering(case.inputs, cap=5).lower(sympy.log(a**0.5 * b))
-    with pytest.raises(TableLoweringError, match="6 entries, past the cap of 5"):
-        root.realization
-    assert a**0.5 * b not in calls and root.expr not in calls
-    product = TableLowering(case.inputs, cap=5).lower(a**0.5 * b)
-    assert isinstance(product.realization, SwitchRealization)
+    root = sympy.log(a**0.5 * b)
+    with pytest.raises(
+        TableLoweringError, match="6 entries, past the cap of 5"
+    ) as caught:
+        TableLowering(case.inputs, cap=5).print(root)
+    assert caught.value.node == root
+    assert a**0.5 * b not in calls and root not in calls
+    product = TableLowering(case.inputs, cap=5).print(a**0.5 * b)
+    assert isinstance(product, SwitchRealization)
+    assert product.tabulated(5) is None
+    with pytest.raises(TableLoweringError, match="no table of it fits the cap of 5"):
+        product.table(5)
 
 
 def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
@@ -411,19 +481,20 @@ def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
     assert rows == {1: 1024, 2: 2048, 3: 4096, 4: 8192}
 
 
-def test_lower_realizes_nothing_and_a_refusal_leaves_the_model_as_it_was():
+def test_print_builds_nothing_and_a_refusal_leaves_the_model_as_it_was():
+    """The printer holds no model: a realization is built when its cp_expr is read. A
+    node that cannot be lowered is refused by print, before anything is built."""
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
-    root = TableLowering(case.inputs, cap=CAP).lower(a**0.5 * b)
-    assert type(root) is MulNode and root.expr == a**0.5 * b
-    assert "realization" not in vars(root) and "tabulated" not in vars(root)
+    size = len(case.model.proto.constraints), len(case.model.proto.variables)
+    root = TableLowering(case.inputs, cap=CAP).print(a**0.5 * b)
+    assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
     root.cp_expr(case.model)
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
-    wide = TableLowering(case.inputs, cap=4).lower(sympy.log(a**0.5 * b))
     with pytest.raises(TableLoweringError, match="past the cap of 4"):
-        wide.cp_expr(case.model)
+        TableLowering(case.inputs, cap=4).print(sympy.log(a**0.5 * b))
     assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
 
 
@@ -446,10 +517,9 @@ def test_a_realization_is_abstract_and_a_table_is_one():
     assert table.finite
     assert not TableRealization(values=[1.0, np.inf, 4.0], index=position).finite
     a = case.symbol("a")
-    assert isinstance(
-        TableLowering(case.inputs, cap=CAP).lower(a**0.5).realization,
-        AbstractRealization,
-    )
+    printed = TableLowering(case.inputs, cap=CAP).print(a**0.5)
+    assert isinstance(printed, AbstractRealization)
+    assert printed.table(CAP) is printed  # a table is its own table
 
 
 def test_a_list_must_have_its_index_size():
@@ -524,7 +594,7 @@ def test_a_position_read_twice_in_one_build_is_built_once():
 # ------------------------------------------------------------------- a node's list
 
 
-def _points(node: Node) -> tuple[list[sympy.Symbol], list[tuple[float, ...]]]:
+def _points(node: Printed) -> tuple[list[sympy.Symbol], list[tuple[float, ...]]]:
     """node's free symbols, sorted by sympy.default_sort_key, and their values at each
     entry of one table over its inputs: their positions in that order, row-major, the
     last fastest."""
@@ -537,11 +607,17 @@ def _points(node: Node) -> tuple[list[sympy.Symbol], list[tuple[float, ...]]]:
     return symbols, list(zip(*arguments))
 
 
-def _stage_1(node: Node) -> np.ndarray:
+def _stage_1(node: Printed) -> np.ndarray:
     """node's list as Stage 1 computed it: its whole expression lambdified with the
     numpy module over its inputs, point by point when it takes scalars only."""
-    symbols, points = _points(node)
-    func = sympy.lambdify(symbols, node.expr, modules="numpy")
+    return _whole(node.expr, *_points(node))
+
+
+def _whole(
+    expr: sympy.Basic, symbols: list[sympy.Symbol], points: list[tuple[float, ...]]
+) -> np.ndarray:
+    """expr lambdified whole with the numpy module, at points."""
+    func = sympy.lambdify(symbols, expr, modules="numpy")
     with np.errstate(all="ignore"):
         try:
             result = np.asarray(func(*np.array(points).T), dtype=float)
@@ -551,7 +627,7 @@ def _stage_1(node: Node) -> np.ndarray:
 
 
 def _list(case: Case, expr: sympy.Basic) -> list[float]:
-    return list(_on_inputs(TableLowering(case.inputs, cap=CAP).lower(expr)))
+    return list(_on_inputs(_printed(case, expr)))
 
 
 def test_a_list_is_row_major_with_the_last_position_fastest():
@@ -610,14 +686,16 @@ def test_a_value_that_is_not_finite_is_refused_at_its_node_under_a_finite_root()
         (sympy.oo, sympy.Piecewise((sympy.oo, a > 4), (a, True))),
         (b, sympy.Min(a, b)),
     ):
-        root = TableLowering(case.inputs, cap=CAP).lower(expr)
-        assert np.all(np.isfinite(_stage_1(root)))
+        points = list(zip(*(case.inputs[s][1] for s in (a, b))))
+        assert np.all(np.isfinite(_whole(expr, [a, b], points)))
         with pytest.raises(TableLoweringError, match="not finite") as caught:
             case.lower(expr)
         assert caught.value.node == child
 
 
-def test_a_node_is_evaluated_once_and_only_when_it_is_read(monkeypatch):
+def test_a_node_is_evaluated_once(monkeypatch):
+    """A node's list is computed once by a printer, however many parents read it and
+    however often it is printed or its table read."""
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -626,17 +704,15 @@ def test_a_node_is_evaluated_once_and_only_when_it_is_read(monkeypatch):
     shared = a**0.5 + b
     expr = shared * a + sympy.log(shared)
     nodes = _nodes(case, expr)
-    assert calls == []  # making the nodes realizes nothing
-    computed = [e for e in nodes if e.free_symbols and not isinstance(e, sympy.Symbol)]
+    assert sympy.log(shared) in calls and a**0.5 in calls
+    assert len(calls) == len(set(calls))
+    first = list(calls)
     for _ in range(2):
-        for e in computed:
-            assert nodes[e].table is not None
-    assert len(calls) == len(computed) == len(set(calls))
-    calls.clear()
-    TableLowering(case.inputs, cap=CAP).lower(expr).cp_expr(case.model)
-    # every node computed is under the root, and computed once
-    assert len(calls) == len(set(calls)) and set(calls) <= set(computed)
-    assert sympy.log(shared) in calls
+        for e in list(nodes):
+            assert nodes.printer.print(e).table(CAP) is not None
+    nodes[expr].cp_expr(case.model)
+    assert len(set(calls)) == len(calls)
+    assert [e for e in calls if e in first] == first
 
 
 # ---------------------------------------------------------------- exact lowering
@@ -758,7 +834,7 @@ def test_an_entry_too_large_for_int64_sums_is_refused():
     a = case.symbol("a")
     with pytest.raises(TableLoweringError, match="2\\^50") as caught:
         case.lower(1e14 * a)
-    assert caught.value.node == 1e14 * a
+    assert caught.value.node is None  # refused by the build, which reads no node
 
 
 def test_a_symbol_with_no_input_is_refused_by_name():
@@ -809,7 +885,7 @@ def test_a_node_is_lambdified_only_when_the_core_has_no_function(monkeypatch):
     calls = _count_lambdify(monkeypatch)
     nodes = _nodes(case, expr)
     listed = _on_inputs(nodes[expr])
-    assert len([n for n in nodes.values() if type(n) is not InputNode]) > 300
+    assert len([e for e in nodes if not e.is_Symbol]) > 300
     assert {str(c) for c in calls} == {"sec(operand0)", "sinc(operand0)"}
     first = len(calls)
     _on_inputs(_nodes(case, expr)[expr])
@@ -930,7 +1006,7 @@ def test_the_cost_models_objective_has_the_annealers_values(rows):
     evaluator, and so is the lowered objective, within its rounding. At decode it
     holds the delivery-price functions, which take scalars only."""
     case, expr = _projection(rows)
-    root = TableLowering(case.inputs, cap=CAP).lower(expr)
+    root = _printed(case, expr)
     prices = [f for f in expr.atoms(sympy.Function) if "delivery_price" in str(f)]
     assert bool(prices) == (rows == 8)
     symbols, points = _points(root)
@@ -1109,7 +1185,7 @@ def test_the_way_with_fewer_entries_wins():
     case.add_input("k", k=[1.0, 2.0, 3.0])
     case.add_input("a", a=[1.0, 2.0, 4.0, 8.0])
     k, a = case.symbol("k"), case.symbol("a")
-    root = TableLowering(case.inputs, cap=CAP).lower(k * a**0.5)
+    root = _printed(case, k * a**0.5)
     assert isinstance(root.realization, SwitchRealization)
     assert root.realization.entries < root.table.entries
 
