@@ -574,13 +574,27 @@ class TableLowering(Printer):
         return _sum(operands, tuple(self._inputs(expr)))
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
-        """A product of several operands is a switch, its constants applied to its
-        rest, where that has fewer entries than its one table (rule 3). Otherwise a
-        quotient is one table (_quotient), a constant times one operand is the operand
-        scaled in float, and any other product is declined."""
+        """A product of several operands is a switch (_switch) on the one with the
+        fewest distinct values among those whose table fits the cap, the first in
+        expr's order on a tie, over the others' product, its constants applied to that
+        rest. Otherwise a quotient is one table (_quotient), a constant times one
+        operand is the operand scaled in float, and any other product is declined."""
         constants = [factor for factor in expr.args if not factor.free_symbols]
         operands = [factor for factor in expr.args if factor.free_symbols]
-        switch = self._switch(expr, operands) if len(operands) > 1 else None
+        switch: AbstractRealization | None = None
+        if len(operands) > 1:
+            tables = {
+                operand: self._table(operand)
+                for operand in operands
+                if math.prod(p.size for p in self._inputs(operand)) <= self.cap
+            }
+            if tables:
+                factor = min(tables, key=lambda o: len(np.unique(tables[o].values)))
+                values, index = _ranked(tables[factor])
+                index = self._ranks.setdefault(index, index)
+                rest = self._print(sympy.Mul(*(o for o in operands if o != factor)))
+                positions = tuple(self._inputs(expr))
+                switch = _switch(values, index, rest, positions, self.cap)
         if switch is None and any(_divides(factor) for factor in expr.args):
             return self._quotient(expr)
         realization = self._print(operands[0]) if len(operands) == 1 else switch
@@ -588,31 +602,6 @@ class TableLowering(Printer):
             return realization
         coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
         return realization.scaled(coefficient)
-
-    def _switch(
-        self, expr: sympy.Mul, operands: list[sympy.Basic]
-    ) -> AbstractRealization | None:
-        """The switch on the operand with the fewest distinct values among those with
-        a table within the cap, the first in expr's order on a tie; None where expr's
-        one table has no more entries. The rest is the other operands' product. A
-        factor of one value is a constant on its inputs: it scales the rest."""
-        tables = {
-            operand: self._table(operand)
-            for operand in operands
-            if math.prod(p.size for p in self._inputs(operand)) <= self.cap
-        }
-        if not tables:
-            return None
-        factor = min(tables, key=lambda operand: len(np.unique(tables[operand].values)))
-        values, index = _ranked(tables[factor])
-        index = self._ranks.setdefault(index, index)
-        others = [operand for operand in operands if operand != factor]
-        rest = self._print(others[0] if len(others) == 1 else sympy.Mul(*others))
-        if len(values) == 1:
-            return rest.scaled(values[0])
-        switch = SwitchRealization(values, index, rest, tuple(self._inputs(expr)))
-        entries = math.prod(position.size for position in switch.positions)
-        return switch if entries > self.cap or switch.entries() < entries else None
 
     def _quotient(self, expr: sympy.Mul) -> TableRealization:
         """expr as one table: the product of its other factors divided by the product
@@ -721,6 +710,23 @@ def _joined(switches: list[SwitchRealization]) -> SwitchRealization:
     positions = tuple(dict.fromkeys(p for s in switches for p in s.positions))
     rest = _sum([switch.rest for switch in switches], positions)
     return SwitchRealization(switches[0].values, switches[0].index, rest, positions)
+
+
+def _switch(
+    values: tuple[float, ...],
+    index: Index,
+    rest: AbstractRealization,
+    positions: tuple[Index, ...],
+    cap: int,
+) -> AbstractRealization | None:
+    """values[index] * rest. A factor of one value is a constant on its inputs: it
+    scales the rest. Otherwise the switch where one table over positions is past cap
+    or has more entries (rule 3), and None where that table is kept."""
+    if len(values) == 1:
+        return rest.scaled(values[0])
+    switch = SwitchRealization(values, index, rest, positions)
+    entries = math.prod(position.size for position in positions)
+    return switch if entries > cap or switch.entries() < entries else None
 
 
 def _ranked(table: TableRealization) -> tuple[tuple[float, ...], Index]:
