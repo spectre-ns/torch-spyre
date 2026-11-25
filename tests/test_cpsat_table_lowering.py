@@ -457,7 +457,7 @@ def test_a_realization_is_abstract_and_a_table_is_one():
     class Built(AbstractRealization):
         """A realization that builds itself but cannot be asked for its table."""
 
-        def build(self, model: cp_model.CpModel, built: dict) -> cp_model.LinearExprT:
+        def build(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
             return 0
 
     with pytest.raises(TypeError):
@@ -1031,10 +1031,11 @@ def test_products_with_one_factor_are_one_switch_over_their_rests_sum():
     assert [len(_named(case.model, name)) for name in ("switch", "case")] == [1, 3]
 
 
-def test_a_position_and_a_realization_are_built_once_per_build():
+def test_a_position_and_a_realization_are_built_once_per_model():
     """Two factors on one buffer with equal ranks share one CompactIndex, and their
     switches one rest: one rank lookup and one list. A position that reads the rank
-    twice adds one lookup."""
+    twice adds one lookup. A second build in the model adds nothing; a build in
+    another model adds it all again."""
     case = Case()
     position = case.add_input("k", f=[1.0, 1.0, 2.0], h=[5.0, 5.0, 7.0])
     f, h, (a, _, _) = case.symbol("f"), case.symbol("h"), _abc(case)
@@ -1045,6 +1046,12 @@ def test_a_position_and_a_realization_are_built_once_per_build():
     assert sorted(_tables(case.model)) == [3, 4]
     CombineIndex(rank, rank).cp_expr(case.model)
     assert sorted(_tables(case.model)) == [3, 3, 4]
+    plan.cp_expr(case.model)
+    assert sorted(_tables(case.model)) == [3, 3, 4]
+    other = cp_model.CpModel()
+    other.proto.copy_from(case.model.proto)
+    plan.cp_expr(other)
+    assert sorted(_tables(other)) == [3, 3, 3, 4, 4]
 
 
 def test_a_product_of_three_operands_is_a_switch_inside_a_switch():

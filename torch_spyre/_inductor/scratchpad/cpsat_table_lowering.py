@@ -18,12 +18,13 @@ Every cost value is computed before the solve, in floating point, and CP-SAT onl
 works out which entry of a table applies: ``value == values[index]``. Three layers:
 
 - values: ``Index``, a position, and ``AbstractRealization``, what a node is realized
-  as: a list on a position or a linear form of its operands. They hold no model;
+  as: a list on a position or a linear form of its operands;
 - the printer: ``TableLowering``, a sympy ``Printer`` whose print of a node is the
   node's realization. It prints a node's operands first, reads their tables, and
   computes the node's list on a position it builds from the node's inputs;
 - the build: a realization's ``cp_expr`` rounds it onto ``COST_SCALE`` and adds it to
-  the model, building each position and realization once per build. Only ``cp_expr``
+  the model. Each position and realization keeps its expression in the model it was
+  last built in, so one held by several readers is built once. Only ``cp_expr``
   methods touch the model.
 
 A sum stays linear, so no table crosses two of its terms. A product of several
@@ -63,8 +64,6 @@ MAX_PRODUCT = 2**60
 
 # What CP-SAT takes as a linear expression: a LinearExpr, an IntVar or an int.
 CpExpr: TypeAlias = cp_model.LinearExprT
-# What one build has built: a position by its value, a realization by identity.
-Built: TypeAlias = dict[Any, CpExpr]
 
 
 class TableLoweringError(Exception):
@@ -87,20 +86,21 @@ class TableLoweringError(Exception):
 class Index(ABC):
     """A position: a map from the inputs' values to 0 .. size - 1. Each kind of step is
     a frozen dataclass holding the positions it is made from, so equal steps are one
-    position. It holds no model."""
+    position."""
 
     size: int  # the number of positions
+    _built: tuple[cp_model.CpModel, CpExpr] | None = None  # not a dataclass field
 
-    def cp_expr(self, model: cp_model.CpModel, built: Built | None = None) -> CpExpr:
-        """The position in model, built once per build by its value. A call with no
-        built starts a build."""
-        built = {} if built is None else built
-        if self not in built:
-            built[self] = self.build(model, built)
-        return built[self]
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """The position in model, built once per model."""
+        built = self._built
+        if built is None or built[0] is not model:
+            built = (model, self.build(model))
+            object.__setattr__(self, "_built", built)
+        return built[1]
 
     @abstractmethod
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         """The position in model, its parts read through their cp_expr."""
 
     def entries(self) -> int:
@@ -122,7 +122,7 @@ class InputIndex(Index):
     size: int
     lo: int = 0
 
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         return self.var - self.lo if self.lo else self.var
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
@@ -135,7 +135,7 @@ class UnitIndex(Index):
 
     size: int = field(default=1, init=False)
 
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         return 0
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
@@ -153,9 +153,9 @@ class CombineIndex(Index):
     def __post_init__(self) -> None:
         object.__setattr__(self, "size", self.left.size * self.right.size)
 
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
-        left = self.left.cp_expr(model, built)
-        return left * self.right.size + self.right.cp_expr(model, built)
+    def build(self, model: cp_model.CpModel) -> CpExpr:
+        left = self.left.cp_expr(model)
+        return left * self.right.size + self.right.cp_expr(model)
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return self.left.on_grid(grid) * self.right.size + self.right.on_grid(grid)
@@ -175,9 +175,9 @@ class CompactIndex(Index):
     def entries(self) -> int:
         return len(self.remap)
 
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         rank = model.new_int_var(0, self.size - 1, "rank")
-        model.add_element(self.parent.cp_expr(model, built), list(self.remap), rank)
+        model.add_element(self.parent.cp_expr(model), list(self.remap), rank)
         return rank
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
@@ -212,19 +212,21 @@ def _rounded(values: Any) -> list[int]:
 
 
 class AbstractRealization(ABC):
-    """What the printer returns for a node. It holds no model, and only finite
-    values."""
+    """What the printer returns for a node. It holds only finite values."""
 
-    def cp_expr(self, model: cp_model.CpModel, built: Built | None = None) -> CpExpr:
-        """The realization in model, built once per build: a realization that several
-        readers hold is one expression. A call with no built starts a build."""
-        built = {} if built is None else built
-        if self not in built:
-            built[self] = self.build(model, built)
-        return built[self]
+    _built: tuple[cp_model.CpModel, CpExpr] | None = None  # not a dataclass field
+
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """The realization in model, built once per model: a realization that several
+        readers hold is one expression."""
+        built = self._built
+        if built is None or built[0] is not model:
+            built = (model, self.build(model))
+            object.__setattr__(self, "_built", built)
+        return built[1]
 
     @abstractmethod
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         """The realization in model, in COST_SCALE units, its operands read through
         their cp_expr."""
 
@@ -260,18 +262,18 @@ class TableRealization(AbstractRealization):
             raise TableLoweringError(None, "a value that is not finite")
         object.__setattr__(self, "values", values)
 
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         """A constant or affine list adds no table; any other is one add_element."""
         entries = _rounded(self.values)
         step = entries[1] - entries[0] if len(entries) > 1 else 0
         if all(entry == entries[0] + i * step for i, entry in enumerate(entries)):
             if step == 0:
                 return entries[0]
-            return entries[0] + step * self.index.cp_expr(model, built)
+            return entries[0] + step * self.index.cp_expr(model)
         target = model.new_int_var_from_domain(
             cp_model.Domain.from_values(sorted(set(entries))), "table"
         )
-        model.add_element(self.index.cp_expr(model, built), entries, target)
+        model.add_element(self.index.cp_expr(model), entries, target)
         return target
 
     def table(self, cap: int) -> TableRealization:
@@ -331,11 +333,11 @@ class SumRealization(SymbolicRealization):
         if not math.isfinite(self.constant):
             raise TableLoweringError(None, "a value that is not finite")
 
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         total = _rounded([self.constant])[0]
         exprs = []
         for term in self.terms:
-            expr = term.cp_expr(model, built)
+            expr = term.cp_expr(model)
             if isinstance(expr, int):
                 total += expr
             else:
@@ -375,13 +377,13 @@ class SwitchRealization(SymbolicRealization):
     rest: AbstractRealization
     positions: tuple[Index, ...]
 
-    def build(self, model: cp_model.CpModel, built: Built) -> CpExpr:
+    def build(self, model: cp_model.CpModel) -> CpExpr:
         """A whole value is g == v * w; a fraction, p / q with q = denominator(), is
         the floor: q * g <= p * w <= q * g + q - 1."""
-        w = self.rest.cp_expr(model, built)
+        w = self.rest.cp_expr(model)
         q = self.denominator()
         cases = [model.new_bool_var("case") for _ in self.values]
-        model.add_map_domain(self.index.cp_expr(model, built), cases)
+        model.add_map_domain(self.index.cp_expr(model), cases)
         g = model.new_int_var(*self.bounds(), "switch")
         for value, case in zip(self.values, cases):
             if value.is_integer():
@@ -511,6 +513,8 @@ class TableLowering(Printer):
         self.inputs = inputs
         self.cap = cap
         self._realizations: dict[sympy.Basic, AbstractRealization] = {}
+        # one instance per rank, so equal ranks are one lookup
+        self._ranks: dict[Index, Index] = {}
 
     def print(self, expr: sympy.Basic) -> AbstractRealization:
         """expr's realization; raises TableLoweringError for what cannot be lowered."""
@@ -646,6 +650,7 @@ class TableLowering(Printer):
             return None
         factor = min(tables, key=lambda operand: len(np.unique(tables[operand].values)))
         values, index = _ranked(tables[factor])
+        index = self._ranks.setdefault(index, index)
         others = [operand for operand in operands if operand != factor]
         rest = self._print(others[0] if len(others) == 1 else sympy.Mul(*others))
         if len(values) == 1:
