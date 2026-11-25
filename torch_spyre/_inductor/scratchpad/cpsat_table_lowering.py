@@ -323,18 +323,13 @@ class SymbolicRealization(AbstractRealization):
 
 @dataclass(frozen=True, eq=False)
 class SumRealization(SymbolicRealization):
-    """constant + sum(terms)."""
+    """sum(terms). A constant is a term on UNIT."""
 
-    constant: float
     terms: tuple[AbstractRealization, ...]
     positions: tuple[Index, ...]
 
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.constant):
-            raise TableLoweringError(None, "a value that is not finite")
-
     def build(self, model: cp_model.CpModel) -> CpExpr:
-        total = _rounded([self.constant])[0]
+        total = 0
         exprs = []
         for term in self.terms:
             expr = term.cp_expr(model)
@@ -347,20 +342,18 @@ class SumRealization(SymbolicRealization):
     def _list(
         self, index: Index, grid: Mapping[Index, np.ndarray], cap: int
     ) -> np.ndarray:
-        values = np.full(index.size, self.constant)
+        values = np.zeros(index.size)
         for term in self.terms:
             values = values + _on(term.table(cap), index, grid)
         return values
 
     def scaled(self, factor: float) -> SumRealization:
         terms = tuple(term.scaled(factor) for term in self.terms)
-        return SumRealization(factor * self.constant, terms, self.positions)
+        return SumRealization(terms, self.positions)
 
     def bounds(self) -> tuple[int, int]:
-        constant = _rounded([self.constant])[0]
         ends = [term.bounds() for term in self.terms]
-        low = constant + sum(end[0] for end in ends)
-        return low, constant + sum(end[1] for end in ends)
+        return sum(end[0] for end in ends), sum(end[1] for end in ends)
 
     def entries(self) -> int:
         return sum(term.entries() for term in self.terms)
@@ -578,45 +571,7 @@ class TableLowering(Printer):
         if not expr.free_symbols:
             return None
         operands = [self._print(operand) for operand in expr.args]
-        return self._sum(operands, tuple(self._inputs(expr)))
-
-    def _sum(
-        self, operands: Sequence[AbstractRealization], positions: tuple[Index, ...]
-    ) -> SumRealization:
-        """operands added, kept linear. Lists on one position are added in float: one
-        lookup, one rounding. Switches on one factor are one switch. Any other
-        symbolic operand, as sqrt(2) * (a + b) is (sympy distributes only a number),
-        stays one term."""
-        constant = 0.0
-        lists: dict[Index, TableRealization] = {}
-        switches: dict[tuple[Index, tuple[float, ...]], list[SwitchRealization]] = {}
-        others: list[AbstractRealization] = []
-        for operand in operands:
-            if isinstance(operand, SwitchRealization):
-                switches.setdefault((operand.index, operand.values), []).append(operand)
-            elif isinstance(operand, TableRealization):
-                index = operand.index
-                if index == UNIT:
-                    constant += float(operand.values[0])
-                elif index in lists:
-                    # inf is refused by TableRealization
-                    with np.errstate(over="ignore"):
-                        values = lists[index].values + operand.values
-                    lists[index] = TableRealization(values=values, index=index)
-                else:
-                    lists[index] = operand
-            else:
-                others.append(operand)
-        joined = [self._joined(group) for group in switches.values()]
-        return SumRealization(constant, (*lists.values(), *joined, *others), positions)
-
-    def _joined(self, switches: list[SwitchRealization]) -> SwitchRealization:
-        """Switches on one factor as one, over the sum of their rests: one w."""
-        if len(switches) == 1:
-            return switches[0]
-        positions = tuple(dict.fromkeys(p for s in switches for p in s.positions))
-        rest = self._sum([switch.rest for switch in switches], positions)
-        return SwitchRealization(switches[0].values, switches[0].index, rest, positions)
+        return _sum(operands, tuple(self._inputs(expr)))
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
         """A product of several operands is a switch, its constants applied to its
@@ -729,6 +684,43 @@ class TableLowering(Printer):
             return realization.table(self.cap)
         except TableLoweringError as exc:
             raise TableLoweringError(expr, exc.reason) from exc
+
+
+def _sum(
+    operands: Sequence[AbstractRealization], positions: tuple[Index, ...]
+) -> SumRealization:
+    """operands added, kept linear. Lists on one position, constants among them, are
+    added in float: one lookup, one rounding. Switches on one factor are one switch.
+    Any other symbolic operand, as sqrt(2) * (a + b) is (sympy distributes only a
+    number), stays one term."""
+    lists: dict[Index, TableRealization] = {}
+    switches: dict[tuple[Index, tuple[float, ...]], list[SwitchRealization]] = {}
+    others: list[AbstractRealization] = []
+    for operand in operands:
+        if isinstance(operand, SwitchRealization):
+            switches.setdefault((operand.index, operand.values), []).append(operand)
+        elif isinstance(operand, TableRealization):
+            index = operand.index
+            if index in lists:
+                # inf is refused by TableRealization
+                with np.errstate(over="ignore"):
+                    values = lists[index].values + operand.values
+                lists[index] = TableRealization(values=values, index=index)
+            else:
+                lists[index] = operand
+        else:
+            others.append(operand)
+    joined = [_joined(group) for group in switches.values()]
+    return SumRealization((*lists.values(), *joined, *others), positions)
+
+
+def _joined(switches: list[SwitchRealization]) -> SwitchRealization:
+    """Switches on one factor as one, over the sum of their rests: one w."""
+    if len(switches) == 1:
+        return switches[0]
+    positions = tuple(dict.fromkeys(p for s in switches for p in s.positions))
+    rest = _sum([switch.rest for switch in switches], positions)
+    return SwitchRealization(switches[0].values, switches[0].index, rest, positions)
 
 
 def _ranked(table: TableRealization) -> tuple[tuple[float, ...], Index]:

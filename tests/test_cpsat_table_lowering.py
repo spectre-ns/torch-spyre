@@ -474,11 +474,9 @@ def test_a_realization_with_a_value_that_is_not_finite_is_not_made():
     """Refused naming no node: the printer names the node it was printing."""
     case = Case()
     position = case.add_input("a", a=[1.0, 2.0, 4.0])
-    table = TableRealization(values=[1.0, 2.0, 4.0], index=position)
     for make in (
         lambda: TableRealization(values=[1.0, np.inf, 4.0], index=position),
         lambda: TableRealization(values=[1.0, np.nan, 4.0], index=position),
-        lambda: SumRealization(-np.inf, (table,), (position,)),
     ):
         with pytest.raises(TableLoweringError, match="not finite") as caught:
             make()
@@ -827,8 +825,10 @@ def test_a_sum_is_a_sum_realization_of_its_operands_realizations():
     printer = TableLowering(case.inputs, cap=CAP)
     root = printer.print(sympy.log(b) + a**0.5 + 2.5)
     assert type(root) is SumRealization
-    assert root.constant == 2.5
-    assert set(root.terms) == {printer.print(a**0.5), printer.print(sympy.log(b))}
+    (constant,) = [term for term in root.terms if term.index == UNIT]
+    assert list(constant.values) == [2.5]
+    operands = {printer.print(a**0.5), printer.print(sympy.log(b))}
+    assert set(root.terms) == {constant, *operands}
     assert root.positions == (pa, pb)
     assert list(root.table(CAP).values) == pytest.approx(
         [2.5 + va**0.5 + math.log(vb) for va in (1.0, 2.0, 4.0) for vb in (1.0, 3.0)]
@@ -849,10 +849,11 @@ def test_a_constant_times_one_operand_is_the_operand_with_the_constant_applied()
     assert type(scaled) is TableRealization and scaled.index == pa
     assert list(scaled.values) == [7 * value for value in roots.values]
     total = printer.print(-2 * (a**0.5 + b + 0.25))
-    assert type(total) is SumRealization and total.constant == -0.5
+    assert type(total) is SumRealization
     assert {term.index: list(term.values) for term in total.terms} == {
         pa: [-2 * value for value in roots.values],
         pb: [-2.0, -6.0],
+        UNIT: [-0.5],
     }
     quotient = printer.print(98 / a)
     assert type(quotient) is TableRealization
@@ -866,7 +867,7 @@ def test_a_coefficient_on_a_sum_is_applied_before_the_rounding():
     a, b = case.symbol("a"), case.symbol("b")
     expr = 7 * (a**0.5 + b**0.5 + sympy.Rational(1, 3))
     plan = case.assert_exact(expr)
-    assert type(plan) is SumRealization and len(plan.terms) == 2
+    assert type(plan) is SumRealization and len(plan.terms) == 3
     _, objective = case.lower(expr)
     cost = case.model.new_int_var(0, 2**40, "at")
     case.model.add(cost == objective)
