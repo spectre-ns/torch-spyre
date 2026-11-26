@@ -47,7 +47,11 @@ from ortools.sat.python import cp_model
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
-from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
+    divides,
+    numpy_eval,
+    operands,
+)
 
 # One cost unit is COST_SCALE objective units: a table entry is
 # rint(COST_SCALE * value).
@@ -366,7 +370,7 @@ class TableLowering(Printer):
             try:
                 realization = super()._print(expr, **kwargs)
                 if realization is None:
-                    realization = self._operation(expr, expr.args)
+                    realization = self._operation(expr, operands(expr))
             except TableLoweringError as exc:
                 if exc.node is not None:
                     raise
@@ -433,20 +437,16 @@ class TableLowering(Printer):
         return SumRealization(constant, terms, tuple(self._inputs(expr)))
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
-        """A constant times one operand is the operand scaled in float. Any other
-        product is declined. A quotient is a product too: 98/a is 98 times 1/a, a hair
-        under 2 at a = 49, which floor and the comparisons read as 2 (the numpy core's
-        NEAR_INTEGER)."""
+        """A constant times one operand is the operand scaled in float. A product that
+        divides (divides), 98/a or a/49, is declined: its table divides once, in the
+        numpy core, so 98/a is 2 at a = 49, where 98 times the table of 1/a is under
+        2. Any other product is declined."""
         constants = [factor for factor in expr.args if not factor.free_symbols]
-        operands = [factor for factor in expr.args if factor.free_symbols]
-        if len(operands) != 1:
+        factors = [factor for factor in expr.args if factor.free_symbols]
+        if len(factors) != 1 or any(divides(factor) for factor in expr.args):
             return None
         coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
-        return self._print(operands[0]).scaled(coefficient)
-
-    def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
-        """Over its arms' values and conditions: an ExprCondPair is not printed."""
-        return self._operation(expr, [part for pair in expr.args for part in pair.args])
+        return self._print(factors[0]).scaled(coefficient)
 
     def emptyPrinter(self, expr: sympy.Basic) -> None:
         """Any other node is declined. sympy's own returns str(expr)."""

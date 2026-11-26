@@ -27,7 +27,11 @@ from sympy.logic.boolalg import Boolean
 from sympy.utilities.lambdify import implemented_function
 
 from torch_spyre._inductor.scratchpad import cpsat_expr_printer
-from torch_spyre._inductor.scratchpad.cost_expr_numpy import NUMPY_FUNC_MAP, numpy_eval
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
+    NUMPY_FUNC_MAP,
+    numpy_eval,
+    operands,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 x, y = sympy.symbols("split_x split_y", integer=True, positive=True)
@@ -36,20 +40,16 @@ MENU = {x: [1, 2, 4, 8], y: [8, 2, 4, 1]}
 
 
 def _value(expr: sympy.Basic, env: dict[sympy.Symbol, Any]) -> Any:
-    """expr's value where each symbol has its value in env: the core applied to each
-    node's operands' values, from the leaves up, as a caller of the core does."""
+    """expr's value where each symbol has its value in env: the core applied to the
+    values of each node's operands (operands), from the leaves up, as a caller of the
+    core does."""
     if expr in env:
         return env[expr]
     if expr is sympy.true or expr is sympy.false:
         return bool(expr)
     if expr.is_Number:
         return int(expr) if expr.is_Integer else float(expr)
-    operands = (
-        [part for pair in expr.args for part in pair.args]
-        if expr.is_Piecewise
-        else expr.args
-    )
-    return numpy_eval(expr, [_value(operand, env) for operand in operands])
+    return numpy_eval(expr, [_value(operand, env) for operand in operands(expr)])
 
 
 def _sympy_value(expr: sympy.Basic, point: dict[sympy.Symbol, int]) -> Any:
@@ -164,28 +164,23 @@ def test_a_plain_int_stays_exact_at_any_size():
     assert numpy_eval(x * y * 2, floats) == math.prod(floats)
 
 
-def test_floor_ceiling_and_the_comparisons_read_a_float_near_an_integer_as_it():
-    """A product computed in another order than sympy's is a few ulps off its exact
-    value: 98 * (1/49) is one below 2, and 0.1 * 3 * 10 one above 3. floor, ceiling,
-    the relationals and KroneckerDelta read each as its integer, over floats and over
-    an object array, as the printer holds its candidates. A float farther than
-    NEAR_INTEGER from an integer, and an exact int, are as they are."""
-    below, above = 98 * (1 / 49), 0.1 * 3 * 10
-    t = sympy.Symbol("t", real=True)  # floor of an integer symbol is the symbol
-    assert math.floor(below) == 1 and math.ceil(above) == 4
+def test_a_mul_divides_once_by_the_factors_it_divides_by():
+    """98/x is Mul(98, Pow(x, -1)) and x/49 is Mul(1/49, x): from the values of 1/x
+    and 1/49 each would be a product, and 98 * (1/49) is one ulp under 2. A Mul reads a
+    power it divides by as its base and a rational as its numerator and denominator
+    (operands), and divides once, over floats and over the printer's exact ints."""
+    assert math.floor(98 * (1 / 49)) == 1
+    assert operands(98 / x) == [98, x] and operands(x / 49) == [x]
+    assert set(operands(x**2 * y / 3)) == {x**2, y} == set(operands(x**2 * y))
+    assert set(operands(x * y**-2)) == {x, y}
     for dtype in (float, object):
-        column = np.asarray([below, above, 2.5], dtype=dtype)
-        assert list(numpy_eval(sympy.floor(t), [column])) == [2, 3, 2]
-        assert list(numpy_eval(sympy.ceiling(t), [column])) == [2, 3, 3]
-        integers = np.asarray([2, 3, 2], dtype=object)
-        delta = numpy_eval(sympy.KroneckerDelta(x, y), [column, integers])
-        assert list(delta) == [True, True, False]
-    for relation in (sympy.Eq, sympy.Ne, sympy.Lt, sympy.Le, sympy.Gt, sympy.Ge):
-        assert numpy_eval(relation(x, y), [below, 2]) == bool(relation(2, 2))
-        assert numpy_eval(relation(x, y), [2, above - 1]) == bool(relation(2, 2))
-    assert numpy_eval(sympy.floor(t), [2 - 1e-9]) == 1
-    assert numpy_eval(sympy.floor(t), [2**70 + 1]) == 2**70 + 1
-    assert numpy_eval(x > y, [2**70 + 1, 2**70])
+        column = np.asarray([49, 7, 98], dtype=dtype)
+        assert list(_value(98 / x, {x: column})) == [2, 14, 1]
+        assert list(_value(x / 49, {x: column})) == [1, 1 / 7, 2]
+        assert list(_value(sympy.floor(98 / x), {x: column})) == [2, 14, 1]
+        assert list(_value(98 / x >= 2, {x: column})) == [True, True, False]
+        assert list(_value(98 * x / y**2, {x: column, y: 7})) == [98, 14, 196]
+        assert list(_value(x / sympy.sqrt(y), {x: column, y: 4})) == [24.5, 3.5, 49]
 
 
 def test_a_number_stands_at_every_entry():

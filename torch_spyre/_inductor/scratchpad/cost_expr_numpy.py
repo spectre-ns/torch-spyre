@@ -15,9 +15,10 @@
 """The numpy core of a sympy cost expression: one node's value from its operands'.
 
 ``NUMPY_FUNC_MAP`` maps a sympy class to the function that computes a node of that
-class from the values of its operands, and ``numpy_eval`` applies it. A value is a
-number, a truth value, or a numpy array of them with one entry per candidate: every
-function works entry by entry, and a number stands for itself at every entry.
+class from the values of its operands, and ``numpy_eval`` applies it to the values of
+``operands(expr)``. A value is a number, a truth value, or a numpy array of them with
+one entry per candidate: every function works entry by entry, and a number stands for
+itself at every entry. A Mul divides once, so 98/a at a = 49 is 2.
 
 The core reads no symbol and walks no expression: its caller evaluates a node's
 operands and hands over their values. It has two callers. The CP-SAT printer
@@ -40,6 +41,52 @@ import sympy
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 
+def divides(factor: sympy.Basic) -> bool:
+    """Whether factor, a factor of a Mul, divides it: a power with a negative rational
+    exponent, or a rational that is not an integer, as sympy writes x/49."""
+    if isinstance(factor, sympy.Pow):
+        return bool(factor.exp.is_Rational) and bool(factor.exp.is_negative)
+    return bool(factor.is_Rational) and not factor.is_Integer
+
+
+def operands(expr: sympy.Basic) -> list[sympy.Basic]:
+    """The nodes whose values numpy_eval(expr, ...) takes, in order: a Piecewise's
+    arms' values and conditions, value then condition; a Mul's factors, a power it
+    divides by (divides) as its base and a rational it divides by as nothing, as _mul
+    reads it from the Mul itself; any other node's arguments."""
+    if isinstance(expr, sympy.Piecewise):
+        return [part for pair in expr.args for part in pair.args]
+    if isinstance(expr, sympy.Mul):
+        return [
+            factor.base if divides(factor) else factor
+            for factor in expr.args
+            if isinstance(factor, sympy.Pow) or not divides(factor)
+        ]
+    return list(expr.args)
+
+
+def _mul(expr: sympy.Mul, values: Sequence[Any]) -> Any:
+    """A Mul from the values of operands(expr): the product of the factors it does not
+    divide by, divided once by the product of those it does, a power's base raised to
+    minus its exponent and a rational's denominator. 98/a is 2 at a = 49, where
+    98 * (1/a) is under 2."""
+    above: list[Any] = []
+    below: list[Any] = []
+    remaining = iter(values)
+    for factor in expr.args:
+        if isinstance(factor, sympy.Pow) and divides(factor):
+            exp = -factor.exp
+            below.append(
+                next(remaining) ** (int(exp) if exp.is_Integer else float(exp))
+            )
+        elif divides(factor):
+            above.append(int(factor.p))
+            below.append(int(factor.q))
+        else:
+            above.append(next(remaining))
+    return math.prod(above) / math.prod(below) if below else math.prod(above)
+
+
 def _fold(binary: Callable[[Any, Any], Any]) -> Callable[..., Any]:
     """An n-ary function from a binary numpy one, applied pairwise from the left."""
     return lambda *values: reduce(binary, values)
@@ -49,31 +96,6 @@ def _floats(function: Callable[..., Any]) -> Callable[..., Any]:
     """function over its operands as floats. numpy's log, exp and rint have no loop for
     a column of exact ints, which is how the printer holds a buffer's candidates."""
     return lambda *values: function(*(np.asarray(v, dtype=float) for v in values))
-
-
-# floor, ceiling and the comparisons read a float within NEAR_INTEGER of an integer,
-# relative to it, as that integer: a product or quotient computed in another order than
-# sympy's is a few ulps off its exact value, and 98 * (1/49) is one below 2.
-NEAR_INTEGER = 16 * np.finfo(float).eps
-
-
-def _snapped(value: Any) -> Any:
-    """value with each float within NEAR_INTEGER of an integer made that integer. An
-    exact int, a truth value and a float far from any integer are as they are. A
-    value near 0 is not snapped: its error is the operands', not its own."""
-    array = np.asarray(value)
-    if array.dtype.kind not in "fO":
-        return value
-    below, above = np.floor(array), np.ceil(array)
-    with np.errstate(invalid="ignore"):  # inf - inf: an infinity is not near
-        near_above = np.abs(array - above) <= NEAR_INTEGER * np.abs(above)
-        near_below = np.abs(array - below) <= NEAR_INTEGER * np.abs(below)
-    return np.where(near_above, above, np.where(near_below, below, array))[()]
-
-
-def _near_integers(function: Callable[..., Any]) -> Callable[..., Any]:
-    """function over its operands, each float near an integer as it (_snapped)."""
-    return lambda *values: function(*(_snapped(v) for v in values))
 
 
 def _piecewise(*parts: Any) -> Any:
@@ -99,44 +121,45 @@ def _relayout_charge(is_lx: Any, division: Any, *prices: Any) -> Any:
     return is_lx * (np.select(priced, prices, default=0.0) if priced else 0.0)
 
 
-# Add, Mul, Pow and the relationals are Python's own: a numpy array takes them entry by
-# entry, and a plain int stays exact at any size, where np.add(2**62, 2**62) wraps.
+# Add, Mul (_mul), Pow and the relationals are Python's own: a numpy array takes them
+# entry by entry, and a plain int stays exact at any size, where np.add(2**62, 2**62)
+# wraps.
 # floor and ceiling are numpy's, and round a column of exact ints or of floats alike.
-# They, the relationals and KroneckerDelta read a float near an integer as it.
 # log and exp are numpy's over floats, so their operands are made floats first.
 NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Add: lambda *values: sum(values),
-    sympy.Mul: lambda *values: math.prod(values),
     sympy.Pow: operator.pow,
     sympy.Abs: np.abs,
     sympy.Min: _fold(np.minimum),
     sympy.Max: _fold(np.maximum),
-    sympy.floor: _near_integers(np.floor),
-    sympy.ceiling: _near_integers(np.ceil),
+    sympy.floor: np.floor,
+    sympy.ceiling: np.ceil,
     sympy.log: _floats(np.log),
     sympy.exp: _floats(np.exp),
-    sympy.Eq: _near_integers(operator.eq),
-    sympy.Ne: _near_integers(operator.ne),
-    sympy.Lt: _near_integers(operator.lt),
-    sympy.Le: _near_integers(operator.le),
-    sympy.Gt: _near_integers(operator.gt),
-    sympy.Ge: _near_integers(operator.ge),
+    sympy.Eq: operator.eq,
+    sympy.Ne: operator.ne,
+    sympy.Lt: operator.lt,
+    sympy.Le: operator.le,
+    sympy.Gt: operator.gt,
+    sympy.Ge: operator.ge,
     sympy.And: _fold(np.logical_and),
     sympy.Or: _fold(np.logical_or),
     sympy.Not: np.logical_not,
     sympy.ITE: np.where,
     sympy.Piecewise: _piecewise,
-    sympy.KroneckerDelta: _near_integers(np.equal),
+    sympy.KroneckerDelta: np.equal,
     RelayoutCharge: _relayout_charge,
 }
 
 
 def numpy_eval(expr: sympy.Basic, values: Sequence[Any]) -> Any:
-    """expr's value from values, its operands' values in order: a Piecewise's arms'
-    values and conditions, value then condition, and any other node's arguments. The
-    function is that of expr's class, or of the nearest class along its MRO that has
-    one, or else an implemented function's ``_imp_``, which takes scalars, at each
-    entry. Raises NotImplementedError, naming the class, when it has neither."""
+    """expr's value from values, the values of operands(expr) in order. A Mul is
+    _mul. Any other node's function is that of its class, or of the nearest class
+    along its MRO that has one, or else an implemented function's ``_imp_``, which
+    takes scalars, at each entry. Raises NotImplementedError, naming the class, when
+    it has neither."""
+    if isinstance(expr, sympy.Mul):
+        return _mul(expr, values)
     for cls in type(expr).__mro__:
         if cls in NUMPY_FUNC_MAP:
             return NUMPY_FUNC_MAP[cls](*values)
