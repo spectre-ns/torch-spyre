@@ -18,7 +18,8 @@
 class from the values of its operands, and ``numpy_eval`` applies it to the values of
 ``operands(expr)``. A value is a number, a truth value, or a numpy array of them with
 one entry per candidate: every function works entry by entry, and a number stands for
-itself at every entry. A Mul divides once, so 98/a at a = 49 is 2.
+itself at every entry. A Mul is computed as lambdify prints it, dividing once by
+what it divides by: 98/a at a = 49 is 2.
 
 The core reads no symbol and walks no expression: its caller evaluates a node's
 operands and hands over their values. It has two callers. The CP-SAT printer
@@ -42,48 +43,40 @@ from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 
 def divides(factor: sympy.Basic) -> bool:
-    """Whether factor, a factor of a Mul, divides it: a power with a negative rational
-    exponent, or a rational that is not an integer, as sympy writes x/49."""
-    if isinstance(factor, sympy.Pow):
-        return bool(factor.exp.is_Rational) and bool(factor.exp.is_negative)
-    return bool(factor.is_Rational) and not factor.is_Integer
+    """Whether factor, a factor of a Mul, is one lambdify prints it dividing by: a
+    power with a negative rational exponent. A rational coefficient is not: lambdify
+    prints a/49 as (1/49)*a."""
+    return (
+        isinstance(factor, sympy.Pow)
+        and bool(factor.exp.is_Rational)
+        and bool(factor.exp.is_negative)
+    )
 
 
 def operands(expr: sympy.Basic) -> list[sympy.Basic]:
     """The nodes whose values numpy_eval(expr, ...) takes, in order: a Piecewise's
-    arms' values and conditions, value then condition; a Mul's factors, a power it
-    divides by (divides) as its base and a rational it divides by as nothing, as _mul
-    reads it from the Mul itself; any other node's arguments."""
+    arms' values and conditions, value then condition; a Mul's factors, one it divides
+    by (divides) as its base; any other node's arguments."""
     if isinstance(expr, sympy.Piecewise):
         return [part for pair in expr.args for part in pair.args]
     if isinstance(expr, sympy.Mul):
-        return [
-            factor.base if divides(factor) else factor
-            for factor in expr.args
-            if isinstance(factor, sympy.Pow) or not divides(factor)
-        ]
+        return [factor.base if divides(factor) else factor for factor in expr.args]
     return list(expr.args)
 
 
 def _mul(expr: sympy.Mul, values: Sequence[Any]) -> Any:
-    """A Mul from the values of operands(expr): the product of the factors it does not
-    divide by, divided once by the product of those it does, a power's base raised to
-    minus its exponent and a rational's denominator. 98/a is 2 at a = 49, where
-    98 * (1/a) is under 2."""
+    """A Mul from the values of operands(expr), as lambdify prints it: the product of
+    the factors it does not divide by, divided once by the product of the bases of
+    those it does, each raised to minus its exponent. 98/a is 2 at a = 49, where
+    98 * (1/a) is under 2; a/49 is (1/49) * a, as lambdify prints it."""
     above: list[Any] = []
     below: list[Any] = []
-    remaining = iter(values)
-    for factor in expr.args:
-        if isinstance(factor, sympy.Pow) and divides(factor):
+    for factor, value in zip(expr.args, values):
+        if divides(factor):
             exp = -factor.exp
-            below.append(
-                next(remaining) ** (int(exp) if exp.is_Integer else float(exp))
-            )
-        elif divides(factor):
-            above.append(int(factor.p))
-            below.append(int(factor.q))
+            below.append(value ** (int(exp) if exp.is_Integer else float(exp)))
         else:
-            above.append(next(remaining))
+            above.append(value)
     return math.prod(above) / math.prod(below) if below else math.prod(above)
 
 

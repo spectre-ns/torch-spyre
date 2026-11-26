@@ -437,10 +437,11 @@ class TableLowering(Printer):
         return SumRealization(constant, terms, tuple(self._inputs(expr)))
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
-        """A constant times one operand is the operand scaled in float. A product that
-        divides (divides), 98/a or a/49, is declined: its table divides once, in the
-        numpy core, so 98/a is 2 at a = 49, where 98 times the table of 1/a is under
-        2. Any other product is declined."""
+        """A constant times one operand is the operand scaled in float, as lambdify
+        prints a/49: (1/49)*a. A product that divides (divides), 98/a, is declined:
+        its table divides once in the numpy core, as lambdify prints it, so 98/a is 2
+        at a = 49, where 98 times the table of 1/a is under 2. Any other product is
+        declined."""
         constants = [factor for factor in expr.args if not factor.free_symbols]
         factors = [factor for factor in expr.args if factor.free_symbols]
         if len(factors) != 1 or any(divides(factor) for factor in expr.args):

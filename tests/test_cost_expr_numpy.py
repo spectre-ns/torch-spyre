@@ -164,23 +164,39 @@ def test_a_plain_int_stays_exact_at_any_size():
     assert numpy_eval(x * y * 2, floats) == math.prod(floats)
 
 
-def test_a_mul_divides_once_by_the_factors_it_divides_by():
-    """98/x is Mul(98, Pow(x, -1)) and x/49 is Mul(1/49, x): from the values of 1/x
-    and 1/49 each would be a product, and 98 * (1/49) is one ulp under 2. A Mul reads a
-    power it divides by as its base and a rational as its numerator and denominator
-    (operands), and divides once, over floats and over the printer's exact ints."""
+# Products that divide, and what reads them: lambdify prints each Mul with a negative
+# power as one division and a rational coefficient as a factor, (1/49)*x.
+QUOTIENTS = [
+    98 / x,
+    x / 49,
+    98 * x / y**2,
+    x / (3 * y),
+    x / sympy.sqrt(y),
+    sympy.floor(98 / x),
+    98 / x >= 2,
+]
+
+
+def test_a_mul_is_computed_as_lambdify_prints_it():
+    """98/x is Mul(98, Pow(x, -1)): from the value of 1/x it would be 98 * (1/x), one
+    ulp under 2 at x = 49. A Mul reads a power with a negative exponent as its base
+    (operands) and divides once by it, and multiplies by a rational, as lambdify
+    prints x/49. Each value is lambdify's to the bit, over floats and over the
+    printer's exact ints."""
     assert math.floor(98 * (1 / 49)) == 1
-    assert operands(98 / x) == [98, x] and operands(x / 49) == [x]
-    assert set(operands(x**2 * y / 3)) == {x**2, y} == set(operands(x**2 * y))
+    assert operands(98 / x) == [98, x]
+    assert operands(x / 49) == [sympy.Rational(1, 49), x]
     assert set(operands(x * y**-2)) == {x, y}
-    for dtype in (float, object):
-        column = np.asarray([49, 7, 98], dtype=dtype)
-        assert list(_value(98 / x, {x: column})) == [2, 14, 1]
-        assert list(_value(x / 49, {x: column})) == [1, 1 / 7, 2]
-        assert list(_value(sympy.floor(98 / x), {x: column})) == [2, 14, 1]
-        assert list(_value(98 / x >= 2, {x: column})) == [True, True, False]
-        assert list(_value(98 * x / y**2, {x: column, y: 7})) == [98, 14, 196]
-        assert list(_value(x / sympy.sqrt(y), {x: column, y: 4})) == [24.5, 3.5, 49]
+    assert set(operands(x**2 * y)) == {x**2, y}
+    floats = {x: np.asarray([49.0, 7.0, 98.0]), y: 4.0}
+    ints = {x: np.asarray([49, 7, 98], dtype=object), y: 4}
+    for expr in QUOTIENTS:
+        over_floats = sympy.lambdify([x, y], expr, modules="numpy")
+        at_ints = sympy.lambdify([x, y], expr, modules="math")
+        expected = list(over_floats(floats[x], floats[y]))
+        assert list(_value(expr, floats)) == expected, expr
+        expected = [at_ints(value, ints[y]) for value in ints[x]]
+        assert list(_value(expr, ints)) == expected, expr
 
 
 def test_a_number_stands_at_every_entry():
