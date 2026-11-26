@@ -99,8 +99,8 @@ class Index(ABC):
     @abstractmethod
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         """The position in model, its parts read through their cp_expr. A step's is a
-        memoize_method, built once per model; a leaf's is not, as its memo would keep
-        every model UNIT is built in."""
+        memoize_method, built once per model; a leaf's adds nothing to the model, so
+        it is not."""
 
     def entries(self) -> int:
         """The entries of the lookups it is read through."""
@@ -186,9 +186,6 @@ class CompactIndex(Index):
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return np.asarray(self.remap)[self.parent.on_grid(grid)]
-
-
-UNIT = UnitIndex()
 
 
 def _read_only(values: Any, index: Index) -> np.ndarray:
@@ -335,7 +332,7 @@ class SymbolicRealization(AbstractRealization):
 
 @dataclass(frozen=True, eq=False)
 class SumRealization(SymbolicRealization):
-    """sum(terms). A constant is a term on UNIT."""
+    """sum(terms). A constant is a term on a UnitIndex."""
 
     terms: tuple[AbstractRealization, ...]
     positions: tuple[Index, ...]
@@ -528,8 +525,8 @@ def _values(expr: sympy.Basic, count: int, compute: Callable[[], Any]) -> np.nda
 
 
 def _combined(positions: Sequence[Index]) -> Index:
-    """positions as one position, the last fastest; UNIT for none."""
-    index = positions[0] if positions else UNIT
+    """positions as one position, the last fastest; a UnitIndex for none."""
+    index = positions[0] if positions else UnitIndex()
     for position in positions[1:]:
         index = CombineIndex(index, position)
     return index
@@ -547,9 +544,9 @@ def _on(
 ) -> np.ndarray:
     """table's list at each entry of index; grid holds the coordinates of the
     positions index combines."""
-    # On UNIT too a constant is broadcast: numpy computes x**0.5 as sqrt(x) only for a
-    # broadcast exponent, and both sides of a tie must take one path.
-    if table.index == index and index != UNIT:
+    # On a UnitIndex too a constant is broadcast: numpy computes x**0.5 as sqrt(x)
+    # only for a broadcast exponent, and both sides of a tie must take one path.
+    if table.index == index and index != UnitIndex():
         return table.values
     at = grid[table.index] if table.index in grid else table.index.on_grid(grid)
     return np.broadcast_to(table.values[at], (index.size,))
@@ -564,7 +561,7 @@ def _ways(
     adds no position. Parts on one position share one rank, of their rows."""
     on: dict[Index, list[int]] = {}
     for i, part in enumerate(parts):
-        if part.index != UNIT:
+        if part.index != UnitIndex():
             on.setdefault(part.index, []).append(i)
     own = list(parts)
     if len(on) > 1:
@@ -572,7 +569,7 @@ def _ways(
             rank, lists = _ranked(index, [parts[i].values for i in members])
             for i, values in zip(members, lists):
                 own[i] = TableRealization(values=values, index=rank)
-    ranks = [own[members[0]].index for members in on.values()] or [UNIT]
+    ranks = [own[members[0]].index for members in on.values()] or [UnitIndex()]
     ways = [(list(positions), list(parts))]
     if set(ranks) != set(positions):
         ways.append((ranks, own))
@@ -848,7 +845,8 @@ class TableLowering(Printer):
             above, below = lists[: len(numerators)], lists[len(numerators) :]
             return math.prod(above) / math.prod(b**e for b, e in zip(below, exponents))
 
-        return _table_of(expr, parts, self._inputs(expr) or [UNIT], self.cap, quotient)
+        positions = self._inputs(expr) or [UnitIndex()]
+        return _table_of(expr, parts, positions, self.cap, quotient)
 
     def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
         """Over its arms' values and conditions: an ExprCondPair is not printed."""
@@ -862,15 +860,15 @@ class TableLowering(Printer):
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
     ) -> TableRealization:
         """expr as its table (_table_of) of its operands. An operation on numbers is
-        computed the same way, on UNIT, so sqrt(19) equals sqrt(a) at a = 19 (sympy's
-        float is one double below)."""
+        computed the same way, on a UnitIndex, so sqrt(19) equals sqrt(a) at a = 19
+        (sympy's float is one double below)."""
         if not operands:
-            return TableRealization(values=[_constant(expr)], index=UNIT)
+            return TableRealization(values=[_constant(expr)], index=UnitIndex())
         parts = [self._table(operand) for operand in operands]
         return _table_of(
             expr,
             parts,
-            self._inputs(expr) or [UNIT],
+            self._inputs(expr) or [UnitIndex()],
             self.cap,
             lambda lists: numpy_eval(expr, lists),
         )

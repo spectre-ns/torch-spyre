@@ -43,7 +43,6 @@ from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     COST_SCALE,
-    UNIT,
     CombineIndex,
     CompactIndex,
     AbstractRealization,
@@ -276,9 +275,9 @@ def test_a_symbol_a_constant_and_an_operation_are_each_one_table():
         assert realization.table(CAP) is realization
     printed = _printed(case, expr)
     assert printed[a].index == position and list(printed[a].values) == [1.0, 2.0, 4.0]
-    assert printed[sympy.Integer(3)].index == UNIT
+    assert printed[sympy.Integer(3)].index == UnitIndex()
     assert list(printed[sympy.Integer(3)].values) == [3.0]
-    assert printed[root2].index == UNIT  # an operation on numbers
+    assert printed[root2].index == UnitIndex()  # an operation on numbers
     assert list(printed[root2].values) == [2**0.5]
     assert printed[sympy.Max(a, 3)].index == position
     assert printed[expr].index == position
@@ -301,7 +300,7 @@ def test_the_lowering_is_a_sympy_printer_dispatching_on_the_sympy_class():
     assert list(logs.values) == pytest.approx([0.0, math.log(2), math.log(4)])
     number = sympy.log(sympy.Integer(2)) + sympy.pi
     constant = printer.print(number).table(CAP)
-    assert constant.index == UNIT
+    assert constant.index == UnitIndex()
     assert printer.emptyPrinter(sympy.log(a)) is None
     assert printer._print_Add(number) is None
     assert printer._print_Mul(a * sympy.log(a)) is None
@@ -354,7 +353,7 @@ def test_an_operations_position_combines_its_inputs_in_symbol_order():
     printed = _printed(case, expr)
     assert printed[expr].index == CombineIndex(pa, pb)
     assert printed[2 * b].index == pb
-    assert printed[sympy.Integer(2)].index == UNIT
+    assert printed[sympy.Integer(2)].index == UnitIndex()
     assert _printed(case, sympy.log(b) * a)[sympy.log(b) * a].index == CombineIndex(
         pa, pb
     )
@@ -533,7 +532,8 @@ def test_a_step_takes_the_parts_it_names_and_equal_steps_are_one_position():
     assert pair.size == 6 and (pair.left, pair.right) == (a, b)
     assert pair == CombineIndex(a, b) and hash(pair) == hash(CombineIndex(a, b))
     assert pair != CombineIndex(b, a)
-    assert UNIT.size == 1 and UNIT == UnitIndex()
+    assert UnitIndex().size == 1 and UnitIndex() == UnitIndex()
+    assert hash(UnitIndex()) == hash(UnitIndex())
 
 
 def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
@@ -552,7 +552,7 @@ def test_a_table_takes_values_and_index_only_and_its_list_is_read_only():
     with pytest.raises(AttributeError):
         table.values = np.zeros(3)  # type: ignore[misc]
     with pytest.raises(AttributeError):
-        table.index = UNIT  # type: ignore[misc]
+        table.index = UnitIndex()  # type: ignore[misc]
 
 
 def test_a_combined_position_is_row_major_at_every_assignment():
@@ -849,7 +849,7 @@ def test_a_sum_is_a_sum_realization_of_its_operands_realizations():
     printer = TableLowering(case.inputs, cap=CAP)
     root = printer.print(sympy.log(b) + a**0.5 + 2.5)
     assert type(root) is SumRealization
-    (constant,) = [term for term in root.terms if term.index == UNIT]
+    (constant,) = [term for term in root.terms if term.index == UnitIndex()]
     assert list(constant.values) == [2.5]
     operands = {printer.print(a**0.5), printer.print(sympy.log(b))}
     assert set(root.terms) == {constant, *operands}
@@ -858,7 +858,7 @@ def test_a_sum_is_a_sum_realization_of_its_operands_realizations():
         [2.5 + va**0.5 + math.log(vb) for va in (1.0, 2.0, 4.0) for vb in (1.0, 3.0)]
     )
     number = printer.print(sympy.log(sympy.Integer(2)) + sympy.pi)
-    assert type(number) is TableRealization and number.index == UNIT
+    assert type(number) is TableRealization and number.index == UnitIndex()
 
 
 def test_a_constant_times_one_operand_is_the_operand_with_the_constant_applied():
@@ -877,7 +877,7 @@ def test_a_constant_times_one_operand_is_the_operand_with_the_constant_applied()
     assert {term.index: list(term.values) for term in total.terms} == {
         pa: [-2 * value for value in roots.values],
         pb: [-2.0, -6.0],
-        UNIT: [-0.5],
+        UnitIndex(): [-0.5],
     }
     quotient = printer.print(98 / a)
     assert type(quotient) is TableRealization
@@ -1801,8 +1801,8 @@ EXAMPLES = [
         id="lin_min",
         marks=_refused(
             "a Min of two sums of 15 and 14 residency literals has no table: the "
-            "smaller sum's is 16384 entries, over its literals or their ranks, past the "
-            "cap of 8192, and a Min kept as a linear constraint is not built"
+            "smaller sum's is 16384 entries, over its literals or their ranks, past "
+            "the cap of 8192, and a Min kept as a linear constraint is not built"
         ),
     ),
 ]
