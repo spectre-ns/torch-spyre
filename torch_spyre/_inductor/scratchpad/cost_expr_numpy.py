@@ -55,26 +55,46 @@ def divides(factor: sympy.Basic) -> bool:
 
 def operands(expr: sympy.Basic) -> list[sympy.Basic]:
     """The nodes whose values numpy_eval(expr, ...) takes, in order: a Piecewise's
-    arms' values and conditions, value then condition; a Mul's factors, one it divides
-    by (divides) as its base; any other node's arguments."""
+    arms' values and conditions, value then condition; a Mul's factors in the order
+    lambdify prints them (as_ordered_factors), one it divides by (divides) as its
+    base; any other node's arguments."""
     if isinstance(expr, sympy.Piecewise):
         return [part for pair in expr.args for part in pair.args]
     if isinstance(expr, sympy.Mul):
-        return [factor.base if divides(factor) else factor for factor in expr.args]
+        return [
+            factor.base if divides(factor) else factor
+            for factor in expr.as_ordered_factors()
+        ]
     return list(expr.args)
+
+
+def _power(base: Any, exp: sympy.Basic, value: Any) -> Any:
+    """base raised to exp, a sympy exponent of value value, as lambdify prints it: a
+    power of one half is sqrt(base) and one of minus a half 1/sqrt(base), where
+    base**0.5 is not always the correctly rounded root."""
+    if exp == sympy.S.Half:
+        return np.sqrt(np.asarray(base, dtype=float))[()]
+    if exp == -sympy.S.Half:
+        return 1 / np.sqrt(np.asarray(base, dtype=float))[()]
+    return base**value
+
+
+def _pow(expr: sympy.Pow, values: Sequence[Any]) -> Any:
+    base, value = values
+    return _power(base, expr.exp, value)
 
 
 def _mul(expr: sympy.Mul, values: Sequence[Any]) -> Any:
     """A Mul from the values of operands(expr), as lambdify prints it: the product of
-    the factors it does not divide by, divided once by the product of the bases of
-    those it does, each raised to minus its exponent. 98/a is 2 at a = 49, where
-    98 * (1/a) is under 2; a/49 is (1/49) * a, as lambdify prints it."""
+    the factors it does not divide by, in its printed order, divided once by the
+    product of the bases of those it does, each raised to minus its exponent. 98/a is
+    2 at a = 49, where 98 * (1/a) is under 2; a/49 is (1/49) * a."""
     above: list[Any] = []
     below: list[Any] = []
-    for factor, value in zip(expr.args, values):
+    for factor, value in zip(expr.as_ordered_factors(), values):
         if divides(factor):
             exp = -factor.exp
-            below.append(value ** (int(exp) if exp.is_Integer else float(exp)))
+            below.append(_power(value, exp, int(exp) if exp.is_Integer else float(exp)))
         else:
             above.append(value)
     return math.prod(above) / math.prod(below) if below else math.prod(above)
@@ -114,14 +134,13 @@ def _relayout_charge(is_lx: Any, division: Any, *prices: Any) -> Any:
     return is_lx * (np.select(priced, prices, default=0.0) if priced else 0.0)
 
 
-# Add, Mul (_mul), Pow and the relationals are Python's own: a numpy array takes them
-# entry by entry, and a plain int stays exact at any size, where np.add(2**62, 2**62)
-# wraps.
+# Add and the relationals are Python's own, as are a Mul's and a Pow's (NODE_FUNC_MAP):
+# a numpy array takes them entry by entry, and a plain int stays exact at any size,
+# where np.add(2**62, 2**62) wraps.
 # floor and ceiling are numpy's, and round a column of exact ints or of floats alike.
 # log and exp are numpy's over floats, so their operands are made floats first.
 NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Add: lambda *values: sum(values),
-    sympy.Pow: operator.pow,
     sympy.Abs: np.abs,
     sympy.Min: _fold(np.minimum),
     sympy.Max: _fold(np.maximum),
@@ -145,15 +164,23 @@ NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
 }
 
 
+# The classes lambdify prints by their node, not by a function of their operands'
+# values: a Mul's divisions and order, a Pow's square roots.
+NODE_FUNC_MAP: dict[type, Callable[[Any, Sequence[Any]], Any]] = {
+    sympy.Mul: _mul,
+    sympy.Pow: _pow,
+}
+
+
 def numpy_eval(expr: sympy.Basic, values: Sequence[Any]) -> Any:
-    """expr's value from values, the values of operands(expr) in order. A Mul is
-    _mul. Any other node's function is that of its class, or of the nearest class
-    along its MRO that has one, or else an implemented function's ``_imp_``, which
-    takes scalars, at each entry. Raises NotImplementedError, naming the class, when
-    it has neither."""
-    if isinstance(expr, sympy.Mul):
-        return _mul(expr, values)
+    """expr's value from values, the values of operands(expr) in order. A Mul or a
+    Pow is computed from its node as lambdify prints it (NODE_FUNC_MAP). Any other
+    node's function is that of its class, or of the nearest class along its MRO that
+    has one, or else an implemented function's ``_imp_``, which takes scalars, at each
+    entry. Raises NotImplementedError, naming the class, when it has neither."""
     for cls in type(expr).__mro__:
+        if cls in NODE_FUNC_MAP:
+            return NODE_FUNC_MAP[cls](expr, values)
         if cls in NUMPY_FUNC_MAP:
             return NUMPY_FUNC_MAP[cls](*values)
     imp = getattr(expr, "_imp_", None)

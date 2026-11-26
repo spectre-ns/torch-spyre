@@ -442,8 +442,9 @@ class TableLowering(Printer):
         its table divides once in the numpy core, as lambdify prints it, so 98/a is 2
         at a = 49, where 98 times the table of 1/a is under 2. Any other product is
         declined."""
-        constants = [factor for factor in expr.args if not factor.free_symbols]
-        factors = [factor for factor in expr.args if factor.free_symbols]
+        printed = expr.as_ordered_factors()
+        constants = [factor for factor in printed if not factor.free_symbols]
+        factors = [factor for factor in printed if factor.free_symbols]
         if len(factors) != 1 or any(divides(factor) for factor in expr.args):
             return None
         coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
