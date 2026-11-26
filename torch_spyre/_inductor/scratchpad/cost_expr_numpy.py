@@ -51,6 +51,31 @@ def _floats(function: Callable[..., Any]) -> Callable[..., Any]:
     return lambda *values: function(*(np.asarray(v, dtype=float) for v in values))
 
 
+# floor, ceiling and the comparisons read a float within NEAR_INTEGER of an integer,
+# relative to it, as that integer: a product or quotient computed in another order than
+# sympy's is a few ulps off its exact value, and 98 * (1/49) is one below 2.
+NEAR_INTEGER = 16 * np.finfo(float).eps
+
+
+def _snapped(value: Any) -> Any:
+    """value with each float within NEAR_INTEGER of an integer made that integer. An
+    exact int, a truth value and a float far from any integer are as they are. A
+    value near 0 is not snapped: its error is the operands', not its own."""
+    array = np.asarray(value)
+    if array.dtype.kind not in "fO":
+        return value
+    below, above = np.floor(array), np.ceil(array)
+    with np.errstate(invalid="ignore"):  # inf - inf: an infinity is not near
+        near_above = np.abs(array - above) <= NEAR_INTEGER * np.abs(above)
+        near_below = np.abs(array - below) <= NEAR_INTEGER * np.abs(below)
+    return np.where(near_above, above, np.where(near_below, below, array))[()]
+
+
+def _near_integers(function: Callable[..., Any]) -> Callable[..., Any]:
+    """function over its operands, each float near an integer as it (_snapped)."""
+    return lambda *values: function(*(_snapped(v) for v in values))
+
+
 def _piecewise(*parts: Any) -> Any:
     """A Piecewise from its arms' values and conditions, value then condition, in
     order: each entry takes the first arm whose condition holds, and NaN where none
@@ -77,6 +102,7 @@ def _relayout_charge(is_lx: Any, division: Any, *prices: Any) -> Any:
 # Add, Mul, Pow and the relationals are Python's own: a numpy array takes them entry by
 # entry, and a plain int stays exact at any size, where np.add(2**62, 2**62) wraps.
 # floor and ceiling are numpy's, and round a column of exact ints or of floats alike.
+# They, the relationals and KroneckerDelta read a float near an integer as it.
 # log and exp are numpy's over floats, so their operands are made floats first.
 NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Add: lambda *values: sum(values),
@@ -85,22 +111,22 @@ NUMPY_FUNC_MAP: dict[type, Callable[..., Any]] = {
     sympy.Abs: np.abs,
     sympy.Min: _fold(np.minimum),
     sympy.Max: _fold(np.maximum),
-    sympy.floor: np.floor,
-    sympy.ceiling: np.ceil,
+    sympy.floor: _near_integers(np.floor),
+    sympy.ceiling: _near_integers(np.ceil),
     sympy.log: _floats(np.log),
     sympy.exp: _floats(np.exp),
-    sympy.Eq: operator.eq,
-    sympy.Ne: operator.ne,
-    sympy.Lt: operator.lt,
-    sympy.Le: operator.le,
-    sympy.Gt: operator.gt,
-    sympy.Ge: operator.ge,
+    sympy.Eq: _near_integers(operator.eq),
+    sympy.Ne: _near_integers(operator.ne),
+    sympy.Lt: _near_integers(operator.lt),
+    sympy.Le: _near_integers(operator.le),
+    sympy.Gt: _near_integers(operator.gt),
+    sympy.Ge: _near_integers(operator.ge),
     sympy.And: _fold(np.logical_and),
     sympy.Or: _fold(np.logical_or),
     sympy.Not: np.logical_not,
     sympy.ITE: np.where,
     sympy.Piecewise: _piecewise,
-    sympy.KroneckerDelta: np.equal,
+    sympy.KroneckerDelta: _near_integers(np.equal),
     RelayoutCharge: _relayout_charge,
 }
 

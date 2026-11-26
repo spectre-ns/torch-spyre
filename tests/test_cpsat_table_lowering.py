@@ -828,7 +828,7 @@ def test_a_sum_is_a_sum_realization_of_its_operands_realizations():
 
 
 def test_a_constant_times_one_operand_is_the_operand_with_the_constant_applied():
-    """A quotient is divided, not scaled: 98 * (1 / 49) is under 2."""
+    """A quotient is scaled too: 98/a is 98 times 1/a, one ulp under 2 at a = 49."""
     case = Case()
     pa = case.add_input("a", a=[1.0, 7.0, 49.0])
     pb = case.add_input("b", b=[1.0, 3.0])
@@ -849,7 +849,9 @@ def test_a_constant_times_one_operand_is_the_operand_with_the_constant_applied()
     assert product.index == CombineIndex(pa, pb)
     quotient = printer.print(98 / a)
     assert type(quotient) is TableRealization
-    assert list(quotient.values) == [98.0, 14.0, 2.0] and 98 * (1 / 49) < 2
+    reciprocals = printer.print(1 / a).table(CAP)
+    assert list(quotient.values) == [98 * value for value in reciprocals.values]
+    assert quotient.values[2] < 2
 
 
 def test_a_coefficient_on_a_sum_is_applied_before_the_rounding():
@@ -1002,15 +1004,17 @@ def test_an_operation_on_numbers_is_computed_as_any_other_operation():
     assert list(root.table(CAP).values) == [0.0, 0.0, 1.0]
 
 
-def test_a_quotient_is_divided_as_lambdify_prints_it():
-    """x/y is Mul(x, Pow(y, -1)), and from the lists of its children it would be
-    x*(1/y): 98*(1/49) is 1.9999999999999998, whose floor is 1. The Mul divides by
-    y, as lambdify prints it, and so for any negative rational exponent: 98/7**2."""
+def test_a_quotient_floors_and_compares_at_its_exact_value():
+    """x/y is Mul(x, Pow(y, -1)), x*(1/y) from the lists of its children: 98*(1/49)
+    is 1.9999999999999998, whose floor is 1, and so for any negative rational
+    exponent: 98/7**2. The numpy core reads a float within NEAR_INTEGER of an integer
+    as that integer, so floor and a comparison see 2."""
     case = Case()
-    case.add_input("a", x=[98.0, 98.0, 49.0], y=[49.0, 7.0, 7.0])
+    case.add_input("a", x=[98.0, 98.0, 49.0, 13.0], y=[49.0, 7.0, 7.0, 7.0])
     x, y = case.symbol("x"), case.symbol("y")
     assert math.floor(98 * (1 / 49)) == 1 and math.floor(98 * 7.0**-2) == 1
-    case.assert_exact(sympy.floor(x / y) + sympy.floor(x / y**2))
+    at_least_2 = sympy.Piecewise((1, x / y >= 2), (0, True))
+    case.assert_exact(sympy.floor(x / y) + sympy.floor(x / y**2) + at_least_2)
 
 
 # Expressions over a, b and c, each node's list compared with Stage 1's.

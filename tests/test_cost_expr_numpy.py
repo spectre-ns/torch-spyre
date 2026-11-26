@@ -164,6 +164,30 @@ def test_a_plain_int_stays_exact_at_any_size():
     assert numpy_eval(x * y * 2, floats) == math.prod(floats)
 
 
+def test_floor_ceiling_and_the_comparisons_read_a_float_near_an_integer_as_it():
+    """A product computed in another order than sympy's is a few ulps off its exact
+    value: 98 * (1/49) is one below 2, and 0.1 * 3 * 10 one above 3. floor, ceiling,
+    the relationals and KroneckerDelta read each as its integer, over floats and over
+    an object array, as the printer holds its candidates. A float farther than
+    NEAR_INTEGER from an integer, and an exact int, are as they are."""
+    below, above = 98 * (1 / 49), 0.1 * 3 * 10
+    t = sympy.Symbol("t", real=True)  # floor of an integer symbol is the symbol
+    assert math.floor(below) == 1 and math.ceil(above) == 4
+    for dtype in (float, object):
+        column = np.asarray([below, above, 2.5], dtype=dtype)
+        assert list(numpy_eval(sympy.floor(t), [column])) == [2, 3, 2]
+        assert list(numpy_eval(sympy.ceiling(t), [column])) == [2, 3, 3]
+        integers = np.asarray([2, 3, 2], dtype=object)
+        delta = numpy_eval(sympy.KroneckerDelta(x, y), [column, integers])
+        assert list(delta) == [True, True, False]
+    for relation in (sympy.Eq, sympy.Ne, sympy.Lt, sympy.Le, sympy.Gt, sympy.Ge):
+        assert numpy_eval(relation(x, y), [below, 2]) == bool(relation(2, 2))
+        assert numpy_eval(relation(x, y), [2, above - 1]) == bool(relation(2, 2))
+    assert numpy_eval(sympy.floor(t), [2 - 1e-9]) == 1
+    assert numpy_eval(sympy.floor(t), [2**70 + 1]) == 2**70 + 1
+    assert numpy_eval(x > y, [2**70 + 1, 2**70])
+
+
 def test_a_number_stands_at_every_entry():
     column = np.asarray([1, 5, 9], dtype=object)
     assert list(numpy_eval(sympy.Max(x, 3), [column, 3])) == [3, 5, 9]
