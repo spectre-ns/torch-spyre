@@ -53,18 +53,21 @@ def divides(factor: sympy.Basic) -> bool:
     )
 
 
+def factors(expr: sympy.Mul) -> Sequence[sympy.Basic]:
+    """expr's factors in the order lambdify multiplies them, as_ordered_factors(), for
+    three or more: two give the same product either way, and the sort costs."""
+    return expr.as_ordered_factors() if len(expr.args) > 2 else expr.args
+
+
 def operands(expr: sympy.Basic) -> list[sympy.Basic]:
     """The nodes whose values numpy_eval(expr, ...) takes, in order: a Piecewise's
     arms' values and conditions, value then condition; a Mul's factors in the order
-    lambdify prints them (as_ordered_factors), one it divides by (divides) as its
-    base; any other node's arguments."""
+    lambdify multiplies them (factors), one it divides by (divides) as its base; any
+    other node's arguments."""
     if isinstance(expr, sympy.Piecewise):
         return [part for pair in expr.args for part in pair.args]
     if isinstance(expr, sympy.Mul):
-        return [
-            factor.base if divides(factor) else factor
-            for factor in expr.as_ordered_factors()
-        ]
+        return [factor.base if divides(factor) else factor for factor in factors(expr)]
     return list(expr.args)
 
 
@@ -91,7 +94,7 @@ def _mul(expr: sympy.Mul, values: Sequence[Any]) -> Any:
     2 at a = 49, where 98 * (1/a) is under 2; a/49 is (1/49) * a."""
     above: list[Any] = []
     below: list[Any] = []
-    for factor, value in zip(expr.as_ordered_factors(), values):
+    for factor, value in zip(factors(expr), values):
         if divides(factor):
             exp = -factor.exp
             below.append(_power(value, exp, int(exp) if exp.is_Integer else float(exp)))

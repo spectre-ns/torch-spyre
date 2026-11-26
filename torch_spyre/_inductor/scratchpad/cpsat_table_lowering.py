@@ -49,6 +49,7 @@ from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
     divides,
+    factors,
     numpy_eval,
     operands,
 )
@@ -442,13 +443,13 @@ class TableLowering(Printer):
         its table divides once in the numpy core, as lambdify prints it, so 98/a is 2
         at a = 49, where 98 times the table of 1/a is under 2. Any other product is
         declined."""
-        printed = expr.as_ordered_factors()
+        printed = factors(expr)
         constants = [factor for factor in printed if not factor.free_symbols]
-        factors = [factor for factor in printed if factor.free_symbols]
-        if len(factors) != 1 or any(divides(factor) for factor in expr.args):
+        symbolic = [factor for factor in printed if factor.free_symbols]
+        if len(symbolic) != 1 or any(divides(factor) for factor in expr.args):
             return None
         coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
-        return self._print(factors[0]).scaled(coefficient)
+        return self._print(symbolic[0]).scaled(coefficient)
 
     def emptyPrinter(self, expr: sympy.Basic) -> None:
         """Any other node is declined. sympy's own returns str(expr)."""
