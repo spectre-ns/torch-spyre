@@ -610,6 +610,23 @@ def _tabulated(
     return TableRealization(values=compute(index.size, lists), index=index)
 
 
+def _table_of(
+    expr: sympy.Basic,
+    parts: Sequence[TableRealization],
+    positions: Sequence[Index],
+    cap: int,
+    compute: Callable[[list[np.ndarray]], Any],
+) -> TableRealization:
+    """expr, compute of parts' lists, as its table (_tabulated) over positions, its
+    inputs in symbol order, or over its parts' positions."""
+    return _tabulated(
+        parts,
+        positions,
+        cap,
+        lambda count, lists: _values(expr, count, lambda: compute(lists)),
+    )
+
+
 # ---------------------------------------------------------------------- the printer
 
 
@@ -831,7 +848,7 @@ class TableLowering(Printer):
             above, below = lists[: len(numerators)], lists[len(numerators) :]
             return math.prod(above) / math.prod(b**e for b, e in zip(below, exponents))
 
-        return self._table_of(expr, parts, quotient)
+        return _table_of(expr, parts, self._inputs(expr) or [UNIT], self.cap, quotient)
 
     def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
         """Over its arms' values and conditions: an ExprCondPair is not printed."""
@@ -850,21 +867,12 @@ class TableLowering(Printer):
         if not operands:
             return TableRealization(values=[_constant(expr)], index=UNIT)
         parts = [self._table(operand) for operand in operands]
-        return self._table_of(expr, parts, lambda lists: numpy_eval(expr, lists))
-
-    def _table_of(
-        self,
-        expr: sympy.Basic,
-        parts: Sequence[TableRealization],
-        compute: Callable[[list[np.ndarray]], Any],
-    ) -> TableRealization:
-        """expr, compute of parts' lists, as its cheapest table: over its inputs, in
-        symbol order, or over its parts' positions (_tabulated)."""
-        return _tabulated(
+        return _table_of(
+            expr,
             parts,
             self._inputs(expr) or [UNIT],
             self.cap,
-            lambda count, lists: _values(expr, count, lambda: compute(lists)),
+            lambda lists: numpy_eval(expr, lists),
         )
 
     def _fits(self, expr: sympy.Basic) -> bool:
