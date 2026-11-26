@@ -391,6 +391,9 @@ def _count_evaluations(monkeypatch) -> list[sympy.Basic]:
 
 
 def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
+    """A node's operands are printed first: its table from its parts reads their
+    lists. The product's table, over its inputs or its parts, is past the cap, so its
+    parent is refused at it, and neither table is computed."""
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
@@ -400,8 +403,8 @@ def test_a_table_past_the_cap_is_never_evaluated(monkeypatch):
         TableLoweringError, match="6 entries, past the cap of 5"
     ) as caught:
         TableLowering(case.inputs, cap=5).print(sympy.log(a**0.5 * b))
-    assert caught.value.node == sympy.log(a**0.5 * b)  # the root, refused first
-    assert calls == []  # not the root's table, and nothing under it
+    assert caught.value.node == a**0.5 * b
+    assert calls == [a**0.5]  # an operand's list, not the product's or the root's
 
 
 def test_a_table_builds_its_own_lookup_and_a_constant_one_adds_nothing():
@@ -594,6 +597,20 @@ def _stage_1(case: Case, expr: sympy.Basic) -> np.ndarray:
         except (TypeError, ValueError):
             result = np.array([func(*point) for point in points], dtype=float)
     return np.broadcast_to(result, (len(points),))
+
+
+def _at_inputs(
+    printed: dict[sympy.Basic, TableRealization], expr: sympy.Basic
+) -> np.ndarray:
+    """expr's table read at each joint assignment of its inputs, in Stage 1's order:
+    its position, ranks and pairs included, computed from the inputs'."""
+    symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
+    inputs = list(dict.fromkeys(printed[symbol].index for symbol in symbols))
+    grid = lowering._grid(inputs)
+    table = printed[expr]
+    return np.broadcast_to(
+        table.values[table.index.on_grid(grid)], (math.prod(p.size for p in inputs),)
+    )
 
 
 def _list(case: Case, expr: sympy.Basic) -> list[float]:
@@ -944,7 +961,8 @@ def test_an_affine_list_adds_no_table():
 
 
 def test_a_sum_under_a_power_is_read_as_its_table_and_refused_past_the_cap():
-    """Past the cap the parent is refused before the sum is printed."""
+    """Past the cap the parent is refused at the sum's table, over its inputs or its
+    terms' positions."""
     case = Case()
     pa = case.add_input("a", a=[1.0, 2.0, 4.0])
     pb = case.add_input("b", b=[1.0, 3.0])
@@ -958,8 +976,8 @@ def test_a_sum_under_a_power_is_read_as_its_table_and_refused_past_the_cap():
         TableLoweringError, match="6 entries, past the cap of 5"
     ) as caught:
         printer.print(expr)
-    assert caught.value.node == expr
-    assert a + 2 * b not in printer.printed
+    assert caught.value.node == a + 2 * b
+    assert expr not in printer.printed
 
 
 def test_a_sum_that_is_not_finite_is_refused_at_the_sum():
@@ -1128,7 +1146,8 @@ def test_a_product_takes_its_switch_or_its_table_by_entries():
 
 
 def test_a_factor_with_more_values_than_the_cap_has_no_switch():
-    """With no table either, the product is refused, naming it."""
+    """With no table either, the product is refused at its first operand, which its
+    table would be made from."""
     case = Case()
     case.add_input("a", a=[1.0, 2.0, 4.0, 9.0, 16.0])
     case.add_input("b", b=[1.0, 3.0, 4.0, 5.0, 8.0])
@@ -1136,10 +1155,10 @@ def test_a_factor_with_more_values_than_the_cap_has_no_switch():
     expr = a**0.5 * sympy.log(b)
     assert type(TableLowering(case.inputs, cap=5).print(expr)) is SwitchRealization
     with pytest.raises(
-        TableLoweringError, match="25 entries, past the cap of 4"
+        TableLoweringError, match="5 entries, past the cap of 4"
     ) as caught:
         TableLowering(case.inputs, cap=4).print(expr)
-    assert caught.value.node == expr
+    assert caught.value.node == a**0.5
 
 
 def test_a_switched_product_past_2_60_is_refused_as_it_is_built():
@@ -1231,7 +1250,8 @@ def test_a_gated_or_switched_quotient_is_divided_as_lambdify_prints_it(
     case.assert_exact(sympy.floor(product))
 
 
-# Expressions over a, b and c, each node's list compared with Stage 1's.
+# Expressions over a, b and c, each node's list, read at every assignment of its
+# inputs, compared with Stage 1's.
 STAGE_1_LISTS = [
     lambda a, b, c: a**2 * b + b**0.5 / a,
     lambda a, b, c: (a**0.5 + b) * a + sympy.log(a**0.5 + b),
@@ -1255,7 +1275,10 @@ def test_every_list_is_stage_1s(make):
     printed[expr].cp_expr(case.model)
     for node in _operations(printed):
         np.testing.assert_allclose(
-            printed[node].values, _stage_1(case, node), rtol=1e-12, err_msg=str(node)
+            _at_inputs(printed, node),
+            _stage_1(case, node),
+            rtol=1e-12,
+            err_msg=str(node),
         )
 
 
@@ -1575,6 +1598,96 @@ def test_a_gated_product_under_a_log_or_a_power_is_its_table(read):
     assert _tables(case.model) == [10] and not _named(case.model, "gate")
 
 
+# ------------------------------------------------------------------ ranks and pairs
+
+
+def _ab(
+    a: list[float], b: list[float]
+) -> tuple[Case, Index, Index, sympy.Symbol, sympy.Symbol]:
+    """A Case with two buffers whose splits a and b take the values given."""
+    case = Case()
+    pa, pb = case.add_input("a", a=a), case.add_input("b", b=b)
+    return case, pa, pb, case.symbol("a"), case.symbol("b")
+
+
+A_REPEATS = [1.0, 2.0, 2.0, 4.0, 1.0, 4.0]  # three values over six divisions
+
+
+def test_a_menu_with_repeated_values_reads_its_entry_through_its_rank():
+    """Under a log the product is its table from its parts: a's rank, its three
+    values, paired with b. 9 entries and a rank lookup of 6, where one table over the
+    divisions holds 18, and each assignment reads its own entry."""
+    case, pa, pb, a, b = _ab(A_REPEATS, [1.0, 3.0, 5.0])
+    plan = case.assert_exact(sympy.log(a * b + 1))
+    assert type(plan) is TableRealization
+    assert plan.index == CombineIndex(CompactIndex(pa, (0, 1, 1, 2, 0, 2)), pb)
+    assert sorted(_tables(case.model)) == [6, 9]
+
+
+def test_a_product_read_under_a_power_is_exact_as_its_pair():
+    """Lists of different sizes, in a product not symmetric in them, so a pair read
+    the wrong way round reads the wrong entries: 3 * 2 entries against 24."""
+    case, _, _, a, b = _ab([1.0, 2.0, 1.0, 3.0, 2.0, 3.0], [2.0, 5.0, 5.0, 2.0])
+    plan = case.assert_exact(2 ** (a**2 * b / 8))
+    assert type(plan) is TableRealization and plan.index.size == 6
+
+
+def test_parts_on_one_position_share_a_rank_and_a_pair_past_the_cap_is_refused():
+    """u and v, one buffer's, take three distinct rows of five, which the Max pairs
+    with b's two values: 6 entries, where ranking u and v apart would pair 2 * 3 * 2,
+    some of no assignment. At a cap of 5 the pair is refused."""
+    case = Case()
+    pa = case.add_input("a", u=[1.0, 1.0, 2.0, 2.0, 1.0], v=[3.0, 3.0, 4.0, 5.0, 3.0])
+    pb = case.add_input("b", b=[2.0, 6.0, 6.0, 2.0])
+    u, v, b = (case.symbol(name) for name in "uvb")
+    expr = sympy.Max(u, v, b)
+    plan = case.assert_exact(expr)
+    assert type(plan) is TableRealization and isinstance(plan.index, CombineIndex)
+    assert {plan.index.left, plan.index.right} == {
+        CompactIndex(pa, (0, 0, 1, 2, 0)),
+        CompactIndex(pb, (0, 1, 1, 0)),
+    }
+    with pytest.raises(
+        TableLoweringError,
+        match="20 entries, past the cap of 5, and one from its parts 6",
+    ) as caught:
+        TableLowering(case.inputs, cap=5).print(expr)
+    assert caught.value.node == expr
+
+
+def test_a_function_of_one_list_adds_no_position():
+    """A node whose operands are on one position, constants aside, is on it, unranked:
+    the product's pair, the sum with 1 and the log over it share one, though the
+    pair's 9 entries take 5 values, and a's root is on a's division, though a repeats
+    values."""
+    case, pa, _, a, b = _ab(A_REPEATS, [1.0, 2.0, 4.0])
+    product = a * b
+    printed = _printed(case, sympy.log(product + 1) + sympy.sqrt(a))
+    pair = printed[product].index
+    assert isinstance(pair, CombineIndex)
+    assert printed[product + 1].index == printed[sympy.log(product + 1)].index == pair
+    assert printed[sympy.sqrt(a)].index == pa
+
+
+def test_a_node_takes_its_way_with_the_fewest_entries():
+    """Rule 3 over a node's ways. Read linearly, a * b is a switch, 4 + 3 + 6
+    entries, where its pair has 12 + 6 and one table 24; under a log it is its pair.
+    With a's menu [1, 1, 2] and b's [3, 5], one table of 6 wins over the pair's
+    4 + 3, and with b's [3, 5, 7] one table of 9 wins the tie with 6 + 3: it reads no
+    lookup."""
+    case, _, _, a, b = _ab(A_REPEATS, [1.0, 3.0, 5.0, 7.0])
+    switch = case.assert_exact(a * b)
+    assert type(switch) is SwitchRealization and switch.entries() == 4 + 3 + 6
+    case, _, _, a, b = _ab(A_REPEATS, [1.0, 3.0, 5.0, 7.0])
+    pair = case.assert_exact(sympy.log(a * b))
+    assert type(pair) is TableRealization and pair.entries() == 12 + 6
+    for b_menu in ([3.0, 5.0], [3.0, 5.0, 7.0]):
+        case, pa, pb, a, b = _ab([1.0, 1.0, 2.0], b_menu)
+        table = case.assert_exact(sympy.log(a * b))
+        assert type(table) is TableRealization and table.index == CombineIndex(pa, pb)
+        assert table.entries() == 3 * len(b_menu)
+
+
 # ------------------------------------------ synthetic examples of later optimizations
 
 
@@ -1651,7 +1764,9 @@ EXAMPLES = [
     ),
     pytest.param(
         lambda: _with(
-            lambda s: (sympy.floor(s["a"] / 16) * sympy.floor(s["b"] / 32)) ** 0.5,
+            lambda s: sympy.log(
+                sympy.floor(s["a"] / 16) * sympy.floor(s["b"] / 32) + 1
+            ),
             a=128,
             b=128,
         ),
@@ -1668,9 +1783,10 @@ EXAMPLES = [
         CAP,
         id="rung",
         marks=_refused(
-            "a Max is one table over every input of its operands: three buffers need "
-            "8640 entries, past the cap of 8192, and a Max read from the order of its "
-            "operands' values is not built"
+            "a Max is one table over its operands' inputs or their ranks: three "
+            "buffers whose values are all distinct need 8640 entries either way, past "
+            "the cap of 8192, and a Max read from the order of its operands' values is "
+            "not built"
         ),
     ),
     pytest.param(
@@ -1684,9 +1800,9 @@ EXAMPLES = [
         CAP,
         id="lin_min",
         marks=_refused(
-            "a Min of two sums of 15 residency literals is one table of 32768 "
-            "entries, past the cap of 8192, neither sum fits a table either, and a "
-            "Min kept as a linear constraint is not built"
+            "a Min of two sums of 15 and 14 residency literals has no table: the "
+            "smaller sum's is 16384 entries, over its literals or their ranks, past the "
+            "cap of 8192, and a Min kept as a linear constraint is not built"
         ),
     ),
 ]
