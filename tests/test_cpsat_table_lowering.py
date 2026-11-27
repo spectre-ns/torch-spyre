@@ -1883,6 +1883,19 @@ def test_a_product_of_maxes_read_as_a_table_is_its_fold():
     assert type(plan) is TableRealization and plan.index.size == 12
 
 
+def test_a_product_of_maxes_and_mins_read_as_a_table_is_its_fold():
+    """Two Maxes and two Mins of the three buffers: each Min folds its rungs by their
+    min and each Max by their max. One table over the buffers holds 1,728 entries and
+    their ladders crossed 6,480, past a cap of 1,000, but 72 tuples of their rungs
+    occur."""
+    case, s = _with(lambda s: s, a=12, b=12, c=12)
+    buffers = (s["a"], s["b"], s["c"])
+    factors = [sympy.Max(*buffers, k) for k in (1, 3)]
+    factors += [sympy.Min(*buffers, k) for k in (6, 9)]
+    plan = case.assert_exact(sympy.log(sympy.Mul(*factors)), cap=1000)
+    assert type(plan) is TableRealization and plan.index.size == 72
+
+
 def test_the_pair_of_rungs_wins_where_it_has_fewer_entries_than_the_fold():
     """Two of those Maxes cross in 7 * 4 entries, where their fold holds 187: the
     product read under a log is the pair of their rungs."""
