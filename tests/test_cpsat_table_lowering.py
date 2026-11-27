@@ -27,6 +27,7 @@ import functools
 import itertools
 import math
 import sys
+import types
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -52,6 +53,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     GateRealization,
     Index,
     InputIndex,
+    LocateIndex,
     SumRealization,
     SwitchRealization,
     TableRealization,
@@ -133,7 +135,7 @@ class Case:
         values = dict(zip(self.variables, assignment))
         point = {}
         for symbol, (var, column) in self.inputs.items():
-            value = float(column[values[var] - self.values[var][0]])
+            value = float(column[self.values[var].index(values[var])])
             point[symbol] = (
                 sympy.Integer(int(value)) if value.is_integer() else sympy.Float(value)
             )
@@ -339,7 +341,7 @@ def test_the_printer_makes_a_symbols_position_on_its_variable():
     for refused, match in (
         ((division, [1.0, 2.0]), "2 values for a variable with 3, 0 to 2"),
         ((division, [1.0, "two", 4.0]), "values that are not one number each"),
-        ((gapped, [1.0, 2.0, 3.0, 4.0]), "a variable whose domain has gaps"),
+        ((gapped, [1.0, 2.0, 3.0, 4.0]), "4 values for a variable with 3, 1 to 4"),
         ((~literal, [1.0, 2.0]), "a variable that is not an IntVar"),
     ):
         printer = TableLowering({d0: refused}, cap=CAP)  # type: ignore[dict-item]
@@ -2004,6 +2006,136 @@ def test_a_max_too_wide_to_index_stays_linear_only_under_a_linear_reader(read, l
     else:
         with pytest.raises(TableLoweringError, match="past the cap of 16"):
             case.lower(expr, cap=16)
+
+
+# ------------------------------------------------------------- the solver's maps
+
+
+def _maps(case: Case) -> tuple[dict[str, Any], dict[str, Any]]:
+    """case's inputs as the CP-SAT printer's maps: a buffer's symbols in buffer_map,
+    on a wrapper that holds its division, and any other variable in sym_map."""
+    sym_map: dict[str, Any] = {}
+    buffer_map: dict[str, Any] = {}
+    for symbol, (var, values) in case.inputs.items():
+        if var.name.startswith("division_"):
+            buffer_map[symbol.name] = (types.SimpleNamespace(division=var), values)
+        else:
+            sym_map[symbol.name] = var
+    return sym_map, buffer_map
+
+
+def test_a_variable_whose_domain_has_gaps_is_read_through_its_position():
+    """Its position is one lookup, values[position] == var, and a table on it is
+    exact."""
+    case = Case()
+    domain = [1, 2, 5, 9]
+    var = case.model.new_int_var_from_domain(cp_model.Domain.from_values(domain), "g")
+    g = sympy.Symbol("g", integer=True)
+    case.inputs[g] = (var, [float(v) for v in domain])
+    case.variables.append(var)
+    case.values[var] = domain
+    case.add_input("a", a=[1.0, 3.0])
+    column = TableLowering(case.inputs, cap=CAP).print(g).table(CAP)
+    assert column.index == LocateIndex(var, tuple(domain))
+    case.assert_exact(g**0.5 * case.symbol("a") + sympy.log(g))
+
+
+def test_the_maps_give_each_symbol_its_variable_and_values():
+    """A buffer's symbol its value at each division, any other integer variable its
+    domain's values; a domain past the cap, and an entry that is no variable, are no
+    input."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0], t=[8.0, 4.0, 2.0])
+    case.integer("y", 2, 3)
+    sym_map, buffer_map = _maps(case)
+    sym_map["wide"] = case.model.new_int_var(0, 99, "wide")
+    sym_map["_division_of_a"] = buffer_map["a"][0]
+    inputs = lowering.inputs_from_maps(sym_map, buffer_map, cap=64)
+    division = case.variables[0]
+    assert inputs == {
+        "a": (division, [1.0, 2.0, 4.0]),
+        "t": (division, [8.0, 4.0, 2.0]),
+        "y": (case.variables[1], [2.0, 3.0, 4.0]),
+    }
+
+
+def test_two_menu_lengths_on_one_division_are_refused():
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    sym_map, buffer_map = _maps(case)
+    buffer_map["b"] = (buffer_map["a"][0], [1.0, 2.0])
+    expr = case.symbol("a") + sympy.Symbol("b", positive=True)
+    with pytest.raises(TableLoweringError, match="2 values for a variable with 3"):
+        lowering.lower_cost_with_tables(case.model, sym_map, buffer_map, expr, cap=CAP)
+
+
+def test_the_entry_point_reads_numbers_and_prices_an_undivided_relayout_at_0():
+    """A number in sym_map is its symbol's value, a relayout on a division with no
+    input is 0, as the CP-SAT printer prices it, and a constant objective is an
+    int."""
+    case = Case()
+    case.integer("x", 0, 2)
+    sym_map, buffer_map = _maps(case)
+    sym_map["n"] = 4
+    charge = RelayoutCharge(case.symbol("x"), sympy.Symbol("division_of_b"), 5, 7)
+    expr = 2 * sympy.Symbol("n") + charge
+    objective = lowering.lower_cost_with_tables(
+        case.model, sym_map, buffer_map, expr, cap=CAP
+    )
+    assert objective == 8 * COST_SCALE
+
+
+def test_a_failed_build_leaves_the_model_as_it_was(monkeypatch):
+    """An entry past 2^50 is found as the root is built, after the variables of the
+    terms before it were made. The model is its copy again, and a constant the
+    failed build made is not handed out by the model's next new_constant, where it
+    would be MODEL_INVALID."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 3.0])
+    case.add_input("b", b=[1.0, 2.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    sym_map, buffer_map = _maps(case)
+    before = str(case.model.proto)
+    build = TableRealization.__dict__["cp_expr"].func
+
+    def making_a_constant(self, model):
+        model.new_constant(3)
+        return build(self, model)
+
+    monkeypatch.setattr(TableRealization, "cp_expr", making_a_constant)
+    expr = sympy.log(a + 1) * b + 2.0**60 * b**0.5
+    with pytest.raises(TableLoweringError, match="past 2\\^50"):
+        lowering.lower_cost_with_tables(case.model, sym_map, buffer_map, expr, cap=CAP)
+    assert str(case.model.proto) == before
+    monkeypatch.undo()
+    three = case.model.new_constant(3)
+    case.model.add(case.variables[0] + three >= 4)
+    case.model.minimize(case.variables[0])
+    assert cp_model.CpSolver().solve(case.model) == cp_model.OPTIMAL
+
+
+def test_an_exception_of_another_type_leaves_the_entry_point_as_a_refusal(monkeypatch):
+    """With the original as its cause and no node; a refusal keeps its node."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0])
+    sym_map, buffer_map = _maps(case)
+    a = case.symbol("a")
+
+    def failing(self, expr):
+        raise ValueError("boom")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(TableLowering, "print", failing)
+        with pytest.raises(TableLoweringError) as caught:
+            lowering.lower_cost_with_tables(case.model, sym_map, buffer_map, a, cap=CAP)
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert (caught.value.node, caught.value.reason) == (None, "ValueError: boom")
+    stray = sympy.Symbol("stray")
+    with pytest.raises(TableLoweringError, match="a symbol with no input") as caught:
+        lowering.lower_cost_with_tables(
+            case.model, sym_map, buffer_map, a + stray, cap=CAP
+        )
+    assert caught.value.node == stray
 
 
 # ------------------------------------------ synthetic examples of later optimizations
