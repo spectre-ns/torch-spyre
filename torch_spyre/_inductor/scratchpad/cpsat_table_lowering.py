@@ -439,7 +439,7 @@ class SumRealization(SymbolicRealization):
         return [term.table(cap) for term in self.terms]
 
     def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
-        return sum(lists, np.zeros(len(lists[0])))
+        return sum(lists[1:], lists[0])
 
     def scaled(self, factor: float) -> SumRealization:
         terms = tuple(term.scaled(factor) for term in self.terms)
