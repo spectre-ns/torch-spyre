@@ -613,23 +613,6 @@ def _tabulated(
     return TableRealization(values=compute(index.size, lists), index=index)
 
 
-def _table_of(
-    expr: sympy.Basic,
-    parts: Sequence[TableRealization],
-    positions: Sequence[Index],
-    cap: int,
-    compute: Callable[[list[np.ndarray]], Any],
-) -> TableRealization:
-    """expr, compute of parts' lists, as its table (_tabulated) over positions, its
-    inputs in symbol order, or over its parts' positions."""
-    return _tabulated(
-        parts,
-        positions,
-        cap,
-        lambda count, lists: _values(expr, count, lambda: compute(lists)),
-    )
-
-
 # ---------------------------------------------------------------------- the printer
 
 
@@ -832,18 +815,16 @@ class TableLowering(Printer):
     def _operation(
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
     ) -> TableRealization:
-        """expr as its table (_table_of) of its operands. An operation on numbers is
+        """expr as its table (_tabulated) of its operands. An operation on numbers is
         computed the same way, on a UnitIndex, so sqrt(19) equals sqrt(a) at a = 19
         (sympy's float is one double below)."""
         if not operands:
             return TableRealization(values=[_constant(expr)], index=UnitIndex())
-        parts = [self._table(operand) for operand in operands]
-        return _table_of(
-            expr,
-            parts,
+        return _tabulated(
+            [self._table(operand) for operand in operands],
             self._inputs(expr) or [UnitIndex()],
             self.cap,
-            lambda lists: numpy_eval(expr, lists),
+            lambda count, lists: _values(expr, count, lambda: numpy_eval(expr, lists)),
         )
 
     def _fits(self, expr: sympy.Basic) -> bool:
