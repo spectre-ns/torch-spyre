@@ -692,8 +692,9 @@ def _ways(
 ) -> list[tuple[list[Index], list[TableRealization]]]:
     """The positions a table of a function of parts can be on, each with the parts as
     read there: positions, its inputs; and the parts' own positions, ranked to their
-    distinct values (_ranked) when the parts are on several, so a function of one list
-    adds no position. Parts on one position share one rank, of their rows."""
+    distinct values (_compact_to_unique_rows) when the parts are on several, so a
+    function of one list adds no position. Parts on one position share one rank, of
+    their rows."""
     on: dict[Index, list[int]] = {}
     for i, part in enumerate(parts):
         if part.index != UnitIndex():
@@ -701,7 +702,9 @@ def _ways(
     own = list(parts)
     if len(on) > 1:
         for index, members in on.items():
-            rank, lists = _ranked(index, [parts[i].values for i in members])
+            rank, lists = _compact_to_unique_rows(
+                index, [parts[i].values for i in members]
+            )
             for i, values in zip(members, lists):
                 own[i] = TableRealization(values=values, index=rank)
     ranks = [own[members[0]].index for members in on.values()] or [UnitIndex()]
@@ -1012,7 +1015,7 @@ class TableLowering(Printer):
         a product of five Maxes 5e-4 off, and CP-SAT 9.15's presolve reported a wrong
         optimum on it."""
         table = self._table(factor)
-        index, (ranked,) = _ranked(table.index, [table.values])
+        index, (ranked,) = _compact_to_unique_rows(table.index, [table.values])
         index = self._ranks.setdefault(index, index)
         values = tuple(ranked.tolist())
         rest = self._print(sympy.Mul(*others))
@@ -1176,10 +1179,10 @@ def _number(value: float) -> sympy.Number:
     )
 
 
-def _ranked(
+def _compact_to_unique_rows(
     index: Index, lists: Sequence[np.ndarray]
 ) -> tuple[Index, list[np.ndarray]]:
-    """index ranked to the distinct rows of lists, each a list on index, in the order
+    """index compacted to the unique rows of lists, each a list on index, in the order
     of their first entries: the rank of each entry's row, a CompactIndex, or index
     itself when no row repeats; and each list's value at each rank."""
     rows = list(zip(*(values.tolist() for values in lists)))
