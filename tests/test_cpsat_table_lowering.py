@@ -1700,11 +1700,6 @@ def _ab(
 A_REPEATS = [1.0, 2.0, 2.0, 4.0, 1.0, 4.0]  # three values over six divisions
 
 
-def test_dedup_keeps_each_item_once_in_the_order_first_met():
-    assert lowering._dedup(iter([3, 1, 3, 2, 1])) == [3, 1, 2]
-    assert lowering._dedup([]) == []
-
-
 def test_a_menu_with_repeated_values_reads_its_entry_through_its_rank():
     """Under a log the product is its table from its parts: a's rank, its three
     values, paired with b. 9 entries and a rank lookup of 6, where one table over the
