@@ -1032,20 +1032,23 @@ FACTORS = {
 
 @pytest.mark.parametrize("factor", FACTORS.values(), ids=FACTORS)
 def test_a_factor_times_a_sum_over_two_buffers_is_a_switch_and_exact(factor):
-    """No table crosses factor and rest: one per list. Each case's true/false is on
-    exactly where the factor takes its value, and sets g with one constraint for a
-    whole value and two for a fraction."""
+    """No table crosses factor and rest: one per list. Its values are the factor's
+    divided by the power of two at or above the largest, the rest multiplied by it.
+    Each case's true/false is on exactly where the factor takes its value, and sets g
+    with one constraint for a whole value and two for a fraction."""
     case = Case()
     position = case.add_input("k", k=factor)
     k, (a, b, _) = case.symbol("k"), _abc(case)
     plan = case.assert_exact(k * (a**0.5 + sympy.log(b)))
     assert type(plan) is SwitchRealization and type(plan.rest) is SumRealization
-    assert plan.values == tuple(factor) and plan.index == position  # no rank lookup
+    size = 2.0 ** math.ceil(math.log2(max(abs(v) for v in factor)))
+    assert plan.values == tuple(v / size for v in factor)
+    assert plan.index == position  # no rank lookup
     assert sorted(_tables(case.model)) == [3, 4]
     model = case.model
     (g,) = _named(model, "switch")
     on_g = [c for c in model.proto.constraints if c.has_linear() and g in c.linear.vars]
-    assert len(on_g) == 1 + sum(1 if v.is_integer() else 2 for v in factor)  # + cost
+    assert len(on_g) == 1 + sum(1 if v.is_integer() else 2 for v in plan.values)
     cases = [model.get_bool_var_from_proto_index(i) for i in _named(model, "case")]
     for row in case.solutions([case.variables[0], *cases]):
         assert row[1:] == tuple(int(i == row[0]) for i in range(len(factor)))
@@ -1068,12 +1071,13 @@ def test_products_with_one_factor_are_one_switch_over_their_rests_sum():
 
 def test_a_position_and_a_realization_are_built_once_per_model():
     """Two factors on one buffer with equal ranks share one CompactIndex, and their
-    switches one rest: one rank lookup and one list. A position that reads the rank
+    switches, of one scale, one rest: one rank lookup and one list. A position that
+    reads the rank
     twice adds one lookup. A second build in the model adds nothing, and each step and
     realization gives back the expression it built; a build in another model adds it
     all again."""
     case = Case()
-    position = case.add_input("k", f=[1.0, 1.0, 2.0], h=[5.0, 5.0, 7.0])
+    position = case.add_input("k", f=[1.0, 1.0, 2.0], h=[1.25, 1.25, 1.75])
     f, h, (a, _, _) = case.symbol("f"), case.symbol("h"), _abc(case)
     plan = case.assert_exact(f * a**0.5 + h * a**0.5)
     rank = CompactIndex(position, (0, 0, 1))
@@ -1108,7 +1112,7 @@ def test_a_factor_over_two_buffers_is_ranked_on_their_combined_position():
     case = Case()
     a, b, c = _abc(case)
     plan = case.assert_exact(sympy.floor((a + b) / 4) * c**1.5)
-    assert type(plan) is SwitchRealization and plan.values == (0.0, 1.0, 2.0, 3.0)
+    assert type(plan) is SwitchRealization and plan.values == (0.0, 0.25, 0.5, 0.75)
     assert isinstance(plan.index, CompactIndex) and plan.index.parent.size == 12
 
 
@@ -1175,13 +1179,33 @@ def test_a_factor_with_more_values_than_the_cap_has_no_switch():
 
 
 def test_a_switched_product_past_2_60_is_refused_as_it_is_built():
-    """A fraction's q halves down to 1 first."""
+    """A switch's values are at most 1, so its rest passes 2^60 only as a sum of many
+    lists near 2^50; a fraction's q halves down to 1 first."""
     case = Case()
-    case.add_input("k", k=[0.5, 2.0**20])
-    case.add_input("a", a=[1.0, 1e11, 2e11])
+    position = case.add_input("k", k=[0.5, 1.0])
+    near = [TableRealization(values=[2.0**40], index=UnitIndex()) for _ in range(1100)]
+    rest = SumRealization(tuple(near), ())
     with pytest.raises(TableLoweringError, match="2\\^60") as caught:
-        case.lower(case.symbol("k") * case.symbol("a"))
+        SwitchRealization((0.5, 1.0), position, rest, (position,)).cp_expr(case.model)
     assert caught.value.node is None
+
+
+def test_a_large_factor_multiplies_a_rest_rounded_at_the_products_scale():
+    """k of 1e6 and 3e6 times a**0.5: the rest is multiplied by 2^22 before it is
+    rounded and the switch's values are at most 1, so every product is within 1e-6 of
+    its value, where a**0.5 rounded onto COST_SCALE first, 1448 for 1448.15, was
+    1e-4 off once multiplied by 3e6."""
+    case = Case()
+    case.add_input("k", k=[1e6, 3e6])
+    case.add_input("a", a=[1.0, 2.0, 3.0])
+    expr = case.symbol("k") * case.symbol("a") ** 0.5
+    plan, objective = case.lower(expr)
+    assert type(plan) is SwitchRealization and max(plan.values) <= 1
+    cost = case.model.new_int_var(-(2**60), 2**60, "cost")
+    case.model.add(cost == objective)
+    for row in case.solutions(case.variables + [cost]):
+        exact = COST_SCALE * case.sympy_value(expr, row[:-1])
+        assert abs(row[-1] - exact) <= 1e-6 * exact
 
 
 def test_a_switchs_rest_of_several_terms_is_one_variable():
@@ -1581,7 +1605,7 @@ def test_a_literal_is_its_variable_whatever_its_symbols_values():
 
 @pytest.mark.parametrize(
     "factor, variable, values",
-    [(lambda v: 1 + v, (0, 2), (1.0, 2.0)), (lambda v: v - 1, (1, 2), (0.0, 1.0))],
+    [(lambda v: 1 + v, (0, 2), (0.5, 1.0)), (lambda v: v - 1, (1, 2), (0.0, 1.0))],
     ids=["never_0", "not_0_1"],
 )
 def test_a_factor_that_is_never_0_or_reads_no_0_1_variable_is_no_gate(

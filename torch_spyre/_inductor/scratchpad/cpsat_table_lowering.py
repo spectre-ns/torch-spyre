@@ -944,6 +944,8 @@ class TableLowering(Printer):
         self._realizations: dict[sympy.Basic, AbstractRealization] = {}
         # one instance per rank, so equal ranks are one lookup
         self._ranks: dict[Index, Index] = {}
+        # one instance per rest and scale, so switches that share a rest share it
+        self._scaled: dict[tuple[AbstractRealization, float], AbstractRealization] = {}
 
     def print(self, expr: sympy.Basic) -> AbstractRealization:
         """expr's realization; raises TableLoweringError for what cannot be lowered."""
@@ -1121,13 +1123,26 @@ class TableLowering(Printer):
         self, expr: sympy.Basic, factor: sympy.Basic, others: Sequence[sympy.Basic]
     ) -> AbstractRealization | None:
         """expr as a switch (_switch) on factor's table, ranked, over the product of
-        others."""
+        others. A factor past 1 is divided by the power of two at or above its largest
+        value, and the rest multiplied by it before it is rounded, both exactly: the
+        rest is rounded at the product's scale, and the switch multiplies that rounding
+        by values at most 1. A rest rounded at its own scale under a factor of 2e6 left
+        a product of five Maxes 5e-4 off, and CP-SAT 9.15's presolve reported a wrong
+        optimum on it."""
         table = self._table(factor)
-        index, (values,) = _ranked(table.index, [table.values])
+        index, (ranked,) = _ranked(table.index, [table.values])
         index = self._ranks.setdefault(index, index)
+        values = tuple(ranked.tolist())
         rest = self._print(sympy.Mul(*others))
+        largest = max(abs(value) for value in values)
+        if largest > 1:
+            size = 2.0 ** math.ceil(math.log2(largest))
+            values = tuple(value / size for value in values)
+            if (rest, size) not in self._scaled:
+                self._scaled[rest, size] = rest.scaled(size)
+            rest = self._scaled[rest, size]
         positions = tuple(self._inputs(expr))
-        return _switch(tuple(values.tolist()), index, rest, positions, self.cap)
+        return _switch(values, index, rest, positions, self.cap)
 
     def _print_Min(self, expr: sympy.Min) -> AbstractRealization | None:
         return self._extreme(expr, is_min=True)
