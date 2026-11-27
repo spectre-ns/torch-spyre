@@ -75,6 +75,10 @@ MAX_ENTRY = 2**50
 # A switch writes a fraction p / q, q <= MAX_DENOMINATOR, each p * w < MAX_PRODUCT.
 MAX_DENOMINATOR = 2**24
 MAX_PRODUCT = 2**60
+# A Min or Max whose parent reads it linearly stays linear where that needs under
+# 1/LINEAR_MARGIN of its table's entries (rule 3): a table searches faster on a near
+# tie.
+LINEAR_MARGIN = 2
 
 # What CP-SAT takes as a linear expression: a LinearExpr, an IntVar or an int.
 CpExpr: TypeAlias = cp_model.LinearExprT
@@ -450,11 +454,7 @@ class SwitchRealization(SymbolicRealization):
         the floor: q * g <= p * w <= q * g + q - 1. A rest of several terms is one
         variable w, so p multiplies one coefficient, not each term's: CP-SAT 9.15's
         presolve calls a model with p times a list's step past 2^31 infeasible."""
-        w = self.rest.cp_expr(model)
-        if not isinstance(w, (int, cp_model.IntVar)):
-            rest = model.new_int_var(*self.rest.bounds(), "rest")
-            model.add(rest == w)
-            w = rest
+        w = _one_variable(model, self.rest, "rest")
         q = self.denominator()
         cases = [model.new_bool_var("case") for _ in self.values]
         model.add_map_domain(self.index.cp_expr(model), cases)
@@ -522,6 +522,68 @@ class SwitchRealization(SymbolicRealization):
                 raise TableLoweringError(None, "a switched product past 2^60")
             q //= 2
         return q
+
+
+@dataclass(frozen=True, eq=False)
+class ExtremeRealization(SymbolicRealization):
+    """A Min (is_min) or Max kept linear: one lin_min or lin_max of its operands, each
+    behind a variable of its own. Its parent reads it linearly, as a sum, a constant,
+    a switch's or a gate's rest, or another Min or Max kept linear does; any other
+    parent reads its table."""
+
+    is_min: bool
+    operands: tuple[AbstractRealization, ...]
+    positions: tuple[Index, ...]
+
+    @memoize_method
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        """Each operand one variable: a long sum inside lin_max made CP-SAT's presolve
+        run out of memory."""
+        operands = [_one_variable(model, o, "term") for o in self.operands]
+        target = model.new_int_var(*self.bounds(), "min" if self.is_min else "max")
+        if self.is_min:
+            model.add_min_equality(target, operands)
+        else:
+            model.add_max_equality(target, operands)
+        return target
+
+    def _parts(self, cap: int) -> list[TableRealization]:
+        return [operand.table(cap) for operand in self.operands]
+
+    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+        return reduce(np.minimum if self.is_min else np.maximum, lists)
+
+    def _made(
+        self, parts: list[TableRealization], cap: int
+    ) -> tuple[TableRealization, ...]:
+        return (_by_rung(parts, self.is_min),)
+
+    def scaled(self, factor: float) -> ExtremeRealization:
+        """A negative factor turns a Min into a Max."""
+        operands = tuple(operand.scaled(factor) for operand in self.operands)
+        return ExtremeRealization(
+            self.is_min == (factor >= 0), operands, self.positions
+        )
+
+    def bounds(self) -> tuple[int, int]:
+        ends = [operand.bounds() for operand in self.operands]
+        pick = min if self.is_min else max
+        return pick(lo for lo, _ in ends), pick(hi for _, hi in ends)
+
+    def entries(self) -> int:
+        return sum(operand.entries() for operand in self.operands)
+
+
+def _one_variable(
+    model: cp_model.CpModel, realization: AbstractRealization, name: str
+) -> CpExpr:
+    """realization's expression in model as one variable, or the number it is."""
+    expr = realization.cp_expr(model)
+    if isinstance(expr, (int, cp_model.IntVar)):
+        return expr
+    var = model.new_int_var(*realization.bounds(), name)
+    model.add(var == expr)
+    return var
 
 
 @dataclass(frozen=True, eq=False)
@@ -655,20 +717,33 @@ def _tabulated(
     compute: Callable[[int, list[np.ndarray]], Any],
     made: Sequence[TableRealization] = (),
 ) -> TableRealization:
-    """A function of parts as the table within cap with the fewest entries, its
-    list's and its lookups' (rule 3): one of its ways (_ways), over positions on a
-    tie, or one of made, tables already made. A way's list is compute(count, the
-    parts' lists on it), and only the way taken is computed."""
-    ways = _ways(parts, positions)
-    sizes = [_size(way) for way, _ in ways]
-    made = [table for table in made if table.index.size <= cap]
-    if min(sizes) > cap and not made:
-        inputs, *own = sizes
+    """A function of parts as its cheapest table (_cheapest), refused where none fits
+    cap."""
+    table = _cheapest(parts, positions, cap, compute, made)
+    if table is None:
+        inputs, *own = [_size(way) for way, _ in _ways(parts, positions)]
         raise TableLoweringError(
             None,
             f"one table over its inputs would hold {inputs} entries, past the cap of "
             f"{cap}" + "".join(f", and one from its parts {size}" for size in own),
         )
+    return table
+
+
+def _cheapest(
+    parts: Sequence[TableRealization],
+    positions: Sequence[Index],
+    cap: int,
+    compute: Callable[[int, list[np.ndarray]], Any],
+    made: Sequence[TableRealization] = (),
+) -> TableRealization | None:
+    """A function of parts as the table within cap with the fewest entries, its
+    list's and its lookups' (rule 3): one of its ways (_ways), over positions on a
+    tie, or one of made, tables already made; None where none fits. A way's list is
+    compute(count, the parts' lists on it), and only the way taken is computed."""
+    ways = _ways(parts, positions)
+    sizes = [_size(way) for way, _ in ways]
+    made = [table for table in made if table.index.size <= cap]
     fitting = [(_size(w) + sum(p.entries() for p in w), w, ops) for w, ops in ways]
     best = min(
         (f for f, size in zip(fitting, sizes) if size <= cap),
@@ -678,7 +753,8 @@ def _tabulated(
     cheapest = min(made, key=lambda table: table.entries(), default=None)
     if cheapest is not None and (best is None or cheapest.entries() < best[0]):
         return cheapest
-    assert best is not None
+    if best is None:
+        return None
     _, way, operands = best
     index, grid = _combined(way), _grid(way)
     lists = [_on(operand, index, grid) for operand in operands]
@@ -908,10 +984,11 @@ class TableLowering(Printer):
         gate, its constants in the gate's rest. Otherwise a product that divides
         (divides), 98*k/a, is declined: one table, divided once in the numpy core as
         lambdify prints it, and no table of 1/a, so 98*k/a is 2k at a = 49, where k
-        times 98 * (1/49) is under 2k. Any other product of several operands is a
-        switch (_switched), its constants applied to the rest. A constant times one
-        operand is the operand scaled in float, as lambdify prints a/49: (1/49)*a, and
-        any other product is declined."""
+        times 98 * (1/49) is under 2k; where an operand has no table, it is a switch
+        on that quotient of the others (_divided). Any other product of several
+        operands is a switch (_switched), its constants applied to the rest. A constant
+        times one operand is the operand scaled in float, as lambdify prints a/49:
+        (1/49)*a, and any other product is declined."""
         constants = [factor for factor in factors(expr) if not factor.free_symbols]
         symbolic = [factor for factor in expr.args if factor.free_symbols]
         if len(symbolic) > 1:
@@ -919,7 +996,7 @@ class TableLowering(Printer):
             if gated is not None:
                 return gated
         if any(divides(factor) for factor in expr.args):
-            return None
+            return self._divided(expr)
         if len(symbolic) == 1:
             realization: AbstractRealization | None = self._print(symbolic[0])
         else:
@@ -988,9 +1065,32 @@ class TableLowering(Printer):
         if not tables:
             return None
         factor = min(tables, key=lambda o: len(np.unique(tables[o].values)))
-        index, (values,) = _ranked(tables[factor].index, [tables[factor].values])
+        return self._switch_on(expr, factor, [o for o in operands if o != factor])
+
+    def _divided(self, expr: sympy.Mul) -> AbstractRealization | None:
+        """A product that divides, declined where each of its operands (operands)
+        has a table. Otherwise a switch on the quotient of the factors whose operands
+        have one, its table divided once, over the product of the others, as a sum of
+        residency literals too wide for any table is: S / (d0 * d1)."""
+        wide = [
+            factor
+            for factor, operand in zip(factors(expr), operands(expr))
+            if operand.free_symbols and not self._has_table(operand)
+        ]
+        if not wide:
+            return None
+        quotient = sympy.Mul(*(factor for factor in expr.args if factor not in wide))
+        return self._switch_on(expr, quotient, wide)
+
+    def _switch_on(
+        self, expr: sympy.Basic, factor: sympy.Basic, others: Sequence[sympy.Basic]
+    ) -> AbstractRealization | None:
+        """expr as a switch (_switch) on factor's table, ranked, over the product of
+        others."""
+        table = self._table(factor)
+        index, (values,) = _ranked(table.index, [table.values])
         index = self._ranks.setdefault(index, index)
-        rest = self._print(sympy.Mul(*(o for o in operands if o != factor)))
+        rest = self._print(sympy.Mul(*others))
         positions = tuple(self._inputs(expr))
         return _switch(tuple(values.tolist()), index, rest, positions, self.cap)
 
@@ -1003,12 +1103,27 @@ class TableLowering(Printer):
     def _extreme(
         self, expr: sympy.Basic, *, is_min: bool
     ) -> AbstractRealization | None:
-        """A Min or Max as its table, by rung (_by_rung) where that has the fewest
-        entries. Declined where it reads no symbol."""
+        """A Min or Max as its cheapest table, by rung (_by_rung) among its ways, or
+        kept linear (ExtremeRealization, rule 3): where an operand has no table
+        (_has_table), none of its tables fits the cap, or the linear one needs under
+        1/LINEAR_MARGIN of its table's entries. Declined where it reads no symbol."""
         if not expr.free_symbols:
             return None
-        by_rung = _by_rung([self._table(operand) for operand in expr.args], is_min)
-        return self._operation(expr, expr.args, (by_rung,))
+        operands = tuple(self._print(operand) for operand in expr.args)
+        linear = ExtremeRealization(is_min, operands, tuple(self._inputs(expr)))
+        if not all(self._has_table(operand) for operand in expr.args):
+            return linear
+        parts = [self._table(operand) for operand in expr.args]
+        table = _cheapest(
+            parts,
+            self._inputs(expr),
+            self.cap,
+            lambda count, lists: _values(expr, count, lambda: numpy_eval(expr, lists)),
+            (_by_rung(parts, is_min),),
+        )
+        if table is None or LINEAR_MARGIN * linear.entries() < table.entries():
+            return linear
+        return table
 
     def _print_RelayoutCharge(self, expr: sympy.Function) -> AbstractRealization | None:
         """RelayoutCharge(is_lx, division, *prices), is_lx times the price at the
