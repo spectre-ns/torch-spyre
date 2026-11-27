@@ -37,10 +37,11 @@ factor and the rest. Any other node is a table, and a parent that reads a sum, a
 switch or a gate as a list reads its table. A table is over the node's inputs, over
 its operands' positions, each ranked to its distinct values, or, for a Min or Max, by
 rung: its ladder at the min or max of its operands' positions on it. It takes the way
-with the fewest entries (rule 3), and is refused when none fits the cap. Its list is the
-numpy core's function of its sympy class (``cost_expr_numpy.py``, which the CP-SAT
-printer evaluates its candidates with) applied to its operands' tables; a class the
-core has no function for is refused. Nothing imports the module yet.
+with the fewest entries (rule 3), the next where that one's list is not finite, and
+is refused when none fits the cap. Its list is the numpy core's function of its sympy
+class (``cost_expr_numpy.py``, which the CP-SAT printer evaluates its candidates
+with) applied to its operands' tables; a class the core has no function for is
+refused. Nothing imports the module yet.
 """
 
 from __future__ import annotations
@@ -119,6 +120,10 @@ class Index(ABC):
         """The entries of the lookups it is read through."""
 
     @abstractmethod
+    def inputs(self) -> tuple[InputIndex, ...]:
+        """The input positions it is made from."""
+
+    @abstractmethod
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         """The position at every point of grid, which holds each input position's
         coordinate there: what cp_expr builds, computed."""
@@ -136,6 +141,9 @@ class InputIndex(Index):
     def entries(self) -> int:
         return 0
 
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return (self,)
+
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return self.var - self.lo if self.lo else self.var
 
@@ -151,6 +159,9 @@ class UnitIndex(Index):
 
     def entries(self) -> int:
         return 0
+
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return ()
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return 0
@@ -172,6 +183,9 @@ class CombineIndex(Index):
 
     def entries(self) -> int:
         return self.left.entries() + self.right.entries()
+
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return self.left.inputs() + self.right.inputs()
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -196,6 +210,9 @@ class CompactIndex(Index):
     def entries(self) -> int:
         return len(self.remap) + self.parent.entries()
 
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return self.parent.inputs()
+
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         rank = model.new_int_var(0, self.size - 1, "rank")
@@ -218,6 +235,9 @@ class ExtremeIndex(Index):
 
     def entries(self) -> int:
         return sum(rung.entries() for rung in self.rungs)
+
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return tuple(i for rung in self.rungs for i in rung.inputs())
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -355,10 +375,7 @@ class TableRealization(AbstractRealization):
 
 
 class SymbolicRealization(AbstractRealization):
-    """No list of its own: CP-SAT builds it from its operands' expressions. positions
-    are its inputs', in its table's order."""
-
-    positions: tuple[Index, ...]
+    """No list of its own: CP-SAT builds it from its operands' expressions."""
 
     def table(self, cap: int) -> TableRealization:
         """Its cheapest table from its parts' tables (_tabulated), or one _made."""
@@ -366,7 +383,6 @@ class SymbolicRealization(AbstractRealization):
         with np.errstate(over="ignore"):  # inf is refused by TableRealization
             return _tabulated(
                 parts,
-                self.positions,
                 cap,
                 lambda _, lists: self._values_from_parts(lists),
                 self._made(parts, cap),
@@ -392,7 +408,6 @@ class SumRealization(SymbolicRealization):
     """sum(terms). A constant is a term on a UnitIndex."""
 
     terms: tuple[AbstractRealization, ...]
-    positions: tuple[Index, ...]
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -414,7 +429,7 @@ class SumRealization(SymbolicRealization):
 
     def scaled(self, factor: float) -> SumRealization:
         terms = tuple(term.scaled(factor) for term in self.terms)
-        return SumRealization(terms, self.positions)
+        return SumRealization(terms)
 
     def bounds(self) -> tuple[int, int]:
         ends = [term.bounds() for term in self.terms]
@@ -433,7 +448,6 @@ class SwitchRealization(SymbolicRealization):
     values: tuple[float, ...]
     index: Index
     rest: AbstractRealization
-    positions: tuple[Index, ...]
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -464,7 +478,7 @@ class SwitchRealization(SymbolicRealization):
 
     def scaled(self, factor: float) -> SwitchRealization:
         rest = self.rest.scaled(factor)
-        return SwitchRealization(self.values, self.index, rest, self.positions)
+        return SwitchRealization(self.values, self.index, rest)
 
     @memoize_method
     def bounds(self) -> tuple[int, int]:
@@ -487,8 +501,7 @@ class SwitchRealization(SymbolicRealization):
         return self.index, self.values
 
     def joined(self, others: Sequence[Self]) -> SwitchRealization:
-        rest, positions = _joined((self, *others))
-        return SwitchRealization(self.values, self.index, rest, positions)
+        return SwitchRealization(self.values, self.index, _joined((self, *others)))
 
     def denominator(self) -> int:
         """q: 1 when every value is whole, otherwise the largest power of two up to
@@ -511,7 +524,6 @@ class ExtremeRealization(SymbolicRealization):
 
     is_min: bool
     operands: tuple[AbstractRealization, ...]
-    positions: tuple[Index, ...]
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -539,9 +551,7 @@ class ExtremeRealization(SymbolicRealization):
     def scaled(self, factor: float) -> ExtremeRealization:
         """A negative factor turns a Min into a Max."""
         operands = tuple(operand.scaled(factor) for operand in self.operands)
-        return ExtremeRealization(
-            self.is_min == (factor >= 0), operands, self.positions
-        )
+        return ExtremeRealization(self.is_min == (factor >= 0), operands)
 
     def bounds(self) -> tuple[int, int]:
         ends = [operand.bounds() for operand in self.operands]
@@ -573,7 +583,6 @@ class GateRealization(SymbolicRealization):
     literal: InputIndex
     kept: int
     rest: AbstractRealization
-    positions: tuple[Index, ...]
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -609,8 +618,7 @@ class GateRealization(SymbolicRealization):
         return self.literal, self.kept
 
     def joined(self, others: Sequence[Self]) -> GateRealization:
-        rest, positions = _joined((self, *others))
-        return replace(self, rest=rest, positions=positions)
+        return replace(self, rest=_joined((self, *others)))
 
 
 # --------------------------------------------------------------------- a node's list
@@ -661,17 +669,21 @@ def _values_at(
 
 
 def _ways(
-    parts: Sequence[TableRealization], positions: Sequence[Index]
+    parts: Sequence[TableRealization],
 ) -> list[tuple[list[Index], list[TableRealization]]]:
     """The positions a table of a function of parts can be on, each with the parts as
-    read there: positions, its inputs; and the parts' own positions, ranked to their
-    distinct values (_compact_to_unique_rows) when the parts are on several, so a
-    function of one list adds no position. Parts on one position share one rank, of
-    their rows."""
+    read there: the parts' inputs, in the order of their variables; and the parts' own
+    positions, ranked to their distinct values (_compact_to_unique_rows) when the
+    parts are on several, so a function of one list adds no position. Parts on one
+    position share one rank, of their rows; two positions that share an input pair
+    their rows at two values of it too, which no assignment reaches."""
     on: dict[Index, list[int]] = {}
     for i, part in enumerate(parts):
         if part.index != UnitIndex():
             on.setdefault(part.index, []).append(i)
+    inputs = {i for index in on for i in index.inputs()}
+    positions: list[Index] = sorted(inputs, key=lambda i: i.var.index) or [UnitIndex()]
+    ways = [(positions, list(parts))]
     own = list(parts)
     if len(on) > 1:
         for index, members in on.items():
@@ -681,7 +693,6 @@ def _ways(
             for i, values in zip(members, lists):
                 own[i] = TableRealization(values=values, index=rank)
     ranks = [own[members[0]].index for members in on.values()] or [UnitIndex()]
-    ways = [(list(positions), list(parts))]
     if set(ranks) != set(positions):
         ways.append((ranks, own))
     return ways
@@ -693,16 +704,15 @@ def _size(positions: Sequence[Index]) -> int:
 
 def _tabulated(
     parts: Sequence[TableRealization],
-    positions: Sequence[Index],
     cap: int,
     compute: Callable[[int, list[np.ndarray]], Any],
     made: Sequence[TableRealization] = (),
 ) -> TableRealization:
     """A function of parts as its cheapest table (_cheapest), refused where none fits
     cap."""
-    table = _cheapest(parts, positions, cap, compute, made)
+    table = _cheapest(parts, cap, compute, made)
     if table is None:
-        inputs, *own = [_size(way) for way, _ in _ways(parts, positions)]
+        inputs, *own = [_size(way) for way, _ in _ways(parts)]
         raise TableLoweringError(
             None,
             f"one table over its inputs would hold {inputs} entries, past the cap of "
@@ -713,33 +723,41 @@ def _tabulated(
 
 def _cheapest(
     parts: Sequence[TableRealization],
-    positions: Sequence[Index],
     cap: int,
     compute: Callable[[int, list[np.ndarray]], Any],
     made: Sequence[TableRealization] = (),
 ) -> TableRealization | None:
     """A function of parts as the table within cap with the fewest entries, its
-    list's and its lookups' (rule 3): one of its ways (_ways), over positions on a
+    list's and its lookups' (rule 3): one of its ways (_ways), over its inputs on a
     tie, or one of made, tables already made; None where none fits. A way's list is
-    compute(count, the parts' lists on it), and only the way taken is computed."""
-    ways = _ways(parts, positions)
+    compute(count, the parts' lists on it), and only the way taken is computed, but
+    where its list is not finite, at a pair no assignment reaches (_ways), the next
+    is."""
+    ways = _ways(parts)
     sizes = [_size(way) for way, _ in ways]
     made = [table for table in made if table.index.size <= cap]
-    fitting = [(_size(w) + sum(p.entries() for p in w), w, ops) for w, ops in ways]
-    best = min(
-        (f for f, size in zip(fitting, sizes) if size <= cap),
+    fitting = sorted(
+        (
+            (_size(w) + sum(p.entries() for p in w), w, read)
+            for (w, read), size in zip(ways, sizes)
+            if size <= cap
+        ),
         key=lambda f: f[0],
-        default=None,
     )
     cheapest = min(made, key=lambda table: table.entries(), default=None)
-    if cheapest is not None and (best is None or cheapest.entries() < best[0]):
+    for entries, way, read in fitting:
+        if cheapest is not None and cheapest.entries() < entries:
+            break
+        index, grid = _combined(way), _grid(way)
+        lists = [_values_at(part, index, grid) for part in read]
+        values = compute(index.size, lists)
+        if np.all(np.isfinite(values)):
+            return TableRealization(values=values, index=index)
+    if cheapest is not None:
         return cheapest
-    if best is None:
+    if not fitting:
         return None
-    _, way, operands = best
-    index, grid = _combined(way), _grid(way)
-    lists = [_values_at(operand, index, grid) for operand in operands]
-    return TableRealization(values=compute(index.size, lists), index=index)
+    return TableRealization(values=values, index=index)
 
 
 def _by_rung(parts: Sequence[TableRealization], is_min: bool) -> TableRealization:
@@ -865,7 +883,7 @@ class TableLowering(Printer):
         if not expr.free_symbols:
             return None
         operands = [self._print(operand) for operand in expr.args]
-        return _sum(operands, tuple(self._inputs(expr)))
+        return _sum(operands)
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
         """A product of several operands is gated (_gated) where one of them is a
@@ -912,7 +930,7 @@ class TableLowering(Printer):
                         expr, f"no value ({type(exc).__name__}: {exc})"
                     ) from exc
                 rest = self._print(kept_product)
-                return _gate(literal, kept, rest, tuple(self._inputs(expr)))
+                return _gate(literal, kept, rest)
         return None
 
     def _literal(self, operand: sympy.Basic) -> tuple[InputIndex, int] | None:
@@ -998,13 +1016,12 @@ class TableLowering(Printer):
         if not expr.free_symbols:
             return None
         operands = tuple(self._print(operand) for operand in expr.args)
-        linear = ExtremeRealization(is_min, operands, tuple(self._inputs(expr)))
+        linear = ExtremeRealization(is_min, operands)
         if not all(self._has_table(operand) for operand in expr.args):
             return linear
         parts = [self._table(operand) for operand in expr.args]
         table = _cheapest(
             parts,
-            self._inputs(expr),
             self.cap,
             lambda count, lists: _values(expr, count, lambda: numpy_eval(expr, lists)),
             (_by_rung(parts, is_min),),
@@ -1039,7 +1056,6 @@ class TableLowering(Printer):
             return TableRealization(values=[_constant(expr)], index=UnitIndex())
         return _tabulated(
             [self._table(operand) for operand in operands],
-            self._inputs(expr) or [UnitIndex()],
             self.cap,
             lambda count, lists: _values(expr, count, lambda: numpy_eval(expr, lists)),
             made,
@@ -1068,9 +1084,7 @@ class TableLowering(Printer):
             raise TableLoweringError(expr, exc.reason) from exc
 
 
-def _sum(
-    operands: Sequence[AbstractRealization], positions: tuple[Index, ...]
-) -> SumRealization:
+def _sum(operands: Sequence[AbstractRealization]) -> SumRealization:
     """operands added, kept linear. Terms with one sum_key are joined into one: lists
     on one position, constants among them, added in float, one lookup and one
     rounding; switches on one factor, and gates on one literal and kept value, one
@@ -1080,16 +1094,15 @@ def _sum(
     for operand in operands:
         groups.setdefault(operand.sum_key(), []).append(operand)
     terms = (g[0] if len(g) == 1 else g[0].joined(g[1:]) for g in groups.values())
-    return SumRealization(tuple(terms), positions)
+    return SumRealization(tuple(terms))
 
 
 def _joined(
     group: Sequence[SwitchRealization] | Sequence[GateRealization],
-) -> tuple[SumRealization, tuple[Index, ...]]:
-    """The rest and positions of group, switches on one factor or gates on one
-    literal and kept value, joined into one: the sum of their rests, one w."""
-    positions = tuple(dict.fromkeys(p for r in group for p in r.positions))
-    return _sum([realization.rest for realization in group], positions), positions
+) -> SumRealization:
+    """The rest of group, switches on one factor or gates on one literal and kept
+    value, joined into one: the sum of their rests, one w."""
+    return _sum([realization.rest for realization in group])
 
 
 def _switch(
@@ -1106,7 +1119,7 @@ def _switch(
     which never has fewer entries than the switch."""
     if len(values) == 1:
         return rest.scaled(values[0])
-    switch = SwitchRealization(values, index, rest, positions)
+    switch = SwitchRealization(values, index, rest)
     entries = math.prod(position.size for position in positions)
     return switch if entries > cap or switch.entries() < entries else None
 
@@ -1115,14 +1128,13 @@ def _gate(
     literal: InputIndex,
     kept: int,
     rest: AbstractRealization,
-    positions: tuple[Index, ...],
 ) -> AbstractRealization:
     """rest where literal is at kept and 0 at its other value (rule 5). A rest of one
     value makes it one list on the literal, affine: no gate and no table."""
     if isinstance(rest, TableRealization) and len(np.unique(rest.values)) == 1:
         values = np.where(np.arange(2) == kept, float(rest.values[0]), 0.0)
         return TableRealization(values=values, index=literal)
-    return GateRealization(literal, kept, rest, positions)
+    return GateRealization(literal, kept, rest)
 
 
 def _number(value: float) -> sympy.Number:
