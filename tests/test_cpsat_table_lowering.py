@@ -47,6 +47,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     CombineIndex,
     CompactIndex,
     AbstractRealization,
+    GateRealization,
     Index,
     InputIndex,
     SumRealization,
@@ -108,7 +109,8 @@ class Case:
         root = TableLowering(self.inputs, cap=cap).print(expr)
         return root, root.cp_expr(self.model)
 
-    def solutions(self, exprs: list) -> list[tuple[int, ...]]:
+    def solutions(self, exprs: list, limit: int | None = None) -> list[tuple[int, ...]]:
+        """Every solution's values of exprs; the search stops past limit solutions."""
         solver = cp_model.CpSolver()
         solver.parameters.enumerate_all_solutions = True
         found: list[tuple[int, ...]] = []
@@ -116,9 +118,12 @@ class Case:
         class Collect(cp_model.CpSolverSolutionCallback):
             def on_solution_callback(self) -> None:
                 found.append(tuple(self.value(e) for e in exprs))
+                if limit is not None and len(found) > limit:
+                    self.stop_search()
 
         status = solver.solve(self.model, Collect())
-        assert status == cp_model.OPTIMAL, solver.status_name(status)
+        if limit is None or len(found) <= limit:
+            assert status == cp_model.OPTIMAL, solver.status_name(status)
         return found
 
     def sympy_value(self, expr: sympy.Basic, assignment: tuple[int, ...]) -> float:
@@ -136,8 +141,8 @@ class Case:
         plan, objective = self.lower(expr, cap)
         cost = self.model.new_int_var(-(2**60), 2**60, "cost")
         self.model.add(cost == objective)
-        rows = self.solutions(self.variables + [cost])
         assignments = list(itertools.product(*(self.values[v] for v in self.variables)))
+        rows = self.solutions(self.variables + [cost], limit=len(assignments))
         assert len(rows) == len(assignments)
         assert sorted(row[:-1] for row in rows) == sorted(assignments)
         bound = _rounding_bound(plan)
@@ -180,9 +185,11 @@ def _printed(
 def _rounding_bound(plan: AbstractRealization) -> float:
     """Half a unit per rounding: each list's and each sum's constant's. A switch
     scales its rest's bound by each value, and a fraction p / q adds under one unit
-    for the floor plus |w| / (2q)."""
+    for the floor plus |w| / (2q). A gate has its rest's."""
     if isinstance(plan, SumRealization):
         return 0.5 + sum(_rounding_bound(term) for term in plan.terms)
+    if isinstance(plan, GateRealization):
+        return _rounding_bound(plan.rest)
     if isinstance(plan, SwitchRealization):
         rest = _rounding_bound(plan.rest)
         fraction = 1 + max(map(abs, plan.rest.bounds())) / (2 * plan.denominator())
@@ -457,7 +464,7 @@ def test_a_realization_is_abstract_and_a_table_is_one():
     class Built(AbstractRealization):
         """A realization that builds itself but cannot be asked for its table."""
 
-        def build(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
+        def cp_expr(self, model: cp_model.CpModel) -> cp_model.LinearExprT:
             return 0
 
     with pytest.raises(TypeError):
@@ -1035,8 +1042,9 @@ def test_products_with_one_factor_are_one_switch_over_their_rests_sum():
 def test_a_position_and_a_realization_are_built_once_per_model():
     """Two factors on one buffer with equal ranks share one CompactIndex, and their
     switches one rest: one rank lookup and one list. A position that reads the rank
-    twice adds one lookup. A second build in the model adds nothing; a build in
-    another model adds it all again."""
+    twice adds one lookup. A second build in the model adds nothing, and each step and
+    realization gives back the expression it built; a build in another model adds it
+    all again."""
     case = Case()
     position = case.add_input("k", f=[1.0, 1.0, 2.0], h=[5.0, 5.0, 7.0])
     f, h, (a, _, _) = case.symbol("f"), case.symbol("h"), _abc(case)
@@ -1049,6 +1057,12 @@ def test_a_position_and_a_realization_are_built_once_per_model():
     assert sorted(_tables(case.model)) == [3, 3, 4]
     plan.cp_expr(case.model)
     assert sorted(_tables(case.model)) == [3, 3, 4]
+    combine = CombineIndex(rank, rank)
+    nodes = [combine, plan.terms[0].index, plan, *plan.terms, plan.terms[0].rest]
+    built = [node.cp_expr(case.model) for node in nodes]
+    constraints = len(case.model.proto.constraints)
+    assert all(node.cp_expr(case.model) is e for node, e in zip(nodes, built))
+    assert len(case.model.proto.constraints) == constraints
     other = cp_model.CpModel()
     other.proto.copy_from(case.model.proto)
     plan.cp_expr(other)
@@ -1071,14 +1085,15 @@ def test_a_factor_over_two_buffers_is_ranked_on_their_combined_position():
     assert isinstance(plan.index, CompactIndex) and plan.index.parent.size == 12
 
 
-def test_a_literal_times_a_sum_is_the_two_value_switch():
-    """The rest's entries count once, where Stage 5's one table held them twice."""
+def test_a_literal_times_a_sum_is_a_gate():
+    """The rest's entries count once, where Stage 5's one table held them twice, and
+    the literal adds no case."""
     case = Case()
     case.integer("x", 0, 2)
     x, (a, b, c) = case.symbol("x"), _abc(case)
     plan = case.assert_exact(x * (a**0.5 + sympy.log(b) + c**1.5))
-    assert type(plan) is SwitchRealization and plan.values == (0.0, 1.0)
-    assert plan.entries() == plan.rest.entries() + 2 == 4 + 3 + 5 + 2
+    assert type(plan) is GateRealization and plan.kept == 1
+    assert plan.entries() == plan.rest.entries() == 4 + 3 + 5
 
 
 def test_a_product_takes_its_switch_or_its_table_by_entries():
@@ -1139,6 +1154,20 @@ def test_a_switched_product_past_2_60_is_refused_as_it_is_built():
     with pytest.raises(TableLoweringError, match="2\\^60") as caught:
         case.lower(case.symbol("k") * case.symbol("a"))
     assert caught.value.node is None
+
+
+def test_a_switchs_rest_of_several_terms_is_one_variable():
+    """So p multiplies one coefficient in a fraction's constraints: p times the step
+    of a's list passes 2^31 here, where CP-SAT 9.15's presolve called the model
+    infeasible."""
+    case = Case()
+    for name in "xyd":
+        case.integer(name, 0, 2)
+    case.integer("a", 2, 2)
+    case.add_input("b", b=[3.0, 8.0])
+    x, y, d, a, b = (case.symbol(name) for name in "xydab")
+    plan = case.assert_exact((27 * a * y + a + d) * (b * d + x + sympy.sqrt(5)))
+    assert type(plan) is SwitchRealization and len(_named(case.model, "rest")) == 1
 
 
 def test_a_constant_is_read_as_the_double_it_is():
@@ -1220,6 +1249,24 @@ def test_a_product_that_divides_is_one_table_and_no_switch():
     assert 1 / case.symbol("a") not in printer.printed
     case.assert_exact(sympy.floor(product))
     assert _tables(case.model) == [12] and not _named(case.model, "switch")
+
+
+@pytest.mark.parametrize(
+    "factor, menu, realization",
+    [((0, 2), [7.0, 49.0], GateRealization), ((1, 3), [7.0, 14.0, 49.0, 98.0], TableRealization)],
+    ids=["gate", "table"],
+)  # fmt: skip
+def test_a_gated_or_tabled_quotient_is_divided_as_lambdify_prints_it(
+    factor, menu, realization
+):
+    """A gate's rest holds the product's constants, and a product that divides is one
+    table: floor(98 * k / a) at a = 49 is 2k, not floor(98 * (1/49) * k)."""
+    case = Case()
+    case.integer("k", *factor)
+    case.add_input("a", a=menu)
+    product = 98 * case.symbol("k") / case.symbol("a")
+    assert type(TableLowering(case.inputs, cap=CAP).print(product)) is realization
+    case.assert_exact(sympy.floor(product))
 
 
 # Expressions over a, b and c, each node's list compared with Stage 1's.
@@ -1323,6 +1370,261 @@ def test_the_projection_objective_differs_by_candidate():
     assert at(4, 8, 1, 1) != at(4, 8, 1, 0)
 
 
+# ----------------------------------------------------------------------- the gate
+
+
+def _reads(model: cp_model.CpModel, name: str) -> bool:
+    """Whether a table's position or a linear constraint reads the variable named
+    name. An enforcement literal is not read."""
+    (var,) = _named(model, name)
+    return any(
+        (c.has_element() and var in c.element.linear_index.vars)
+        or (c.has_linear() and var in c.linear.vars)
+        for c in model.proto.constraints
+    )
+
+
+def _ungated(monkeypatch) -> None:
+    """Lower as Stage 6 did: no operand is a gate."""
+    monkeypatch.setattr(TableLowering, "_gated", lambda self, expr, operands: None)
+
+
+GATED = [
+    pytest.param(lambda s: s["x"] * s["a"] ** 0.5, dict(a=5), id="x"),
+    pytest.param(lambda s: (0.5 - 0.5 * s["x"]) * s["a"] ** 0.5, dict(a=5), id="half"),
+    pytest.param(
+        lambda s: s["x"] * (s["a"] ** 0.5 + sympy.log(s["b"]) + s["c"] ** 1.5),
+        dict(a=4, b=3, c=5),
+        id="sum",
+    ),
+    pytest.param(
+        lambda s: s["x"] * (1 - s["y"]) * s["a"] ** 0.5,
+        dict(y=(0, 2), a=5),
+        id="two_literals",
+    ),
+    pytest.param(
+        lambda s: s["x"] * s["k"] * s["a"] ** 0.5,
+        dict(k=(1, 3), a=5),
+        id="over_a_switch",
+    ),
+    pytest.param(
+        lambda s: s["x"] * sympy.Max(s["x"] * s["a"], s["b"]), dict(a=5, b=3), id="max"
+    ),
+    pytest.param(
+        lambda s: s["x"] * s["a"] ** 0.5 + s["x"] * s["a"] ** 0.7,
+        dict(a=5),
+        id="two_terms",
+    ),
+    pytest.param(
+        lambda s: RelayoutCharge(s["x"], s["d"], 0, 65, 147),
+        dict(d=(0, 4)),
+        id="relayout_charge",
+    ),
+]
+
+
+@pytest.mark.parametrize("objective, inputs", GATED)
+def test_a_gate_has_the_two_value_switchs_cost_with_its_literal_read_by_nothing(
+    objective, inputs, monkeypatch
+):
+    """Each product gated by a literal x is exact, as Stage 6's two-value switch is,
+    so the two agree within their bounds at every assignment. The gate has fewer
+    entries, and no table and no case reads x: it is only an enforcement literal."""
+    case, expr = _with(objective, x=(0, 2), **inputs)
+    gated = case.assert_exact(expr)
+    _ungated(monkeypatch)
+    stage_6, expr = _with(objective, x=(0, 2), **inputs)
+    switched = stage_6.assert_exact(expr)
+    assert gated.entries() < switched.entries()
+    assert _reads(stage_6.model, "x") and not _reads(case.model, "x")
+
+
+@pytest.mark.parametrize(
+    "gate, kept, value",
+    [
+        (lambda x: x, 1, 1.0),
+        (lambda x: 1 - x, 0, 1.0),
+        (lambda x: 3 * x, 1, 3.0),
+        (lambda x: 2 - 2 * x, 0, 2.0),
+    ],
+    ids=["x", "1-x", "3x", "2-2x"],
+)
+def test_a_gate_is_its_rest_on_the_division_times_its_kept_value(gate, kept, value):
+    """One list of the menu's length, on the division only, the gate's value applied
+    to it in float. The gate's variable is 0 wherever the literal is not kept, and a
+    second build in the model gives it back and adds nothing."""
+    case, expr = _with(lambda s: gate(s["x"]) * s["a"] ** 0.5, x=(0, 2), a=5)
+    plan = case.assert_exact(expr)
+    assert type(plan) is GateRealization and plan.kept == kept
+    assert type(plan.rest) is TableRealization and _tables(case.model) == [5]
+    constraints = len(case.model.proto.constraints)
+    assert plan.cp_expr(case.model) is plan.cp_expr(case.model)
+    assert len(case.model.proto.constraints) == constraints
+    np.testing.assert_allclose(
+        plan.rest.values, value * np.arange(1.0, 6.0) ** 0.5, rtol=1e-15
+    )
+    (index,) = _named(case.model, "gate")
+    gate = case.model.get_int_var_from_proto_index(index)
+    rows = case.solutions([case.variables[0], gate])
+    assert len(rows) == 10 and all((g != 0) == (x == kept) for x, g in rows)
+
+
+def test_gates_on_two_literals_keep_the_term_only_where_both_are_kept():
+    case, expr = _with(
+        lambda s: s["x"] * (1 - s["y"]) * s["a"] ** 0.5, x=(0, 2), y=(0, 2), a=5
+    )
+    plan = case.assert_exact(expr)
+    assert type(plan) is GateRealization and type(plan.rest) is GateRealization
+    assert _tables(case.model) == [5]
+    (cost,) = _named(case.model, "cost")
+    x, y = case.variables[:2]
+    for row in case.solutions([x, y, case.model.get_int_var_from_proto_index(cost)]):
+        assert (row[2] != 0) == (row[:2] == (1, 0))
+
+
+def test_terms_gated_by_one_literal_are_one_gate_over_one_list():
+    """Rounded once: 3112 at a = 2, where two lists rounded apart make 1448 + 1663."""
+    case, expr = _with(
+        lambda s: s["x"] * s["a"] ** 0.5 + s["x"] * s["a"] ** 0.7, x=(0, 2), a=5
+    )
+    plan = case.assert_exact(expr)
+    assert isinstance(plan, SumRealization) and len(plan.terms) == 1
+    (gate,) = plan.terms
+    assert type(gate) is GateRealization and isinstance(gate.rest, SumRealization)
+    assert [type(term) for term in gate.rest.terms] == [TableRealization]
+    assert _tables(case.model) == [5]
+    assert _solve_at(case, plan.cp_expr(case.model), (1, 1)) == (3112, 3112)
+
+
+def test_the_rest_of_a_gate_reads_no_literal():
+    """x * Max(x*a, b) is x * Max(a, b): one table over a and b."""
+    case, expr = _with(
+        lambda s: s["x"] * sympy.Max(s["x"] * s["a"], s["b"]), x=(0, 2), a=5, b=3
+    )
+    plan = case.assert_exact(expr)
+    assert type(plan) is GateRealization and type(plan.rest) is TableRealization
+    assert plan.rest.index.size == 15 and _tables(case.model) == [15]
+    assert not _reads(case.model, "x")
+
+
+def test_a_gate_over_a_constant_is_a_list_on_its_literal_with_no_table():
+    """(1 - x) * (c - c*x + c*x/t) is c * (1 - x): affine on the literal, with no
+    gate and no table over the tile's division t."""
+    case, expr = _with(
+        lambda s: (1 - s["x"]) * (6 - 6 * s["x"] + 6 * s["x"] / s["t"]), x=(0, 2), t=4
+    )
+    plan = case.assert_exact(expr)
+    assert type(plan) is TableRealization and list(plan.values) == [6.0, 0.0]
+    assert not _tables(case.model) and not _named(case.model, "gate")
+
+
+@pytest.mark.parametrize(
+    "factor",
+    [
+        lambda s: sympy.Piecewise((s["a"] ** 0.5, s["x"] > 0), (0, True)),
+        lambda s: sympy.Max(s["x"] * s["a"], 0),
+        lambda s: sympy.Piecewise((0, (s["x"] < 1) & (s["a"] < 2)), (1, True)),
+    ],
+    ids=["piecewise", "max", "one_zero"],
+)
+def test_a_factor_that_reads_more_than_its_literal_is_no_gate(factor):
+    """It reads a too, whether it is 0 wherever x is 0 or at one entry only: a gate
+    reads its boolean literal only."""
+    case, expr = _with(lambda s: factor(s) * sympy.log(s["b"] + 1), x=(0, 2), a=5, b=3)
+    assert type(case.assert_exact(expr)) is not GateRealization
+    assert _reads(case.model, "x")
+
+
+def test_a_literal_is_its_variable_whatever_its_symbols_values():
+    """x takes 2 and 1 on a boolean variable: 1 - x is -1 and 0, a gate kept where
+    the variable is 0."""
+    case = Case()
+    case.add_input("v", x=[2.0, 1.0])
+    case.add_input("a", a=[1.0, 2.0, 4.0, 8.0, 16.0])
+    plan = case.assert_exact((1 - case.symbol("x")) * case.symbol("a") ** 0.5)
+    assert type(plan) is GateRealization and plan.kept == 0
+    assert _tables(case.model) == [5] and not _named(case.model, "case")
+
+
+@pytest.mark.parametrize(
+    "factor, variable, values",
+    [(lambda v: 1 + v, (0, 2), (1.0, 2.0)), (lambda v: v - 1, (1, 2), (0.0, 1.0))],
+    ids=["never_0", "not_0_1"],
+)
+def test_a_factor_that_is_never_0_or_reads_no_0_1_variable_is_no_gate(
+    factor, variable, values
+):
+    """It stays Stage 6's switch: 1 + x on a literal x, and v - 1 on a variable v
+    whose values are 1 and 2, which is no literal."""
+    case, expr = _with(lambda s: factor(s["v"]) * s["a"] ** 0.5, v=variable, a=5)
+    plan = case.assert_exact(expr)
+    assert type(plan) is SwitchRealization and plan.values == values
+
+
+def test_a_divisor_is_not_printed_to_look_for_a_gate():
+    """1/a is never 0, so no table of 1/a is made, even where a has two rows, as a
+    literal does."""
+    case = Case()
+    case.integer("k", 1, 3)
+    case.add_input("a", a=[7.0, 49.0])
+    a = case.symbol("a")
+    printer = Recording(case.inputs)
+    assert type(printer.print(case.symbol("k") / a)) is TableRealization
+    assert 1 / a not in printer.printed
+
+
+def test_a_gates_fractional_value_adds_no_rounding(monkeypatch):
+    """Half a unit, its list's; Stage 6's switch on 0.5 - 0.5*x adds one unit for its
+    floor."""
+
+    def bound() -> float:
+        case, expr = _with(
+            lambda s: (0.5 - 0.5 * s["x"]) * s["a"] ** 0.5, x=(0, 2), a=5
+        )
+        return _rounding_bound(case.assert_exact(expr))
+
+    assert bound() == 0.5
+    _ungated(monkeypatch)
+    assert bound() > 1
+
+
+@pytest.mark.parametrize(
+    "read, realization, tables",
+    [(lambda c: c, GateRealization, [4]), (lambda c: c**2, TableRealization, [8])],
+    ids=["linear", "power"],
+)
+def test_a_relayout_charge_is_a_gate_of_its_prices_on_its_division(
+    read, realization, tables
+):
+    """As many entries as the menu; under a power it is one table over its literal and
+    its division."""
+    case, expr = _with(
+        lambda s: read(RelayoutCharge(s["x"], s["d"], 0, 65, 147)), x=(0, 2), d=(0, 4)
+    )
+    assert type(case.assert_exact(expr)) is realization
+    assert _tables(case.model) == tables
+
+
+def test_a_gated_product_with_no_value_at_the_kept_value_is_refused():
+    """x and y on one literal, y at 3 and 1: where x keeps the term sqrt(y - 2) is
+    imaginary, and sympy raises as it reads the rest there."""
+    case = Case()
+    case.add_input("v", x=[0.0, 1.0], y=[3.0, 1.0])
+    case.add_input("a", a=[1.0, 2.0, 3.0, 4.0])
+    x, y, a = case.symbol("x"), case.symbol("y"), case.symbol("a")
+    expr = x * sympy.Max(sympy.sqrt(y - 2), a)
+    with pytest.raises(TableLoweringError, match="no value") as caught:
+        case.lower(expr)
+    assert caught.value.node == expr
+
+
+@pytest.mark.parametrize("read", [lambda p: sympy.log(p + 1), lambda p: 2**p])
+def test_a_gated_product_under_a_log_or_a_power_is_its_table(read):
+    case, expr = _with(lambda s: read(s["x"] * s["a"] ** 0.5), x=(0, 2), a=5)
+    assert type(case.assert_exact(expr)) is TableRealization
+    assert _tables(case.model) == [10] and not _named(case.model, "gate")
+
+
 # ------------------------------------------ synthetic examples of later optimizations
 
 
@@ -1396,11 +1698,6 @@ EXAMPLES = [
         ),
         40,
         id="gate",
-        marks=_refused(
-            "the rest of a term a 0/1 literal gates reads the literal: one table over "
-            "the literal and a, 80 entries under a cap of 40, and reading the rest "
-            "with the literal fixed, which halves it, is not built"
-        ),
     ),
     pytest.param(
         lambda: _with(
