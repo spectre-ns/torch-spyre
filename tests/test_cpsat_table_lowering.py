@@ -41,6 +41,7 @@ pytest.importorskip("ortools.sat.python.cp_model")
 
 from ortools.sat.python import cp_model
 from sympy.functions.elementary.piecewise import ExprCondPair
+from sympy.utilities.lambdify import implemented_function
 from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
@@ -2083,6 +2084,23 @@ def test_the_entry_point_reads_numbers_and_prices_an_undivided_relayout_at_0():
         case.model, sym_map, buffer_map, expr, cap=CAP
     )
     assert objective == 8 * COST_SCALE
+
+
+def test_the_entry_point_prices_a_function_of_a_symbol_with_no_input_at_0():
+    """As the printer prices a functor of no buffer of this solve; a function of a
+    buffer's split is its value at each division."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    sym_map, buffer_map = _maps(case)
+    price = implemented_function("price", lambda split: 3 * split)
+    expr = price(case.symbol("a")) + price(sympy.Symbol("split_of_b", positive=True))
+    root = lowering.lower_cost_with_tables(
+        case.model, sym_map, buffer_map, expr, cap=CAP
+    )
+    case.model.minimize(root)
+    solver = cp_model.CpSolver()
+    assert solver.solve(case.model) == cp_model.OPTIMAL
+    assert solver.objective_value == 3 * COST_SCALE
 
 
 def test_a_failed_build_leaves_the_model_as_it_was(monkeypatch):

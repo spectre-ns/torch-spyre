@@ -56,6 +56,7 @@ from typing import Any, Self, TypeAlias
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
+from sympy.core.function import AppliedUndef
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
@@ -1345,7 +1346,8 @@ def lower_cost_with_tables(
     """cost_expr as a CP-SAT objective in model, in COST_SCALE units, an int where it
     is constant. sym_map and buffer_map are the CP-SAT printer's: a number in sym_map
     is its symbol's value, and a relayout charge on a division with no input, a
-    source this solve does not divide, is 0, as the printer prices them. On any
+    source this solve does not divide, and an implemented function of a symbol with
+    no input, are 0, as the printer prices them. On any
     failure the model is as it was, a copy swapped back, and TableLoweringError is
     raised, from the original exception where that was of another type."""
     copy = model.clone()
@@ -1362,6 +1364,9 @@ def lower_cost_with_tables(
             division = charge.args[1]
             if isinstance(division, sympy.Symbol) and division.name not in by_name:
                 known[charge] = sympy.S.Zero
+        for function in expr.atoms(AppliedUndef):
+            if any(symbol.name not in by_name for symbol in function.free_symbols):
+                known[function] = sympy.S.Zero
         expr = expr.xreplace(known)
         inputs = {s: by_name[s.name] for s in expr.free_symbols if s.name in by_name}
         return TableLowering(inputs, cap=cap).print(expr).cp_expr(model)
