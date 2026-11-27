@@ -30,12 +30,13 @@ works out which entry of a table applies: ``value == values[index]``. Three laye
 A sum stays linear, so no table crosses two of its terms. A product of several
 operands is gated by one that reads a boolean literal only and is 0 at one of its
 values: its rest is the product with the literal at the other, so no table reads the
-literal. A relayout charge is gated by its literal too. Any other product is a
-switch on one of its operands where that has fewer entries than its one table, so no
-table crosses that factor and the rest. Any other node is a table, and a parent that
-reads a sum, a switch or a gate as a list reads its table. A table is over the node's
-inputs or over its operands' positions, each ranked to its distinct values, whichever
-has fewer entries (rule 3), and is refused when neither fits the cap. Its list is the
+literal. A relayout charge is gated by its literal too. Any other product that
+divides is one table, divided once. Any other product is a switch on one of its
+operands where that has fewer entries than its one table, so no table crosses that
+factor and the rest. Any other node is a table, and a parent that reads a sum, a
+switch or a gate as a list reads its table. A table is over the node's inputs or
+over its operands' positions, each ranked to its distinct values, whichever has
+fewer entries (rule 3), and is refused when neither fits the cap. Its list is the
 numpy core's function of its sympy class (``cost_expr_numpy.py``, which the CP-SAT
 printer evaluates its candidates with) applied to its operands' tables; a class the
 core has no function for is refused. Nothing imports the module yet.
@@ -56,7 +57,12 @@ from ortools.sat.python import cp_model
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
-from torch_spyre._inductor.scratchpad.cost_expr_numpy import numpy_eval
+from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
+    divides,
+    factors,
+    numpy_eval,
+    operands,
+)
 from torch_spyre._inductor.scratchpad.cpsat_expr_printer import memoize_method
 
 # One cost unit is COST_SCALE objective units: a table entry is
@@ -377,7 +383,6 @@ class SwitchRealization(SymbolicRealization):
     index: Index
     rest: AbstractRealization
     positions: tuple[Index, ...]
-    quotient: TableRealization | None = None  # its table, for a product that divides
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -403,12 +408,6 @@ class SwitchRealization(SymbolicRealization):
                 model.add(p * w <= q * g + q - 1).only_enforce_if(case)
         return g
 
-    def table(self, cap: int) -> TableRealization:
-        """A product that divides is its quotient's table, divided as lambdify prints
-        it (_quotient): its factor times its rest's table multiplies by a reciprocal,
-        and floor(98 * (1/49)) is 1."""
-        return self.quotient or super().table(cap)
-
     def _parts(self, cap: int) -> list[TableRealization]:
         factor = TableRealization(values=self.values, index=self.index)
         return [factor, self.rest.table(cap)]
@@ -418,10 +417,7 @@ class SwitchRealization(SymbolicRealization):
 
     def scaled(self, factor: float) -> SwitchRealization:
         rest = self.rest.scaled(factor)
-        quotient = self.quotient and self.quotient.scaled(factor)
-        return SwitchRealization(
-            self.values, self.index, rest, self.positions, quotient
-        )
+        return SwitchRealization(self.values, self.index, rest, self.positions)
 
     def bounds(self) -> tuple[int, int]:
         q = self.denominator()
@@ -440,7 +436,6 @@ class SwitchRealization(SymbolicRealization):
         return self.index, self.values
 
     def joined(self, others: Sequence[Self]) -> SwitchRealization:
-        """A sum of products, so it has no quotient of its own."""
         rest, positions = _joined((self, *others))
         return SwitchRealization(self.values, self.index, rest, positions)
 
@@ -627,16 +622,6 @@ def _table_of(
 # ---------------------------------------------------------------------- the printer
 
 
-def _divides(factor: sympy.Basic) -> bool:
-    """Whether factor, a factor of a Mul, has a negative rational exponent, which
-    lambdify prints as a division."""
-    return (
-        isinstance(factor, sympy.Pow)
-        and bool(factor.exp.is_Rational)
-        and bool(factor.exp.is_negative)
-    )
-
-
 def _is_condition(expr: sympy.Basic) -> bool:
     """Whether expr is a condition: a relational, a logical operation, true or false,
     and not a symbol."""
@@ -685,7 +670,7 @@ class TableLowering(Printer):
             try:
                 realization = super()._print(expr, **kwargs)
                 if realization is None:
-                    realization = self._operation(expr, expr.args)
+                    realization = self._operation(expr, operands(expr))
             except TableLoweringError as exc:
                 if exc.node is not None:
                     raise
@@ -733,29 +718,29 @@ class TableLowering(Printer):
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
         """A product of several operands is gated (_gated) where one of them is a
-        gate, its constants in the gate's rest, and is otherwise a switch
-        (_switched), its constants applied to the rest and, where it divides, with its
-        quotient's table (_quotient). Otherwise a quotient is one table, a constant
-        times one operand is the operand scaled in float, and any other product is
-        declined."""
-        constants = [factor for factor in expr.args if not factor.free_symbols]
-        operands = [factor for factor in expr.args if factor.free_symbols]
-        divides = any(_divides(factor) for factor in expr.args)
-        switch: AbstractRealization | None = None
-        if len(operands) > 1:
+        gate, its constants in the gate's rest. Otherwise a product that divides
+        (divides), 98*k/a, is declined: one table, divided once in the numpy core as
+        lambdify prints it, and no table of 1/a, so 98*k/a is 2k at a = 49, where k
+        times 98 * (1/49) is under 2k. Any other product of several operands is a
+        switch (_switched), its constants applied to the rest. A constant times one
+        operand is the operand scaled in float, as lambdify prints a/49: (1/49)*a, and
+        any other product is declined."""
+        constants = [factor for factor in factors(expr) if not factor.free_symbols]
+        symbolic = [factor for factor in expr.args if factor.free_symbols]
+        if len(symbolic) > 1:
             gated = self._gated(expr, expr.args)
             if gated is not None:
                 return gated
-            switch = self._switched(expr, operands)
-        if switch is None and divides:
-            return self._quotient(expr)
-        realization = self._print(operands[0]) if len(operands) == 1 else switch
-        if realization is not None and constants:
-            coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
-            realization = realization.scaled(coefficient)
-        if isinstance(realization, SwitchRealization) and divides and self._fits(expr):
-            realization = replace(realization, quotient=self._quotient(expr))
-        return realization
+        if any(divides(factor) for factor in expr.args):
+            return None
+        if len(symbolic) == 1:
+            realization: AbstractRealization | None = self._print(symbolic[0])
+        else:
+            realization = self._switched(expr, symbolic)
+        if realization is None or not constants:
+            return realization
+        coefficient = math.prod(float(self._table(c).values[0]) for c in constants)
+        return realization.scaled(coefficient)
 
     def _gated(
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
@@ -783,7 +768,8 @@ class TableLowering(Printer):
         reads that literal only and is 0 at exactly one of its values, as x, 1 - x and
         2 - 2*x are and 1 + x is not. None for any other operand."""
         positions = self._inputs(operand)
-        literal = positions[0] if len(positions) == 1 else None
+        one = len(positions) == 1 and not divides(operand)  # 1/a is never 0
+        literal = positions[0] if one else None
         if isinstance(literal, InputIndex) and (literal.lo, literal.size) == (0, 2):
             zero = self._table(operand).values == 0
             if np.count_nonzero(zero) == 1:
@@ -827,30 +813,6 @@ class TableLowering(Printer):
         if not is_lx.free_symbols:
             return None
         return self._gated(expr, [is_lx, expr.func(sympy.S.One, *others)])
-
-    def _quotient(self, expr: sympy.Mul) -> TableRealization:
-        """expr as its table (_table_of): the product of its other factors divided by
-        the product of the bases of its factors with a negative rational exponent,
-        each raised to minus that exponent, as lambdify prints a quotient: 98/a, where
-        98*(1/a) floors one low at a = 49. A factor it divides by is still printed,
-        refusing its own value that is not finite."""
-        numerators = [factor for factor in expr.args if not _divides(factor)]
-        divisors = [factor for factor in expr.args if _divides(factor)]
-        for divisor in divisors:
-            self._table(divisor)
-        parts = [self._table(f) for f in (*numerators, *(d.base for d in divisors))]
-        exponents = [float(-divisor.exp) for divisor in divisors]
-
-        def quotient(lists: list[np.ndarray]) -> Any:
-            above, below = lists[: len(numerators)], lists[len(numerators) :]
-            return math.prod(above) / math.prod(b**e for b, e in zip(below, exponents))
-
-        positions = self._inputs(expr) or [UnitIndex()]
-        return _table_of(expr, parts, positions, self.cap, quotient)
-
-    def _print_Piecewise(self, expr: sympy.Piecewise) -> AbstractRealization:
-        """Over its arms' values and conditions: an ExprCondPair is not printed."""
-        return self._operation(expr, [part for pair in expr.args for part in pair.args])
 
     def emptyPrinter(self, expr: sympy.Basic) -> None:
         """Any other node is declined. sympy's own returns str(expr)."""
