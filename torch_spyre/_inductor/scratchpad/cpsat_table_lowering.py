@@ -449,12 +449,16 @@ class SwitchRealization(SymbolicRealization):
         rest = self.rest.scaled(factor)
         return SwitchRealization(self.values, self.index, rest, self.positions)
 
+    @memoize_method
     def bounds(self) -> tuple[int, int]:
+        """Memoized, and its rest's read once: a switch inside a switch reads it
+        again, so a chain of switches is otherwise exponential in its depth."""
         q = self.denominator()
+        rest = self.rest.bounds()
         ends = [
             int(value) * end if value.is_integer() else round(value * q) * end // q
             for value in self.values
-            for end in self.rest.bounds()
+            for end in rest
         ]
         return min(ends), max(ends)
 

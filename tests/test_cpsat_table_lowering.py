@@ -1833,6 +1833,23 @@ def test_a_product_of_maxes_wider_than_the_cap_switches_on_one_of_them():
     assert len(plan.values) == 4
 
 
+def test_a_chain_of_switches_reads_each_tables_bounds_a_few_times(monkeypatch):
+    """A product of six factors of 12 values each is five switches deep. Each switch
+    reads its rest's bounds once, where a read per value of the factor made the build
+    exponential in the depth: 12^5 reads."""
+    case, expr = _with(
+        lambda s: sympy.Mul(*(s[n] ** (1 + i / 7) for i, n in enumerate("abcdef"))),
+        **{name: 12 for name in "abcdef"},
+    )
+    reads = []
+    bounds = TableRealization.bounds
+    monkeypatch.setattr(
+        TableRealization, "bounds", lambda self: reads.append(self) or bounds(self)
+    )
+    root, _ = case.lower(expr)
+    assert type(root) is SwitchRealization and len(reads) <= 3 * 5
+
+
 def test_a_max_read_by_a_switch_or_under_a_log_is_its_ladder_on_its_rung():
     """Its 5 values are the switch's factor, where d's 6 are more, and a log of it is
     a list on its rung: no table crosses the three buffers."""
