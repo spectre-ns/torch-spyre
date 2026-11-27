@@ -102,6 +102,36 @@ def test_a_failure_in_the_lowering_leaves_the_solve(failure):
     assert solver.last_solve_stats == {}  # no fallback solve followed
 
 
+def test_with_auto_coarse_tiling_the_allocator_hands_the_solver_its_cost():
+    """Where the solver chooses tilings too: the tables lower the cost model's tiling
+    terms, so the allocator withholds the expression from no solver. An empty graph
+    costs 0, which is not None."""
+    from types import SimpleNamespace
+
+    import torch_spyre._inductor.scratchpad.allocator as allocator_module
+
+    solver = mock.create_autospec(
+        allocator_module.CoreDivisionLayoutSolver, instance=True
+    )
+    solver.buffers = []
+    solver.chooses_tilings.return_value = True
+    solver.plan_layout_and_core_divisions.return_value = []
+    allocator = allocator_module.CoOptimizingAllocator(
+        # Never built: the test hands _solve the mock directly.
+        layout_planning=allocator_module.ExhaustiveSearchSolver.wrapping(
+            allocator_module.GreedyLayoutSolver
+        ),
+        size=0,
+    )
+    graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
+    with (
+        config.patch({"auto_coarse_tiling": True}),
+        mock.patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
+    ):
+        allocator._solve(solver, graph)
+    solver.plan_layout_and_core_divisions.assert_called_once_with(0)
+
+
 def test_the_table_lowering_and_the_solver_import_without_ortools():
     """In a fresh interpreter that cannot import ortools, as on s390x and ppc64le, the
     table module imports with cp_model None, and so does ilp_solver_ortools."""
