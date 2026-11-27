@@ -300,6 +300,7 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
 | `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
 | `cpsat_expr_printer.py` | `cost_expr_to_cpsat`, lowering the sympy cost expression into the CP-SAT objective |
+| `cpsat_table_lowering.py` | `lower_cost_with_tables`, the cost expression as exact element tables, linear sums and `lin_min`/`lin_max`, under `config.cpsat_table_lowering` |
 | `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
 | `cooling_schedules.py` | cooling schedules for the annealing search |
 | `torch_spyre/csrc/perm_layout_native.cpp` | `NativePermutationLayoutSolver`, the C++ permutation packer |
@@ -646,10 +647,14 @@ Those two modes minimize two different objectives:
   whole expression into the constraint model via `cost_expr_to_cpsat`
   (`_SympyExprToCpSat` in
   `scratchpad/cpsat_expr_printer.py`), so CP-SAT searches it symbolically
-  rather than evaluating it per candidate. When there is no usable
+  rather than evaluating it per candidate. With `config.cpsat_table_lowering`
+  on, `lower_cost_with_tables` (`scratchpad/cpsat_table_lowering.py`) lowers
+  it instead: every cost value computed in floating point before the solve,
+  CP-SAT reading which entry of a table applies, and an expression the tables
+  cannot lower raising `TableLoweringError`. When there is no usable
   expression -- symbolic shapes, a serialized capture, `auto_coarse_tiling`
-  on (the allocator withholds it, the model being flat in tile size), or
-  the lowering raising -- the solve falls back to the ladder above, which
+  on with the printer (the allocator withholds it, the model being flat in
+  tile size), or the printer raising -- the solve falls back to the ladder above, which
   knows no relayout price and therefore pins every relayout copy out. See
   [The co-optimizer](co_optimizer.md#cost-model) for how both production
   solvers consume the same expression, and
