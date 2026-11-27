@@ -224,7 +224,7 @@ class CombineIndex(Index):
         return self.left.on_grid(grid) * self.right.size + self.right.on_grid(grid)
 
     def leaves(self) -> tuple[Index, ...]:
-        return tuple(_dedup(self.left.leaves() + self.right.leaves()))
+        return tuple(dict.fromkeys(self.left.leaves() + self.right.leaves()))
 
 
 @dataclass(frozen=True)
@@ -288,7 +288,7 @@ class ExtremeIndex(Index):
         return reduce(pick, (rung.on_grid(grid) for rung in self.rungs))
 
     def leaves(self) -> tuple[Index, ...]:
-        return tuple(_dedup(leaf for r in self.rungs for leaf in r.leaves()))
+        return tuple(dict.fromkeys(leaf for r in self.rungs for leaf in r.leaves()))
 
 
 def _read_only(values: Any, index: Index) -> np.ndarray:
@@ -317,7 +317,7 @@ def _link(
     start, the link's own). An input is listed as its variable, so a domain with gaps
     needs no position lookup. None where the constraint would list columns
     unchanged."""
-    leaves = tuple(_dedup(leaf for c in columns for leaf in c.leaves()))
+    leaves = tuple(dict.fromkeys(leaf for c in columns for leaf in c.leaves()))
     if _size(leaves) > TABLE_GRID:
         return None
     grid = _grid(leaves)
