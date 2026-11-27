@@ -59,6 +59,7 @@ from typing import Any, Self, TypeAlias, TypeGuard
 import numpy as np
 import sympy
 from ortools.sat.python import cp_model
+from sympy.core.function import AppliedUndef
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
 
@@ -69,6 +70,7 @@ from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
     operands,
 )
 from torch_spyre._inductor.scratchpad.cpsat_expr_printer import memoize_method
+from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
 
 # One cost unit is COST_SCALE objective units: a table entry is
 # rint(COST_SCALE * value).
@@ -122,7 +124,7 @@ class Index(ABC):
         """The entries of the lookups it is read through."""
 
     @abstractmethod
-    def inputs(self) -> tuple[InputIndex, ...]:
+    def inputs(self) -> tuple[InputIndex | LocateIndex, ...]:
         """The input positions it is made from."""
 
     @abstractmethod
@@ -143,11 +145,39 @@ class InputIndex(Index):
     def entries(self) -> int:
         return 0
 
-    def inputs(self) -> tuple[InputIndex, ...]:
+    def inputs(self) -> tuple[InputIndex | LocateIndex, ...]:
         return (self,)
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return self.var - self.lo if self.lo else self.var
+
+    def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
+        return grid[self]
+
+
+@dataclass(frozen=True)
+class LocateIndex(Index):
+    """A leaf: the position of a variable whose domain has gaps, one lookup,
+    values[position] == var, values the domain's, lowest first."""
+
+    var: cp_model.IntVar
+    values: tuple[int, ...]
+    size: int = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "size", len(self.values))
+
+    def entries(self) -> int:
+        return self.size
+
+    def inputs(self) -> tuple[InputIndex | LocateIndex, ...]:
+        return (self,)
+
+    @memoize_method
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        position = model.new_int_var(0, self.size - 1, "locate")
+        model.add_element(position, list(self.values), self.var)
+        return position
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return grid[self]
@@ -162,7 +192,7 @@ class UnitIndex(Index):
     def entries(self) -> int:
         return 0
 
-    def inputs(self) -> tuple[InputIndex, ...]:
+    def inputs(self) -> tuple[InputIndex | LocateIndex, ...]:
         return ()
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -186,7 +216,7 @@ class CombineIndex(Index):
     def entries(self) -> int:
         return self.left.entries() + self.right.entries()
 
-    def inputs(self) -> tuple[InputIndex, ...]:
+    def inputs(self) -> tuple[InputIndex | LocateIndex, ...]:
         return self.left.inputs() + self.right.inputs()
 
     @memoize_method
@@ -212,7 +242,7 @@ class CompactIndex(Index):
     def entries(self) -> int:
         return len(self.remap) + self.parent.entries()
 
-    def inputs(self) -> tuple[InputIndex, ...]:
+    def inputs(self) -> tuple[InputIndex | LocateIndex, ...]:
         return self.parent.inputs()
 
     @memoize_method
@@ -238,7 +268,7 @@ class ExtremeIndex(Index):
     def entries(self) -> int:
         return sum(rung.entries() for rung in self.rungs)
 
-    def inputs(self) -> tuple[InputIndex, ...]:
+    def inputs(self) -> tuple[InputIndex | LocateIndex, ...]:
         return tuple(i for rung in self.rungs for i in rung.inputs())
 
     @memoize_method
@@ -755,6 +785,8 @@ class TableLowering(Printer):
         self._gates: dict[sympy.Basic, sympy.Mul] = {}
         # one instance per rank, so equal ranks are one lookup
         self._ranks: dict[Index, Index] = {}
+        # one instance per rest and scale, so switches that share a rest share it
+        self._scaled: dict[tuple[AbstractRealization, float], AbstractRealization] = {}
 
     def print(self, expr: sympy.Basic) -> AbstractRealization:
         """expr's realization; raises TableLoweringError for what cannot be lowered."""
@@ -787,7 +819,8 @@ class TableLowering(Printer):
         raise NotImplementedError("TableLowering prints realizations: call print")
 
     def _print_Symbol(self, expr: sympy.Symbol) -> AbstractRealization:
-        """A symbol's column on its variable. A domain with gaps waits for Stage 13."""
+        """A symbol's column on its variable: its own position, or one looked up
+        (LocateIndex) where its domain has gaps."""
         if expr not in self.inputs:
             raise TableLoweringError(expr, "a symbol with no input")
         var, values = self.inputs[expr]
@@ -795,16 +828,20 @@ class TableLowering(Printer):
             raise TableLoweringError(
                 expr, f"a variable that is not an IntVar ({type(var).__name__})"
             )
-        domain = list(var.proto.domain)  # its intervals, flattened: lowest first
-        if len(domain) != 2:
-            raise TableLoweringError(expr, "a variable whose domain has gaps")
-        lo, hi = domain
-        if len(values) != hi - lo + 1:
+        intervals = _intervals(var)
+        count = sum(hi - lo + 1 for lo, hi in intervals)
+        if len(values) != count:
             raise TableLoweringError(
                 expr,
-                f"{len(values)} values for a variable with {hi - lo + 1}, {lo} to {hi}",
+                f"{len(values)} values for a variable with {count}, "
+                f"{intervals[0][0]} to {intervals[-1][1]}",
             )
-        index = InputIndex(var, size=len(values), lo=lo)
+        index: Index
+        if len(intervals) == 1:
+            index = InputIndex(var, size=count, lo=intervals[0][0])
+        else:
+            domain = tuple(v for lo, hi in intervals for v in range(lo, hi + 1))
+            index = LocateIndex(var, domain)
         try:
             column = TableRealization(values=values, index=index)
         except (TypeError, ValueError) as exc:
@@ -931,13 +968,26 @@ class TableLowering(Printer):
         self, expr: sympy.Basic, factor: sympy.Basic, others: Sequence[sympy.Basic]
     ) -> AbstractRealization | None:
         """expr as a switch (_switch) on factor's table, ranked, over the product of
-        others."""
+        others. A factor past 1 is divided by the power of two at or above its largest
+        value, and the rest multiplied by it before it is rounded, both exactly: the
+        rest is rounded at the product's scale, and the switch multiplies that rounding
+        by values at most 1. A rest rounded at its own scale under a factor of 2e6 left
+        a product of five Maxes 5e-4 off, and CP-SAT 9.15's presolve reported a wrong
+        optimum on it."""
         table = self.table(factor)
-        index, (values,) = _compact_to_unique_rows(table.index, [table.values])
+        index, (ranked,) = _compact_to_unique_rows(table.index, [table.values])
         index = self._ranks.setdefault(index, index)
+        values = tuple(ranked.tolist())
         rest = self._print(sympy.Mul(*others))
+        largest = max(abs(value) for value in values)
+        if largest > 1:
+            size = 2.0 ** math.ceil(math.log2(largest))
+            values = tuple(value / size for value in values)
+            if (rest, size) not in self._scaled:
+                self._scaled[rest, size] = rest.scaled(size)
+            rest = self._scaled[rest, size]
         positions = tuple(self._inputs(expr))
-        return _switch(tuple(values.tolist()), index, rest, positions, self.cap)
+        return _switch(values, index, rest, positions, self.cap)
 
     def _print_Min(self, expr: sympy.Min) -> AbstractRealization | None:
         return self._extreme(expr, is_min=True)
@@ -1104,3 +1154,75 @@ def _constant(expr: sympy.Basic) -> float | bool:
         return float(expr)  # type: ignore[arg-type]
     except TypeError as exc:
         raise TableLoweringError(expr, "a constant with no numeric value") from exc
+
+
+def _intervals(var: cp_model.IntVar) -> list[tuple[int, int]]:
+    """var's domain as its intervals, lowest first."""
+    bounds = list(var.proto.domain)
+    return list(zip(bounds[0::2], bounds[1::2]))
+
+
+# ---------------------------------------------------------------- the solver's maps
+
+
+def inputs_from_maps(
+    sym_map: Mapping[str, Any], buffer_map: Mapping[str, Any], *, cap: int
+) -> dict[str, tuple[cp_model.IntVar, list[float]]]:
+    """Each symbol of the CP-SAT printer's two maps, by name, as its variable and its
+    values: a buffer's symbol its value at each of its buffer's divisions
+    (buffer_map), and any other integer variable its domain's values, a domain past
+    cap no input."""
+    inputs: dict[str, tuple[cp_model.IntVar, list[float]]] = {}
+    for name, (wrapper, raw) in buffer_map.items():
+        if wrapper is not None:
+            inputs[name] = (wrapper.division, [float(value) for value in raw])
+    for name, var in sym_map.items():
+        if name in inputs or not isinstance(var, cp_model.IntVar):
+            continue
+        domain = [v for lo, hi in _intervals(var) for v in range(lo, hi + 1)]
+        if len(domain) <= cap:
+            inputs[name] = (var, [float(value) for value in domain])
+    return inputs
+
+
+def lower_cost_with_tables(
+    model: cp_model.CpModel,
+    sym_map: Mapping[str, Any],
+    buffer_map: Mapping[str, Any],
+    cost_expr: sympy.Basic,
+    *,
+    cap: int,
+) -> CpExpr:
+    """cost_expr as a CP-SAT objective in model, in COST_SCALE units, an int where it
+    is constant. sym_map and buffer_map are the CP-SAT printer's: a number in sym_map
+    is its symbol's value, and a relayout charge on a division with no input, a
+    source this solve does not divide, and an implemented function of a symbol with
+    no input, are 0, as the printer prices them. On any
+    failure the model is as it was, a copy swapped back, and TableLoweringError is
+    raised, from the original exception where that was of another type."""
+    copy = model.clone()
+    try:
+        by_name = inputs_from_maps(sym_map, buffer_map, cap=cap)
+        expr = sympy.sympify(cost_expr)
+        known: dict[sympy.Basic, sympy.Basic] = {
+            symbol: _number(value)
+            for symbol in expr.free_symbols
+            if symbol.name not in by_name
+            and isinstance(value := sym_map.get(symbol.name), (int, float))
+        }
+        for charge in expr.atoms(RelayoutCharge):
+            division = charge.args[1]
+            if isinstance(division, sympy.Symbol) and division.name not in by_name:
+                known[charge] = sympy.S.Zero
+        for function in expr.atoms(AppliedUndef):
+            if any(symbol.name not in by_name for symbol in function.free_symbols):
+                known[function] = sympy.S.Zero
+        expr = expr.xreplace(known)
+        inputs = {s: by_name[s.name] for s in expr.free_symbols if s.name in by_name}
+        return TableLowering(inputs, cap=cap).print(expr).cp_expr(model)
+    except Exception as exc:
+        model.proto.copy_from(copy.proto)
+        model.rebuild_constant_map()  # else a constant of the failed build is reused
+        if isinstance(exc, TableLoweringError):
+            raise
+        raise TableLoweringError(None, f"{type(exc).__name__}: {exc}") from exc

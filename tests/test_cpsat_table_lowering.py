@@ -27,6 +27,7 @@ import functools
 import itertools
 import math
 import sys
+import types
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -40,6 +41,7 @@ pytest.importorskip("ortools.sat.python.cp_model")
 
 from ortools.sat.python import cp_model
 from sympy.functions.elementary.piecewise import ExprCondPair
+from sympy.utilities.lambdify import implemented_function
 from sympy.printing.printer import Printer
 
 from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
@@ -51,6 +53,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     ExtremeRealization,
     Index,
     InputIndex,
+    LocateIndex,
     SumRealization,
     SwitchRealization,
     TableRealization,
@@ -132,7 +135,7 @@ class Case:
         values = dict(zip(self.variables, assignment))
         point = {}
         for symbol, (var, column) in self.inputs.items():
-            value = float(column[values[var] - self.values[var][0]])
+            value = float(column[self.values[var].index(values[var])])
             point[symbol] = (
                 sympy.Integer(int(value)) if value.is_integer() else sympy.Float(value)
             )
@@ -334,7 +337,7 @@ def test_the_printer_makes_a_symbols_position_on_its_variable():
     for refused, match in (
         ((division, [1.0, 2.0]), "2 values for a variable with 3, 0 to 2"),
         ((division, [1.0, "two", 4.0]), "values that are not one number each"),
-        ((gapped, [1.0, 2.0, 3.0, 4.0]), "a variable whose domain has gaps"),
+        ((gapped, [1.0, 2.0, 3.0, 4.0]), "4 values for a variable with 3, 1 to 4"),
         ((~literal, [1.0, 2.0]), "a variable that is not an IntVar"),
     ):
         printer = TableLowering({d0: refused}, cap=CAP)  # type: ignore[dict-item]
@@ -1028,21 +1031,24 @@ FACTORS = {
 
 @pytest.mark.parametrize("factor", FACTORS.values(), ids=FACTORS)
 def test_a_factor_times_a_sum_over_two_buffers_is_a_switch_and_exact(factor):
-    """No table crosses factor and rest: one per list. Each case's true/false is on
-    exactly where the factor takes its value, a two-row factor's own 0/1 variable and
-    its negation, and sets g with one constraint for a whole value and two for a
-    fraction."""
+    """No table crosses factor and rest: one per list. Its values are the factor's
+    divided by the power of two at or above the largest, the rest multiplied by it.
+    Each case's true/false is on exactly where the factor takes its value, a two-row
+    factor's own 0/1 variable and its negation, and sets g with one constraint for a
+    whole value and two for a fraction."""
     case = Case()
     position = case.add_input("k", k=factor)
     k, (a, b, _) = case.symbol("k"), _abc(case)
     plan = case.assert_exact(k * (a**0.5 + sympy.log(b)))
     assert type(plan) is SwitchRealization and type(plan.rest) is SumRealization
-    assert plan.values == tuple(factor) and plan.index == position  # no rank lookup
+    size = 2.0 ** math.ceil(math.log2(max(abs(v) for v in factor)))
+    assert plan.values == tuple(v / size for v in factor)
+    assert plan.index == position  # no rank lookup
     assert sorted(_tables(case.model)) == [3, 4]
     model = case.model
     (g,) = _named(model, "switch")
     on_g = [c for c in model.proto.constraints if c.has_linear() and g in c.linear.vars]
-    assert len(on_g) == 1 + sum(1 if v.is_integer() else 2 for v in factor)  # + cost
+    assert len(on_g) == 1 + sum(1 if v.is_integer() else 2 for v in plan.values)
     cases = [model.get_bool_var_from_proto_index(i) for i in _named(model, "case")]
     if len(factor) == 2:
         var = case.variables[0].index
@@ -1069,12 +1075,13 @@ def test_products_with_one_factor_are_one_switch_over_their_rests_sum():
 
 def test_a_position_and_a_realization_are_built_once_per_model():
     """Two factors on one buffer with equal ranks share one CompactIndex, and their
-    switches one rest: one rank lookup and one list. A position that reads the rank
+    switches, of one scale, one rest: one rank lookup and one list. A position that
+    reads the rank
     twice adds one lookup. A second build in the model adds nothing, and each step and
     realization gives back the expression it built; a build in another model adds it
     all again."""
     case = Case()
-    position = case.add_input("k", f=[1.0, 1.0, 2.0], h=[5.0, 5.0, 7.0])
+    position = case.add_input("k", f=[1.0, 1.0, 2.0], h=[1.25, 1.25, 1.75])
     f, h, (a, _, _) = case.symbol("f"), case.symbol("h"), _abc(case)
     plan = case.assert_exact(f * a**0.5 + h * a**0.5)
     rank = CompactIndex(position, (0, 0, 1))
@@ -1109,7 +1116,7 @@ def test_a_factor_over_two_buffers_is_ranked_on_their_combined_position():
     case = Case()
     a, b, c = _abc(case)
     plan = case.assert_exact(sympy.floor((a + b) / 4) * c**1.5)
-    assert type(plan) is SwitchRealization and plan.values == (0.0, 1.0, 2.0, 3.0)
+    assert type(plan) is SwitchRealization and plan.values == (0.0, 0.25, 0.5, 0.75)
     assert isinstance(plan.index, CompactIndex) and plan.index.parent.size == 12
 
 
@@ -1178,13 +1185,33 @@ def test_a_factor_with_more_values_than_the_cap_has_no_switch():
 
 
 def test_a_switched_product_past_2_60_is_refused_as_it_is_built():
-    """A fraction's q halves down to 1 first."""
+    """A switch's values are at most 1, so its rest passes 2^60 only as a sum of many
+    lists near 2^50; a fraction's q halves down to 1 first."""
     case = Case()
-    case.add_input("k", k=[0.5, 2.0**20])
-    case.add_input("a", a=[1.0, 1e11, 2e11])
+    position = case.add_input("k", k=[0.5, 1.0])
+    near = [TableRealization(values=[2.0**40], index=UnitIndex()) for _ in range(1100)]
+    rest = SumRealization(tuple(near))
     with pytest.raises(TableLoweringError, match="2\\^60") as caught:
-        case.lower(case.symbol("k") * case.symbol("a"))
+        SwitchRealization((0.5, 1.0), position, rest).cp_expr(case.model)
     assert caught.value.node is None
+
+
+def test_a_large_factor_multiplies_a_rest_rounded_at_the_products_scale():
+    """k of 1e6 and 3e6 times a**0.5: the rest is multiplied by 2^22 before it is
+    rounded and the switch's values are at most 1, so every product is within 1e-6 of
+    its value, where a**0.5 rounded onto COST_SCALE first, 1448 for 1448.15, was
+    1e-4 off once multiplied by 3e6."""
+    case = Case()
+    case.add_input("k", k=[1e6, 3e6])
+    case.add_input("a", a=[1.0, 2.0, 3.0])
+    expr = case.symbol("k") * case.symbol("a") ** 0.5
+    plan, objective = case.lower(expr)
+    assert type(plan) is SwitchRealization and max(plan.values) <= 1
+    cost = case.model.new_int_var(-(2**60), 2**60, "cost")
+    case.model.add(cost == objective)
+    for row in case.solutions(case.variables + [cost]):
+        exact = COST_SCALE * case.sympy_value(expr, row[:-1])
+        assert abs(row[-1] - exact) <= 1e-6 * exact
 
 
 def test_a_switchs_rest_of_several_terms_is_one_variable():
@@ -1598,7 +1625,7 @@ def test_a_literal_is_its_variable_whatever_its_symbols_values():
 
 @pytest.mark.parametrize(
     "factor, variable, values",
-    [(lambda v: 1 + v, (0, 2), (1.0, 2.0)), (lambda v: v - 1, (1, 2), (0.0, 1.0))],
+    [(lambda v: 1 + v, (0, 2), (0.5, 1.0)), (lambda v: v - 1, (1, 2), (0.0, 1.0))],
     ids=["never_0", "not_0_1"],
 )
 def test_a_factor_that_is_never_0_or_reads_no_0_1_variable_is_no_gate(
@@ -2063,6 +2090,153 @@ def test_a_max_too_wide_to_index_stays_linear_only_under_a_linear_reader(read, l
     else:
         with pytest.raises(TableLoweringError, match="past the cap of 16"):
             case.lower(expr, cap=16)
+
+
+# ------------------------------------------------------------- the solver's maps
+
+
+def _maps(case: Case) -> tuple[dict[str, Any], dict[str, Any]]:
+    """case's inputs as the CP-SAT printer's maps: a buffer's symbols in buffer_map,
+    on a wrapper that holds its division, and any other variable in sym_map."""
+    sym_map: dict[str, Any] = {}
+    buffer_map: dict[str, Any] = {}
+    for symbol, (var, values) in case.inputs.items():
+        if var.name.startswith("division_"):
+            buffer_map[symbol.name] = (types.SimpleNamespace(division=var), values)
+        else:
+            sym_map[symbol.name] = var
+    return sym_map, buffer_map
+
+
+def test_a_variable_whose_domain_has_gaps_is_read_through_its_position():
+    """Its position is one lookup, values[position] == var, and a table on it is
+    exact."""
+    case = Case()
+    domain = [1, 2, 5, 9]
+    var = case.model.new_int_var_from_domain(cp_model.Domain.from_values(domain), "g")
+    g = sympy.Symbol("g", integer=True)
+    case.inputs[g] = (var, [float(v) for v in domain])
+    case.variables.append(var)
+    case.values[var] = domain
+    case.add_input("a", a=[1.0, 3.0])
+    column = TableLowering(case.inputs, cap=CAP).table(g)
+    assert column.index == LocateIndex(var, tuple(domain))
+    case.assert_exact(g**0.5 * case.symbol("a") + sympy.log(g))
+
+
+def test_the_maps_give_each_symbol_its_variable_and_values():
+    """A buffer's symbol its value at each division, any other integer variable its
+    domain's values; a domain past the cap, and an entry that is no variable, are no
+    input."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0], t=[8.0, 4.0, 2.0])
+    case.integer("y", 2, 3)
+    sym_map, buffer_map = _maps(case)
+    sym_map["wide"] = case.model.new_int_var(0, 99, "wide")
+    sym_map["_division_of_a"] = buffer_map["a"][0]
+    inputs = lowering.inputs_from_maps(sym_map, buffer_map, cap=64)
+    division = case.variables[0]
+    assert inputs == {
+        "a": (division, [1.0, 2.0, 4.0]),
+        "t": (division, [8.0, 4.0, 2.0]),
+        "y": (case.variables[1], [2.0, 3.0, 4.0]),
+    }
+
+
+def test_two_menu_lengths_on_one_division_are_refused():
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    sym_map, buffer_map = _maps(case)
+    buffer_map["b"] = (buffer_map["a"][0], [1.0, 2.0])
+    expr = case.symbol("a") + sympy.Symbol("b", positive=True)
+    with pytest.raises(TableLoweringError, match="2 values for a variable with 3"):
+        lowering.lower_cost_with_tables(case.model, sym_map, buffer_map, expr, cap=CAP)
+
+
+def test_the_entry_point_reads_numbers_and_prices_an_undivided_relayout_at_0():
+    """A number in sym_map is its symbol's value, a relayout on a division with no
+    input is 0, as the CP-SAT printer prices it, and a constant objective is an
+    int."""
+    case = Case()
+    case.integer("x", 0, 2)
+    sym_map, buffer_map = _maps(case)
+    sym_map["n"] = 4
+    charge = RelayoutCharge(case.symbol("x"), sympy.Symbol("division_of_b"), 5, 7)
+    expr = 2 * sympy.Symbol("n") + charge
+    objective = lowering.lower_cost_with_tables(
+        case.model, sym_map, buffer_map, expr, cap=CAP
+    )
+    assert objective == 8 * COST_SCALE
+
+
+def test_the_entry_point_prices_a_function_of_a_symbol_with_no_input_at_0():
+    """As the printer prices a functor of no buffer of this solve; a function of a
+    buffer's split is its value at each division."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    sym_map, buffer_map = _maps(case)
+    price = implemented_function("price", lambda split: 3 * split)
+    expr = price(case.symbol("a")) + price(sympy.Symbol("split_of_b", positive=True))
+    root = lowering.lower_cost_with_tables(
+        case.model, sym_map, buffer_map, expr, cap=CAP
+    )
+    case.model.minimize(root)
+    solver = cp_model.CpSolver()
+    assert solver.solve(case.model) == cp_model.OPTIMAL
+    assert solver.objective_value == 3 * COST_SCALE
+
+
+def test_a_failed_build_leaves_the_model_as_it_was(monkeypatch):
+    """An entry past 2^50 is found as the root is built, after the variables of the
+    terms before it were made. The model is its copy again, and a constant the
+    failed build made is not handed out by the model's next new_constant, where it
+    would be MODEL_INVALID."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 3.0])
+    case.add_input("b", b=[1.0, 2.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    sym_map, buffer_map = _maps(case)
+    before = str(case.model.proto)
+    build = TableRealization.__dict__["cp_expr"].func
+
+    def making_a_constant(self, model):
+        model.new_constant(3)
+        return build(self, model)
+
+    monkeypatch.setattr(TableRealization, "cp_expr", making_a_constant)
+    expr = sympy.log(a + 1) * b + 2.0**60 * b**0.5
+    with pytest.raises(TableLoweringError, match="past 2\\^50"):
+        lowering.lower_cost_with_tables(case.model, sym_map, buffer_map, expr, cap=CAP)
+    assert str(case.model.proto) == before
+    monkeypatch.undo()
+    three = case.model.new_constant(3)
+    case.model.add(case.variables[0] + three >= 4)
+    case.model.minimize(case.variables[0])
+    assert cp_model.CpSolver().solve(case.model) == cp_model.OPTIMAL
+
+
+def test_an_exception_of_another_type_leaves_the_entry_point_as_a_refusal(monkeypatch):
+    """With the original as its cause and no node; a refusal keeps its node."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0])
+    sym_map, buffer_map = _maps(case)
+    a = case.symbol("a")
+
+    def failing(self, expr):
+        raise ValueError("boom")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(TableLowering, "print", failing)
+        with pytest.raises(TableLoweringError) as caught:
+            lowering.lower_cost_with_tables(case.model, sym_map, buffer_map, a, cap=CAP)
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert (caught.value.node, caught.value.reason) == (None, "ValueError: boom")
+    stray = sympy.Symbol("stray")
+    with pytest.raises(TableLoweringError, match="a symbol with no input") as caught:
+        lowering.lower_cost_with_tables(
+            case.model, sym_map, buffer_map, a + stray, cap=CAP
+        )
+    assert caught.value.node == stray
 
 
 # ------------------------------------------ synthetic examples of later optimizations
