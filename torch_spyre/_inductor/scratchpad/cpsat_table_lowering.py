@@ -456,7 +456,8 @@ class SwitchRealization(SymbolicRealization):
         return self.index, self.values
 
     def joined(self, others: Sequence[Self]) -> SwitchRealization:
-        return SwitchRealization(self.values, self.index, _joined((self, *others)))
+        rest = _sum([switch.rest for switch in (self, *others)])
+        return SwitchRealization(self.values, self.index, rest)
 
     def denominator(self) -> int:
         """q: 1 when every value is whole, otherwise the largest power of two up to
@@ -514,7 +515,7 @@ class GateRealization(SymbolicRealization):
         return self.literal, self.kept
 
     def joined(self, others: Sequence[Self]) -> GateRealization:
-        return replace(self, rest=_joined((self, *others)))
+        return replace(self, rest=_sum([gate.rest for gate in (self, *others)]))
 
 
 # --------------------------------------------------------------------- a node's list
@@ -873,14 +874,6 @@ def _sum(operands: Sequence[AbstractRealization]) -> SumRealization:
         groups.setdefault(operand.sum_key(), []).append(operand)
     terms = (g[0] if len(g) == 1 else g[0].joined(g[1:]) for g in groups.values())
     return SumRealization(tuple(terms))
-
-
-def _joined(
-    group: Sequence[SwitchRealization] | Sequence[GateRealization],
-) -> SumRealization:
-    """The rest of group, switches on one factor or gates on one literal and kept
-    value, joined into one: the sum of their rests, one w."""
-    return _sum([realization.rest for realization in group])
 
 
 def _switch(
