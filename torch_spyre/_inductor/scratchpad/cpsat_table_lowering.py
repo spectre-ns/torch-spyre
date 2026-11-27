@@ -81,6 +81,8 @@ MAX_PRODUCT = 2**60
 # 1/LINEAR_MARGIN of its table's entries (rule 3): a table searches faster on a near
 # tie.
 LINEAR_MARGIN = 2
+# The most input assignments a table constraint's rows are read over.
+TABLE_GRID = 2**16
 
 # What CP-SAT takes as a linear expression: a LinearExpr, an IntVar or an int.
 CpExpr: TypeAlias = cp_model.LinearExprT
@@ -235,6 +237,9 @@ class CompactIndex(Index):
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        linked = _link(model, (self.parent,), len(self.remap), self.on_grid, "rank")
+        if linked is not None:
+            return linked
         rank = model.new_int_var(0, self.size - 1, "rank")
         model.add_element(self.parent.cp_expr(model), list(self.remap), rank)
         return rank
@@ -261,6 +266,9 @@ class ExtremeIndex(Index):
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        linked = _link(model, self.rungs, 0, self.on_grid, "rung")
+        if linked is not None:
+            return linked
         rung = model.new_int_var(0, self.size - 1, "rung")
         rungs = [r.cp_expr(model) for r in self.rungs]
         if self.is_min:
@@ -288,6 +296,95 @@ def _read_only(values: Any, index: Index) -> np.ndarray:
         )
     array.setflags(write=False)
     return array
+
+
+def _link(
+    model: cp_model.CpModel,
+    columns: Sequence[Index],
+    taken: int,
+    out: Callable[[Mapping[Index, np.ndarray]], Any],
+    name: str,
+) -> CpExpr | None:
+    """out, a position or a cost read off columns, as one table constraint. A column
+    made by a combine, a compact or a rung is listed as the positions it is made from,
+    where the rows are no more than the entries of the lookups taken in (taken, to
+    start, the link's own). An input is listed as its variable, so a domain with gaps
+    needs no position lookup. None where the constraint would list columns
+    unchanged."""
+    leaves = tuple(dict.fromkeys(leaf for c in columns for leaf in c.leaves()))
+    if _size(leaves) > TABLE_GRID:
+        return None
+    grid = _grid(leaves)
+
+    def fits(trial: Sequence[Index], entries: int) -> bool:
+        return len(_rows(trial, grid)) <= entries
+
+    listed = list(columns)
+    progress = True
+    while progress:
+        progress = False
+        for i, column in enumerate(listed):
+            step = _made_from(column)
+            if step is None:
+                continue
+            parts, entries = step
+            trial = [*listed[:i], *parts, *listed[i + 1 :]]
+            if fits(trial, taken + entries):
+                listed, taken, progress = trial, taken + entries, True
+                break
+    located = any(isinstance(c, LocateIndex) for c in listed)
+    if (listed == list(columns) and not located) or not fits(listed, taken):
+        return None
+    size = _size(leaves)
+    out_values = np.broadcast_to(out(grid), (size,))
+    rows = np.unique(np.stack([*_columns(listed, grid), out_values], axis=1), axis=0)
+    target = model.new_int_var_from_domain(
+        cp_model.Domain.from_values(sorted(set(out_values.tolist()))), name
+    )
+    variables = [
+        c.var if isinstance(c, (InputIndex, LocateIndex)) else c.cp_expr(model)
+        for c in listed
+    ]
+    model.add_allowed_assignments([*variables, target], rows.tolist())
+    return target
+
+
+def _made_from(column: Index) -> tuple[tuple[Index, ...], int] | None:
+    """The positions column is made from and the entries of its own lookup; None for
+    an input."""
+    if isinstance(column, CombineIndex):
+        return (column.left, column.right), 0
+    if isinstance(column, CompactIndex):
+        return (column.parent,), len(column.remap)
+    if isinstance(column, ExtremeIndex):
+        return column.rungs, 0
+    if isinstance(column, UnitIndex):
+        return (), 0
+    return None
+
+
+def _columns(
+    columns: Sequence[Index], grid: Mapping[Index, np.ndarray]
+) -> list[np.ndarray]:
+    """Each column's value at every point of grid, an input's that of its variable."""
+    size = _size(tuple(grid))
+    values = []
+    for c in columns:
+        if isinstance(c, InputIndex):
+            value = grid[c] + c.lo
+        elif isinstance(c, LocateIndex):
+            value = np.asarray(c.values)[grid[c]]
+        else:
+            value = c.on_grid(grid)
+        values.append(np.broadcast_to(value, (size,)))
+    return values
+
+
+def _rows(columns: Sequence[Index], grid: Mapping[Index, np.ndarray]) -> np.ndarray:
+    """The rows of columns that occur on grid."""
+    if not columns:
+        return np.zeros((1, 0))
+    return np.unique(np.stack(_columns(columns, grid), axis=1), axis=0)
 
 
 def _rounded(values: Any) -> list[int]:
@@ -354,13 +451,25 @@ class TableRealization(AbstractRealization):
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
-        """A constant or affine list adds no table; any other is one add_element."""
+        """A constant or affine list adds no table; a list read through lookups that
+        a table constraint takes in is that constraint (_link); any other is one
+        add_element."""
         entries = _rounded(self.values)
         step = entries[1] - entries[0] if len(entries) > 1 else 0
         if all(entry == entries[0] + i * step for i, entry in enumerate(entries)):
             if step == 0:
                 return entries[0]
             return entries[0] + step * self.index.cp_expr(model)
+        listed = np.asarray(entries)
+        linked = _link(
+            model,
+            (self.index,),
+            len(entries),
+            lambda grid: listed[self.index.on_grid(grid)],
+            "table",
+        )
+        if linked is not None:
+            return linked
         target = model.new_int_var_from_domain(
             cp_model.Domain.from_values(sorted(set(entries))), "table"
         )
