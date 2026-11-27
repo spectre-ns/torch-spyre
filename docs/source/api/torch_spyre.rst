@@ -731,6 +731,15 @@ Environment Variables
      - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
        disables the limit). Applies separately to each optimization phase.
        A timeout may return a feasible plan without proving optimality.
+   * - ``CPSAT_TABLE_LOWERING``
+     - Lower the CP-SAT cost objective from exact element tables
+       (``scratchpad/cpsat_table_lowering.py``) instead of the CP-SAT
+       printer (default ``0``). An objective the tables cannot lower raises
+       ``TableLoweringError``, with no fallback; with it on, the cost
+       expression of auto coarse tiling is lowered too
+   * - ``CPSAT_TABLE_CAP``
+     - The largest table the table lowering makes, in entries
+       (``config.cpsat_table_cap``)
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)

@@ -43,7 +43,8 @@ with the fewest entries (rule 3), the next where that one's list is not finite, 
 is refused when none fits the cap. Its list is the numpy core's function of its sympy
 class (``cost_expr_numpy.py``, which the CP-SAT printer evaluates its candidates
 with) applied to its operands' tables; a class the core has no function for is
-refused. Nothing imports the module yet.
+refused. The CP-SAT layout solver lowers its objective through
+``lower_cost_with_tables`` under ``config.cpsat_table_lowering``.
 """
 
 from __future__ import annotations
@@ -54,11 +55,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import reduce
-from typing import Any, Self, TypeAlias, TypeGuard
+from typing import TYPE_CHECKING, Any, Self, TypeAlias, TypeGuard
 
 import numpy as np
 import sympy
-from ortools.sat.python import cp_model
 from sympy.core.function import AppliedUndef
 from sympy.logic.boolalg import Boolean
 from sympy.printing.printer import Printer
@@ -71,6 +71,14 @@ from torch_spyre._inductor.scratchpad.cost_expr_numpy import (
 )
 from torch_spyre._inductor.scratchpad.cpsat_expr_printer import memoize_method
 from torch_spyre._inductor.scratchpad.plan_solver import RelayoutCharge
+
+if TYPE_CHECKING:
+    from ortools.sat.python import cp_model
+else:
+    try:
+        from ortools.sat.python import cp_model
+    except ImportError:  # pragma: no cover - only where ortools is not installed
+        cp_model = None  # the solver never lowers then: CpSatLayoutSolver refuses
 
 # One cost unit is COST_SCALE objective units: a table entry is
 # rint(COST_SCALE * value).
@@ -86,7 +94,7 @@ MAX_PRODUCT = 2**60
 LINEAR_MARGIN = 2
 
 # What CP-SAT takes as a linear expression: a LinearExpr, an IntVar or an int.
-CpExpr: TypeAlias = cp_model.LinearExprT
+CpExpr: TypeAlias = "cp_model.LinearExprT"
 
 
 class TableLoweringError(Exception):

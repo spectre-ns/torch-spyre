@@ -294,8 +294,9 @@ side that traffic term is the first level of the lexicographic ladder in
 [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
 remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
 that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
-`auto_coarse_tiling` is on, since the allocator then withholds the expression (the model is flat
-in tile size and cut count).
+`auto_coarse_tiling` is on with the printer, since the allocator then withholds the expression
+(the model is flat in tile size and cut count). With `config.cpsat_table_lowering` the allocator
+hands it over, and the table lowering raises rather than falling back.
 
 :::{warning}
 Even when the expression survives, parts of the model go quiet. Both engines price the *same*
@@ -427,8 +428,10 @@ solvers differ in what "substitute and evaluate" compiles down to:
   decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
   `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
   as the objective to minimize via `cost_expr_to_cpsat(...)`
-  (`scratchpad/cpsat_expr_printer.py`). CP-SAT never evaluates `cost_expr` in Python; it
-  searches the symbolic constraint space directly.
+  (`scratchpad/cpsat_expr_printer.py`), or via `lower_cost_with_tables(...)`
+  (`scratchpad/cpsat_table_lowering.py`) under `config.cpsat_table_lowering`. CP-SAT never
+  evaluates `cost_expr` in Python; the printer hands it the symbolic constraint space, and the
+  table lowering exact tables of values computed before the solve.
 - **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
   (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
   a plain Python function of `(chosen, resident)`, and calls that function fresh for every
