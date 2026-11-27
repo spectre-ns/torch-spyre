@@ -118,9 +118,9 @@ class Index(ABC):
         memoize_method, built once per model; a leaf's adds nothing to the model, so
         it is not."""
 
+    @abstractmethod
     def entries(self) -> int:
         """The entries of the lookups it is read through."""
-        return 0
 
     @abstractmethod
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
@@ -140,6 +140,9 @@ class InputIndex(Index):
     var: cp_model.IntVar
     size: int
     lo: int = 0
+
+    def entries(self) -> int:
+        return 0
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return self.var - self.lo if self.lo else self.var
@@ -184,6 +187,9 @@ class UnitIndex(Index):
     """A leaf: the one position of a constant, on no input."""
 
     size: int = field(default=1, init=False)
+
+    def entries(self) -> int:
+        return 0
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return 0
