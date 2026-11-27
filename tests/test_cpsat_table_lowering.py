@@ -854,7 +854,7 @@ def test_a_sum_is_a_sum_realization_of_its_operands_realizations():
     assert list(constant.values) == [2.5]
     operands = {printer.print(a**0.5), printer.print(sympy.log(b))}
     assert set(root.terms) == {constant, *operands}
-    assert root.positions == (pa, pb)
+    assert root.table(CAP).index == CombineIndex(pa, pb)
     assert list(root.table(CAP).values) == pytest.approx(
         [2.5 + va**0.5 + math.log(vb) for va in (1.0, 2.0, 4.0) for vb in (1.0, 3.0)]
     )

@@ -338,10 +338,7 @@ class TableRealization(AbstractRealization):
 
 
 class SymbolicRealization(AbstractRealization):
-    """No list of its own: CP-SAT builds it from its operands' expressions. positions
-    are its inputs', in its table's order."""
-
-    positions: tuple[Index, ...]
+    """No list of its own: CP-SAT builds it from its operands' expressions."""
 
     def table(self, cap: int) -> TableRealization:
         """Its cheapest table from its parts' tables (_tabulated)."""
@@ -366,7 +363,6 @@ class SumRealization(SymbolicRealization):
     """sum(terms). A constant is a term on a UnitIndex."""
 
     terms: tuple[AbstractRealization, ...]
-    positions: tuple[Index, ...]
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -388,7 +384,7 @@ class SumRealization(SymbolicRealization):
 
     def scaled(self, factor: float) -> SumRealization:
         terms = tuple(term.scaled(factor) for term in self.terms)
-        return SumRealization(terms, self.positions)
+        return SumRealization(terms)
 
     def bounds(self) -> tuple[int, int]:
         ends = [term.bounds() for term in self.terms]
@@ -407,7 +403,6 @@ class SwitchRealization(SymbolicRealization):
     values: tuple[float, ...]
     index: Index
     rest: AbstractRealization
-    positions: tuple[Index, ...]
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -442,7 +437,7 @@ class SwitchRealization(SymbolicRealization):
 
     def scaled(self, factor: float) -> SwitchRealization:
         rest = self.rest.scaled(factor)
-        return SwitchRealization(self.values, self.index, rest, self.positions)
+        return SwitchRealization(self.values, self.index, rest)
 
     def bounds(self) -> tuple[int, int]:
         q = self.denominator()
@@ -461,8 +456,7 @@ class SwitchRealization(SymbolicRealization):
         return self.index, self.values
 
     def joined(self, others: Sequence[Self]) -> SwitchRealization:
-        rest, positions = _joined((self, *others))
-        return SwitchRealization(self.values, self.index, rest, positions)
+        return SwitchRealization(self.values, self.index, _joined((self, *others)))
 
     def denominator(self) -> int:
         """q: 1 when every value is whole, otherwise the largest power of two up to
@@ -485,7 +479,6 @@ class GateRealization(SymbolicRealization):
     literal: InputIndex
     kept: int
     rest: AbstractRealization
-    positions: tuple[Index, ...]
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -521,8 +514,7 @@ class GateRealization(SymbolicRealization):
         return self.literal, self.kept
 
     def joined(self, others: Sequence[Self]) -> GateRealization:
-        rest, positions = _joined((self, *others))
-        return replace(self, rest=rest, positions=positions)
+        return replace(self, rest=_joined((self, *others)))
 
 
 # --------------------------------------------------------------------- a node's list
@@ -732,7 +724,7 @@ class TableLowering(Printer):
         if not expr.free_symbols:
             return None
         operands = [self._print(operand) for operand in expr.args]
-        return _sum(operands, tuple(self._inputs(expr)))
+        return _sum(operands)
 
     def _print_Mul(self, expr: sympy.Mul) -> AbstractRealization | None:
         """A product of several operands is gated (_gated) where one of them is a
@@ -778,7 +770,7 @@ class TableLowering(Printer):
                         expr, f"no value ({type(exc).__name__}: {exc})"
                     ) from exc
                 rest = self._print(kept_product)
-                return _gate(literal, kept, rest, tuple(self._inputs(expr)))
+                return _gate(literal, kept, rest)
         return None
 
     def _literal(self, operand: sympy.Basic) -> tuple[InputIndex, int] | None:
@@ -870,9 +862,7 @@ class TableLowering(Printer):
             raise TableLoweringError(expr, exc.reason) from exc
 
 
-def _sum(
-    operands: Sequence[AbstractRealization], positions: tuple[Index, ...]
-) -> SumRealization:
+def _sum(operands: Sequence[AbstractRealization]) -> SumRealization:
     """operands added, kept linear. Terms with one sum_key are joined into one: lists
     on one position, constants among them, added in float, one lookup and one
     rounding; switches on one factor, and gates on one literal and kept value, one
@@ -882,16 +872,15 @@ def _sum(
     for operand in operands:
         groups.setdefault(operand.sum_key(), []).append(operand)
     terms = (g[0] if len(g) == 1 else g[0].joined(g[1:]) for g in groups.values())
-    return SumRealization(tuple(terms), positions)
+    return SumRealization(tuple(terms))
 
 
 def _joined(
     group: Sequence[SwitchRealization] | Sequence[GateRealization],
-) -> tuple[SumRealization, tuple[Index, ...]]:
-    """The rest and positions of group, switches on one factor or gates on one
-    literal and kept value, joined into one: the sum of their rests, one w."""
-    positions = tuple(dict.fromkeys(p for r in group for p in r.positions))
-    return _sum([realization.rest for realization in group], positions), positions
+) -> SumRealization:
+    """The rest of group, switches on one factor or gates on one literal and kept
+    value, joined into one: the sum of their rests, one w."""
+    return _sum([realization.rest for realization in group])
 
 
 def _switch(
@@ -908,7 +897,7 @@ def _switch(
     which never has fewer entries than the switch."""
     if len(values) == 1:
         return rest.scaled(values[0])
-    switch = SwitchRealization(values, index, rest, positions)
+    switch = SwitchRealization(values, index, rest)
     entries = math.prod(position.size for position in positions)
     return switch if entries > cap or switch.entries() < entries else None
 
@@ -917,14 +906,13 @@ def _gate(
     literal: InputIndex,
     kept: int,
     rest: AbstractRealization,
-    positions: tuple[Index, ...],
 ) -> AbstractRealization:
     """rest where literal is at kept and 0 at its other value (rule 5). A rest of one
     value makes it one list on the literal, affine: no gate and no table."""
     if isinstance(rest, TableRealization) and len(np.unique(rest.values)) == 1:
         values = np.where(np.arange(2) == kept, float(rest.values[0]), 0.0)
         return TableRealization(values=values, index=literal)
-    return GateRealization(literal, kept, rest, positions)
+    return GateRealization(literal, kept, rest)
 
 
 def _number(value: float) -> sympy.Number:
