@@ -1822,6 +1822,17 @@ def test_the_min_of_rungs_is_the_rung_of_the_min():
         assert list(read) == list(expected)
 
 
+def test_a_product_of_maxes_wider_than_the_cap_switches_on_one_of_them():
+    """At a cap of 19 neither Max fits one table over the three buffers, 24 entries,
+    and their pair is 20, but each is a table by rung: the product is a switch on the
+    Max with fewer values, over the other."""
+    case, first = _step_graph_max()
+    a, b, c = (case.symbol(f"split_{name}") for name in "abc")
+    plan = case.assert_exact(first * sympy.Max(a, b, c), cap=19)
+    assert type(plan) is SwitchRealization and isinstance(plan.index, ExtremeIndex)
+    assert len(plan.values) == 4
+
+
 def test_a_max_read_by_a_switch_or_under_a_log_is_its_ladder_on_its_rung():
     """Its 5 values are the switch's factor, where d's 6 are more, and a log of it is
     a list on its rung: no table crosses the three buffers."""

@@ -860,11 +860,13 @@ class TableLowering(Printer):
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
     ) -> AbstractRealization | None:
         """expr, the product of operands, as a switch (_switch) on the operand with
-        the fewest distinct values among those whose table fits the cap, the first in
-        expr's order on a tie, over the others' product. None where no operand's table
-        fits or the product keeps its table."""
+        the fewest distinct values among those with a table (_has_table), the first in
+        expr's order on a tie, over the others' product. None where no operand has a
+        table or the product keeps its table."""
         tables = {
-            operand: self._table(operand) for operand in operands if self._fits(operand)
+            operand: self._table(operand)
+            for operand in operands
+            if self._has_table(operand)
         }
         if not tables:
             return None
@@ -928,6 +930,11 @@ class TableLowering(Printer):
     def _fits(self, expr: sympy.Basic) -> bool:
         """Whether one table over expr's inputs is within the cap."""
         return math.prod(position.size for position in self._inputs(expr)) <= self.cap
+
+    def _has_table(self, expr: sympy.Basic) -> bool:
+        """Whether expr has a table within the cap: it is one, as a Max by rung over
+        more inputs than one table holds is, or one over its inputs fits."""
+        return isinstance(self._print(expr), TableRealization) or self._fits(expr)
 
     def _inputs(self, expr: sympy.Basic) -> list[Index]:
         """The positions of expr's inputs, in the order of its symbols."""
