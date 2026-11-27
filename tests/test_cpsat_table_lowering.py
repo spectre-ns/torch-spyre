@@ -203,8 +203,17 @@ def _rounding_bound(plan: AbstractRealization) -> float:
 
 
 def _tables(model: cp_model.CpModel) -> list[int]:
-    """The entries of each table in model: one add_element per table."""
-    return [len(c.element.exprs) for c in model.proto.constraints if c.has_element()]
+    """The entries of each table in model: an add_element's entries, or a table
+    constraint's rows."""
+    return [
+        len(c.element.exprs) if c.has_element() else _row_count(c)
+        for c in model.proto.constraints
+        if c.has_element() or c.has_table()
+    ]
+
+
+def _row_count(constraint) -> int:
+    return len(constraint.table.values) // len(constraint.table.exprs)
 
 
 def _operations(printed: Iterable[sympy.Basic]) -> list[sympy.Basic]:
@@ -1439,11 +1448,12 @@ def test_the_projection_objective_differs_by_candidate():
 
 
 def _reads(model: cp_model.CpModel, name: str) -> bool:
-    """Whether a table's position or a linear constraint reads the variable named
-    name. An enforcement literal is not read."""
+    """Whether a table's position, a table constraint's column or a linear
+    constraint reads the variable named name. An enforcement literal is not read."""
     (var,) = _named(model, name)
     return any(
         (c.has_element() and var in c.element.linear_index.vars)
+        or (c.has_table() and any(var in e.vars for e in list(c.table.exprs)[:-1]))
         or (c.has_linear() and var in c.linear.vars)
         for c in model.proto.constraints
     )
@@ -1851,7 +1861,7 @@ def test_a_refusal_names_no_table_from_parts_that_are_on_its_inputs():
 
 
 @pytest.mark.parametrize(
-    "offset, tables", [(9, [25, 120, 120]), (2, [3 * 40 * 3])], ids=["pair", "table"]
+    "offset, tables", [(9, [120, 144]), (2, [3 * 40 * 3])], ids=["pair", "table"]
 )
 def test_a_pair_over_a_shared_input_is_taken_where_its_list_is_finite(offset, tables):
     """x is on a's and b's divisions, y on b's and c's, and the pair of their ranks,
@@ -2122,6 +2132,50 @@ def test_a_variable_whose_domain_has_gaps_is_read_through_its_position():
     column = TableLowering(case.inputs, cap=CAP).table(g)
     assert column.index == LocateIndex(var, tuple(domain))
     case.assert_exact(g**0.5 * case.symbol("a") + sympy.log(g))
+
+
+def test_the_graph_roll_up_is_two_table_constraints():
+    """Max(split_a / 2, split_b ** 0.5) * (1 + 1 / split_c) under a log, on the menus
+    of the plan's graph example: the Max is ranked on the pair of divisions, 6 rows,
+    and the cost read on that rank and split_c's division, 12 rows, which takes in
+    split_c's rank. No add_element is left."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 4.0])
+    case.add_input("b", b=[1.0, 3.0])
+    case.add_input("c", c=[1.0, 2.0, 2.0, 4.0])
+    a, b, c = (case.symbol(name) for name in "abc")
+    case.assert_exact(sympy.log(sympy.Max(a / 2, b**0.5) * (1 + 1 / c)))
+    variables = case.model.proto.variables
+    links = {
+        tuple(variables[e.vars[0]].name for e in c.table.exprs): _row_count(c)
+        for c in case.model.proto.constraints
+        if c.has_table()
+    }
+    assert links == {
+        ("division_a", "division_b", "rank"): 6,
+        ("division_c", "rank", "table"): 12,
+    }
+    assert not any(c.has_element() for c in case.model.proto.constraints)
+
+
+def test_a_roll_up_reads_its_cost_through_one_table_constraint_on_its_rank_and_rung():
+    """A Max by rung times a ranked factor, under a log: the cost link takes in the
+    combine of the rank and the rung, 24 rows for the list's 24 entries, and nothing
+    under them, since listing a division instead of its rank, or the Max's operands
+    instead of its rung, needs more rows than the lookups it takes in. It is exact,
+    with one solution per assignment, and names no division."""
+    case = Case()
+    case.add_input("a", a=[1.0, 2.0, 3.0, 4.0, 6.0, 8.0])
+    case.add_input("b", b=[1.0, 2.0, 5.0, 9.0, 16.0, 25.0])
+    case.add_input("c", c=[1.0, 2.0, 2.0, 4.0, 1.0])
+    a, b, c = (case.symbol(name) for name in "abc")
+    case.assert_exact(sympy.log(sympy.Max(a / 2, b**0.5) * (1 + 1 / c)))
+    constraints = case.model.proto.constraints
+    (link,) = (c for c in constraints if c.has_table())
+    names = [case.model.proto.variables[e.vars[0]].name for e in link.table.exprs]
+    assert names[:2] == ["rank", "rung"] and _row_count(link) == 24
+    assert sorted(_tables(case.model)) == [5, 6, 6, 24]
+    assert sum(c.has_lin_max() for c in constraints) == 1
 
 
 def test_the_maps_give_each_symbol_its_variable_and_values():
