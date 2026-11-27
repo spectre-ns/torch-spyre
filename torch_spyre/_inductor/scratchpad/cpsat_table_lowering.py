@@ -145,10 +145,6 @@ class Index(ABC):
         """The position at every point of grid, which holds each input position's
         coordinate there: what cp_expr builds, computed."""
 
-    @abstractmethod
-    def leaves(self) -> tuple[Index, ...]:
-        """The input positions it is made from, in the order they are met."""
-
 
 @dataclass(frozen=True)
 class InputIndex(Index):
@@ -164,9 +160,6 @@ class InputIndex(Index):
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return grid[self]
-
-    def leaves(self) -> tuple[Index, ...]:
-        return (self,)
 
 
 @dataclass(frozen=True)
@@ -193,9 +186,6 @@ class LocateIndex(Index):
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return grid[self]
 
-    def leaves(self) -> tuple[Index, ...]:
-        return (self,)
-
 
 @dataclass(frozen=True)
 class UnitIndex(Index):
@@ -208,9 +198,6 @@ class UnitIndex(Index):
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return 0
-
-    def leaves(self) -> tuple[Index, ...]:
-        return ()
 
 
 @dataclass(frozen=True)
@@ -235,9 +222,6 @@ class CombineIndex(Index):
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return self.left.on_grid(grid) * self.right.size + self.right.on_grid(grid)
 
-    def leaves(self) -> tuple[Index, ...]:
-        return tuple(dict.fromkeys(self.left.leaves() + self.right.leaves()))
-
 
 @dataclass(frozen=True)
 class CompactIndex(Index):
@@ -261,9 +245,6 @@ class CompactIndex(Index):
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return np.asarray(self.remap)[self.parent.on_grid(grid)]
-
-    def leaves(self) -> tuple[Index, ...]:
-        return self.parent.leaves()
 
 
 @dataclass(frozen=True)
@@ -292,9 +273,6 @@ class ExtremeIndex(Index):
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         pick = np.minimum if self.is_min else np.maximum
         return reduce(pick, (rung.on_grid(grid) for rung in self.rungs))
-
-    def leaves(self) -> tuple[Index, ...]:
-        return tuple(dict.fromkeys(leaf for r in self.rungs for leaf in r.leaves()))
 
 
 def _read_only(values: Any, index: Index) -> np.ndarray:
@@ -519,20 +497,11 @@ class SwitchRealization(SymbolicRealization):
         return g
 
     def _parts(self, cap: int) -> list[TableRealization]:
-        """Its factor and its rest's factors, so a switch inside a switch is read as
-        one product of all of them."""
         factor = TableRealization(values=self.values, index=self.index)
-        if isinstance(self.rest, SwitchRealization):
-            return [factor, *self.rest._parts(cap)]
         return [factor, self.rest.table(cap)]
 
     def _of(self, lists: list[np.ndarray]) -> np.ndarray:
-        return math.prod(lists[1:], start=lists[0])
-
-    def _made(
-        self, parts: list[TableRealization], cap: int
-    ) -> tuple[TableRealization, ...]:
-        return _folds(parts, cap)
+        return lists[0] * lists[1]
 
     def scaled(self, factor: float) -> SwitchRealization:
         rest = self.rest.scaled(factor)
@@ -856,80 +825,6 @@ def _by_rung(parts: Sequence[TableRealization], is_min: bool) -> TableRealizatio
             values=ladder, index=ExtremeIndex(tuple(rungs), is_min, len(ladder))
         )
     return TableRealization(values=ladder, index=rungs[0] if rungs else UnitIndex())
-
-
-def _folds(parts: Sequence[TableRealization], cap: int) -> tuple[TableRealization, ...]:
-    """The product of parts as its fold (_fold), where two or more are a Min or Max
-    by rung; none otherwise."""
-    if sum(isinstance(part.index, ExtremeIndex) for part in parts) < 2:
-        return ()
-    fold = _fold(parts, cap)
-    return () if fold is None else (fold,)
-
-
-def _fold(factors: Sequence[TableRealization], cap: int) -> TableRealization | None:
-    """The product of factors on the tuples of their rungs that occur together (rule
-    2). A Min or Max by rung is the min or max of its rungs, and any other factor its
-    own position as one rung. Rungs that share an input are one group, and the state,
-    each factor's rung over the groups read so far, is combined with each group's
-    inputs in turn and compacted onto the states that occur. None where a step passes
-    cap."""
-    picks: list[Callable[[int, int], int]] = []
-    groups: list[tuple[list[Index], list[tuple[int, Index]]]] = []
-    for f, factor in enumerate(factors):
-        position = factor.index
-        picks.append(
-            min if isinstance(position, ExtremeIndex) and position.is_min else max
-        )
-        for rung in (
-            position.rungs if isinstance(position, ExtremeIndex) else (position,)
-        ):
-            leaves = rung.leaves()
-            if not leaves:
-                continue
-            hit = [group for group in groups if set(group[0]) & set(leaves)]
-            merged = list(dict.fromkeys([*(p for g in hit for p in g[0]), *leaves]))
-            members = [*(m for g in hit for m in g[1]), (f, rung)]
-            groups = [g for g in groups if all(g is not h for h in hit)]
-            groups.append((merged, members))
-
-    def joined(f: int, a: int | None, b: int | None) -> int | None:
-        return b if a is None else a if b is None else picks[f](a, b)
-
-    states: list[tuple[int | None, ...]] = [(None,) * len(factors)]
-    index: Index = UnitIndex()
-    for positions, members in groups:
-        joint = _size(positions)
-        if len(states) * joint > cap:
-            return None
-        grid = _grid(positions)
-        rows: list[list[int | None]] = [[None] * len(factors) for _ in range(joint)]
-        for f, rung in members:
-            for row, at in zip(rows, np.broadcast_to(rung.on_grid(grid), (joint,))):
-                row[f] = joined(f, row[f], int(at))
-        numbered: dict[tuple[int | None, ...], int] = {}
-        remap = tuple(
-            numbered.setdefault(
-                tuple(joined(f, s, r) for f, (s, r) in enumerate(zip(state, row))),
-                len(numbered),
-            )
-            for state in states
-            for row in rows
-        )
-        here = _combined(positions)
-        parent = here if index == UnitIndex() else CombineIndex(index, here)
-        index = (
-            parent if remap == tuple(range(len(remap))) else CompactIndex(parent, remap)
-        )
-        states = list(numbered)
-    values = [
-        math.prod(
-            float(factor.values[0 if s is None else s])
-            for factor, s in zip(factors, state)
-        )
-        for state in states
-    ]
-    return TableRealization(values=values, index=index)
 
 
 # ------------------------------------------------------------------ the numpy core
