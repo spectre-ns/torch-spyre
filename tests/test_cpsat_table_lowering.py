@@ -48,6 +48,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     CompactIndex,
     AbstractRealization,
     ExtremeIndex,
+    ExtremeRealization,
     Index,
     InputIndex,
     SumRealization,
@@ -183,7 +184,10 @@ def _printed(
 def _rounding_bound(plan: AbstractRealization) -> float:
     """Half a unit per rounding: each list's and each sum's constant's. A switch
     scales its rest's bound by each value, and a fraction p / q adds under one unit
-    for the floor plus |w| / (2q), and a gate's values 0 and 1 give its rest's."""
+    for the floor plus |w| / (2q), and a gate's values 0 and 1 give its rest's. A Min or
+    Max kept linear has its widest operand's."""
+    if isinstance(plan, ExtremeRealization):
+        return max(_rounding_bound(operand) for operand in plan.operands)
     if isinstance(plan, SumRealization):
         return 0.5 + sum(_rounding_bound(term) for term in plan.terms)
     if isinstance(plan, SwitchRealization):
@@ -1964,6 +1968,103 @@ def test_a_max_read_by_a_switch_or_under_a_log_is_its_ladder_on_its_rung():
     assert type(plan) is TableRealization and isinstance(plan.index, ExtremeIndex)
 
 
+# ------------------------------------------------------- a Min or Max kept linear
+
+
+def _literal_sums(count: int) -> tuple[Case, sympy.Basic, sympy.Basic]:
+    """Two sums of count 0/1 literals each with distinct coefficients, so neither
+    has a table under a cap of 2^count / 2."""
+    case, s = _with(lambda s: s, **{f"x{j}": (0, 2) for j in range(count)})
+    first = 40 - sum((3 + j) * s[f"x{j}"] for j in range(count))
+    second = 30 - sum((2 + 2 * j) * s[f"x{j}"] for j in range(count))
+    return case, first, second
+
+
+def test_a_min_of_two_sums_of_literals_stays_linear_and_is_exact():
+    """No table over its inputs, 32 entries past a cap of 16: a lin_min of the two
+    sums, each behind a variable of its own, and every literal's term affine. Its
+    bounds are the least of its operands' lows and of their highs."""
+    case, first, second = _literal_sums(5)
+    plan = case.assert_exact(sympy.Min(first, second), cap=16)
+    assert type(plan) is ExtremeRealization and plan.is_min
+    lows, highs = zip(*(operand.bounds() for operand in plan.operands))
+    assert plan.bounds() == (min(lows), min(highs))
+    assert _tables(case.model) == []
+    assert [len(_named(case.model, n)) for n in ("min", "term")] == [1, 2]
+
+
+def test_a_quotient_times_a_sum_too_wide_for_a_table_is_a_switch_over_the_sum():
+    """98 * k * S / a, S a sum of five residency literals with no table under a cap
+    of 16: a switch on 98*k/a, one table divided once with no table of 1/a, over S."""
+    case, first, _ = _literal_sums(5)
+    case.integer("k", 1, 2)
+    case.add_input("a", a=[7.0, 49.0])
+    k, a = case.symbol("k"), case.symbol("a")
+    expr = 98 * k * first / a
+    printer = Recording(case.inputs, cap=16)
+    plan = printer.print(expr)
+    assert type(plan) is SwitchRealization and type(plan.rest) is SumRealization
+    assert 1 / a not in printer.printed
+    case.assert_exact(expr, cap=16)
+
+
+def test_a_coefficient_on_a_linear_min_is_applied_to_its_operands():
+    """A negative one turns the Min into a Max, a fractional one is within its widest
+    operand's bound."""
+    for coefficient, is_min in ((-2, False), (0.37, True)):
+        case, first, second = _literal_sums(5)
+        plan = case.assert_exact(coefficient * sympy.Min(first, second), cap=16)
+        assert type(plan) is ExtremeRealization and plan.is_min is is_min
+
+
+def test_a_factor_of_any_sign_times_a_linear_min_is_a_switch_over_it():
+    case, first, second = _literal_sums(4)
+    case.add_input("k", k=[-1.5, 0.0, 2.0])
+    plan = case.assert_exact(case.symbol("k") * sympy.Min(first, second), cap=8)
+    assert type(plan) is SwitchRealization and type(plan.rest) is ExtremeRealization
+
+
+def test_a_max_keeps_its_table_unless_the_linear_one_needs_under_half_its_entries():
+    """Max(a, b**2) of two lists, 4 + 4 entries kept linear, keeps its table by rung
+    of 10; Max(a + b**2, c**3 + d) of two sums, 16 entries linear, would be a table by
+    rung of 56, and stays linear (LINEAR_MARGIN). Under a log it is read as that
+    table by rung."""
+    case, s = _with(lambda s: s, a=4, b=4, c=4, d=4)
+    lists = case.assert_exact(sympy.Max(s["a"], s["b"] ** 2))
+    assert type(lists) is TableRealization
+    case, s = _with(lambda s: s, a=4, b=4, c=4, d=4)
+    sums = case.assert_exact(sympy.Max(s["a"] + s["b"] ** 2, s["c"] ** 3 + s["d"]))
+    assert type(sums) is ExtremeRealization and not sums.is_min
+    case, s = _with(lambda s: s, a=4, b=4, c=4, d=4)
+    expr = sympy.log(sympy.Max(s["a"] + s["b"] ** 2, s["c"] ** 3 + s["d"]))
+    read = case.assert_exact(expr)
+    assert type(read) is TableRealization and isinstance(read.index, ExtremeIndex)
+
+
+@pytest.mark.parametrize(
+    "read, lowers",
+    [
+        (lambda m: m + 1, True),
+        (lambda m: 3 * m, True),
+        (lambda m: m * sympy.Symbol("k", integer=True), True),
+        (lambda m: sympy.Min(m, 30), True),
+        (lambda m: m**0.5, False),
+        (lambda m: sympy.log(m), False),
+        (lambda m: 1 / m, False),
+    ],
+    ids=["sum", "constant", "product", "min", "power", "log", "division"],
+)
+def test_a_max_too_wide_to_index_stays_linear_only_under_a_linear_reader(read, lowers):
+    case, first, second = _literal_sums(5)
+    case.integer("k", 1, 2)
+    expr = read(sympy.Max(first, second))
+    if lowers:
+        case.assert_exact(expr, cap=16)
+    else:
+        with pytest.raises(TableLoweringError, match="past the cap of 16"):
+            case.lower(expr, cap=16)
+
+
 # ------------------------------------------ synthetic examples of later optimizations
 
 
@@ -1989,10 +2090,8 @@ def _refused(reason):
 # its cap, which no stage before that one can lower and that stage's optimization can.
 # Each is refused today, for the reason its mark gives; the stage that lowers it drops
 # its mark, so the marks show what each stage adds. Stage 3's caching and Stage 4's
-# numpy steps change no lowering, so they have none, and the fold's example comes with
-# Stage 10, since whether it fits where the switch and Stage 9's rungs do not depends
-# on the fold's own counts. The first example lowers today, so the check below runs end
-# to end on every stage.
+# numpy steps change no lowering, so they have none. The first example lowers today, so
+# the check below runs end to end on every stage.
 EXAMPLES = [
     pytest.param(
         lambda: _with(
@@ -2069,11 +2168,6 @@ EXAMPLES = [
         ),
         CAP,
         id="lin_min",
-        marks=_refused(
-            "a Min of two sums of 15 and 14 residency literals has no table: the "
-            "smaller sum's is 16384 entries, over its literals or their ranks, past "
-            "the cap of 8192, and a Min kept as a linear constraint is not built"
-        ),
     ),
 ]
 
