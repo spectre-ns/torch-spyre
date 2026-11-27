@@ -36,10 +36,11 @@ operands where that has fewer entries than its one table, so no table crosses th
 factor and the rest. Any other node is a table, and a parent that reads a sum, a
 switch or a gate as a list reads its table. A table is over the node's inputs or
 over its operands' positions, each ranked to its distinct values, whichever has
-fewer entries (rule 3), and is refused when neither fits the cap. Its list is the
-numpy core's function of its sympy class (``cost_expr_numpy.py``, which the CP-SAT
-printer evaluates its candidates with) applied to its operands' tables; a class the
-core has no function for is refused. Nothing imports the module yet.
+fewer entries (rule 3), the other where that one's list is not finite, and is
+refused when neither fits the cap. Its list is the numpy core's function of its
+sympy class (``cost_expr_numpy.py``, which the CP-SAT printer evaluates its
+candidates with) applied to its operands' tables; a class the core has no function
+for is refused. Nothing imports the module yet.
 """
 
 from __future__ import annotations
@@ -113,6 +114,10 @@ class Index(ABC):
         """The entries of the lookups it is read through."""
 
     @abstractmethod
+    def inputs(self) -> tuple[InputIndex, ...]:
+        """The input positions it is made from."""
+
+    @abstractmethod
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         """The position at every point of grid, which holds each input position's
         coordinate there: what cp_expr builds, computed."""
@@ -130,6 +135,9 @@ class InputIndex(Index):
     def entries(self) -> int:
         return 0
 
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return (self,)
+
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return self.var - self.lo if self.lo else self.var
 
@@ -145,6 +153,9 @@ class UnitIndex(Index):
 
     def entries(self) -> int:
         return 0
+
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return ()
 
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
         return 0
@@ -166,6 +177,9 @@ class CombineIndex(Index):
 
     def entries(self) -> int:
         return self.left.entries() + self.right.entries()
+
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return self.left.inputs() + self.right.inputs()
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -189,6 +203,9 @@ class CompactIndex(Index):
 
     def entries(self) -> int:
         return len(self.remap) + self.parent.entries()
+
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return self.parent.inputs()
 
     @memoize_method
     def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
@@ -331,7 +348,6 @@ class SymbolicRealization(AbstractRealization):
         with np.errstate(over="ignore"):  # inf is refused by TableRealization
             return _tabulated(
                 self._parts(cap),
-                self.positions,
                 cap,
                 lambda _, lists: self._values_from_parts(lists),
             )
@@ -557,17 +573,21 @@ def _values_at(
 
 
 def _ways(
-    parts: Sequence[TableRealization], positions: Sequence[Index]
+    parts: Sequence[TableRealization],
 ) -> list[tuple[list[Index], list[TableRealization]]]:
     """The positions a table of a function of parts can be on, each with the parts as
-    read there: positions, its inputs; and the parts' own positions, ranked to their
-    distinct values (_compact_to_unique_rows) when the parts are on several, so a
-    function of one list adds no position. Parts on one position share one rank, of
-    their rows."""
+    read there: the parts' inputs, in the order of their variables; and the parts' own
+    positions, ranked to their distinct values (_compact_to_unique_rows) when the
+    parts are on several, so a function of one list adds no position. Parts on one
+    position share one rank, of their rows; two positions that share an input pair
+    their rows at two values of it too, which no assignment reaches."""
     on: dict[Index, list[int]] = {}
     for i, part in enumerate(parts):
         if part.index != UnitIndex():
             on.setdefault(part.index, []).append(i)
+    inputs = {i for index in on for i in index.inputs()}
+    positions: list[Index] = sorted(inputs, key=lambda i: i.var.index) or [UnitIndex()]
+    ways = [(positions, list(parts))]
     own = list(parts)
     if len(on) > 1:
         for index, members in on.items():
@@ -577,7 +597,6 @@ def _ways(
             for i, values in zip(members, lists):
                 own[i] = TableRealization(values=values, index=rank)
     ranks = [own[members[0]].index for members in on.values()] or [UnitIndex()]
-    ways = [(list(positions), list(parts))]
     if set(ranks) != set(positions):
         ways.append((ranks, own))
     return ways
@@ -589,14 +608,14 @@ def _size(positions: Sequence[Index]) -> int:
 
 def _tabulated(
     parts: Sequence[TableRealization],
-    positions: Sequence[Index],
     cap: int,
     compute: Callable[[int, list[np.ndarray]], Any],
 ) -> TableRealization:
     """A function of parts as the table (_ways) within cap with the fewest entries,
-    its list's and its lookups' (rule 3), over positions on a tie. Its list is
-    compute(count, the parts' lists on it), and only that table is computed."""
-    ways = _ways(parts, positions)
+    its list's and its lookups' (rule 3), over its inputs on a tie. Its list is
+    compute(count, the parts' lists on it), and only that table is computed, but where
+    its list is not finite, at a pair no assignment reaches (_ways), the next is."""
+    ways = _ways(parts)
     sizes = [_size(way) for way, _ in ways]
     if min(sizes) > cap:
         inputs, *own = sizes
@@ -605,13 +624,17 @@ def _tabulated(
             f"one table over its inputs would hold {inputs} entries, past the cap of "
             f"{cap}" + "".join(f", and one from its parts {size}" for size in own),
         )
-    way, operands = min(
+    fitting = sorted(
         (w for w, size in zip(ways, sizes) if size <= cap),
         key=lambda w: _size(w[0]) + sum(position.entries() for position in w[0]),
     )
-    index, grid = _combined(way), _grid(way)
-    lists = [_values_at(operand, index, grid) for operand in operands]
-    return TableRealization(values=compute(index.size, lists), index=index)
+    for way, read in fitting:
+        index, grid = _combined(way), _grid(way)
+        lists = [_values_at(part, index, grid) for part in read]
+        values = compute(index.size, lists)
+        if np.all(np.isfinite(values)):
+            break
+    return TableRealization(values=values, index=index)
 
 
 # ---------------------------------------------------------------------- the printer
@@ -825,7 +848,6 @@ class TableLowering(Printer):
             return TableRealization(values=[_constant(expr)], index=UnitIndex())
         return _tabulated(
             [self._table(operand) for operand in operands],
-            self._inputs(expr) or [UnitIndex()],
             self.cap,
             lambda count, lists: _values(expr, count, lambda: numpy_eval(expr, lists)),
         )

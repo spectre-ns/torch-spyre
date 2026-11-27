@@ -342,20 +342,21 @@ def test_the_printer_makes_a_symbols_position_on_its_variable():
         assert caught.value.node == d0
 
 
-def test_an_operations_position_combines_its_inputs_in_symbol_order():
+def test_an_operations_position_combines_its_inputs_in_variable_order():
     """The printer builds an operation's position from its inputs' positions, in the
-    order of its symbols, however the expression is written."""
+    order of their variables, however the expression is written: b's variable is made
+    first, so b's position leads though a sorts first."""
     case = Case()
-    pa = case.add_input("a", a=[1.0, 2.0, 4.0])
     pb = case.add_input("b", b=[1.0, 3.0])
+    pa = case.add_input("a", a=[1.0, 2.0, 4.0])
     a, b = case.symbol("a"), case.symbol("b")
     expr = a**0.5 + 2 * b
     printed = _printed(case, expr)
-    assert printed[expr].index == CombineIndex(pa, pb)
+    assert printed[expr].index == CombineIndex(pb, pa)
     assert printed[2 * b].index == pb
     assert printed[sympy.Integer(2)].index == UnitIndex()
     assert _printed(case, sympy.log(b) * a)[sympy.log(b) * a].index == CombineIndex(
-        pa, pb
+        pb, pa
     )
 
 
@@ -1372,12 +1373,14 @@ def test_the_cost_models_objective_has_the_annealers_values(rows):
     for k, split in enumerate((SPLIT_M, SPLIT_N, SPLIT_K)):
         case.inputs[split] = (candidate, [float(s[k]) for s in MENU])
     case.inputs[WEIGHT_LX] = (lit, [0.0, 1.0])
-    root = TableLowering(case.inputs, cap=CAP).print(expr)
+    printer = TableLowering(case.inputs, cap=CAP)
+    root = printer.print(expr)
     prices = [f for f in expr.atoms(sympy.Function) if "delivery_price" in str(f)]
     assert bool(prices) == (rows == 8)
     symbols, points = _points(case, expr)
     annealer = sympy.lambdify(symbols, expr, modules="math")
-    values = root.table(CAP).values
+    printed = {s: printer.print(s).table(CAP) for s in symbols}
+    values = _at_inputs(printed | {expr: root.table(CAP)}, expr)
     assert len(values) == 2 * len(MENU)
     for value, point in zip(values, points):
         assert value == pytest.approx(annealer(*point), rel=1e-9), point
@@ -1736,6 +1739,30 @@ def test_a_node_takes_its_way_with_the_fewest_entries():
         table = case.assert_exact(sympy.log(a * b))
         assert type(table) is TableRealization and table.index == CombineIndex(pa, pb)
         assert table.entries() == 3 * len(b_menu)
+
+
+@pytest.mark.parametrize(
+    "offset, tables", [(9, [25, 120, 120]), (2, [3 * 40 * 3])], ids=["pair", "table"]
+)
+def test_a_pair_over_a_shared_input_is_taken_where_its_list_is_finite(offset, tables):
+    """x is on a's and b's divisions, y on b's and c's, and the pair of their ranks,
+    5 * 5 entries and two lookups of 120, holds x and y at two values of b too, which
+    no assignment reaches: there x - y is -4 to 4, at every assignment -1 to 1. Under
+    log(x - y + 9) the pair is the log's table; under log(x - y + 2) it reaches
+    log(-2), so the log is one table over the three divisions."""
+    case, expr = _with(
+        lambda s: sympy.log(
+            sympy.floor((s["a"] + s["b"]) / 10)
+            - sympy.floor((s["b"] + s["c"]) / 10)
+            + offset
+        ),
+        a=3,
+        b=40,
+        c=3,
+    )
+    plan = case.assert_exact(expr)
+    assert type(plan) is TableRealization
+    assert sorted(_tables(case.model)) == tables
 
 
 # ------------------------------------------ synthetic examples of later optimizations
