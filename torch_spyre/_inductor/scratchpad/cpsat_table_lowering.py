@@ -36,13 +36,14 @@ divides is one table, divided once. Any other product is a switch on one of its
 operands where that has fewer entries than its one table, so no table crosses that
 factor and the rest. Any other node is a table, and a parent that reads a sum or a
 switch as a list reads the node's table, which the printer makes from the node's
-operands' tables (TableLowering.table). A table is over the node's inputs or
-over its operands' positions, each ranked to its distinct values, whichever has
-fewer entries (rule 3), the other where that one's list is not finite, and is
-refused when neither fits the cap. Its list is the numpy core's function of its
-sympy class (``cost_expr_numpy.py``, which the CP-SAT printer evaluates its
-candidates with) applied to its operands' tables; a class the core has no function
-for is refused. Nothing imports the module yet.
+operands' tables (TableLowering.table). A table is over the node's inputs, over
+its operands' positions, each ranked to its distinct values, or, for a Min or Max, by
+rung: its ladder at the min or max of its operands' positions on it. It takes the way
+with the fewest entries (rule 3), the next where that one's list is not finite, and
+is refused when none fits the cap. Its list is the numpy core's function of its sympy
+class (``cost_expr_numpy.py``, which the CP-SAT printer evaluates its candidates
+with) applied to its operands' tables; a class the core has no function for is
+refused. Nothing imports the module yet.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import reduce
 from typing import Any, Self, TypeAlias, TypeGuard
 
 import numpy as np
@@ -217,6 +219,37 @@ class CompactIndex(Index):
 
     def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
         return np.asarray(self.remap)[self.parent.on_grid(grid)]
+
+
+@dataclass(frozen=True)
+class ExtremeIndex(Index):
+    """The max of rungs, positions on one ascending ladder of size values, or their
+    min where is_min: the ladder keeps order, so the Max of the rungs is the rung of
+    the Max."""
+
+    rungs: tuple[Index, ...]
+    is_min: bool
+    size: int
+
+    def entries(self) -> int:
+        return sum(rung.entries() for rung in self.rungs)
+
+    def inputs(self) -> tuple[InputIndex, ...]:
+        return tuple(i for rung in self.rungs for i in rung.inputs())
+
+    @memoize_method
+    def cp_expr(self, model: cp_model.CpModel) -> CpExpr:
+        rung = model.new_int_var(0, self.size - 1, "rung")
+        rungs = [r.cp_expr(model) for r in self.rungs]
+        if self.is_min:
+            model.add_min_equality(rung, rungs)
+        else:
+            model.add_max_equality(rung, rungs)
+        return rung
+
+    def on_grid(self, grid: Mapping[Index, np.ndarray]) -> Any:
+        pick = np.minimum if self.is_min else np.maximum
+        return reduce(pick, (rung.on_grid(grid) for rung in self.rungs))
 
 
 def _read_only(values: Any, index: Index) -> np.ndarray:
@@ -409,12 +442,16 @@ class SwitchRealization(AbstractRealization):
         rest = self.rest.scaled(factor)
         return SwitchRealization(self.values, self.index, rest)
 
+    @memoize_method
     def bounds(self) -> tuple[int, int]:
+        """Memoized, and its rest's read once: a switch inside a switch reads it
+        again, so a chain of switches is otherwise exponential in its depth."""
         q = self.denominator()
+        rest = self.rest.bounds()
         ends = [
             int(value) * end if value.is_integer() else round(value * q) * end // q
             for value in self.values
-            for end in self.rest.bounds()
+            for end in rest
         ]
         return min(ends), max(ends)
 
@@ -531,22 +568,27 @@ def _size(positions: Sequence[Index]) -> int:
 
 
 def _tabulated(
-    expr: sympy.Basic, parts: Sequence[TableRealization], cap: int
+    expr: sympy.Basic,
+    parts: Sequence[TableRealization],
+    cap: int,
+    made: Sequence[TableRealization] = (),
 ) -> TableRealization:
     """expr's table within cap from parts, its operands' tables, laid out over the
     parts' inputs or over the positions of the parts compacted (_compacted), where
-    those are not the inputs: the layout with the fewer entries, its list's and its
-    lookups' (rule 3), the inputs on a tie. Its list is expr's numpy core function of
-    the parts' lists on it (_values), and only that table is computed, but where its
-    list is not finite the other is: a compacted layout whose positions share an
-    input also holds rows no assignment reaches."""
+    those are not the inputs, or one of made, tables already made: the one with the
+    fewest entries, its list's and its lookups' (rule 3), a layout over one made on a
+    tie and the inputs over the compacted. A layout's list is expr's numpy core
+    function of the parts' lists on it (_values), and only the layout taken is
+    computed, but where its list is not finite the next is: a compacted layout whose
+    positions share an input also holds rows no assignment reaches."""
     inputs = _input_positions(parts)
     layouts = [(inputs, list(parts))]
     compacted = _compacted(parts)
     if set(_own_positions(compacted)) != set(inputs):
         layouts.append((_own_positions(compacted), compacted))
     sizes = [_size(positions) for positions, _ in layouts]
-    if min(sizes) > cap:
+    made = [table for table in made if table.index.size <= cap]
+    if min(sizes) > cap and not made:
         over_inputs, *own = sizes
         raise TableLoweringError(
             None,
@@ -554,16 +596,53 @@ def _tabulated(
             f"of {cap}" + "".join(f", and one from its parts {size}" for size in own),
         )
     fitting = sorted(
-        (layout for layout, size in zip(layouts, sizes) if size <= cap),
-        key=lambda layout: _size(layout[0]) + sum(p.entries() for p in layout[0]),
+        (
+            (_size(positions) + sum(p.entries() for p in positions), positions, read)
+            for (positions, read), size in zip(layouts, sizes)
+            if size <= cap
+        ),
+        key=lambda f: f[0],
     )
-    for positions, read in fitting:
+    cheapest = min(made, key=lambda table: table.entries(), default=None)
+    for entries, positions, read in fitting:
+        if cheapest is not None and cheapest.entries() < entries:
+            break
         index, grid = _combined(positions), _grid(positions)
         lists = [_values_at(part, index, grid) for part in read]
         values = _values(expr, index.size, lists)
         if np.all(np.isfinite(values)):
-            break
+            return TableRealization(values=values, index=index)
+    if cheapest is not None:
+        return cheapest
     return TableRealization(values=values, index=index)
+
+
+def _by_rung(parts: Sequence[TableRealization], is_min: bool) -> TableRealization:
+    """A Min (is_min) or Max of parts by rung (rule 1): its ladder, the values it can
+    take ascending, at the min or max of each part's rung on it. A Max is never below
+    its largest part's minimum, so a value under that bound is clamped to it, and a Min
+    mirrors it. So a part on no input only sets the bound, and a part at the bound
+    everywhere decides nothing. Parts on one position are one rung."""
+    pick = np.minimum if is_min else np.maximum
+    on: dict[Index, np.ndarray] = {}
+    for part in parts:
+        values = part.values
+        on[part.index] = pick(on[part.index], values) if part.index in on else values
+    ends = [values.max() if is_min else values.min() for values in on.values()]
+    bound = min(ends) if is_min else max(ends)
+    ladder = np.unique(np.concatenate([pick(values, bound) for values in on.values()]))
+    still = len(ladder) - 1 if is_min else 0  # the rung that decides nothing
+    rungs: list[Index] = []
+    for index, values in on.items():
+        remap = tuple(np.searchsorted(ladder, pick(values, bound)).tolist())
+        if set(remap) != {still}:
+            identity = remap == tuple(range(index.size))
+            rungs.append(index if identity else CompactIndex(index, remap))
+    if len(rungs) > 1:
+        return TableRealization(
+            values=ladder, index=ExtremeIndex(tuple(rungs), is_min, len(ladder))
+        )
+    return TableRealization(values=ladder, index=rungs[0] if rungs else UnitIndex())
 
 
 # ---------------------------------------------------------------------- the printer
@@ -745,11 +824,13 @@ class TableLowering(Printer):
         self, expr: sympy.Basic, operands: Sequence[sympy.Basic]
     ) -> AbstractRealization | None:
         """expr, the product of operands, as a switch (_switch) on the operand with
-        the fewest distinct values among those whose table fits the cap, the first in
-        expr's order on a tie, over the others' product. None where no operand's table
-        fits or the product keeps its table."""
+        the fewest distinct values among those with a table (_has_table), the first in
+        expr's order on a tie, over the others' product. None where no operand has a
+        table or the product keeps its table."""
         tables = {
-            operand: self.table(operand) for operand in operands if self._fits(operand)
+            operand: self.table(operand)
+            for operand in operands
+            if self._has_table(operand)
         }
         if not tables:
             return None
@@ -761,6 +842,22 @@ class TableLowering(Printer):
         rest = self._print(sympy.Mul(*(o for o in operands if o != factor)))
         positions = tuple(self._inputs(expr))
         return _switch(tuple(values.tolist()), index, rest, positions, self.cap)
+
+    def _print_Min(self, expr: sympy.Min) -> AbstractRealization | None:
+        return self._extreme(expr, is_min=True)
+
+    def _print_Max(self, expr: sympy.Max) -> AbstractRealization | None:
+        return self._extreme(expr, is_min=False)
+
+    def _extreme(
+        self, expr: sympy.Basic, *, is_min: bool
+    ) -> AbstractRealization | None:
+        """A Min or Max as its table, by rung (_by_rung) where that has the fewest
+        entries. Declined where it reads no symbol."""
+        if not expr.free_symbols:
+            return None
+        by_rung = _by_rung([self.table(operand) for operand in expr.args], is_min)
+        return self._operation(expr, (by_rung,))
 
     def _print_RelayoutCharge(self, expr: sympy.Function) -> AbstractRealization | None:
         """RelayoutCharge(is_lx, division, *prices), is_lx times the price at the
@@ -775,18 +872,25 @@ class TableLowering(Printer):
         """Any other node is declined. sympy's own returns str(expr)."""
         return None
 
-    def _operation(self, expr: sympy.Basic) -> TableRealization:
-        """expr as its table (_tabulated) of its operands' tables. An operation on
-        numbers is computed the same way, on a UnitIndex, so sqrt(19) equals sqrt(a)
-        at a = 19 (sympy's float is one double below)."""
+    def _operation(
+        self, expr: sympy.Basic, made: Sequence[TableRealization] = ()
+    ) -> TableRealization:
+        """expr as its table (_tabulated) of its operands' tables, or one of made. An
+        operation on numbers is computed the same way, on a UnitIndex, so sqrt(19)
+        equals sqrt(a) at a = 19 (sympy's float is one double below)."""
         if not operands(expr):
             return TableRealization(values=[_constant(expr)], index=UnitIndex())
         parts = [self.table(operand) for operand in operands(expr)]
-        return _tabulated(expr, parts, self.cap)
+        return _tabulated(expr, parts, self.cap, made)
 
     def _fits(self, expr: sympy.Basic) -> bool:
         """Whether one table over expr's inputs is within the cap."""
         return math.prod(position.size for position in self._inputs(expr)) <= self.cap
+
+    def _has_table(self, expr: sympy.Basic) -> bool:
+        """Whether expr has a table within the cap: it is one, as a Max by rung over
+        more inputs than one table holds is, or one over its inputs fits."""
+        return isinstance(self._print(expr), TableRealization) or self._fits(expr)
 
     def _inputs(self, expr: sympy.Basic) -> list[Index]:
         """The positions of expr's inputs, in the order of its symbols."""

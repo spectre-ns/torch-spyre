@@ -23,6 +23,7 @@ is computed in floating point and rounded once, where it enters CP-SAT: it is he
 the expression's value, not to the bits of another evaluator.
 """
 
+import functools
 import itertools
 import math
 import sys
@@ -46,6 +47,7 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     CombineIndex,
     CompactIndex,
     AbstractRealization,
+    ExtremeIndex,
     Index,
     InputIndex,
     SumRealization,
@@ -212,8 +214,8 @@ def test_the_printer_prints_operands_first_and_a_shared_subexpression_once(monke
     case.add_input("a", a=[1.0, 2.0, 4.0])
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
-    shared = sympy.Min(a, b)
-    expr = sympy.exp(shared) + sympy.log(shared)
+    shared = sympy.Abs(a - b)  # a Min would be read by rung, with no evaluation
+    expr = sympy.exp(shared) + sympy.log(shared + 1)
     before = sympy.srepr(expr)
     calls = _count_evaluations(monkeypatch)
     printer = Recording(case.inputs)
@@ -422,13 +424,13 @@ def test_print_touches_no_model_and_a_refusal_comes_from_print():
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
-    root = TableLowering(case.inputs, cap=CAP).print(sympy.Min(a, b))
+    root = TableLowering(case.inputs, cap=CAP).print(sympy.Abs(a - b))
     assert isinstance(root, TableRealization) and root.index.size == 6
     assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
     root.cp_expr(case.model)  # only the build adds to the model
     size = len(case.model.proto.constraints), len(case.model.proto.variables)
     with pytest.raises(TableLoweringError, match="past the cap of 4"):
-        TableLowering(case.inputs, cap=4).print(sympy.Min(a, b))
+        TableLowering(case.inputs, cap=4).print(sympy.Abs(a - b))
     assert (len(case.model.proto.constraints), len(case.model.proto.variables)) == size
 
 
@@ -497,9 +499,11 @@ def test_every_table_is_made_within_the_printers_cap(monkeypatch):
     asked: list[int] = []
     original = lowering._tabulated
 
-    def tabulated(expr: sympy.Basic, parts: Any, cap: int) -> TableRealization:
+    def tabulated(
+        expr: sympy.Basic, parts: Any, cap: int, made: Any = ()
+    ) -> TableRealization:
         asked.append(cap)
-        return original(expr, parts, cap)
+        return original(expr, parts, cap, made)
 
     monkeypatch.setattr(lowering, "_tabulated", tabulated)
     TableLowering(case.inputs, cap=7).print(a**0.5 * b + sympy.log(a))
@@ -679,7 +683,7 @@ def test_a_node_is_evaluated_once_its_operands_before_it(monkeypatch):
     case.add_input("b", b=[1.0, 3.0])
     a, b = case.symbol("a"), case.symbol("b")
     calls = _count_evaluations(monkeypatch)
-    shared = sympy.Min(a, b)
+    shared = sympy.Piecewise((a, a > b), (b, True))  # a Max would be read by rung
     expr = sympy.Max(sympy.exp(shared), sympy.log(shared))
     printer = Recording(case.inputs)
     root = printer.print(expr)
@@ -1100,8 +1104,8 @@ def test_a_product_of_three_operands_is_a_switch_inside_a_switch():
 def test_a_factor_over_two_buffers_is_ranked_on_their_combined_position():
     case = Case()
     a, b, c = _abc(case)
-    plan = case.assert_exact(sympy.Min(a, b) * c**1.5)
-    assert type(plan) is SwitchRealization and plan.values == (1.0, 2.0, 3.0, 4.0)
+    plan = case.assert_exact(sympy.floor((a + b) / 4) * c**1.5)
+    assert type(plan) is SwitchRealization and plan.values == (0.0, 1.0, 2.0, 3.0)
     assert isinstance(plan.index, CompactIndex) and plan.index.parent.size == 12
 
 
@@ -1538,13 +1542,14 @@ def test_terms_gated_by_one_literal_are_one_gate_over_one_list():
 
 
 def test_the_rest_of_a_gate_reads_no_literal():
-    """x * Max(x*a, b) is x * Max(a, b): one table over a and b."""
+    """x * Max(x*a, b) is x * Max(a, b): by rung over a and b, whose values are their
+    own rungs, so its ladder is affine on its rung and needs no table."""
     case, expr = _with(
         lambda s: s["x"] * sympy.Max(s["x"] * s["a"], s["b"]), x=(0, 2), a=5, b=3
     )
     plan = case.assert_exact(expr)
     assert _kept(plan) is not None and type(plan.rest) is TableRealization
-    assert plan.rest.index.size == 15 and _tables(case.model) == [15]
+    assert isinstance(plan.rest.index, ExtremeIndex) and _tables(case.model) == []
     assert not _reads(case.model, "x")
 
 
@@ -1747,14 +1752,14 @@ def test_a_product_read_under_a_power_is_exact_as_its_pair():
 
 
 def test_parts_on_one_position_share_a_rank_and_a_pair_past_the_cap_is_refused():
-    """u and v, one buffer's, take three distinct rows of five, which the Max pairs
-    with b's two values: 6 entries, where ranking u and v apart would pair 2 * 3 * 2,
-    some of no assignment. At a cap of 5 the pair is refused."""
+    """u and v, one buffer's, take three distinct rows of five, which the Piecewise
+    pairs with b > 3's two values: 6 entries, where ranking u and v apart would pair
+    2 * 3 * 2, some of no assignment. At a cap of 5 the pair is refused."""
     case = Case()
     pa = case.add_input("a", u=[1.0, 1.0, 2.0, 2.0, 1.0], v=[3.0, 3.0, 4.0, 5.0, 3.0])
     pb = case.add_input("b", b=[2.0, 6.0, 6.0, 2.0])
     u, v, b = (case.symbol(name) for name in "uvb")
-    expr = sympy.Max(u, v, b)
+    expr = sympy.Piecewise((u, b > 3), (v, True))
     plan = case.assert_exact(expr)
     assert type(plan) is TableRealization and isinstance(plan.index, CombineIndex)
     assert {plan.index.left, plan.index.right} == {
@@ -1836,6 +1841,127 @@ def test_a_pair_over_a_shared_input_is_taken_where_its_list_is_finite(offset, ta
     plan = case.assert_exact(expr)
     assert type(plan) is TableRealization
     assert sorted(_tables(case.model)) == tables
+
+
+# ------------------------------------------------------------------------- rungs
+
+
+def _step_graph_max(d: int | None = None) -> tuple[Case, sympy.Basic]:
+    """The Max of "The process, step by step", at its own menus, times d**1.5 for a
+    buffer whose split takes 1 to d."""
+    case = Case()
+    case.add_input("a", split_a=[1.0, 2.0, 4.0])
+    case.add_input("b", split_b=[1.0, 3.0])
+    case.add_input("c", split_c=[1.0, 2.0, 2.0, 4.0])
+    a, b, c = (case.symbol(f"split_{name}") for name in "abc")
+    expr = sympy.Max(a / 2, b**0.5, c**0.25)
+    if d is None:
+        return case, expr
+    case.add_input("d", split_d=[float(v) for v in range(1, d + 1)])
+    return case, expr * case.symbol("split_d") ** 1.5
+
+
+def test_a_max_over_three_buffers_is_exact_by_rung():
+    """Each operand lands on the rung of its value clamped at 1, the largest operand
+    minimum, so split_a / 2 at 0.5 counts as 1: a ladder of 5 and rung lookups of 3, 2
+    and 4, 14 entries, where one table over the three buffers holds 24. Max(a, b) of
+    two buffers ties its one table at 12 and takes it, which reads no lookup."""
+    case = Case()
+    a, b, _ = _abc(case)
+    tie = case.assert_exact(sympy.Max(a, b))
+    assert type(tie) is TableRealization and isinstance(tie.index, CombineIndex)
+    case, expr = _step_graph_max()
+    plan = case.assert_exact(expr)
+    assert type(plan) is TableRealization and isinstance(plan.index, ExtremeIndex)
+    assert list(plan.values) == pytest.approx([1, 2**0.25, 2**0.5, 3**0.5, 2])
+    rungs = sorted(list(rung.remap) for rung in plan.index.rungs)
+    assert rungs == [[0, 0, 4], [0, 1, 1, 2], [0, 3]]
+    assert plan.entries() == 14 and sorted(_tables(case.model)) == [2, 3, 4, 5]
+
+
+def test_a_ladder_is_clamped_at_its_bound():
+    """A Max is never below its largest operand minimum and a Min never above its
+    smallest operand maximum, so the ladder drops what lies past that bound: 1 and 2
+    for the Max, 5 and 6 for the Min, where a constant moves it. An operand at the
+    bound everywhere has no rung: Max(a, b - 10) is a, on a's position, and
+    Max(a, b, 7) is 7."""
+    case = Case()
+    pa = case.add_input("a", a=[1.0, 3.0, 5.0])
+    case.add_input("b", b=[2.0, 4.0, 6.0])
+    a, b = case.symbol("a"), case.symbol("b")
+    printer = TableLowering(case.inputs, cap=CAP)
+
+    def ladder(*operands: Any, is_min: bool) -> list[float]:
+        parts = [printer.table(sympy.sympify(o)) for o in operands]
+        return list(lowering._by_rung(parts, is_min).values)
+
+    assert ladder(a, b, 3, is_min=False) == [3, 4, 5, 6]
+    assert ladder(a, b, 4, is_min=True) == [1, 2, 3, 4]
+    assert printer.table(sympy.Max(a, b - 10)).index == pa
+    constant = printer.table(sympy.Max(a, b, 7))
+    assert constant.index == UnitIndex() and list(constant.values) == [7]
+
+
+def test_the_min_of_rungs_is_the_rung_of_the_min():
+    """At every assignment of three buffers with seeded random lists, repeats and
+    ties among them, the ladder at the min or max of the rungs is the Min or Max of
+    the lists."""
+    rng = np.random.default_rng(0)
+    model = cp_model.CpModel()
+    for is_min, _ in itertools.product((True, False), range(20)):
+        parts = []
+        for size in rng.integers(1, 6, size=3):
+            var = model.new_int_var(0, int(size) - 1, "division")
+            values = rng.integers(0, 6, size=size).astype(float)
+            parts.append(TableRealization(values=values, index=InputIndex(var, size)))
+        positions = [part.index for part in parts]
+        grid = lowering._grid(positions)
+        count = math.prod(position.size for position in positions)
+        table = lowering._by_rung(parts, is_min)
+        read = np.broadcast_to(table.values[table.index.on_grid(grid)], (count,))
+        pick = np.minimum if is_min else np.maximum
+        expected = functools.reduce(pick, (p.values[grid[p.index]] for p in parts))
+        assert list(read) == list(expected)
+
+
+def test_a_product_of_maxes_wider_than_the_cap_switches_on_one_of_them():
+    """At a cap of 19 neither Max fits one table over the three buffers, 24 entries,
+    and their pair is 20, but each is a table by rung: the product is a switch on the
+    Max with fewer values, over the other."""
+    case, first = _step_graph_max()
+    a, b, c = (case.symbol(f"split_{name}") for name in "abc")
+    plan = case.assert_exact(first * sympy.Max(a, b, c), cap=19)
+    assert type(plan) is SwitchRealization and isinstance(plan.index, ExtremeIndex)
+    assert len(plan.values) == 4
+
+
+def test_a_chain_of_switches_reads_each_tables_bounds_a_few_times(monkeypatch):
+    """A product of six factors of 12 values each is five switches deep. Each switch
+    reads its rest's bounds once, where a read per value of the factor made the build
+    exponential in the depth: 12^5 reads."""
+    case, expr = _with(
+        lambda s: sympy.Mul(*(s[n] ** (1 + i / 7) for i, n in enumerate("abcdef"))),
+        **{name: 12 for name in "abcdef"},
+    )
+    reads = []
+    bounds = TableRealization.bounds
+    monkeypatch.setattr(
+        TableRealization, "bounds", lambda self: reads.append(self) or bounds(self)
+    )
+    root, _ = case.lower(expr)
+    assert type(root) is SwitchRealization and len(reads) <= 3 * 5
+
+
+def test_a_max_read_by_a_switch_or_under_a_log_is_its_ladder_on_its_rung():
+    """Its 5 values are the switch's factor, where d's 6 are more, and a log of it is
+    a list on its rung: no table crosses the three buffers."""
+    case, expr = _step_graph_max(d=6)
+    plan = case.assert_exact(expr)
+    assert type(plan) is SwitchRealization and isinstance(plan.index, ExtremeIndex)
+    assert len(plan.values) == 5
+    case, expr = _step_graph_max()
+    plan = case.assert_exact(sympy.log(expr))
+    assert type(plan) is TableRealization and isinstance(plan.index, ExtremeIndex)
 
 
 # ------------------------------------------ synthetic examples of later optimizations
@@ -1932,12 +2058,6 @@ EXAMPLES = [
         ),
         CAP,
         id="rung",
-        marks=_refused(
-            "a Max is one table over its operands' inputs or their ranks: three "
-            "buffers whose values are all distinct need 8640 entries either way, past "
-            "the cap of 8192, and a Max read from the order of its operands' values is "
-            "not built"
-        ),
     ),
     pytest.param(
         lambda: _with(
