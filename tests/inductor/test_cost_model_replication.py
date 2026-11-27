@@ -635,7 +635,10 @@ def _solve_pinned(expr, menu, candidate, residency=None):
     buffer's candidate divisions, residency a solver variable -- and solve it
     with the division (and residency) pinned. Returns the objective value."""
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        COST_SCALE,
+        lower_cost_with_tables,
+    )
 
     model = cp_model.CpModel()
     division = model.new_int_var(0, len(menu) - 1, "div")
@@ -650,10 +653,10 @@ def _solve_pinned(expr, menu, candidate, residency=None):
     if residency is not None:
         sym_map["is_lx_w"] = model.new_bool_var("is_lx_w")
         model.add(sym_map["is_lx_w"] == residency)
-    model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+    model.minimize(lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=8192))
     solver = cp_model.CpSolver()
     assert solver.Solve(model) == cp_model.OPTIMAL
-    return solver.ObjectiveValue()
+    return solver.ObjectiveValue() / COST_SCALE
 
 
 def test_cp_sat_keeps_the_term_at_every_candidate():
@@ -1088,7 +1091,10 @@ def _decode_buffer():
 @pytest.mark.parametrize("weight_lx", [False, True])
 def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        COST_SCALE,
+        lower_cost_with_tables,
+    )
 
     is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
     expr = _decode_weight_delivery_excess(
@@ -1107,11 +1113,15 @@ def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
             sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
             for key, sym in buffer.sym_core_divs.items()
         }
-        model.minimize(_SympyExprToCpSat(model, sym_map, buffer_map).convert(expr))
+        model.minimize(
+            lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=8192)
+        )
         solver = cp_model.CpSolver()
         assert solver.Solve(model) == cp_model.OPTIMAL
         expected = 0 if weight_lx else _decode_expected(m, k, m * n * k)
-        assert solver.ObjectiveValue() == pytest.approx(expected, rel=2e-3, abs=2.0), (
+        assert solver.ObjectiveValue() / COST_SCALE == pytest.approx(
+            expected, rel=2e-3, abs=2.0
+        ), (
             m,
             n,
             k,
@@ -1120,15 +1130,19 @@ def test_cp_sat_calls_the_functor_at_every_candidate(weight_lx):
 
 def test_cp_sat_leaves_a_split_without_an_owner_unpriced():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        lower_cost_with_tables,
+    )
 
     expr = _decode_weight_delivery_excess([_decode_symbolic(8)], _COST_PARAMS)
-    assert _SympyExprToCpSat(cp_model.CpModel(), {}, {}).convert(expr) == 0
+    assert lower_cost_with_tables(cp_model.CpModel(), {}, {}, expr, cap=8192) == 0
 
 
 def test_cp_sat_gates_the_price_on_residency_without_a_product():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        lower_cost_with_tables,
+    )
 
     is_lx = sympy.Symbol("is_lx_arg1_1", integer=True, nonnegative=True)
     expr = _decode_weight_delivery_excess(
@@ -1144,10 +1158,10 @@ def test_cp_sat_gates_the_price_on_residency_without_a_product():
         sym.name: (wrapper, [cd.splits.get(key, 1) for cd in buffer.core_divisions])
         for key, sym in buffer.sym_core_divs.items()
     }
-    _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+    lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=8192)
     constraints = model.proto.constraints
-    # One lookup for the price, though ``expand`` repeats it under the gate,
-    # and the gate as enforced linear constraints rather than a product.
+    # One lookup for the price, and the gate as enforced linear constraints rather
+    # than a product.
     assert sum(c.has_element() for c in constraints) == 1
     assert not any(c.has_int_prod() for c in constraints)
 
@@ -1156,7 +1170,10 @@ def test_cp_sat_gates_the_price_on_residency_without_a_product():
 @pytest.mark.parametrize("value", [-3, 0, 5])
 def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        COST_SCALE,
+        lower_cost_with_tables,
+    )
 
     b, x = sympy.symbols("b x", integer=True)
     model = cp_model.CpModel()
@@ -1164,18 +1181,21 @@ def test_cp_sat_bool_times_int_is_the_int_while_the_bool_holds(resident, value):
     model.add(bool_var == resident)
     model.add(int_var == value)
     sym_map = {"b": bool_var, "x": int_var}
-    model.minimize(_SympyExprToCpSat(model, sym_map, {}).convert(2 * b * x + 1))
+    model.minimize(lower_cost_with_tables(model, sym_map, {}, 2 * b * x + 1, cap=8192))
     assert not any(c.has_int_prod() for c in model.proto.constraints)
     solver = cp_model.CpSolver()
     assert solver.Solve(model) == cp_model.OPTIMAL
-    assert solver.ObjectiveValue() == 2 * resident * value + 1
+    assert solver.ObjectiveValue() / COST_SCALE == 2 * resident * value + 1
 
 
 @pytest.mark.parametrize("resident", [(0, 0), (0, 1), (1, 0), (1, 1)])
 @pytest.mark.parametrize("value", [None, -3, 5])
 def test_cp_sat_bools_times_int_is_the_int_while_every_bool_holds(resident, value):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        COST_SCALE,
+        lower_cost_with_tables,
+    )
 
     b1, b2, x = sympy.symbols("b1 b2 x", integer=True)
     model = cp_model.CpModel()
@@ -1187,9 +1207,9 @@ def test_cp_sat_bools_times_int_is_the_int_while_every_bool_holds(resident, valu
     sym_map = {"b1": bool_vars[0], "b2": bool_vars[1], "x": int_var}
     # value=None leaves x out: a product of booleans alone.
     expr = 2 * b1 * b2 * (1 if value is None else x) + 1
-    model.minimize(_SympyExprToCpSat(model, sym_map, {}).convert(expr))
+    model.minimize(lower_cost_with_tables(model, sym_map, {}, expr, cap=8192))
     assert not any(c.has_int_prod() for c in model.proto.constraints)
     solver = cp_model.CpSolver()
     assert solver.Solve(model) == cp_model.OPTIMAL
     expected = resident[0] * resident[1] * (1 if value is None else value)
-    assert solver.ObjectiveValue() == 2 * expected + 1
+    assert solver.ObjectiveValue() / COST_SCALE == 2 * expected + 1

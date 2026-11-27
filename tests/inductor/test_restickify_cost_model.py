@@ -392,7 +392,10 @@ def test_serialization_defaults_and_roundtrip():
 @pytest.mark.parametrize("n,trips", [(1024, 1), (1024, 128), (16384, 1)])
 def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        COST_SCALE,
+        lower_cost_with_tables,
+    )
 
     sb, sx = sympy.symbols("split_b split_x", integer=True, positive=True)
     expr = sympy.sympify(cm.predict_ops([restickify(sb, sx, n=n, trips=trips)]))
@@ -409,7 +412,7 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
         model.add_element(division, values, variable)
         variables[symbol.name] = variable
         tables[symbol.name] = (None, values)
-    model.minimize(_SympyExprToCpSat(model, variables, tables).convert(expr))
+    model.minimize(lower_cost_with_tables(model, variables, tables, expr, cap=8192))
     solver = cp_model.CpSolver()
     assert solver.solve(model) == cp_model.OPTIMAL
     assert choices[solver.value(division)] == (2, 1)
@@ -419,7 +422,7 @@ def test_symbolic_cpsat_picks_measured_fast_division(n, trips):
         fixed = model.clone()
         fixed.add(division == i)
         assert solver.solve(fixed) == cp_model.OPTIMAL
-        assert solver.objective_value == pytest.approx(expected, abs=0.1)
+        assert solver.objective_value / COST_SCALE == pytest.approx(expected, abs=0.1)
 
 
 def test_real_layout_extraction_uses_device_order_and_invocation_extent(monkeypatch):

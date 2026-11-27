@@ -494,9 +494,9 @@ class RelayoutCharge(sympy.Function):
     5789 copies made a 39,948-term objective and 183 to 305 s of rewriting
     before the solver saw it. As a single function node the term is opaque to
     the rewrite passes and each engine lowers it in its own vocabulary: CP-SAT
-    as one ``element`` lookup plus a charge reified on residency
-    (``_SympyExprToCpSat._print_RelayoutCharge``), ``lambdify`` through
-    :meth:`_imp_`. The table is indexed by the source's division index and an
+    as one list on the source's division gated by residency
+    (``TableLowering._print_RelayoutCharge`` in ``cpsat_table_lowering.py``),
+    ``lambdify`` through :meth:`_imp_`. The table is indexed by the source's division index and an
     index past its end reads 0 (an unpriced division, which the engine forbids
     while the copy is resident anyway).
 
@@ -1019,10 +1019,7 @@ class MemoryPlanSolver(ABC):
     @classmethod
     @abstractmethod
     def chooses_tilings(cls) -> bool:
-        """Chooses each op's coarse tiling jointly with its core division. With
-        ``linear_cost_only`` too, the allocator hands it no cost expression
-        while ``auto_coarse_tiling`` is on: the cost model cannot score tile
-        size or cut count."""
+        """Chooses each op's coarse tiling jointly with its core division."""
 
     @classmethod
     @abstractmethod
@@ -1031,19 +1028,12 @@ class MemoryPlanSolver(ABC):
         enumerates, rather than generating its own. The allocator enumerates
         tiled candidates only for such a solver."""
 
-    @classmethod
-    @abstractmethod
-    def linear_cost_only(cls) -> bool:
-        """Can only minimize a cost expression that lowers to linear terms, so
-        the objective must avoid the cost model's fractional powers."""
-
     _CAPABILITIES = (
         "supports_paired_buffers",
         "decides_lx_relayouts",
         "generates_divisions",
         "chooses_tilings",
         "tilings_from_menu",
-        "linear_cost_only",
     )
 
     def __init_subclass__(cls, **kwargs) -> None:
@@ -1068,7 +1058,6 @@ class MemoryPlanSolver(ABC):
             ("decides_lx_relayouts", "chooses_core_divisions"),
             ("generates_divisions", "chooses_core_divisions"),
             ("chooses_tilings", "chooses_core_divisions"),
-            ("linear_cost_only", "chooses_core_divisions"),
             ("tilings_from_menu", "chooses_tilings"),
         ):
             if getattr(cls, implied)() and not getattr(cls, prerequisite)():

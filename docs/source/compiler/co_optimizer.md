@@ -293,10 +293,8 @@ every division scores identically and the search has nothing left to optimize on
 side that traffic term is the first level of the lexicographic ladder in
 [CpSatLayoutSolver](scratchpad_planning.md#cpsatlayoutsolver), whose later levels break the
 remaining ties by cut count, parallelism, division balance and tile count; CP-SAT also takes
-that ladder when `cost_expr_to_cpsat` cannot lower the expression, and whenever
-`auto_coarse_tiling` is on with the printer, since the allocator then withholds the expression
-(the model is flat in tile size and cut count). With `config.cpsat_table_lowering` the allocator
-hands it over, and the table lowering raises rather than falling back.
+that ladder when the allocator has no cost expression to hand it. An expression the table
+lowering cannot lower raises rather than falling back.
 
 :::{warning}
 Even when the expression survives, parts of the model go quiet. Both engines price the *same*
@@ -360,12 +358,12 @@ points to the design RFC. What's described here is specifically the *solver's* a
 choose a coarse tiling as part of the joint search, which is a separate, newer effort.
 
 At a high level: both solvers decide tiling jointly with LX placement and work division, but
-rank it differently. CP-SAT does so in the *same* constraint model, just ranked by a different
-objective. When `auto_coarse_tiling` is on,
-`cost_expr` is dropped and residency, division, and tiling are all still decided together, but
-now ranked by an ordered sequence of tie-breaks instead: HBM traffic first, then fewest
-tiling cuts, then parallelism, then division shape, then tile count, each one only resolving
-ties the step before leaves open. Simulated annealing picks a tiling jointly with division too,
+rank it differently. CP-SAT does so in the *same* constraint model, ranked by `cost_expr`
+through its table lowering, which lowers the cost model's fractional powers and prices the
+tiling through its tile-count symbols. Without a cost expression it ranks by an ordered
+sequence of tie-breaks instead: HBM traffic first, then fewest tiling cuts, then parallelism,
+then division shape, then tile count, each one only resolving ties the step before leaves
+open. Simulated annealing picks a tiling jointly with division too,
 through `OpSplitSpace`, and keeps ranking by `cost_expr`, which prices the tiling through its
 tile-count symbols: the loop reaches the price mainly through the operands it re-reads, beside
 the residency the tiling makes possible. Either way there is one solve: once it picks a tiling,
@@ -423,15 +421,13 @@ hardware.
 `cost_expr` once, then score each candidate by substituting its guess and evaluating. The two
 solvers differ in what "substitute and evaluate" compiles down to:
 
-- **CP-SAT (symbolic all the way through)**: `_minimize_cost_expr`
+- **CP-SAT (tabulated once, then searched)**: `_minimize_cost_expr`
   (`scratchpad/ilp_solver_ortools.py`) maps each sympy symbol straight onto a native OR-Tools
   decision variable (`sym_map[t.buffer.sym_is_lx.name] = t.in_buffer`, and similarly for
-  `sym_core_divs`), then hands the whole expression, still unevaluated, to the constraint model
-  as the objective to minimize via `cost_expr_to_cpsat(...)`
-  (`scratchpad/cpsat_expr_printer.py`), or via `lower_cost_with_tables(...)`
-  (`scratchpad/cpsat_table_lowering.py`) under `config.cpsat_table_lowering`. CP-SAT never
-  evaluates `cost_expr` in Python; the printer hands it the symbolic constraint space, and the
-  table lowering exact tables of values computed before the solve.
+  `sym_core_divs`), then hands the whole expression to the constraint model
+  as the objective to minimize via `lower_cost_with_tables(...)`
+  (`scratchpad/cpsat_table_lowering.py`), which computes the expression's values at the
+  decisions' candidates before the solve and hands CP-SAT exact tables of them.
 - **Simulated annealing (compiled, then evaluated numerically per move)**: `_build_score_fn`
   (`scratchpad/sa_cooptimizer.py`) instead compiles `cost_expr` once via `sympy.lambdify` into
   a plain Python function of `(chosen, resident)`, and calls that function fresh for every

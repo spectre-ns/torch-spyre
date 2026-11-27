@@ -261,7 +261,10 @@ def test_burst_price_agrees_before_and_after_replication_is_chosen(broadcast):
 
 def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
     cp_model = pytest.importorskip("ortools.sat.python.cp_model")
-    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import _SympyExprToCpSat
+    from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+        COST_SCALE,
+        lower_cost_with_tables,
+    )
 
     replication, split = sympy.symbols(
         "split_bmm_m split_bmm_n", integer=True, positive=True
@@ -278,7 +281,7 @@ def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
         split.name: model.new_int_var(1, 8, split.name),
         resident.name: model.new_bool_var(resident.name),
     }
-    model.minimize(_SympyExprToCpSat(model, variables, {}).convert(expr))
+    model.minimize(lower_cost_with_tables(model, variables, {}, expr, cap=8192))
     solver = cp_model.CpSolver()
     for replicas, divisor, is_lx in ((1, 1, 0), (1, 8, 0), (2, 8, 0), (1, 8, 1)):
         fixed = model.clone()
@@ -297,7 +300,7 @@ def test_cpsat_keeps_the_burst_price_when_replication_resolves_to_one():
         concrete = dataclasses.replace(op, args=[op.args[0], concrete_arg])
         expected = float(_read_burst_excess_ns([concrete], p))
         assert solver.solve(fixed) == cp_model.OPTIMAL
-        assert solver.objective_value == pytest.approx(expected, abs=1)
+        assert solver.objective_value / COST_SCALE == pytest.approx(expected, abs=1)
 
 
 # ------------------------------------------------- stick-plane run geometry

@@ -131,7 +131,7 @@ else:
         cp_model = None
         _CP_MODEL_IMPORT_ERROR = str(exc)
 
-from torch_spyre._inductor.scratchpad.cpsat_expr_printer import cost_expr_to_cpsat
+from torch_spyre._inductor.scratchpad.cpsat_table_lowering import lower_cost_with_tables
 from torch_spyre._inductor.scratchpad.lx_relayout import ChosenRelayout
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -648,11 +648,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     def tilings_from_menu(cls) -> bool:
         return True
 
-    @classmethod
-    def linear_cost_only(cls) -> bool:
-        """The CP-SAT printer's limit, not the table lowering's."""
-        return not config.cpsat_table_lowering
-
     def __init__(
         self,
         buffers: Sequence[LifetimeBoundBuffer],
@@ -866,17 +861,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 buffer_map[symbol.name] = (t, t.cp_tile_counts_raw[key])
 
         try:
-            if config.cpsat_table_lowering:
-                from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
-                    lower_cost_with_tables,
-                )
-
-                # A TableLoweringError is none of the types caught below.
-                cp_cost = lower_cost_with_tables(
-                    model, sym_map, buffer_map, cost_expr, cap=config.cpsat_table_cap
-                )
-            else:
-                cp_cost = cost_expr_to_cpsat(model, sym_map, buffer_map, cost_expr)
+            # A TableLoweringError is none of the types caught below.
+            cp_cost = lower_cost_with_tables(
+                model, sym_map, buffer_map, cost_expr, cap=config.cpsat_table_cap
+            )
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
@@ -1406,8 +1394,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
-        # Presolve runs on every model, priced or not: the lin_max proxy
-        # variables (see _SympyExprToCpSat._lin_max_operand) removed the
+        # Presolve runs on every model, priced or not: a lin_max operand behind a
+        # variable of its own (ExtremeRealization in cpsat_table_lowering) removed the
         # subset-sum domain work that let it consume the budget, and without it
         # the LNS workers on a priced model can run out of memory. The copy-count
         # threshold remains as an opt-in escape hatch (off by default).
