@@ -354,7 +354,10 @@ class SymbolicRealization(AbstractRealization):
         """Its cheapest table from its parts' tables (_tabulated)."""
         with np.errstate(over="ignore"):  # inf is refused by TableRealization
             return _tabulated(
-                self._parts(cap), self.positions, cap, lambda _, lists: self._of(lists)
+                self._parts(cap),
+                self.positions,
+                cap,
+                lambda _, lists: self._values_from_parts(lists),
             )
 
     @abstractmethod
@@ -362,7 +365,7 @@ class SymbolicRealization(AbstractRealization):
         """The tables it is a function of."""
 
     @abstractmethod
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         """Its value from its parts' lists, each on one position."""
 
 
@@ -388,7 +391,7 @@ class SumRealization(SymbolicRealization):
     def _parts(self, cap: int) -> list[TableRealization]:
         return [term.table(cap) for term in self.terms]
 
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         return sum(lists, np.zeros(len(lists[0])))
 
     def scaled(self, factor: float) -> SumRealization:
@@ -442,7 +445,7 @@ class SwitchRealization(SymbolicRealization):
         factor = TableRealization(values=self.values, index=self.index)
         return [factor, self.rest.table(cap)]
 
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         return lists[0] * lists[1]
 
     def scaled(self, factor: float) -> SwitchRealization:
@@ -511,7 +514,7 @@ class GateRealization(SymbolicRealization):
         literal = TableRealization(values=[0.0, 1.0], index=self.literal)
         return [literal, self.rest.table(cap)]
 
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         return np.where(lists[0] == self.kept, lists[1], 0.0)
 
     def scaled(self, factor: float) -> GateRealization:
@@ -568,7 +571,7 @@ def _grid(positions: Sequence[Index]) -> dict[Index, np.ndarray]:
     return dict(zip(positions, np.indices(shape).reshape(len(shape), -1)))
 
 
-def _on(
+def _values_at(
     table: TableRealization, index: Index, grid: Mapping[Index, np.ndarray]
 ) -> np.ndarray:
     """table's list at each entry of index; grid holds the coordinates of the
@@ -642,7 +645,7 @@ def _tabulated(
     assert best is not None
     _, way, operands = best
     index, grid = _combined(way), _grid(way)
-    lists = [_on(operand, index, grid) for operand in operands]
+    lists = [_values_at(operand, index, grid) for operand in operands]
     return TableRealization(values=compute(index.size, lists), index=index)
 
 
