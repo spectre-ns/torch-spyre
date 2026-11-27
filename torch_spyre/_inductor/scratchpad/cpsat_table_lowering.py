@@ -48,10 +48,10 @@ from __future__ import annotations
 import math
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import reduce
-from typing import Any, Self, TypeAlias
+from typing import Any, Self, TypeAlias, TypeVar
 
 import numpy as np
 import sympy
@@ -520,7 +520,7 @@ class SymbolicRealization(AbstractRealization):
                 parts,
                 self.positions,
                 cap,
-                lambda _, lists: self._of(lists),
+                lambda _, lists: self._values_from_parts(lists),
                 self._made(parts, cap),
             )
 
@@ -535,7 +535,7 @@ class SymbolicRealization(AbstractRealization):
         return ()
 
     @abstractmethod
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         """Its value from its parts' lists, each on one position."""
 
 
@@ -561,7 +561,7 @@ class SumRealization(SymbolicRealization):
     def _parts(self, cap: int) -> list[TableRealization]:
         return [term.table(cap) for term in self.terms]
 
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         return sum(lists, np.zeros(len(lists[0])))
 
     def scaled(self, factor: float) -> SumRealization:
@@ -611,7 +611,7 @@ class SwitchRealization(SymbolicRealization):
         factor = TableRealization(values=self.values, index=self.index)
         return [factor, self.rest.table(cap)]
 
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         return lists[0] * lists[1]
 
     def scaled(self, factor: float) -> SwitchRealization:
@@ -680,7 +680,7 @@ class ExtremeRealization(SymbolicRealization):
     def _parts(self, cap: int) -> list[TableRealization]:
         return [operand.table(cap) for operand in self.operands]
 
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         return reduce(np.minimum if self.is_min else np.maximum, lists)
 
     def _made(
@@ -742,7 +742,7 @@ class GateRealization(SymbolicRealization):
         literal = TableRealization(values=[0.0, 1.0], index=self.literal)
         return [literal, self.rest.table(cap)]
 
-    def _of(self, lists: list[np.ndarray]) -> np.ndarray:
+    def _values_from_parts(self, lists: list[np.ndarray]) -> np.ndarray:
         return np.where(lists[0] == self.kept, lists[1], 0.0)
 
     def scaled(self, factor: float) -> GateRealization:
@@ -799,7 +799,7 @@ def _grid(positions: Sequence[Index]) -> dict[Index, np.ndarray]:
     return dict(zip(positions, np.indices(shape).reshape(len(shape), -1)))
 
 
-def _on(
+def _values_at(
     table: TableRealization, index: Index, grid: Mapping[Index, np.ndarray]
 ) -> np.ndarray:
     """table's list at each entry of index; grid holds the coordinates of the
@@ -838,6 +838,14 @@ def _ways(
 
 def _size(positions: Sequence[Index]) -> int:
     return math.prod(position.size for position in positions)
+
+
+T = TypeVar("T")
+
+
+def _dedup(items: Iterable[T]) -> list[T]:
+    """items in the order first met, each once."""
+    return list(dict.fromkeys(items))
 
 
 def _tabulated(
@@ -887,27 +895,8 @@ def _cheapest(
         return None
     _, way, operands = best
     index, grid = _combined(way), _grid(way)
-    lists = [_on(operand, index, grid) for operand in operands]
+    lists = [_values_at(operand, index, grid) for operand in operands]
     return TableRealization(values=compute(index.size, lists), index=index)
-
-
-def _table_of(
-    expr: sympy.Basic,
-    parts: Sequence[TableRealization],
-    positions: Sequence[Index],
-    cap: int,
-    compute: Callable[[list[np.ndarray]], Any],
-    made: Sequence[TableRealization] = (),
-) -> TableRealization:
-    """expr, compute of parts' lists, as its table (_tabulated) over positions, its
-    inputs in symbol order, over its parts' positions, or one of made."""
-    return _tabulated(
-        parts,
-        positions,
-        cap,
-        lambda count, lists: _values(expr, count, lambda: compute(lists)),
-        made,
-    )
 
 
 def _by_rung(parts: Sequence[TableRealization], is_min: bool) -> TableRealization:
@@ -1220,18 +1209,16 @@ class TableLowering(Printer):
         operands: Sequence[sympy.Basic],
         made: Sequence[TableRealization] = (),
     ) -> TableRealization:
-        """expr as its table (_table_of) of its operands, or one of made. An operation
+        """expr as its table (_tabulated) of its operands, or one of made. An operation
         on numbers is computed the same way, on a UnitIndex, so sqrt(19) equals
         sqrt(a) at a = 19 (sympy's float is one double below)."""
         if not operands:
             return TableRealization(values=[_constant(expr)], index=UnitIndex())
-        parts = [self._table(operand) for operand in operands]
-        return _table_of(
-            expr,
-            parts,
+        return _tabulated(
+            [self._table(operand) for operand in operands],
             self._inputs(expr) or [UnitIndex()],
             self.cap,
-            lambda lists: numpy_eval(expr, lists),
+            lambda count, lists: _values(expr, count, lambda: numpy_eval(expr, lists)),
             made,
         )
 
@@ -1247,7 +1234,7 @@ class TableLowering(Printer):
     def _inputs(self, expr: sympy.Basic) -> list[Index]:
         """The positions of expr's inputs, in the order of its symbols."""
         symbols = sorted(expr.free_symbols, key=sympy.default_sort_key)
-        return list(dict.fromkeys(self._table(symbol).index for symbol in symbols))
+        return _dedup(self._table(symbol).index for symbol in symbols)
 
     def _table(self, expr: sympy.Basic) -> TableRealization:
         """expr's table within the cap; a refusal of that table names expr."""
@@ -1278,7 +1265,7 @@ def _joined(
 ) -> tuple[SumRealization, tuple[Index, ...]]:
     """The rest and positions of group, switches on one factor or gates on one
     literal and kept value, joined into one: the sum of their rests, one w."""
-    positions = tuple(dict.fromkeys(p for r in group for p in r.positions))
+    positions = tuple(_dedup(p for r in group for p in r.positions))
     return _sum([realization.rest for realization in group], positions), positions
 
 
@@ -1329,7 +1316,7 @@ def _ranked(
     of their first entries: the rank of each entry's row, a CompactIndex, or index
     itself when no row repeats; and each list's value at each rank."""
     rows = list(zip(*(values.tolist() for values in lists)))
-    distinct = list(dict.fromkeys(rows))
+    distinct = _dedup(rows)
     if len(distinct) == len(rows):
         return index, list(lists)
     rank = {row: i for i, row in enumerate(distinct)}
