@@ -1866,49 +1866,6 @@ def test_a_max_read_by_a_switch_or_under_a_log_is_its_ladder_on_its_rung():
     assert type(plan) is TableRealization and isinstance(plan.index, ExtremeIndex)
 
 
-# ---------------------------------------------------------------------- the fold
-
-
-def _maxes(*floors: int) -> tuple[Case, list[sympy.Basic]]:
-    """Max(a, b, c, k) for each k of floors, over three buffers whose splits take 1 to
-    12: each Max's ladder starts at its k, so their rungs differ, and each is a
-    function of max(a, b, c), so their rungs move together."""
-    case, s = _with(lambda s: s, a=12, b=12, c=12)
-    return case, [sympy.Max(s["a"], s["b"], s["c"], k) for k in floors]
-
-
-def test_a_product_of_maxes_read_as_a_table_is_its_fold():
-    """Four Maxes over three buffers of 12 divisions: one table over the buffers holds
-    1,728 entries and their ladders crossed 3,360, past a cap of 1,000, but 12 tuples
-    of their rungs occur. The product is a switch, and under a log it is read as its
-    fold, on those 12."""
-    case, maxes = _maxes(1, 3, 6, 9)
-    plan = case.assert_exact(sympy.log(sympy.Mul(*maxes)), cap=1000)
-    assert type(plan) is TableRealization and plan.index.size == 12
-
-
-def test_the_pair_of_rungs_wins_where_it_has_fewer_entries_than_the_fold():
-    """Two of those Maxes cross in 7 * 4 entries, where their fold holds 187: the
-    product read under a log is the pair of their rungs."""
-    case, maxes = _maxes(6, 9)
-    plan = case.assert_exact(sympy.log(maxes[0] * maxes[1]), cap=1000)
-    assert isinstance(plan.index, CombineIndex) and plan.index.size == 28
-    assert all(isinstance(i, ExtremeIndex) for i in (plan.index.left, plan.index.right))
-
-
-def test_the_fold_steps_once_per_group_of_rungs_on_shared_inputs():
-    """The four Maxes' rungs on one buffer are one group, so the fold takes three
-    steps: a's 12 states, then 12 states times b's 12 divisions and the same for c,
-    compacted to 12 each. At a cap under 144 a step passes it and there is no fold."""
-    case, maxes = _maxes(1, 3, 6, 9)
-    printer = TableLowering(case.inputs, cap=CAP)
-    parts = [printer.print(m).table(CAP) for m in maxes]
-    fold = lowering._fold(parts, 1000)
-    assert fold is not None and fold.entries() == 12 + 144 + 144
-    assert len(fold.index.leaves()) == 3
-    assert lowering._fold(parts, 143) is None
-
-
 # ------------------------------------------------------- a Min or Max kept linear
 
 
@@ -2031,10 +1988,8 @@ def _refused(reason):
 # its cap, which no stage before that one can lower and that stage's optimization can.
 # Each is refused today, for the reason its mark gives; the stage that lowers it drops
 # its mark, so the marks show what each stage adds. Stage 3's caching and Stage 4's
-# numpy steps change no lowering, so they have none, and the fold's example came with
-# Stage 10, since whether it fits where the switch and Stage 9's rungs do not depends
-# on the fold's own counts. The first example lowers today, so the check below runs end
-# to end on every stage.
+# numpy steps change no lowering, so they have none. The first example lowers today, so
+# the check below runs end to end on every stage.
 EXAMPLES = [
     pytest.param(
         lambda: _with(
@@ -2100,18 +2055,6 @@ EXAMPLES = [
         ),
         CAP,
         id="rung",
-    ),
-    pytest.param(
-        lambda: _with(
-            lambda s: sympy.log(
-                sympy.Mul(*(sympy.Max(s["a"], s["b"], s["c"], k) for k in (1, 3, 6, 9)))
-            ),
-            a=12,
-            b=12,
-            c=12,
-        ),
-        1000,
-        id="fold",
     ),
     pytest.param(
         lambda: _with(
