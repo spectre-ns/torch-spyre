@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The table lowering inside the CP-SAT layout solver, behind
-config.cpsat_table_lowering. No device: each test plans two buffers. The last test
-needs no ortools, so this file has no module-level skip."""
+"""The table lowering inside the CP-SAT layout solver, which lowers its cost objective
+from tables. No device: each test plans two buffers. The last test needs no ortools,
+so this file has no module-level skip."""
 
 import contextlib
 import importlib.util
@@ -62,49 +62,23 @@ def _cost(buffers: list[CoreDivisionBuffer]) -> sympy.Expr:
 
 
 @needs_ortools
-def test_with_the_flag_the_solve_lowers_from_tables_and_never_the_printer():
-    """OPTIMAL with the objective used, and its plan's exact cost no higher than the
-    printer's plan's."""
-    from torch_spyre._inductor.scratchpad import ilp_solver_ortools
-
-    exact = {}
-    for flag in (False, True):
-        buffers = _buffers()
-        cost = _cost(buffers)
-        solver = ilp_solver_ortools.CpSatLayoutSolver(buffers, 1 << 20, alignment=1)
-        printer = mock.patch.object(
-            ilp_solver_ortools,
-            "cost_expr_to_cpsat",
-            side_effect=AssertionError("the printer was called"),
-        )
-        with config.patch({"cpsat_table_lowering": flag}):
-            with printer if flag else contextlib.nullcontext():
-                result = solver.plan_layout_and_core_divisions(cost)
-        stats = solver.last_solve_stats
-        assert (stats["status"], stats["objective_used"]) == ("OPTIMAL", True)
-        exact[flag] = float(cost.xreplace(solved_bindings(result)))
-    assert exact[True] <= exact[False]
-
-
-@needs_ortools
-def test_without_the_flag_the_solve_never_calls_the_table_lowering():
-    from torch_spyre._inductor.scratchpad import cpsat_table_lowering
+def test_the_solve_lowers_its_objective_from_tables_at_its_optimum():
+    """OPTIMAL with the objective used: 32 cores for the reduction and the second
+    buffer resident, the plan of least exact cost."""
     from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
     buffers = _buffers()
+    cost = _cost(buffers)
     solver = CpSatLayoutSolver(buffers, 1 << 20, alignment=1)
-    with mock.patch.object(
-        cpsat_table_lowering,
-        "lower_cost_with_tables",
-        side_effect=AssertionError("the table lowering was called"),
-    ):
-        solver.plan_layout_and_core_divisions(_cost(buffers))
-    assert solver.last_solve_stats["objective_used"]
+    result = solver.plan_layout_and_core_divisions(cost)
+    stats = solver.last_solve_stats
+    assert (stats["status"], stats["objective_used"]) == ("OPTIMAL", True)
+    assert float(cost.xreplace(solved_bindings(result))) == 1000.0
 
 
 @needs_ortools
 @pytest.mark.parametrize("failure", ["refusal", "ValueError"])
-def test_with_the_flag_a_failure_in_the_lowering_leaves_the_solve(failure):
+def test_a_failure_in_the_lowering_leaves_the_solve(failure):
     """As TableLoweringError, which the solver's except around the objective does not
     catch into its fallback objective, even where _cpsat_warn_on_cost_expr lets the
     printer's failures fall back: a node of a class the numpy core has no function
@@ -122,22 +96,40 @@ def test_with_the_flag_a_failure_in_the_lowering_leaves_the_solve(failure):
             cpsat_table_lowering.TableLowering, "print", side_effect=ValueError("boom")
         )
     solver = CpSatLayoutSolver(buffers, 1 << 20, alignment=1)
-    flags = {"cpsat_table_lowering": True, "_cpsat_warn_on_cost_expr": True}
-    with config.patch(flags), patch:
+    with config.patch({"_cpsat_warn_on_cost_expr": True}), patch:
         with pytest.raises(cpsat_table_lowering.TableLoweringError):
             solver.plan_layout_and_core_divisions(cost)
     assert solver.last_solve_stats == {}  # no fallback solve followed
 
 
-@needs_ortools
-def test_with_the_flag_the_solver_takes_a_cost_expression_that_is_not_linear():
-    """linear_cost_only is the printer's limit: with the tables the allocator hands
-    the solver auto coarse tiling's cost expression too."""
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
+def test_with_auto_coarse_tiling_the_allocator_hands_the_solver_its_cost():
+    """Where the solver chooses tilings too: the tables lower the cost model's tiling
+    terms, so the allocator withholds the expression from no solver. An empty graph
+    costs 0, which is not None."""
+    from types import SimpleNamespace
 
-    for flag in (False, True):
-        with config.patch({"cpsat_table_lowering": flag}):
-            assert CpSatLayoutSolver.linear_cost_only() is not flag
+    import torch_spyre._inductor.scratchpad.allocator as allocator_module
+
+    solver = mock.create_autospec(
+        allocator_module.CoreDivisionLayoutSolver, instance=True
+    )
+    solver.buffers = []
+    solver.chooses_tilings.return_value = True
+    solver.plan_layout_and_core_divisions.return_value = []
+    allocator = allocator_module.CoOptimizingAllocator(
+        # Never built: the test hands _solve the mock directly.
+        layout_planning=allocator_module.ExhaustiveSearchSolver.wrapping(
+            allocator_module.GreedyLayoutSolver
+        ),
+        size=0,
+    )
+    graph = SimpleNamespace(operations=[], get_output_names=lambda: [])
+    with (
+        config.patch({"auto_coarse_tiling": True}),
+        mock.patch.object(allocator_module, "mem_usage_by_buf", return_value={}),
+    ):
+        allocator._solve(solver, graph)
+    solver.plan_layout_and_core_divisions.assert_called_once_with(0)
 
 
 def test_the_table_lowering_and_the_solver_import_without_ortools():

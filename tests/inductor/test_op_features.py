@@ -282,22 +282,25 @@ class SymbolicTiledFeatureTest(TestCase):
                 checked += 1
         self.assertGreater(checked, 10)
 
-    def test_the_tiled_cost_expression_stays_linearizable(self):
-        """``_SympyExprToCpSat`` handles Add/Mul/Min/Max and ``symbol**-1`` only.
+    def test_the_tiled_cost_expression_lowers(self):
+        """The table lowering lowers it, over one residency literal per buffer: an
+        expression it refuses would fail the solve, which takes no other objective."""
+        try:
+            from ortools.sat.python import cp_model
+        except ImportError:
+            self.skipTest("the table lowering needs ortools")
+        from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+            lower_cost_with_tables,
+        )
 
-        A symbolic derate would be a ``Piecewise`` over a fractional ``Pow``,
-        which does not linearize -- CP-SAT then discards the WHOLE cost
-        objective and falls back to its lexicographic solve, so neutralising the
-        derate is what keeps the objective usable, not a shortcut around it.
-        """
         for _, _, b in _entries():
             raw = next((f for f in b["features"] if f is not None), None)
             if raw is None:
                 continue
             expr = sympy.sympify(predict_ops([self._symbolize(op_from_dict(raw))]))
-            self.assertFalse(expr.atoms(sympy.Piecewise))
-            for pow_ in expr.atoms(sympy.Pow):
-                self.assertEqual(pow_.exp, -1, f"non-invertible power {pow_}")
+            model = cp_model.CpModel()
+            sym_map = {s.name: model.new_bool_var(s.name) for s in expr.free_symbols}
+            lower_cost_with_tables(model, sym_map, {}, expr, cap=8192)
 
     def test_a_loop_reread_arg_does_not_consult_symbolic_mem(self):
         """``ArgTraffic.mem`` REJECTS a symbolic ``is_lx``, and
@@ -473,25 +476,21 @@ class SymbolicMatmulSplitCostTest(TestCase):
     only ``is_lx``, and it is the shape ``work_division._matmul_split_cost``'s own
     ``is_symbolic`` guards were added for (#3810) -- nothing currently pins it.
 
-    The proxy that class uses for linearizability (no ``Piecewise``, every ``Pow``
-    exponent -1) does not apply here: a symbolic split legitimately produces
-    ``log(m)`` and ``1/(m*n*k)``, which ``_SympyExprToCpSat`` linearizes through its
-    ``log2_``/``inv_`` aux symbols and ``AddMultiplicationEquality``. So this runs
-    the real converter rather than a structural stand-in.
+    A symbolic split legitimately produces ``log(m)`` and ``1/(m*n*k)``, which the
+    table lowering tabulates over the candidate divisions, so this runs the real
+    lowering.
     """
 
     #: One symbol per split, exactly as ``plan_solver.sym_core_divs`` declares them.
-    #: ``integer`` + ``positive`` is load-bearing twice over: it lets sympy collapse
-    #: ``Max(1, split)`` to ``split`` (so ``_SympyExprToCpSat._inv_sym`` still sees a
-    #: BARE symbol under the reciprocal), and it lets ``expand_log`` split
-    #: ``log(a/split)``.
+    #: ``integer`` + ``positive`` lets sympy collapse ``Max(1, split)`` to ``split``
+    #: and lets ``expand_log`` split ``log(a/split)``.
     M_SPLIT = sympy.Symbol("split_buf5_i0", integer=True, positive=True)
     N_SPLIT = sympy.Symbol("split_buf5_i1", integer=True, positive=True)
     K_SPLIT = sympy.Symbol("split_buf5_r0", integer=True, positive=True)
     IS_LX = sympy.Symbol("is_lx_buf5", integer=True, nonnegative=True)
 
-    #: The candidate splits a ``CoreDivisionBuffer`` would offer, which the CP-SAT
-    #: converter reads back as ``_raw_<symbol>`` to tabulate ``log2``/``inv``.
+    #: The candidate splits a ``CoreDivisionBuffer`` would offer: each split's value at
+    #: each of its division's candidates.
     RAW_SPLITS = (1, 2, 4, 8, 16, 32)
 
     M, N, K, DTYPE_BYTES = 1024, 1024, 64, 2
@@ -611,21 +610,20 @@ class SymbolicMatmulSplitCostTest(TestCase):
         self.assertNotEqual(expr.diff(self.M_SPLIT), 0)
 
     def test_the_symbolic_split_cost_expression_linearizes(self):
-        """Run the REAL CP-SAT converter, not a structural proxy.
+        """Run the real table lowering, not a structural proxy.
 
         ``sym_map``/``buffer_map`` mirror ``CpSatLayoutSolver._minimize_cost_expr``:
-        the split variable in ``sym_map``, plus a ``buffer_map`` entry
-        ``_print_Symbol`` needs to tabulate the ``log2_``/``inv_`` aux variables over
-        the candidate divisions.
+        the split variable in ``sym_map``, and a ``buffer_map`` entry giving its value
+        at each candidate division.
         """
         import types
 
         try:
             from ortools.sat.python import cp_model
         except ImportError:
-            self.skipTest("the cpsat converter needs ortools")
-        from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
-            _SympyExprToCpSat,
+            self.skipTest("the table lowering needs ortools")
+        from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
+            lower_cost_with_tables,
         )
 
         expr = sympy.sympify(predict_ops([self._matmul()], self._params()))
@@ -644,7 +642,7 @@ class SymbolicMatmulSplitCostTest(TestCase):
             buffer_map[sym.name] = (buffer, list(self.RAW_SPLITS))
         sym_map[self.IS_LX.name] = model.new_bool_var(self.IS_LX.name)
 
-        cp_cost = _SympyExprToCpSat(model, sym_map, buffer_map).convert(expr)
+        cp_cost = lower_cost_with_tables(model, sym_map, buffer_map, expr, cap=8192)
         # A constant would mean the objective collapsed rather than linearized.
         self.assertNotIsInstance(cp_cost, (int, float))
         model.minimize(cp_cost)

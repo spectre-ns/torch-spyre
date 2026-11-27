@@ -485,12 +485,8 @@ cpsat_time_limit_seconds: float = float(
     os.environ.get("CPSAT_TIME_LIMIT_SECONDS", "60")
 )
 
-# Lower the CP-SAT cost objective from exact element tables
-# (``scratchpad/cpsat_table_lowering.py``) instead of the CP-SAT printer. An
-# objective the tables cannot lower raises TableLoweringError; nothing falls back.
-# With it on, CpSatLayoutSolver lowers the cost expression of auto coarse tiling too.
-cpsat_table_lowering: bool = os.environ.get("CPSAT_TABLE_LOWERING", "0") == "1"
-# The largest table, in entries, the table lowering makes.
+# The largest table, in entries, the CP-SAT cost objective's table lowering
+# (``scratchpad/cpsat_table_lowering.py``) makes.
 cpsat_table_cap: int = int(os.environ.get("CPSAT_TABLE_CAP", "8192"))
 
 

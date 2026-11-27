@@ -1449,9 +1449,9 @@ def _decode_delivery_price(weight_bytes, p: "CostParams"):
 
     As a Piecewise over the splits the price took ~30 s to rewrite and lower per
     matmul; as a functor each engine evaluates it at the divisions it considers:
-    CP-SAT calls it once per candidate of the owning buffer to build one
-    ``element`` lookup (``_SympyExprToCpSat._print_AppliedUndef``), ``lambdify``
-    and ``evalf`` call it at the chosen splits. Named by its two parameters, so
+    CP-SAT's table lowering calls it at each division of the owning buffer to build
+    one list (``numpy_eval`` in ``cpsat_table_lowering.py``), ``lambdify`` and
+    ``evalf`` call it at the chosen splits. Named by its two parameters, so
     equal functors compare (and cache) equal."""
 
     def price(m, k, cores):

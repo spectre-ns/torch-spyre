@@ -54,12 +54,15 @@ from torch_spyre._inductor.scratchpad.cpsat_table_lowering import (
     Index,
     InputIndex,
     LocateIndex,
+    NUMPY_FUNC_MAP,
     SumRealization,
     SwitchRealization,
     TableRealization,
     TableLowering,
     TableLoweringError,
     UnitIndex,
+    numpy_eval,
+    operands,
 )
 from torch_spyre._inductor.cost_model import ArgTraffic, OpFeatures, predict_ops
 from torch_spyre._inductor.scratchpad import cpsat_table_lowering as lowering
@@ -2237,6 +2240,242 @@ def test_an_exception_of_another_type_leaves_the_entry_point_as_a_refusal(monkey
             case.model, sym_map, buffer_map, a + stray, cap=CAP
         )
     assert caught.value.node == stray
+
+
+# ------------------------------------------------------------------ the numpy core
+
+
+x, y = sympy.symbols("split_x split_y", integer=True, positive=True)
+# One division's menu: its two splits move together, as a buffer's candidates do.
+SPLIT_MENU = {x: [1, 2, 4, 8], y: [8, 2, 4, 1]}
+
+
+def _value(expr: sympy.Basic, env: dict[sympy.Symbol, Any]) -> Any:
+    """expr's value where each symbol has its value in env: the core applied to the
+    values of each node's operands (operands), from the leaves up, as a caller of the
+    core does."""
+    if expr in env:
+        return env[expr]
+    if expr is sympy.true or expr is sympy.false:
+        return bool(expr)
+    if expr.is_Number:
+        return int(expr) if expr.is_Integer else float(expr)
+    return numpy_eval(expr, [_value(operand, env) for operand in operands(expr)])
+
+
+def _sympy_value(expr: sympy.Basic, point: dict[sympy.Symbol, int]) -> Any:
+    """expr at point as sympy computes it: a truth value, an int or a float."""
+    value = expr.xreplace({s: sympy.Integer(v) for s, v in point.items()})
+    if value is sympy.true or value is sympy.false:
+        return bool(value)
+    return int(value) if value.is_Integer else float(value)
+
+
+EXPRESSIONS = [
+    x + y + 3,
+    2 * x * y,
+    x**2 + y**3,
+    sympy.Min(x, y, 3),
+    sympy.Max(x, y, 3),
+    sympy.Eq(x, y),
+    sympy.Ne(x, y),
+    x < y,
+    x <= y,
+    x > y,
+    x >= y,
+    sympy.And(x >= 2, y >= 2),
+    sympy.Or(x <= 1, y <= 1),
+    sympy.KroneckerDelta(x, y),
+    sympy.Piecewise(
+        (x * y, sympy.And(x >= 2, y >= 2)),
+        (x**2, sympy.Or(x <= 1, y <= 1)),
+        (3, True),
+    ),
+    sympy.Max(x * y, 5) + sympy.Piecewise((2 * x, x > y), (y - x, True)),
+]
+
+
+# Expressions of the classes whose values are floats.
+FLOAT_EXPRESSIONS = [
+    sympy.Abs(x - y),
+    sympy.floor(x / 4) + sympy.ceiling(y / 4),
+    sympy.log(x + y) * sympy.exp(-x / 8),
+    sympy.Piecewise((x, sympy.Not(sympy.And(x > 2, y > 2))), (y, True)),
+    sympy.Piecewise((x, sympy.ITE(x > 2, y > 2, y < 2)), (y, True)),
+]
+
+
+@pytest.mark.parametrize("dtype", [float, object])
+@pytest.mark.parametrize("expr", FLOAT_EXPRESSIONS, ids=str)
+def test_a_node_over_floats_is_sympys_value_at_every_entry(expr, dtype):
+    """Over a menu held as a float array, as the table lowering holds a list, and as
+    an object array of exact ints, as an implemented function's values are."""
+    env = {s: np.asarray(menu, dtype=dtype) for s, menu in SPLIT_MENU.items()}
+    got = np.broadcast_to(_value(expr, env), (4,))
+    for i in range(4):
+        exact = _sympy_value(expr, {s: menu[i] for s, menu in SPLIT_MENU.items()})
+        assert got[i] == pytest.approx(exact, rel=1e-12), i
+
+
+def test_a_relayout_charge_is_its_literal_times_the_price_at_its_division():
+    """At every literal and division, the value the class's own ``_imp_`` gives: 0
+    where the literal is 0 and at a division past the prices. The prices are numbers,
+    or lists of one length with the operands, as the table lowering hands them."""
+    is_lx = np.repeat([0.0, 1.0], 5)
+    division = np.tile([0.0, 1.0, 2.0, 3.0, 4.0], 2)
+    prices = (0.0, 65.0, 147.5)
+    expr = RelayoutCharge(sympy.Symbol("is_lx"), sympy.Symbol("division"), *prices)
+    expected = [RelayoutCharge._imp_(*point, *prices) for point in zip(is_lx, division)]
+    assert list(numpy_eval(expr, [is_lx, division, *prices])) == expected
+    lists = [np.full(10, price) for price in prices]
+    assert list(numpy_eval(expr, [is_lx, division, *lists])) == expected
+    exact = np.asarray([0, 1, 2, 3, 4] * 2, dtype=object)
+    assert list(numpy_eval(expr, [is_lx, exact, *prices])) == expected
+    unpriced = RelayoutCharge(sympy.Symbol("is_lx"), sympy.Symbol("division"))
+    assert list(numpy_eval(unpriced, [is_lx, division])) == [0.0] * 10
+
+
+@pytest.mark.parametrize("expr", EXPRESSIONS, ids=str)
+def test_a_node_is_sympys_value_at_every_entry(expr):
+    """Over a menu held as an object array of exact ints, each entry is the value sympy
+    computes there, exactly: an int stays an int."""
+    env = {s: np.asarray(menu, dtype=object) for s, menu in SPLIT_MENU.items()}
+    got = np.broadcast_to(_value(expr, env), (4,))
+    for i in range(4):
+        exact = _sympy_value(expr, {s: menu[i] for s, menu in SPLIT_MENU.items()})
+        assert got[i] == exact and not isinstance(got[i], (float, np.floating)), i
+
+
+def test_every_function_is_reached():
+    """The expressions above, and the relayout charge, reach every class the core has
+    a function for."""
+    reached = {
+        cls
+        for expr in EXPRESSIONS + FLOAT_EXPRESSIONS
+        for node in sympy.preorder_traversal(expr)
+        for cls in type(node).__mro__
+    }
+    assert set(NUMPY_FUNC_MAP) - reached == {RelayoutCharge}
+
+
+def test_a_plain_int_stays_exact_at_any_size():
+    """Add, Mul and Pow are Python's own, so numbers past int64 are exact, alone and
+    in an object array. A sum of floats is Python's sum and a product math.prod."""
+    big = 2**62
+    assert numpy_eval(x + y, [big, big]) == 2**63
+    assert numpy_eval(x * y, [big, big]) == 2**124
+    assert numpy_eval(x**y, [3, 50]) == 3**50
+    column = np.asarray([big, 3], dtype=object)
+    assert list(numpy_eval(x * y, [column, column])) == [2**124, 9]
+    floats = [0.1, 0.2, 0.3]
+    assert numpy_eval(x + y + 1, floats) == sum(floats)
+    assert numpy_eval(x * y * 2, floats) == math.prod(floats)
+
+
+# Forms lambdify prints by their node: a Mul with a negative power as one division and
+# a rational coefficient as a factor, (1/49)*x; a power of a half as sqrt(x) and of
+# minus a half as 1/sqrt(x).
+PRINTED_FORMS = [
+    98 / x,
+    x / 49,
+    98 * x / y**2,
+    x / (3 * y),
+    x / sympy.sqrt(y),
+    sympy.floor(98 / x),
+    98 / x >= 2,
+    sympy.sqrt(x),
+    x ** sympy.Rational(-1, 2),
+    x ** sympy.Rational(3, 2),
+    x**-2,
+]
+
+
+def test_a_mul_or_a_pow_is_computed_as_lambdify_prints_it():
+    """98/x is Mul(98, Pow(x, -1)): from the value of 1/x it would be 98 * (1/x), one
+    ulp under 2 at x = 49. A Mul reads a power with a negative exponent as its base
+    (operands) and divides once by it, and multiplies by a rational, as lambdify
+    prints x/49; a lone x**(-1/2) is 1/sqrt(x). Each value is lambdify's to the bit,
+    over floats and over exact ints."""
+    assert math.floor(98 * (1 / 49)) == 1
+    assert operands(98 / x) == [98, x]
+    assert operands(x / 49) == [sympy.Rational(1, 49), x]
+    assert set(operands(x * y**-2)) == {x, y}
+    assert set(operands(x**2 * y)) == {x**2, y}
+    floats = {x: np.asarray([49.0, 7.0, 98.0]), y: 4.0}
+    ints = {x: np.asarray([49, 7, 98], dtype=object), y: 4}
+    for expr in PRINTED_FORMS:
+        over_floats = sympy.lambdify([x, y], expr, modules="numpy")
+        at_ints = sympy.lambdify([x, y], expr, modules="math")
+        expected = list(over_floats(floats[x], floats[y]))
+        assert list(_value(expr, floats)) == expected, expr
+        expected = [at_ints(value, ints[y]) for value in ints[x]]
+        assert list(_value(expr, ints)) == expected, expr
+
+
+def test_a_mul_multiplies_in_the_order_lambdify_prints_it():
+    """lambdify multiplies a Mul's factors in as_ordered_factors() order, which need
+    not be the order of its args: here the args put the Piecewise before the sum, and
+    multiplying in that order is one ulp off lambdify at x = 0, y = 1."""
+    pick = sympy.Piecewise((1.09235648634148, sympy.Eq(y, 1)), (1.7, True))
+    c = sympy.Float("0.00666666666666667")
+    expr = sympy.Mul(c, pick, 128000 - 128000 * x, evaluate=False)
+    assert list(expr.args) != expr.as_ordered_factors() == operands(expr)
+    by_args = math.prod([0.00666666666666667, 1.09235648634148, 128000])
+    printed = math.prod([0.00666666666666667, 128000, 1.09235648634148])
+    assert by_args != printed
+    env = {x: np.asarray([0.0, 0.0, 1.0]), y: np.asarray([1.0, 2.0, 1.0])}
+    lambdified = sympy.lambdify([x, y], expr, modules="numpy")
+    assert list(_value(expr, env)) == list(lambdified(env[x], env[y]))
+    assert _value(expr, {x: 0.0, y: 1.0}) == printed
+
+
+def test_a_number_stands_at_every_entry():
+    column = np.asarray([1, 5, 9], dtype=object)
+    assert list(numpy_eval(sympy.Max(x, 3), [column, 3])) == [3, 5, 9]
+    assert list(numpy_eval(x + 3, [3, column])) == [4, 8, 12]
+    assert list(numpy_eval(x < 3, [column, 5])) == [True, False, False]
+
+
+def test_a_piecewise_takes_the_first_arm_that_holds():
+    """Where two conditions hold, the earlier arm wins. A default arm is taken as it
+    is, so its ints stay ints; with no default, an entry no arm holds at is NaN."""
+    expr = sympy.Piecewise((x, x > 2), (y, x > 1), (0, True))
+    first = np.asarray([10, 20, 30, 40], dtype=object)
+    second = np.asarray([1, 2, 3, 4], dtype=object)
+    holds = np.asarray([True, False, True, False])
+    also = np.asarray([True, True, False, False])
+    got = numpy_eval(expr, [first, holds, second, also, 7, True])
+    assert list(got) == [10, 2, 30, 7]
+    assert all(type(value) is int for value in got)
+    open_ended = numpy_eval(expr, [first, holds, second, also])
+    assert list(open_ended[:3]) == [10, 2, 30] and math.isnan(open_ended[3])
+
+
+def test_a_subclass_is_evaluated_as_its_class():
+    """The function is that of the nearest class along the MRO: a subclass of sympy's
+    Min is evaluated as a Min."""
+
+    class _LazyMin(sympy.Min):
+        pass
+
+    lazy = _LazyMin(x, y)
+    assert type(lazy) is not sympy.Min
+    column = np.asarray([1, 5, 9], dtype=object)
+    assert list(numpy_eval(lazy, [column, 4])) == [1, 4, 4]
+
+
+def test_an_implemented_function_is_its_imp_at_each_entry():
+    """Its ``_imp_`` takes scalars only, as the cost model's decode price does."""
+    step = implemented_function("step", lambda v, w: 3 if v > w else 1)
+    column = np.asarray([1, 5, 9], dtype=object)
+    got = numpy_eval(step(x, y), [column, 4])
+    assert list(got) == [1, 3, 3]
+    assert all(type(value) is int for value in got)
+
+
+def test_a_class_with_no_function_raises():
+    with pytest.raises(NotImplementedError, match="no numpy function for sinc"):
+        numpy_eval(sympy.sinc(x), [np.asarray([1.0, 2.0])])
 
 
 # ------------------------------------------ synthetic examples of later optimizations
